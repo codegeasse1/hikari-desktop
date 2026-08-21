@@ -40,6 +40,11 @@ class ExtensionsScreenView {
 
     private val extDir: File = File(HikariApp.instance.filesDir, "extensions").apply { mkdirs() }
 
+    private val jarPanel: VBox = VBox(10.0).apply {
+        isVisible = false
+        isManaged = false
+    }
+
     private fun setStatus(text: String, isError: Boolean = false) {
         statusLabel.text = text
         statusLabel.style = "-fx-text-fill: ${if (isError) "#ff8f8f" else Theme.FG_DIM};"
@@ -47,24 +52,52 @@ class ExtensionsScreenView {
 
     init {
         val title = Theme.label("Extensions", size = 26.0, bold = true)
+        jarPanel.children.addAll(installUrlRow(), installFileRow())
         root.children.addAll(
             HBox(12.0, title, busy).apply { alignment = Pos.CENTER_LEFT },
+            hikariRepoRow(),
             addStremioRow(),
             addScraperRow(),
             repoRow(),
-            installUrlRow(),
             Section(title = "Repositories", body = reposBox),
             Section(title = "Repository plugins", body = pluginListBox),
             Section(title = "Installed providers", body = installedBox),
-            installFileRow(),
+            installToggleRow(),
+            jarPanel,
             statusLabel,
         )
         busy.isVisible = false
         refresh()
     }
 
+    private fun installToggleRow(): HBox {
+        val btn = Button("Install .jar extension…").apply {
+            styleClass.add("btn")
+            setOnAction {
+                jarPanel.isVisible = !jarPanel.isVisible
+                jarPanel.isManaged = jarPanel.isVisible
+                text = if (jarPanel.isVisible) "Hide jar install" else "Install .jar extension…"
+            }
+        }
+        return HBox(12.0, btn).apply { alignment = Pos.CENTER_LEFT }
+    }
+
     private fun Section(title: String, body: VBox): VBox =
         VBox(8.0, Theme.label(title, size = 16.0, bold = true), body)
+
+    private fun hikariRepoRow(): HBox {
+        val btn = Button("＋ Add Hikari repo (codegeasse1/hikari-extensions)").apply {
+            styleClass.addAll("btn", "btn-primary")
+            setOnAction {
+                if (AppShell.app.store.repos().any { it.url.contains("codegeasse1/hikari-extensions") }) {
+                    setStatus("The Hikari repo is already added.", isError = true)
+                } else {
+                    addRepo("https://github.com/codegeasse1/hikari-extensions")
+                }
+            }
+        }
+        return HBox(10.0, btn).apply { alignment = Pos.CENTER_LEFT }
+    }
 
     private fun addStremioRow(): HBox {
         val input = TextField().apply {
@@ -123,11 +156,8 @@ class ExtensionsScreenView {
             setOnAction {
                 val url = Http.normalizeUrl(input.text)
                 if (url.isNotBlank()) {
-                    AppShell.app.store.addCs3Repo(
-                        Cs3Repo(url = url, name = url.substringAfter("://").substringBefore("/"), kind = com.hikari.app.data.RepoKind.HIKARI)
-                    )
+                    addRepo(url)
                     input.clear()
-                    refresh()
                 }
             }
         }
@@ -239,16 +269,45 @@ class ExtensionsScreenView {
         }
     }
 
-    private fun browseRepo(repoUrl: String) {
+    /** Validates a repo.json by fetching it (via URL candidates), then saves it
+     *  under the resolved URL and lists its plugins immediately. */
+    private fun addRepo(url: String) {
         busy.isVisible = true
-        setStatus("Fetching $repoUrl…")
-        pluginListBox.children.clear()
+        setStatus("Checking $url…")
         AppShell.uiScope.launch {
-            val result = Http.fetchStringRobust(repoUrl)
+            val result = Http.fetchRepoJson(url)
             Fx.run {
                 busy.isVisible = false
-                val text = result.getOrNull()
-                if (text == null) {
+                val pair = result.getOrNull()
+                if (pair == null) {
+                    setStatus(
+                        "Couldn't load that repo — ${result.exceptionOrNull()?.message ?: "network error"}",
+                        isError = true,
+                    )
+                    return@run
+                }
+                val resolved = pair.first
+                val name = resolved.substringAfter("://").substringBefore("/")
+                AppShell.app.store.addCs3Repo(
+                    Cs3Repo(url = resolved, name = name, kind = com.hikari.app.data.RepoKind.HIKARI)
+                )
+                setStatus("")
+                refresh()
+                renderPlugins(resolved, pair.second)
+            }
+        }
+    }
+
+    private fun browseRepo(repoUrl: String) {
+        busy.isVisible = true
+        setStatus("Fetching repo…")
+        pluginListBox.children.clear()
+        AppShell.uiScope.launch {
+            val result = Http.fetchRepoJson(repoUrl)
+            Fx.run {
+                busy.isVisible = false
+                val pair = result.getOrNull()
+                if (pair == null) {
                     setStatus(
                         "Failed to fetch repo.json — ${result.exceptionOrNull()?.message ?: "network error"}",
                         isError = true,
@@ -256,7 +315,7 @@ class ExtensionsScreenView {
                     return@run
                 }
                 setStatus("")
-                renderPlugins(repoUrl, text)
+                renderPlugins(pair.first, pair.second)
             }
         }
     }
