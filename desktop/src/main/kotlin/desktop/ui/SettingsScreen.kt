@@ -8,6 +8,7 @@ import javafx.geometry.Pos
 import javafx.scene.control.Button
 import javafx.scene.control.CheckBox
 import javafx.scene.control.Label
+import javafx.scene.control.ScrollPane
 import javafx.scene.control.TextField
 import javafx.scene.layout.HBox
 import javafx.scene.layout.VBox
@@ -15,8 +16,12 @@ import kotlinx.coroutines.launch
 
 class SettingsScreenView {
 
-    val root: VBox = VBox(16.0).apply {
+    private val content = VBox(16.0).apply {
         padding = Insets(18.0, 22.0, 18.0, 22.0)
+    }
+    val root: ScrollPane = ScrollPane(content).apply {
+        isFitToWidth = true
+        styleClass.add("scroll-pane")
     }
 
     private val app = HikariApp.instance
@@ -25,7 +30,7 @@ class SettingsScreenView {
 
     init {
         val title = Theme.label("Settings", size = 26.0, bold = true)
-        root.children.addAll(
+        content.children.addAll(
             title,
             crashBanner(),
             themeRow(),
