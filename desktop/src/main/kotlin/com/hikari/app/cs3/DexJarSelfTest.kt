@@ -130,8 +130,9 @@ object DexJarSelfTest {
             // by version (page/url vs name/id/isMovie), so try every constructor
             // with zero-filled primitives/null refs until one instantiates.
             val req = reqClass.constructors
-                .sortedBy { it.parameterTypes.size }
-                .firstNotNullOfOrNull { c ->
+                .map { it to it.parameterTypes.size }
+                .sortedBy { it.second }
+                .firstNotNullOfOrNull { (c, _) ->
                     runCatching {
                         val args = c.parameterTypes.map { t ->
                             when {
