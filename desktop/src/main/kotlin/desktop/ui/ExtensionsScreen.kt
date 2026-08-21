@@ -169,13 +169,13 @@ class ExtensionsScreenView {
             val toggle = CheckBox("Enabled").apply { isSelected = cfg.enabled }
             toggle.setOnAction { AppShell.app.store.setEnabled(cfg.id, toggle.isSelected); refresh() }
             val remove = Button("Remove").apply {
-                styleClass.add("btn", "btn-danger")
+                styleClass.addAll("btn", "btn-danger")
                 setOnAction {
                     AppShell.app.store.removeProvider(cfg.id)
                     if (cfg.url.isNotBlank() && cfg.type in setOf(ProviderType.HIKARI, ProviderType.CS3)) {
                         runCatching { File(cfg.url).delete() }
                     }
-                    AppShell.app.providers.refresh()
+                    AppShell.uiScope.launch { AppShell.app.providers.refresh() }
                     refresh()
                 }
             }
@@ -200,7 +200,7 @@ class ExtensionsScreenView {
                 setOnAction { browseRepo(repo.url) }
             }
             val remove = Button("Remove").apply {
-                styleClass.add("btn", "btn-danger")
+                styleClass.addAll("btn", "btn-danger")
                 setOnAction { AppShell.app.store.removeCs3Repo(repo.url); refresh() }
             }
             reposBox.children.add(HBox(10.0, name, browse, remove).apply {
@@ -270,6 +270,7 @@ class ExtensionsScreenView {
             val dest = File(extDir, "$safeName.jar")
             val ok = Http.downloadTo(url, dest)
             val (kind, err) = if (ok) resolveKind(dest) else null to "Download failed for $url"
+            AppShell.app.providers.refresh()
             Fx.run {
                 busy.isVisible = false
                 if (kind == null) {
@@ -292,7 +293,6 @@ class ExtensionsScreenView {
                     )
                 }
                 AppShell.app.store.addProvider(cfg)
-                AppShell.app.providers.refresh()
                 statusLabel.text = "Installed $name ($kind). Reloading providers…"
                 renderInstalled()
             }
@@ -311,6 +311,7 @@ class ExtensionsScreenView {
             val dest = File(extDir, file.name.lowercase().replace(Regex("[^a-z0-9.]+"), "-"))
             val copied = runCatching { file.copyTo(dest, overwrite = true) }.isSuccess
             val (kind, err) = if (copied) resolveKind(dest) else null to "Could not copy ${file.name}"
+            AppShell.app.providers.refresh()
             Fx.run {
                 busy.isVisible = false
                 if (kind == null) {
@@ -334,7 +335,6 @@ class ExtensionsScreenView {
                     )
                 }
                 AppShell.app.store.addProvider(cfg)
-                AppShell.app.providers.refresh()
                 statusLabel.text = "Installed $base ($kind)."
                 renderInstalled()
             }
