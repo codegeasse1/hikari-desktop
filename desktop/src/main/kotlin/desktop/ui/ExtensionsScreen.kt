@@ -203,8 +203,16 @@ class ExtensionsScreenView {
         val input = TextField().apply {
             styleClass.add("field")
             promptText = prompt
-            prefWidth = 330.0
             text = initial
+            // Wide enough that long repo/plugin URLs are fully visible instead
+            // of clipped with a hidden horizontal scroll.
+            prefWidth = 520.0
+            minWidth = 320.0
+            HBox.setHgrow(this, Priority.ALWAYS)
+            // Selecting the whole URL on focus shows the tail (the meaningful
+            // part) even in a narrow window, and makes retyping/retrying easy.
+            focusedProperty().addListener { _, _, focused -> if (focused) selectAll() }
+            setOnAction { onGo(text) }
         }
         val btn = Button(buttonText).apply {
             styleClass.addAll("btn", "btn-primary")
@@ -318,7 +326,10 @@ class ExtensionsScreenView {
                 busy.isVisible = false
                 val pair = result.getOrNull()
                 if (pair == null) {
-                    setStatus("Failed to fetch repo — ${result.exceptionOrNull()?.message ?: "network error"}", isError = true)
+                    setStatus(
+                        "Couldn't load that repo — ${Http.humanMessage(result.exceptionOrNull())}",
+                        isError = true,
+                    )
                     return@run
                 }
                 val resolved = pair.first
@@ -370,7 +381,7 @@ class ExtensionsScreenView {
                 val pair = result.getOrNull()
                 if (pair == null) {
                     setStatus(
-                        "Couldn't load that repo — ${result.exceptionOrNull()?.message ?: "network error"}",
+                        "Couldn't load that repo — ${Http.humanMessage(result.exceptionOrNull())}",
                         isError = true,
                     )
                     return@run

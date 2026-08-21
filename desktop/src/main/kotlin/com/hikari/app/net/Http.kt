@@ -39,6 +39,10 @@ object Http {
         // DoH-first resolver below let the app reach what the user's browser can.
         System.setProperty("java.net.useSystemProxies", "true")
         client = OkHttpClient.Builder()
+            // Use the OS proxy exactly like the browser does. Without this a
+            // proxy-only network MITMs the direct connection and TLS fails with
+            // an opaque BoringSSL DECODE_ERROR.
+            .proxySelector(java.net.ProxySelector.getDefault())
             .dns(HikariDns)
             .followRedirects(true)
             .followSslRedirects(true)
@@ -47,10 +51,53 @@ object Http {
             .build()
     }
 
+    /** Secondary client pinned to the JDK's own TLS stack (SunJSSE). Conscrypt's
+     *  BoringSSL is the JVM default (installed by initCloudStream) and a few CDN
+     *  TLS 1.3 handshakes fail against it with an opaque DECODE_ERROR; this
+     *  client retries the same request over the JDK TLS implementation, which
+     *  usually succeeds where BoringSSL choked. */
+    private val jdkTlsClient: OkHttpClient? by lazy {
+        try {
+            val ctx = javax.net.ssl.SSLContext.getInstance("TLS", "SunJSSE")
+            val tmf = javax.net.ssl.TrustManagerFactory.getInstance("X509", "SunJSSE")
+            tmf.init(null as java.security.KeyStore?)
+            // SunJSSE trust managers too, so cert validation doesn't route back
+            // through the Conscrypt provider that just failed.
+            ctx.init(null, tmf.trustManagers, null)
+            OkHttpClient.Builder()
+                .proxySelector(java.net.ProxySelector.getDefault())
+                .dns(HikariDns)
+                .followRedirects(true)
+                .followSslRedirects(true)
+                .connectTimeout(20, TimeUnit.SECONDS)
+                .readTimeout(30, TimeUnit.SECONDS)
+                .sslSocketFactory(
+                    ctx.socketFactory,
+                    tmf.trustManagers[0] as javax.net.ssl.X509TrustManager,
+                )
+                .build()
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    /** Runs the call, retrying once over the JDK TLS stack when the default
+     *  (Conscrypt/BoringSSL) client fails — so a TLS quirk can't break repo
+     *  fetches, installs or playback probing. */
+    private fun execute(client: OkHttpClient, request: Request): Response {
+        try {
+            return client.newCall(request).execute()
+        } catch (e: java.io.IOException) {
+            val fb = jdkTlsClient
+            if (fb == null || fb === client) throw e
+            return fb.newCall(request).execute()
+        }
+    }
+
     fun get(url: String, headers: Map<String, String> = emptyMap()): Response {
         val builder = Request.Builder().url(url).header("User-Agent", UA)
         headers.forEach { (k, v) -> builder.header(k, v) }
-        return client.newCall(builder.build()).execute()
+        return execute(client, builder.build())
     }
 
     fun post(
@@ -64,7 +111,7 @@ object Http {
             .header("User-Agent", UA)
             .post(body.toRequestBody(contentType.toMediaType()))
         headers.forEach { (k, v) -> builder.header(k, v) }
-        return client.newCall(builder.build()).execute()
+        return execute(client, builder.build())
     }
 
     fun postString(
@@ -113,6 +160,10 @@ object Http {
                 ghRaw(out, user, repo, branch)
                 if (branch != "main") ghRaw(out, user, repo, "main")
                 ghRaw(out, user, repo, "master")
+                // CloudStream convention: the repo manifest lives on the builds
+                // branch (builds/repo.json), so pasting a CloudStream repo page
+                // should find it too.
+                ghRaw(out, user, repo, "builds")
             }
         Regex("^https?://raw\\.githubusercontent\\.com/([^/]+)/([^/]+)(?:/([^/]+))?(?:/(.*))?$")
             .matchEntire(url)?.let { m ->
@@ -145,8 +196,9 @@ object Http {
     }
 
     /** Fetches a repo.json, trying every candidate URL. Only accepts a response
-     *  that is actually a JSON object with a "plugins" key — a github.com HTML
-     *  page or a CDN error body is skipped instead of being passed to the UI.
+     *  that is actually a JSON object with a "plugins" key — or a CloudStream v2
+     *  manifest whose "pluginLists" files hold the plugins array — a github.com
+     *  HTML page or a CDN error body is skipped instead of being passed to the UI.
      *
      *  repo-desktop.json candidates are tried before repo.json ones: the desktop
      *  app runs JVM jars, and the desktop repos publish repo-desktop.json with
@@ -170,16 +222,63 @@ object Http {
             val r = fetchStringRobust(u)
             if (r.isSuccess) {
                 val text = r.getOrThrow()
-                val looksValid = runCatching {
-                    org.json.JSONObject(text).has("plugins")
-                }.getOrDefault(false)
-                if (looksValid) return Result.success(u to text)
+                val root = runCatching { org.json.JSONObject(text) }.getOrNull()
+                if (root != null) {
+                    if (root.has("plugins")) return Result.success(u to text)
+                    // CloudStream v2 manifests (manifestVersion + pluginLists):
+                    // fetch the pluginLists file and merge its plugins array in,
+                    // so callers keep seeing a plain "plugins" key.
+                    if (root.has("pluginLists")) {
+                        val merged = resolvePluginLists(root)
+                        if (merged != null) return Result.success(u to merged)
+                        last = Exception("repo.json listed no readable plugins list ($u)")
+                        continue
+                    }
+                }
                 last = Exception("not a repo.json ($u)")
                 continue
             }
             r.exceptionOrNull()?.let { last = it }
         }
         return Result.failure(last)
+    }
+
+    /** Fetches a CloudStream v2 manifest's `pluginLists` files and returns the
+     *  manifest text with the first usable plugins array merged under a
+     *  "plugins" key (null when none of the list URLs serves plugins). */
+    private fun resolvePluginLists(root: org.json.JSONObject): String? {
+        val lists = root.optJSONArray("pluginLists") ?: return null
+        for (i in 0 until lists.length()) {
+            val pu = lists.optString(i).ifBlank { continue }
+            val pr = fetchStringRobust(normalizeUrl(pu))
+            if (!pr.isSuccess) continue
+            val text = pr.getOrThrow()
+            val plugins: org.json.JSONArray? = runCatching { org.json.JSONArray(text) }.getOrNull()
+                ?: runCatching {
+                    val o = org.json.JSONObject(text)
+                    when (val p = o.opt("plugins")) {
+                        null -> null
+                        is org.json.JSONArray -> p
+                        else -> org.json.JSONArray(p)
+                    }
+                }.getOrNull()
+            if (plugins != null) {
+                return runCatching { root.put("plugins", plugins).toString() }.getOrNull()
+            }
+        }
+        return null
+    }
+
+    /** Short human-readable reason for a failed network call: collapses the
+     *  multi-line Conscrypt/BoringSSL TLS noise into a single line. */
+    fun humanMessage(t: Throwable?): String {
+        val raw = t?.message?.trim().orEmpty().ifBlank { t?.javaClass?.simpleName ?: "unknown network error" }
+        val firstLine = raw.lineSequence().firstOrNull { it.isNotBlank() } ?: raw
+        return firstLine
+            .replace(Regex("ssl=[0-9A-Fa-f]+: "), "")
+            .replace("error:10000089:SSL routines:OPENSSL_internal:DECODE_ERROR", "TLS handshake failed")
+            .trim()
+            .ifBlank { "unknown network error" }
     }
 
     /** Human-friendly repo name from a URL: "codegeasse1/hikari-extensions"

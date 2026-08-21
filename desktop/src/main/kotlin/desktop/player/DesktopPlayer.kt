@@ -57,14 +57,19 @@ object DesktopPlayer {
             val args = buildList {
                 add(mpv.absolutePath)
                 add("--force-window=yes")
-                add("--no-terminal")
                 add("--title=" + title.take(200).replace('\n', ' '))
                 // Route mpv's own HTTP(S) through the app's loopback proxy so
                 // HLS/CDN domains blocked by the OS resolver still resolve (the
                 // proxy uses the same DoH-first DNS as the rest of the app).
+                // --http-proxy (NOT --https-proxy — the bundled build has no
+                // such option and exits with an error if passed) makes ffmpeg
+                // send https:// streams through the same CONNECT proxy.
                 val proxyPort = LocalProxy.start()
                 add("--http-proxy=127.0.0.1:$proxyPort")
-                add("--https-proxy=127.0.0.1:$proxyPort")
+                // No --no-terminal: stderr is drained for the error dialog, and
+                // mirrored to a log file so a failed stream shows a real reason.
+                val logDir = File(System.getProperty("user.home"), ".hikari").apply { mkdirs() }
+                add("--log-file=${File(logDir, "mpv.log").absolutePath}")
                 for ((k, v) in stream.headers) {
                     if (k.isNotBlank() && v.isNotBlank()) add("--http-header-fields=$k: $v")
                 }
@@ -86,14 +91,19 @@ object DesktopPlayer {
                     if (code != 0 && !p.isAlive) {
                         val early = System.currentTimeMillis() - startedAt < 4_000
                         if (early) {
-                            val err = tail.toString().lineSequence().filter { it.isNotBlank() }.lastOrNull()
+                            // Show the REAL last mpv lines (the log-file mirrors
+                            // stderr, so the most useful lines are at the end).
+                            val err = tail.toString().trim().lineSequence()
+                                .filter { it.isNotBlank() }
+                                .takeLast(10)
+                                .joinToString("\n")
                             Fx.run {
                                 showBrowserFallback(
                                     title, stream.url,
                                     buildString {
                                         append("The player closed with an error")
-                                        if (err != null) append(": ").append(err.take(200))
-                                        append(". Open it in your browser instead?")
+                                        if (err.isNotBlank()) append(":\n").append(err.take(1600))
+                                        append("\n\nOpen it in your browser instead?")
                                     },
                                 )
                             }
@@ -122,9 +132,9 @@ object DesktopPlayer {
     private fun showBrowserFallback(title: String, url: String, reason: String? = null) {
         val stage = Stage()
         stage.title = title
-        val label = Label(
-            listOfNotNull(reason, "Open it in your browser instead?").joinToString(" ").ifBlank { "Open it in your browser instead?" }
-        )
+        val label = Label(reason?.takeIf { it.isNotBlank() } ?: "Open it in your browser instead?").apply {
+            isWrapText = true
+        }
         val openBtn = Button("Open in browser").apply {
             setOnAction {
                 DesktopUi.open(url)
@@ -136,7 +146,7 @@ object DesktopPlayer {
             alignment = Pos.CENTER
             padding = Insets(24.0)
         }
-        stage.scene = Theme.style(Scene(box, 520.0, 180.0))
+        stage.scene = Theme.style(Scene(box, 640.0, 220.0))
         stage.show()
     }
 

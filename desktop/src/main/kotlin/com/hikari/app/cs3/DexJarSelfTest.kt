@@ -1,5 +1,6 @@
 package com.hikari.app.cs3
 
+import com.lagradost.cloudstream3.MainAPI
 import java.io.File
 import java.net.URLClassLoader
 
@@ -70,6 +71,33 @@ object DexJarSelfTest {
                 z.entries().asSequence().count { it.name.startsWith("cs3/") && it.name.endsWith(".cs3") }
             }
             println("bundled cs3 plugins in anime.jar: $cs3Count")
+
+            // Full runtime check: build the real app runtime (CloudStream wiring,
+            // Conscrypt, Http, store) and load() the plugin exactly like the
+            // desktop app does. load() must register providers — the exact step
+            // that was breaking in-app (extensions installed + enabled but no
+            // catalogs). load()/provider registration is a HARD gate so a broken
+            // plugin pipeline fails the build; the catalog probe below is
+            // diagnostic (it makes a real network fetch, so it's warning-only).
+            try {
+                val app = com.hikari.app.HikariApp()
+                app.init()
+                val apis = com.hikari.app.cs3.Cs3PluginManager.reload(app, converted)
+                println("full load() registered ${apis.size} providers")
+                if (apis.isEmpty()) {
+                    val details = com.hikari.app.cs3.Cs3PluginManager.lastError
+                        ?: "load() completed but registered no providers"
+                    println("FAIL: plugin load() registered no providers: $details")
+                    failures++
+                } else {
+                    println("first provider: ${apis[0].javaClass.name}")
+                    probeCatalog(apis[0])
+                }
+            } catch (t: Throwable) {
+                println("FAIL: full-load runtime check threw: ${t.javaClass.simpleName}: ${t.message}")
+                t.printStackTrace()
+                failures++
+            }
         } catch (t: Throwable) {
             t.printStackTrace()
             failures++
@@ -79,5 +107,81 @@ object DexJarSelfTest {
             System.exit(1)
         }
         println("DexJarSelfTest: OK")
+    }
+
+    /** Diagnostic (non-gating): asks the first registered provider for its home
+     *  catalog over the real network and prints a summary, so the CI log shows
+     *  whether catalog fetches work end-to-end (network → plugin → MainAPI).
+     *  Suspended getMainPage is bridged through a Continuation; any failure here
+     *  is warning-only. */
+    private fun probeCatalog(api: MainAPI) {
+        try {
+            val method = api.javaClass.methods.firstOrNull {
+                it.name == "getMainPage" && it.parameterCount == 3
+            } ?: api.javaClass.methods.firstOrNull {
+                it.name == "getMainPage" && it.parameterCount == 2
+            }
+            if (method == null) {
+                println("WARN: no getMainPage on ${api.javaClass.name}")
+                return
+            }
+            val reqClass = method.parameterTypes[1]
+            val req = runCatching {
+                reqClass.getDeclaredConstructor(Int::class.javaPrimitiveType, String::class.java).newInstance(0, null)
+            }.getOrNull() ?: runCatching {
+                reqClass.getDeclaredConstructor(Int::class.javaPrimitiveType).newInstance(0)
+            }.getOrNull()
+            if (req == null) {
+                println("WARN: couldn't build MainPageRequest(0)")
+                return
+            }
+            val outcome = runCatching {
+                if (method.parameterCount == 3) {
+                    // Suspend fun getMainPage(int, MainPageRequest, Continuation).
+                    val latch = java.util.concurrent.CountDownLatch(1)
+                    val box = java.util.concurrent.atomic.AtomicReference<Any?>()
+                    val thrown = java.util.concurrent.atomic.AtomicReference<Throwable?>()
+                    val cont = object : kotlin.coroutines.Continuation<Any?> {
+                        override val context: kotlin.coroutines.CoroutineContext
+                            get() = kotlin.coroutines.EmptyCoroutineContext
+                        override fun resumeWith(result: kotlin.Result<Any?>) {
+                            result.exceptionOrNull()?.let { thrown.set(it) }
+                            if (result.isSuccess) box.set(result.getOrNull())
+                            latch.countDown()
+                        }
+                    }
+                    val returned = method.invoke(api, 0, req, cont)
+                    if (returned === kotlin.coroutines.intrinsics.CoroutineSingletons.COROUTINE_SUSPENDED &&
+                        !latch.await(90, java.util.concurrent.TimeUnit.SECONDS)
+                    ) {
+                        return@runCatching "catalog probe timed out (90s)"
+                    }
+                    thrown.get()?.let { throw it }
+                    box.get()
+                } else {
+                    val exec = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+                        Thread(r, "hikari-probe").apply { isDaemon = true }
+                    }
+                    try {
+                        val fut = exec.submit<Any?> { method.invoke(api, 0, req) }
+                        runCatching { fut.get(90, java.util.concurrent.TimeUnit.SECONDS) }.getOrNull()
+                    } finally {
+                        exec.shutdownNow()
+                    }
+                }
+            }
+            val res = outcome.getOrNull()
+            val summary = res?.let { r ->
+                if (r is List<*>) "catalog returned ${r.size} home lists"
+                else r.javaClass.methods.firstOrNull {
+                    it.name.startsWith("get") && it.returnType == List::class.java
+                }?.invoke(r)?.let { "catalog returned ${(it as? List<*>)?.size ?: -1} home lists" }
+                    ?: "catalog returned ${r.javaClass.simpleName}"
+            } ?: "catalog probe: ${outcome.exceptionOrNull()?.javaClass?.simpleName ?: "?"}: " +
+                "${outcome.exceptionOrNull()?.message ?: "no result"}"
+            println("probe: $summary")
+        } catch (t: Throwable) {
+            println("WARN: catalog probe failed: ${t.javaClass.simpleName}: ${t.message}")
+        }
     }
 }
