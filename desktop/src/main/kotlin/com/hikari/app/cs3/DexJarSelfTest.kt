@@ -126,13 +126,31 @@ object DexJarSelfTest {
                 return
             }
             val reqClass = method.parameterTypes[1]
-            val req = runCatching {
-                reqClass.getDeclaredConstructor(Int::class.javaPrimitiveType, String::class.java).newInstance(0, null)
-            }.getOrNull() ?: runCatching {
-                reqClass.getDeclaredConstructor(Int::class.javaPrimitiveType).newInstance(0)
-            }.getOrNull()
+            // Build the request generically: CS3's MainPageRequest shape varies
+            // by version (page/url vs name/id/isMovie), so try every constructor
+            // with zero-filled primitives/null refs until one instantiates.
+            val req = reqClass.constructors
+                .sortedBy { it.parameterTypes.size }
+                .firstNotNullOfOrNull { c ->
+                    runCatching {
+                        val args = c.parameterTypes.map { t ->
+                            when {
+                                t == java.lang.Integer.TYPE -> 0
+                                t == java.lang.Long.TYPE -> 0L
+                                t == java.lang.Boolean.TYPE -> false
+                                t == java.lang.Double.TYPE -> 0.0
+                                t == java.lang.Float.TYPE -> 0.0f
+                                t == java.lang.Short.TYPE -> 0.toShort()
+                                t == java.lang.Byte.TYPE -> 0.toByte()
+                                t == java.lang.Character.TYPE -> 0.toChar()
+                                else -> null
+                            }
+                        }.toTypedArray()
+                        c.newInstance(*args)
+                    }.getOrNull()
+                }
             if (req == null) {
-                println("WARN: couldn't build MainPageRequest(0)")
+                println("WARN: couldn't build MainPageRequest for ${reqClass.name}")
                 return
             }
             val outcome = runCatching {
