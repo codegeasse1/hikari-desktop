@@ -55,9 +55,17 @@ jobs:
             --input jpackage-input \
             --main-jar hikari-desktop.jar \
             --main-class desktop.MainKt \
+            --icon packaging/hikari.ico \
             --java-options "-Dfile.encoding=UTF-8" \
+            --java-options "-Djava.net.useSystemProxies=true" \
             --app-version 0.1.0
           ls -la "Hikari"
+        shell: bash
+
+      - name: Dex->JVM loader self-test (real .cs3 plugin)
+        run: |
+          set -e
+          java -cp "jpackage-input/*" com.hikari.app.cs3.DexJarSelfTest
         shell: bash
 
       - name: Diagnose packaged runtime
@@ -103,7 +111,9 @@ jobs:
             --input jpackage-input \
             --main-jar hikari-desktop.jar \
             --main-class desktop.MainKt \
+            --icon packaging/hikari.ico \
             --java-options "-Dfile.encoding=UTF-8" \
+            --java-options "-Djava.net.useSystemProxies=true" \
             --app-version 0.1.0 \
             --win-menu --win-dir-chooser
           EXE=$(ls -1 *.exe | head -n 1)

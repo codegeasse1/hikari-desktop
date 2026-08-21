@@ -37,8 +37,14 @@ val cloudstreamCleanJar = tasks.register<org.gradle.api.tasks.bundling.Jar>("clo
     duplicatesStrategy = org.gradle.api.file.DuplicatesStrategy.EXCLUDE
 }
 
+// dex2jar + ASM, vendored from the official dex-tools-v2.4 release (Apache-2.0):
+// translates a CloudStream dex plugin (classes.dex) into JVM .class bytecode so
+// ANY .cs3 extension runs on the desktop, not just hand-ported ones.
+val dex2jarLibs = fileTree("libs/dex2jar") { include("*.jar") }
+
 dependencies {
     implementation(files(cloudstreamCleanJar))
+    implementation(dex2jarLibs)
 
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.coroutines.swing)

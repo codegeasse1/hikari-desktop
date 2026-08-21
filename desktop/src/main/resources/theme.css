@@ -373,3 +373,43 @@
     -fx-background-color: #c42b1c;
     -fx-text-fill: #ffffff;
 }
+
+/* ---- Custom window chrome (frameless stage) ---- */
+
+.win-titlebar {
+    -fx-background-color: #0e1118;
+    -fx-border-color: #1f2431;
+    -fx-border-width: 0 0 1 0;
+}
+
+.win-title {
+    -fx-text-fill: #cfd3de;
+    -fx-font-size: 13px;
+    -fx-font-weight: 600;
+    -fx-padding: 0 0 0 14;
+}
+
+.win-btn {
+    -fx-background-color: transparent;
+    -fx-text-fill: #9aa0ae;
+    -fx-font-size: 14px;
+    -fx-min-width: 46;
+    -fx-min-height: 38;
+    -fx-background-radius: 0;
+    -fx-padding: 0;
+    -fx-cursor: hand;
+}
+
+.win-btn:hover {
+    -fx-background-color: #1b2030;
+    -fx-text-fill: #eceff4;
+}
+
+.win-btn-max {
+    -fx-font-size: 13px;
+}
+
+.win-btn-close:hover {
+    -fx-background-color: #c42b1c;
+    -fx-text-fill: #ffffff;
+}

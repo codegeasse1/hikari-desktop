@@ -34,7 +34,6 @@ class DetailScreenView(private val item: MediaItem) {
     private val loading = ProgressBar(-1.0)
     private val errorLabel = Theme.label("", dim = true)
     private val body = VBox(16.0)
-    private val episodesBox = HBox(8.0).apply { }
     private val streamsBox = VBox(10.0)
 
     private var episodes: List<Episode>? = null
@@ -133,35 +132,63 @@ class DetailScreenView(private val item: MediaItem) {
 
     private fun renderEpisodes(eps: List<Episode>) {
         val title = Theme.label("Episodes", size = 17.0, bold = true)
-        episodesBox.children.clear()
-        episodesBox.alignment = Pos.CENTER_LEFT
-        episodesBox.styleClass.add("list-row")
-        val max = 200
-        val shown = eps.take(max)
-        shown.forEach { ep ->
+        val section = VBox(10.0, title)
+        val group = 30
+        val selector = javafx.scene.control.ComboBox<String>()
+        selector.maxWidth = 260.0
+        selector.prefWidth = 200.0
+        selector.items.add("All episodes")
+        val groups = (eps.size + group - 1) / group
+        for (g in 0 until groups) {
+            val start = g * group
+            val end = minOf(start + group, eps.size)
+            selector.items.add("${start + 1}-${end}")
+        }
+        val defaultToRange = eps.size > group
+        selector.value = if (defaultToRange) "1-${minOf(group, eps.size)}" else "All episodes"
+        section.children.addAll(
+            selector,
+            buildChipScroller(eps, 0, if (defaultToRange) group else eps.size),
+        )
+        selector.setOnAction {
+            val sel = selector.value ?: return@setOnAction
+            val replaceIdx = section.children.size - 1
+            section.children[replaceIdx] = if (sel == "All episodes") {
+                buildChipScroller(eps, 0, eps.size)
+            } else {
+                val start = sel.substringBefore("-").trim().toIntOrNull()?.minus(1) ?: return@setOnAction
+                buildChipScroller(eps, start, minOf(start + group, eps.size))
+            }
+        }
+        body.children.add(1, section)
+    }
+
+    private fun buildChipScroller(eps: List<Episode>, start: Int, end: Int): ScrollPane {
+        val box = HBox(8.0).apply {
+            alignment = Pos.CENTER_LEFT
+            styleClass.add("list-row")
+        }
+        for (i in start until end) {
+            val ep = eps[i]
             val chip = Button(ep.name ?: "Ep ${ep.number}").apply {
                 styleClass.add("episode-chip")
+                if (selectedEpisode?.id == ep.id) styleClass.add("episode-chip-selected")
                 userData = ep
                 setOnAction {
                     selectedEpisode = ep
-                    episodesBox.children.forEach { it.styleClass.remove("episode-chip-selected") }
+                    box.children.forEach { it.styleClass.remove("episode-chip-selected") }
                     styleClass.add("episode-chip-selected")
                     loadStreams(item)
                 }
             }
-            episodesBox.children.add(chip)
+            box.children.add(chip)
         }
-        if (eps.size > max) {
-            episodesBox.children.add(Theme.label("+${eps.size - max} more", size = 12.0, dim = true))
-        }
-        val wrap = ScrollPane(episodesBox).apply {
+        return ScrollPane(box).apply {
             isFitToHeight = true
             hbarPolicy = ScrollPane.ScrollBarPolicy.AS_NEEDED
             vbarPolicy = ScrollPane.ScrollBarPolicy.NEVER
             styleClass.add("scroll-pane")
         }
-        body.children.add(1, title)
-        body.children.add(2, wrap)
     }
 
     private fun loadStreams(meta: MediaItem) {

@@ -59,6 +59,12 @@ object DesktopPlayer {
                 add("--force-window=yes")
                 add("--no-terminal")
                 add("--title=" + title.take(200).replace('\n', ' '))
+                // Route mpv's own HTTP(S) through the app's loopback proxy so
+                // HLS/CDN domains blocked by the OS resolver still resolve (the
+                // proxy uses the same DoH-first DNS as the rest of the app).
+                val proxyPort = LocalProxy.start()
+                add("--http-proxy=127.0.0.1:$proxyPort")
+                add("--https-proxy=127.0.0.1:$proxyPort")
                 for ((k, v) in stream.headers) {
                     if (k.isNotBlank() && v.isNotBlank()) add("--http-header-fields=$k: $v")
                 }
@@ -71,8 +77,29 @@ object DesktopPlayer {
             }
             proc?.let { runCatching { it.destroy() } }
             proc = p
+            val startedAt = System.currentTimeMillis()
             Thread(
-                { runCatching { p.inputStream.bufferedReader().forEachLine { } } },
+                {
+                    val tail = StringBuilder()
+                    runCatching { p.inputStream.bufferedReader().forEachLine { if (tail.length < 4000) tail.append(it).append('\n') } }
+                    val code = runCatching { p.exitValue() }.getOrDefault(-1)
+                    if (code != 0 && !p.isAlive) {
+                        val early = System.currentTimeMillis() - startedAt < 4_000
+                        if (early) {
+                            val err = tail.toString().lineSequence().filter { it.isNotBlank() }.lastOrNull()
+                            Fx.run {
+                                showBrowserFallback(
+                                    title, stream.url,
+                                    buildString {
+                                        append("The player closed with an error")
+                                        if (err != null) append(": ").append(err.take(200))
+                                        append(". Open it in your browser instead?")
+                                    },
+                                )
+                            }
+                        }
+                    }
+                },
                 "hikari-mpv-drain",
             ).apply { isDaemon = true; start() }
         }

@@ -183,17 +183,17 @@ class HomeScreenView {
 
 fun posterCard(media: MediaItem, onClick: () -> Unit): VBox {
     val img = javafx.scene.image.ImageView().apply {
-        fitWidth = 150.0
-        fitHeight = 205.0
+        fitWidth = 180.0
+        fitHeight = 246.0
         isPreserveRatio = true
         styleClass.add("poster-img")
     }
-    desktop.img.ImageLoader.loadAsync(media.posterUrl, onReady = { fx -> img.image = fx }, w = 300, h = 410)
+    desktop.img.ImageLoader.loadAsync(media.posterUrl, onReady = { fx -> img.image = fx }, w = 360, h = 492)
     val title = Label(media.title).apply {
         styleClass.add("poster-title")
         isWrapText = true
-        maxWidth = 150.0
-        prefWidth = 150.0
+        maxWidth = 180.0
+        prefWidth = 180.0
         minHeight = 36.0
     }
     val box = VBox(8.0, img, title).apply {

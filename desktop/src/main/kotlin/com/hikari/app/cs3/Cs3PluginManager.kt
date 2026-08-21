@@ -16,10 +16,15 @@ import java.net.URLClassLoader
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Loads CloudStream-style plugin archives on the desktop JVM. Desktop plugins
- * must be JVM jars (`.jar` — the Android `.cs3`/`.hiki` dex archives cannot be
- * loaded by a plain JVM), opened with a URLClassLoader exactly like the
- * Android PathClassLoader opens dex:
+ * Loads CloudStream-style plugin archives on the desktop JVM. Both forms are
+ * supported:
+ *
+ *  - JVM jars (`.jar`) are opened with a URLClassLoader directly,
+ *  - Android dex archives (`.cs3`/`.hiki` with `classes.dex`) are first
+ *    translated to JVM bytecode by [DexJar], so every dex plugin runs too.
+ *
+ * Then the CloudStream contract runs exactly as the Android PathClassLoader
+ * does it:
  *
  *  1. read `manifest.json` → `pluginClassName` (+ `requiresResources`),
  *  2. instantiate that class with a no-arg constructor,
@@ -119,7 +124,7 @@ object Cs3PluginManager {
         val path = file.absolutePath
 
         val classLoader = try {
-            URLClassLoader(arrayOf(file.toURI().toURL()), context.classLoader)
+            URLClassLoader(arrayOf(DexJar.toJvmJarUrl(file)), context.classLoader)
         } catch (e: Throwable) {
             record("URLClassLoader failed", e)
             return fail()
