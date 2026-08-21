@@ -59,23 +59,33 @@ class ContentRepository(private val manager: ProviderManager) {
         val active = manager.providers.value.filter {
             it.config.enabled && (providerId == null || it.config.id == providerId)
         }
+        // Bound the total work — this is what keeps Home feeling like a native
+        // app instead of a webview. "All providers" shows the FIRST catalog of
+        // up to 8 providers (one row each, so you see variety fast); a single
+        // provider gets up to 10 of its catalog rows. Firing every catalog of
+        // every installed extension at once froze/crashed the app on any
+        // machine, however powerful.
+        val allProviders = providerId == null
+        val useProviders = if (allProviders) active.take(8) else active
+        val catalogsLimit = if (allProviders) 1 else 10
+        val itemsLimit = 20
         // GLOBAL gates shared by ALL providers (not per-provider): with dozens
         // of installed extensions, per-provider limits multiplied into hundreds
         // of concurrent network requests which saturated the IO pool and froze
-        // the UI (ANR). 3 providers run their catalogs in parallel, and at most
-        // 8 catalog fetches exist across the whole app at once.
-        val providerGate = Semaphore(3)
-        val catalogGate = Semaphore(8)
+        // the UI (ANR). 2 providers run their catalogs in parallel, and at most
+        // 4 catalog fetches exist across the whole app at once.
+        val providerGate = Semaphore(2)
+        val catalogGate = Semaphore(4)
         val now = System.currentTimeMillis()
         val rows = coroutineScope {
-            active.map { p ->
+            useProviders.map { p ->
                 async {
                     cancellableCatching {
                         providerGate.withPermit {
-                            withTimeoutOrNull(120_000) {
+                            withTimeoutOrNull(45_000) {
                                 val catalogs = p.catalogs()
                                     .distinctBy { it.type to it.id }
-                                    .take(14)
+                                    .take(catalogsLimit)
                                 coroutineScope {
                                     catalogs.map { c ->
                                         async {
@@ -86,9 +96,9 @@ class ContentRepository(private val manager: ProviderManager) {
                                                     onRow(cached.row)
                                                     return@async cached.row
                                                 }
-                                                val items = withTimeoutOrNull(60_000) {
+                                                val items = withTimeoutOrNull(25_000) {
                                                     cancellableCatching { p.getCatalog(c, 1) }.getOrDefault(emptyList())
-                                                }.orEmpty().distinctBy { it.uniqueId }.take(40)
+                                                }.orEmpty().distinctBy { it.uniqueId }.take(itemsLimit)
                                                 if (items.isEmpty()) null
                                                 else {
                                                     val raw = CatalogRow(

@@ -127,7 +127,7 @@ class DetailScreenView(private val item: MediaItem) {
             val w = root.widthProperty()
             fitWidthProperty().bind(w)
         }
-        desktop.img.ImageLoader.loadAsync(url) { fx -> img.image = fx }
+        desktop.img.ImageLoader.loadAsync(url, w = 1600, h = 300) { fx -> img.image = fx }
         return VBox(img)
     }
 

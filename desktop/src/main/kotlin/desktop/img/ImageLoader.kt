@@ -32,42 +32,53 @@ object ImageLoader {
      *  and makes the UI lag on weak networks. */
     private val gate = java.util.concurrent.Semaphore(6)
 
-    fun loadAsync(url: String?, onReady: (Image?) -> Unit) {
+    fun loadAsync(url: String?, onReady: (Image?) -> Unit, w: Int = 0, h: Int = 0) {
         Fx.requireFx()
         if (url.isNullOrBlank()) {
             onReady(null)
             return
         }
-        mem[url]?.let {
+        // Requested-size-aware cache key: the same URL may be shown as a small
+        // poster and a wide banner.
+        val key = if (w > 0 && h > 0) "$url|${w}x$h" else url
+        mem[key]?.let {
             onReady(it)
             return
         }
-        val pending = inFlight.getOrPut(url) { mutableListOf() }
+        val pending = inFlight.getOrPut(key) { mutableListOf() }
         pending.add(onReady)
         if (pending.size > 1) return
         kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
             val img = runCatching {
                 gate.acquire()
                 try {
-                    load(url)
+                    load(url, key, w, h)
                 } finally {
                     gate.release()
                 }
             }.getOrNull()
             Fx.run {
-                if (img != null) mem[url] = img
-                val list = inFlight.remove(url) ?: emptyList()
+                if (img != null) mem[key] = img
+                val list = inFlight.remove(key) ?: emptyList()
                 list.forEach { it(img) }
             }
         }
     }
 
-    private suspend fun load(url: String): Image? = withContext(Dispatchers.IO) {
-        runCatching {
-            val bytes = fetchBytes(url) ?: return@withContext null
-            Image(ByteArrayInputStream(bytes))
-        }.getOrNull()
-    }
+    private suspend fun load(url: String, key: String, w: Int, h: Int): Image? =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val bytes = fetchBytes(url) ?: return@withContext null
+                // Decode DOWNSCALED: a full-res CDN poster can be 1.5-6MB of
+                // pixels; with hundreds of cards that OOMs the app (the crash
+                // on Home). Requesting a small decode bounds total memory.
+                if (w > 0 && h > 0) {
+                    Image(ByteArrayInputStream(bytes), w.toDouble(), h.toDouble(), true, true)
+                } else {
+                    Image(ByteArrayInputStream(bytes))
+                }
+            }.getOrNull()
+        }
 
     private suspend fun fetchBytes(url: String): ByteArray? {
         if (url.startsWith("data:image/")) {

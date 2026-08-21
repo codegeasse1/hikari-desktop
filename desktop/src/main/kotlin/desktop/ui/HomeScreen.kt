@@ -106,10 +106,11 @@ class HomeScreenView {
                 }
                 // Rows render the moment each catalog lands, so Home fills in
                 // progressively and "All providers" never sits on a spinner
-                // waiting for the slowest addon.
+                // waiting for the slowest addon. One bad row is skipped, never
+                // fatal.
                 val rows = AppShell.app.repository.homeRows(filterId, force = force) { row ->
                     Fx.run {
-                        if (myGen == gen) rowsBox.children.add(buildRow(row))
+                        if (myGen == gen) runCatching { rowsBox.children.add(buildRow(row)) }
                     }
                 }
                 Fx.run {
@@ -187,7 +188,7 @@ fun posterCard(media: MediaItem, onClick: () -> Unit): VBox {
         isPreserveRatio = true
         styleClass.add("poster-img")
     }
-    desktop.img.ImageLoader.loadAsync(media.posterUrl) { fx -> img.image = fx }
+    desktop.img.ImageLoader.loadAsync(media.posterUrl, w = 300, h = 410) { fx -> img.image = fx }
     val title = Label(media.title).apply {
         styleClass.add("poster-title")
         isWrapText = true
