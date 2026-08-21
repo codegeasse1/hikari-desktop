@@ -115,16 +115,37 @@ object Http {
         return out.toList()
     }
 
-    /** Fetches a repo.json, trying every candidate URL. Returns the URL that
-     *  worked together with its body. */
+    /** Fetches a repo.json, trying every candidate URL. Only accepts a response
+     *  that is actually a JSON object with a "plugins" key — a github.com HTML
+     *  page or a CDN error body is skipped instead of being passed to the UI. */
     fun fetchRepoJson(raw: String): Result<Pair<String, String>> {
-        var last: Throwable = Exception("No candidate URL worked")
+        var last: Throwable = Exception("No candidate URL served a valid repo.json")
         for (u in repoJsonCandidates(raw)) {
             val r = fetchStringRobust(u)
-            if (r.isSuccess) return Result.success(u to r.getOrThrow())
+            if (r.isSuccess) {
+                val text = r.getOrThrow()
+                val looksValid = runCatching {
+                    org.json.JSONObject(text).has("plugins")
+                }.getOrDefault(false)
+                if (looksValid) return Result.success(u to text)
+                last = Exception("not a repo.json ($u)")
+                continue
+            }
             r.exceptionOrNull()?.let { last = it }
         }
         return Result.failure(last)
+    }
+
+    /** Human-friendly repo name from a URL: "codegeasse1/hikari-extensions"
+     *  for github/raw URLs, the host otherwise. */
+    fun repoDisplayName(url: String): String {
+        val clean = normalizeUrl(url).removePrefix("https://").removePrefix("http://").removePrefix("www.")
+        val parts = clean.split("/").filter { it.isNotBlank() }
+        return if (parts.size >= 3 && (parts[0] == "github.com" || parts[0] == "raw.githubusercontent.com")) {
+            parts[1] + "/" + parts[2]
+        } else {
+            parts.firstOrNull() ?: clean
+        }
     }
 
     fun getString(url: String, headers: Map<String, String> = emptyMap()): String? =
