@@ -28,8 +28,12 @@ import kotlinx.coroutines.launch
 
 class ExtensionsScreenView {
 
-    val root: VBox = VBox(14.0).apply {
+    private val content = VBox(14.0).apply {
         padding = Insets(18.0, 22.0, 18.0, 22.0)
+    }
+    val root: ScrollPane = ScrollPane(content).apply {
+        isFitToWidth = true
+        styleClass.add("scroll-pane")
     }
 
     private val installedBox = VBox(8.0)
@@ -53,7 +57,7 @@ class ExtensionsScreenView {
     init {
         val title = Theme.label("Extensions", size = 26.0, bold = true)
         jarPanel.children.addAll(installUrlRow(), installFileRow())
-        root.children.addAll(
+        content.children.addAll(
             HBox(12.0, title, busy).apply { alignment = Pos.CENTER_LEFT },
             hikariRepoRow(),
             addStremioRow(),
@@ -253,7 +257,8 @@ class ExtensionsScreenView {
             return
         }
         repos.forEach { repo ->
-            val name = Label(repo.name).apply { maxWidth = 300.0; isWrapText = true }
+            val displayName = Http.repoDisplayName(repo.url).takeIf { it.isNotBlank() } ?: repo.name
+            val name = Label(displayName).apply { maxWidth = 300.0; isWrapText = true }
             val browse = Button("Browse").apply {
                 styleClass.add("btn")
                 setOnAction { browseRepo(repo.url) }
@@ -287,7 +292,7 @@ class ExtensionsScreenView {
                     return@run
                 }
                 val resolved = pair.first
-                val name = resolved.substringAfter("://").substringBefore("/")
+                val name = Http.repoDisplayName(resolved)
                 AppShell.app.store.addCs3Repo(
                     Cs3Repo(url = resolved, name = name, kind = com.hikari.app.data.RepoKind.HIKARI)
                 )
@@ -326,9 +331,12 @@ class ExtensionsScreenView {
             pluginListBox.children.add(Theme.label("Invalid repo.json", dim = true))
             return
         }
-        val plugins = JSONArray(root.opt("plugins"))
+        val plugins = when (val p = root.opt("plugins")) {
+            null -> JSONArray()
+            else -> runCatching { JSONArray(p) }.getOrNull() ?: JSONArray()
+        }
         if (plugins.length() == 0) {
-            pluginListBox.children.add(Theme.label("No plugins listed.", dim = true))
+            pluginListBox.children.add(Theme.label("No plugins listed in this repo.json.", dim = true))
             return
         }
         for (i in 0 until plugins.length()) {
