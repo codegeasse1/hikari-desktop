@@ -38,13 +38,6 @@ jobs:
           fi
         shell: bash
 
-      - name: Download JavaFX jmods (for jpackage)
-        run: |
-          curl -L -o jfx-jmods.zip https://download2.gluonhq.com/openjfx/21.0.8/openjfx-21.0.8_windows-x64_bin-jmods.zip
-          mkdir -p jmods
-          cd jmods && unzip -o ../jfx-jmods.zip && cd ..
-        shell: bash
-
       - name: Package exe (app image)
         run: |
           mkdir -p jpackage-input
@@ -53,8 +46,6 @@ jobs:
             --input jpackage-input \
             --main-jar hikari-desktop.jar \
             --main-class desktop.MainKt \
-            --module-path jmods/javafx-jmods-21.0.8 \
-            --add-modules javafx.controls,javafx.media,javafx.web,javafx.graphics,javafx.base,jdk.crypto.ec,jdk.httpserver,java.desktop \
             --java-options "-Dfile.encoding=UTF-8" \
             --app-version 0.1.0
           ls -la "Hikari"
@@ -62,24 +53,25 @@ jobs:
 
       - name: Diagnose packaged runtime
         run: |
+          set +e
           {
             echo "===== app image root ====="
             ls -la Hikari
             echo "===== app/ ====="
             ls -la Hikari/app
-            echo "===== Hikari.cfg ====="
-            cat Hikari/app/Hikari.cfg
-            echo "===== runtime/bin (jvm-related) ====="
-            ls Hikari/runtime/bin | grep -iE 'java|jvm|server' || echo "(no match)"
+            echo "===== runtime/bin full ====="
+            ls Hikari/runtime/bin 2>&1 | head -40
             echo "===== runtime/bin/server ====="
-            ls -la Hikari/runtime/bin/server 2>&1 | head -20
+            ls -la Hikari/runtime/bin/server 2>&1 | head -10
+            echo "===== runtime/release ====="
+            cat Hikari/runtime/release 2>&1 | head -10
+            echo "===== runtime/lib (head) ====="
+            ls Hikari/runtime/lib 2>&1 | head -20
             echo "===== bundled java.exe -version ====="
             Hikari/runtime/bin/java.exe -version 2>&1 | head -6
-            echo "===== bundled java --list-modules (javafx + jdk.crypto) ====="
-            Hikari/runtime/bin/java.exe --list-modules 2>&1 | grep -iE 'javafx|jdk.crypto|jdk.httpserver' || echo "(none)"
-            echo "===== launch test (12s): expect javaw.exe child ====="
+            echo "===== launch test (15s) ====="
             (cd Hikari && ./Hikari.exe >/dev/null 2>&1 &)
-            sleep 12
+            sleep 15
             tasklist | grep -iE 'hikari|javaw' || echo "(no hikari/javaw processes)"
             taskkill //F //IM Hikari.exe //IM javaw.exe >/dev/null 2>&1 || true
           } > diagnose.log 2>&1
@@ -102,8 +94,6 @@ jobs:
             --input jpackage-input \
             --main-jar hikari-desktop.jar \
             --main-class desktop.MainKt \
-            --module-path jmods/javafx-jmods-21.0.8 \
-            --add-modules javafx.controls,javafx.media,javafx.web,javafx.graphics,javafx.base,jdk.crypto.ec,jdk.httpserver,java.desktop \
             --java-options "-Dfile.encoding=UTF-8" \
             --app-version 0.1.0 \
             --win-menu --win-dir-chooser
