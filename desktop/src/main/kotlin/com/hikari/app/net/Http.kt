@@ -139,7 +139,11 @@ object Http {
     fun fetchRepoJson(raw: String): Result<Pair<String, String>> {
         val candidates = repoJsonCandidates(raw)
         val ordered = candidates.filter { it.contains("repo-desktop.json") } +
-            candidates.filter { !it.contains("repo-desktop.json") }
+            candidates.filter { !it.contains("repo-desktop.json") } +
+            // Last-resort CDN mirror of the official repo: works even when the
+            // user's network blocks GitHub entirely (github.com + raw + jsDelivr
+            // all fail). Regenerate whenever the official repo.json changes.
+            "https://user.uploads.dev/file/7873f4a3c5717dbe566045a9e347facb.json"
         var last: Throwable = Exception("No candidate URL served a valid repo.json")
         for (u in ordered) {
             val r = fetchStringRobust(u)
