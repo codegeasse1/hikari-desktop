@@ -19,6 +19,7 @@ import javafx.scene.media.MediaPlayer
 import javafx.scene.media.MediaView
 import javafx.stage.Stage
 import javafx.util.Duration
+import desktop.ui.Theme
 
 private fun Duration.isUnknownDur(): Boolean = isUnknown || isIndefinite
 
@@ -74,7 +75,7 @@ object DesktopPlayer {
             alignment = Pos.CENTER
             padding = Insets(24.0)
         }
-        stage.scene = Scene(box, 480.0, 160.0)
+        stage.scene = Theme.style(Scene(box, 480.0, 160.0))
         stage.show()
     }
 
@@ -186,7 +187,7 @@ object DesktopPlayer {
             }
         }
 
-        s.scene = Scene(root, 960.0, 540.0)
+        s.scene = Theme.style(Scene(root, 960.0, 540.0))
         s.setOnCloseRequest {
             player.stop()
             player.dispose()
