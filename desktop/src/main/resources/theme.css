@@ -151,6 +151,15 @@
     -fx-background-color: #222840;
 }
 
+.detail-banner {
+    -fx-background-color: #171a23;
+    -fx-background-radius: 12;
+    -fx-background-repeat: no-repeat;
+    -fx-background-size: cover;
+    -fx-background-position: center;
+    -fx-effect: dropshadow(gaussian, rgba(0, 0, 0, 0.45), 18, 0, 0, 4);
+}
+
 .repo-btn {
     -fx-background-color: #211d33;
     -fx-text-fill: #ded7f8;

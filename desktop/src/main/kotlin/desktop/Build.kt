@@ -7,5 +7,5 @@ package desktop
  */
 object Build {
     const val VERSION = "0.1.0"
-    const val DATE = "2026-08-21-r4"
+    const val DATE = "2026-08-21-r5"
 }

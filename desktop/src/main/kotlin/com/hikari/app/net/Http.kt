@@ -139,13 +139,19 @@ object Http {
     fun fetchRepoJson(raw: String): Result<Pair<String, String>> {
         val candidates = repoJsonCandidates(raw)
         val ordered = candidates.filter { it.contains("repo-desktop.json") } +
-            candidates.filter { !it.contains("repo-desktop.json") } +
-            // Last-resort CDN mirror of the official repo: works even when the
-            // user's network blocks GitHub entirely (github.com + raw + jsDelivr
-            // all fail). Regenerate whenever the official repo.json changes.
-            "https://user.uploads.dev/file/7873f4a3c5717dbe566045a9e347facb.json"
+            candidates.filter { !it.contains("repo-desktop.json") }
+        val list = if (ordered.any { it.contains("codegeasse1/hikari-extensions") }) {
+            // The official repo resolves to the CDN mirror FIRST: the mirror
+            // serves every plugin's jar from user.uploads.dev, which works even
+            // on networks where GitHub (github.com + raw + jsDelivr) is blocked
+            // or refused by the app's HTTP stack. Regenerate the mirror whenever
+            // the official repo.json changes.
+            listOf("https://user.uploads.dev/file/7873f4a3c5717dbe566045a9e347facb.json") + ordered
+        } else {
+            ordered
+        }
         var last: Throwable = Exception("No candidate URL served a valid repo.json")
-        for (u in ordered) {
+        for (u in list) {
             val r = fetchStringRobust(u)
             if (r.isSuccess) {
                 val text = r.getOrThrow()

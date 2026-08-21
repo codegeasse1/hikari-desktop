@@ -44,7 +44,7 @@ class ExtensionsScreenView {
 
     private val extDir: File = File(HikariApp.instance.filesDir, "extensions").apply { mkdirs() }
 
-    /** Fetched repo contents, cached per stored repo URL so expanding a folder
+    /** Fetched repo contents, cached per stored repo URL so opening a repo
      *  doesn't hit the network again. */
     private data class RepoData(
         val url: String,
@@ -54,7 +54,12 @@ class ExtensionsScreenView {
     )
 
     private val repoData = HashMap<String, RepoData>()
-    private val expanded = HashSet<String>()
+
+    /** Built once so the add-source option toggles survive re-renders. */
+    private val addGrid = addOptionsGrid()
+
+    /** The repo whose plugin list is currently shown (folder drill-down). */
+    private var openRepo: Cs3Repo? = null
 
     private fun setStatus(text: String, isError: Boolean = false) {
         statusLabel.text = text
@@ -62,20 +67,95 @@ class ExtensionsScreenView {
     }
 
     init {
-        val title = Theme.label("Extensions", size = 26.0, bold = true)
-        content.children.addAll(
-            HBox(12.0, title, busy).apply { alignment = Pos.CENTER_LEFT },
-            addOptionsGrid(),
-            Section("Extension repos", reposBox),
-            Section("Installed extensions", installedBox),
-            statusLabel,
-        )
         busy.isVisible = false
-        refresh()
+        renderAll()
     }
 
     private fun Section(title: String, body: Node): VBox =
         VBox(8.0, Theme.label(title, size = 16.0, bold = true), body)
+
+    private fun renderAll() {
+        content.children.clear()
+        content.children.add(
+            HBox(12.0, Theme.label("Extensions", size = 26.0, bold = true), busy).apply {
+                alignment = Pos.CENTER_LEFT
+            }
+        )
+        val repo = openRepo
+        if (repo != null) renderRepoDetail(repo) else renderMain()
+        content.children.add(statusLabel)
+    }
+
+    /** Main view: add-sources grid, repo folders, installed list. */
+    private fun renderMain() {
+        content.children.add(addGrid)
+        renderRepos()
+        content.children.add(Section("Extension repos", reposBox))
+        renderInstalled()
+        content.children.add(Section("Installed extensions", installedBox))
+    }
+
+    /** Drill-down view: one repo's plugins. Clicking a repo folder lands here. */
+    private fun renderRepoDetail(repo: Cs3Repo) {
+        val data = repoData[repo.url]
+        val back = Button("← Back").apply {
+            styleClass.add("btn")
+            setOnAction {
+                openRepo = null
+                renderAll()
+            }
+        }
+        val refresh = Button("↻ Reload").apply {
+            styleClass.add("btn")
+            setOnAction { refreshRepo(repo.url) }
+        }
+        val remove = Button("🗑 Remove repo").apply {
+            styleClass.addAll("btn", "btn-danger")
+            setOnAction {
+                AppShell.app.store.removeCs3Repo(repo.url)
+                repoData.remove(repo.url)
+                if (openRepo?.url == repo.url) openRepo = null
+                renderAll()
+            }
+        }
+        val title = Theme.label(data?.name?.ifBlank { null } ?: repoDisplayName(repo), size = 20.0, bold = true)
+        content.children.add(
+            HBox(10.0, back, title, refresh, remove).apply {
+                alignment = Pos.CENTER_LEFT
+            }
+        )
+
+        val pluginsBox = VBox(8.0)
+        when {
+            data == null -> pluginsBox.children.add(Theme.label("Loading plugins…", dim = true))
+            data.plugins.isEmpty() ->
+                pluginsBox.children.add(Theme.label("No installable plugins found in this repo.", dim = true))
+            else -> {
+                if (data.description.isNotBlank()) {
+                    pluginsBox.children.add(Theme.label(data.description, size = 11.5, dim = true))
+                }
+                data.plugins.forEach { (pname, purl) ->
+                    val info = VBox(2.0).apply {
+                        children.add(Theme.label(pname, size = 14.0, bold = true))
+                        children.add(Theme.label(purl, size = 10.5, dim = true))
+                    }
+                    val installed = providersFor(purl)
+                    val btn = Button(if (installed.isEmpty()) "Install" else "Uninstall (${installed.size})").apply {
+                        styleClass.addAll("btn", if (installed.isEmpty()) "btn-primary" else "btn-danger")
+                        setOnAction {
+                            if (installed.isEmpty()) installPlugin(pname, purl) else uninstallPlugin(pname, purl)
+                        }
+                    }
+                    pluginsBox.children.add(HBox(10.0, info, btn).apply {
+                        VBox.setVgrow(info, Priority.ALWAYS)
+                        alignment = Pos.CENTER_LEFT
+                        styleClass.add("list-row")
+                    })
+                }
+            }
+        }
+        content.children.add(pluginsBox)
+    }
 
     // ── Add-sources grid (Android-style option list) ────────────────────────
 
@@ -112,7 +192,8 @@ class ExtensionsScreenView {
         val hint = Theme.label(
             "Desktop extensions are JVM .jar files — the same code the Android app dexes into .hiki. " +
                 "Dex .hiki/.cs3 archives can't run on a PC, so the app auto-matches .hiki/.cs3 names to their .jar build. " +
-                "The “Install .jar” options are just the direct form of that.",
+                "The “Install .jar” options are just the direct form of that. " +
+                "A bundle extension (e.g. Anime) installs each of its sub-extensions separately.",
             size = 11.5, dim = true,
         ).apply { isWrapText = true }
         return VBox(8.0, grid, hint)
@@ -155,7 +236,7 @@ class ExtensionsScreenView {
             AppShell.app.store.addProvider(
                 ProviderConfig(id = "stremio|$url", name = "Addon · $name", type = ProviderType.STREMIO, url = url)
             )
-            refresh()
+            renderAll()
             setStatus("Stremio addon added: $name")
         }
     }
@@ -167,7 +248,7 @@ class ExtensionsScreenView {
             AppShell.app.store.addProvider(
                 ProviderConfig(id = "uni|$url", name = "Scraper · $name", type = ProviderType.UNIVERSAL, url = url)
             )
-            refresh()
+            renderAll()
             setStatus("Scraper added: $name")
         }
     }
@@ -176,7 +257,7 @@ class ExtensionsScreenView {
     private fun cs3UrlInput(): HBox = urlInput("Direct .cs3 URL (installs its .jar)", "Install") { installFromUrl(it) }
     private fun jarUrlInput(): HBox = urlInput("Direct .jar URL (GitHub raw / jsDelivr / Drive)", "Install") { installFromUrl(it) }
 
-    // ── Repos as expandable folders ─────────────────────────────────────────
+    // ── Repos as folders (Android-style: click a folder to go inside) ───────
 
     private fun repoDisplayName(repo: Cs3Repo): String {
         val cached = repoData[repo.url]
@@ -194,15 +275,16 @@ class ExtensionsScreenView {
         repos.forEach { repo -> reposBox.children.add(repoFolder(repo)) }
     }
 
-    private fun repoFolder(repo: Cs3Repo): VBox {
-        val open = repo.url in expanded
-        val data = repoData[repo.url]
-
-        val folderBtn = Button((if (open) "▼  " else "▶  ") + repoDisplayName(repo)).apply {
+    private fun repoFolder(repo: Cs3Repo): HBox {
+        val folder = Button("📁  " + repoDisplayName(repo)).apply {
             styleClass.add("repo-folder")
             alignment = Pos.CENTER_LEFT
             maxWidth = Double.MAX_VALUE
-            setOnAction { toggleRepo(repo.url) }
+            setOnAction {
+                openRepo = repo
+                if (repoData[repo.url] == null) loadRepoData(repo.url)
+                renderAll()
+            }
         }
         val refresh = Button("↻").apply {
             styleClass.add("repo-btn")
@@ -215,57 +297,15 @@ class ExtensionsScreenView {
             setOnAction {
                 AppShell.app.store.removeCs3Repo(repo.url)
                 repoData.remove(repo.url)
-                expanded.remove(repo.url)
-                renderRepos()
+                if (openRepo?.url == repo.url) openRepo = null
+                renderAll()
             }
         }
-        val header = HBox(6.0, folderBtn, refresh, remove).apply { alignment = Pos.CENTER_LEFT }
-
-        val body = VBox(6.0)
-        if (open) {
-            when {
-                data == null -> body.children.add(Theme.label("Loading plugins…", dim = true))
-                data.plugins.isEmpty() -> body.children.add(Theme.label("No installable plugins found in this repo.", dim = true))
-                else -> {
-                    if (data.description.isNotBlank()) {
-                        body.children.add(Theme.label(data.description, size = 11.5, dim = true))
-                    }
-                    data.plugins.forEach { (name, url) ->
-                        val info = VBox(2.0).apply {
-                            children.add(Theme.label(name, size = 14.0, bold = true))
-                            children.add(Theme.label(url, size = 10.5, dim = true))
-                        }
-                        val install = Button("Install").apply {
-                            styleClass.addAll("btn", "btn-primary")
-                            setOnAction { installPlugin(name, url) }
-                        }
-                        body.children.add(HBox(10.0, info, install).apply {
-                            VBox.setVgrow(info, Priority.ALWAYS)
-                            alignment = Pos.CENTER_LEFT
-                            styleClass.add("list-row")
-                        })
-                    }
-                }
-            }
-        }
-        val box = VBox(6.0, header)
-        if (open) box.children.add(body)
-        return box
-    }
-
-    private fun toggleRepo(url: String) {
-        if (url in expanded) {
-            expanded.remove(url)
-        } else {
-            expanded.add(url)
-            if (repoData[url] == null) loadRepoData(url)
-        }
-        renderRepos()
+        return HBox(6.0, folder, refresh, remove).apply { alignment = Pos.CENTER_LEFT }
     }
 
     private fun refreshRepo(url: String) {
         repoData.remove(url)
-        expanded.add(url)
         loadRepoData(url)
     }
 
@@ -290,7 +330,7 @@ class ExtensionsScreenView {
                 repoData[url] = RepoData(resolved, name, description, plugins)
                 if (resolved != url) repoData[resolved] = repoData[url]!!
                 setStatus("")
-                renderRepos()
+                renderAll()
             }
         }
     }
@@ -317,8 +357,8 @@ class ExtensionsScreenView {
         return out
     }
 
-    /** Validates + stores a repo, then expands it so its plugins appear
-     *  immediately under the new folder. */
+    /** Validates + stores a repo, then opens its folder so the plugins appear
+     *  immediately (Android behaviour). */
     private fun addRepo(url: String) {
         if (url.isBlank()) return
         busy.isVisible = true
@@ -337,17 +377,20 @@ class ExtensionsScreenView {
                 }
                 val resolved = pair.first
                 val name = Http.repoDisplayName(resolved)
-                val already = AppShell.app.store.repos().any {
+                val existing = AppShell.app.store.repos().firstOrNull {
                     it.url == resolved || Http.repoDisplayName(it.url) == name
                 }
-                if (already) {
-                    setStatus("That repo is already added.", isError = true)
+                if (existing != null) {
+                    openRepo = existing
+                    if (repoData[existing.url] == null) loadRepoData(existing.url)
+                    renderAll()
+                    setStatus("That repo is already added — opened it.", isError = true)
                     return@run
                 }
                 AppShell.app.store.addCs3Repo(
                     Cs3Repo(url = resolved, name = name, kind = com.hikari.app.data.RepoKind.HIKARI)
                 )
-                // Seed the folder with the already-fetched data and expand it.
+                // Seed the cache with the already-fetched data and open it.
                 val root = runCatching { JSONObject(pair.second) }.getOrNull()
                 repoData[resolved] = RepoData(
                     url = resolved,
@@ -355,14 +398,14 @@ class ExtensionsScreenView {
                     description = root?.optString("description").orEmpty(),
                     plugins = parsePlugins(root),
                 )
-                expanded.add(resolved)
+                openRepo = Cs3Repo(url = resolved, name = name, kind = com.hikari.app.data.RepoKind.HIKARI)
                 setStatus("")
-                renderRepos()
+                renderAll()
             }
         }
     }
 
-    // ── Installing plugins ──────────────────────────────────────────────────
+    // ── Installing / uninstalling plugins ───────────────────────────────────
 
     private fun installFromUrl(raw: String) {
         val url = Http.normalizeUrl(raw)
@@ -374,8 +417,16 @@ class ExtensionsScreenView {
         installPlugin(name, url)
     }
 
-    /** Downloads (auto-swapping .hiki → .jar), loads, and registers a provider.
-     *  Every path ends with a visible status — nothing ever fails silently. */
+    /** Providers installed from a given repo plugin URL (bundle providers all
+     *  share the download URL as their extra prefix). */
+    private fun providersFor(url: String): List<ProviderConfig> =
+        AppShell.app.store.providers().filter {
+            it.type == ProviderType.HIKARI && it.extra?.startsWith("$url|") == true
+        }
+
+    /** Downloads (auto-swapping .hiki → .jar), loads, and registers every
+     *  provider inside the extension. Every path ends with a visible status —
+     *  nothing ever fails silently. */
     private fun installPlugin(name: String, url: String) {
         var dl = url
         if (dl.endsWith(".hiki")) dl = dl.removeSuffix(".hiki") + ".jar"
@@ -399,32 +450,16 @@ class ExtensionsScreenView {
                     if (!isZip) {
                         statusText = "Downloaded file is not an extension (the network may have served an error page instead of the jar)."
                     } else {
-                        val (kind, err) = resolveKind(dest)
-                        if (kind != null) {
-                            val cfg = when (kind) {
-                                ProviderType.HIKARI -> ProviderConfig(
-                                    id = "hiki|$safeName",
-                                    name = name,
-                                    type = ProviderType.HIKARI,
-                                    url = dest.absolutePath,
-                                    extra = "$dl|0",
-                                )
-                                else -> ProviderConfig(
-                                    id = "cs3|$safeName|0",
-                                    name = name,
-                                    type = ProviderType.CS3,
-                                    url = dest.absolutePath,
-                                )
-                            }
-                            AppShell.app.store.addProvider(cfg)
-                            statusText = "Installed $name ($kind)."
+                        val registered = registerExtension(name, safeName, dest, dl)
+                        if (registered != null) {
+                            statusText = registered
                             isErr = false
                         } else {
-                            statusText = "Couldn't load $name: ${err ?: "not an extension"}"
+                            statusText = "Couldn't load $name: ${HikariPluginManager.lastError ?: Cs3PluginManager.lastError ?: "not an extension"}"
                         }
                     }
                 } else {
-                    statusText = "Download failed for $name — check the URL and that GitHub/repo host is reachable from your network."
+                    statusText = "Download failed for $name — check the URL and that the repo host is reachable from your network."
                 }
             } catch (t: Throwable) {
                 statusText = "Install failed: ${t.message?.take(300) ?: t.javaClass.simpleName}"
@@ -433,9 +468,57 @@ class ExtensionsScreenView {
             Fx.run {
                 busy.isVisible = false
                 setStatus(statusText, isErr)
-                renderInstalled()
+                renderAll()
             }
         }
+    }
+
+    /** Registers every provider inside [dest] as its own provider config.
+     *  Bundle extensions (a manifest with several mainClass entries) become
+     *  several entries — e.g. the Anime bundle installs AniKoto, Anikage, ….
+     *  Returns a success message, or null (failure reason is left on the
+     *  plugin managers' lastError). */
+    private fun registerExtension(name: String, safeName: String, dest: File, sourceUrl: String): String? {
+        val hiki = HikariPluginManager.reload(HikariApp.instance, dest)
+        if (hiki.isNotEmpty()) {
+            hiki.forEachIndexed { idx, p ->
+                val display = if (hiki.size > 1) "$name · ${p.name}" else name
+                AppShell.app.store.addProvider(
+                    ProviderConfig(
+                        id = "hiki|$safeName|$idx",
+                        name = display,
+                        type = ProviderType.HIKARI,
+                        url = dest.absolutePath,
+                        extra = "$sourceUrl|$idx",
+                    )
+                )
+            }
+            return "Installed $name (${hiki.size} extension${if (hiki.size > 1) "s" else ""})."
+        }
+        val cs3 = Cs3PluginManager.reload(HikariApp.instance, dest)
+        if (cs3.isNotEmpty()) {
+            AppShell.app.store.addProvider(
+                ProviderConfig(
+                    id = "cs3|$safeName|0",
+                    name = name,
+                    type = ProviderType.CS3,
+                    url = dest.absolutePath,
+                )
+            )
+            return "Installed $name (CS3)."
+        }
+        return null
+    }
+
+    private fun uninstallPlugin(name: String, url: String) {
+        val matches = providersFor(url)
+        if (matches.isEmpty()) return
+        matches.forEach { AppShell.app.store.removeProvider(it.id) }
+        val file = matches.first().url.takeIf { it.isNotBlank() }?.let { File(it) }
+        if (file != null && file.exists()) file.delete()
+        AppShell.uiScope.launch { AppShell.app.providers.refresh() }
+        setStatus("Uninstalled $name (${matches.size} extension${if (matches.size > 1) "s" else ""}).")
+        renderAll()
     }
 
     private fun installFromDisk() {
@@ -453,29 +536,13 @@ class ExtensionsScreenView {
             try {
                 val dest = File(extDir, file.name.lowercase().replace(Regex("[^a-z0-9.]"), "-"))
                 file.copyTo(dest, overwrite = true)
-                val (kind, err) = resolveKind(dest)
-                if (kind != null) {
-                    val base = file.nameWithoutExtension
-                    val cfg = when (kind) {
-                        ProviderType.HIKARI -> ProviderConfig(
-                            id = "hiki|$base",
-                            name = base,
-                            type = ProviderType.HIKARI,
-                            url = dest.absolutePath,
-                            extra = "0",
-                        )
-                        else -> ProviderConfig(
-                            id = "cs3|$base|0",
-                            name = base,
-                            type = ProviderType.CS3,
-                            url = dest.absolutePath,
-                        )
-                    }
-                    AppShell.app.store.addProvider(cfg)
-                    statusText = "Installed $base ($kind)."
+                val base = file.nameWithoutExtension.lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-').ifBlank { "ext" }
+                val registered = registerExtension(file.nameWithoutExtension, base, dest, "")
+                if (registered != null) {
+                    statusText = registered
                     isErr = false
                 } else {
-                    statusText = "Couldn't load ${file.name}: ${err ?: "not an extension"}"
+                    statusText = "Couldn't load ${file.name}: ${HikariPluginManager.lastError ?: Cs3PluginManager.lastError ?: "not an extension"}"
                 }
             } catch (t: Throwable) {
                 statusText = "Install failed: ${t.message?.take(300) ?: t.javaClass.simpleName}"
@@ -484,29 +551,15 @@ class ExtensionsScreenView {
             Fx.run {
                 busy.isVisible = false
                 setStatus(statusText, isErr)
-                renderInstalled()
+                renderAll()
             }
         }
-    }
-
-    private fun resolveKind(dest: File): Pair<ProviderType?, String?> {
-        val hiki = HikariPluginManager.reload(HikariApp.instance, dest)
-        if (hiki.isNotEmpty()) return ProviderType.HIKARI to null
-        val hErr = HikariPluginManager.lastError
-        val cs3 = Cs3PluginManager.reload(HikariApp.instance, dest)
-        if (cs3.isNotEmpty()) return ProviderType.CS3 to null
-        return null to (hErr ?: Cs3PluginManager.lastError ?: "not an extension")
     }
 
     // ── Installed providers ─────────────────────────────────────────────────
 
     fun onShown() {
-        refresh()
-    }
-
-    private fun refresh() {
-        renderInstalled()
-        renderRepos()
+        renderAll()
     }
 
     private fun renderInstalled() {
@@ -528,7 +581,7 @@ class ExtensionsScreenView {
             toggle.setOnAction {
                 AppShell.app.store.setEnabled(cfg.id, toggle.isSelected)
                 AppShell.uiScope.launch { AppShell.app.providers.refresh() }
-                refresh()
+                renderAll()
             }
             val remove = Button("Remove").apply {
                 styleClass.addAll("btn", "btn-danger")
@@ -538,7 +591,7 @@ class ExtensionsScreenView {
                         runCatching { File(cfg.url).delete() }
                     }
                     AppShell.uiScope.launch { AppShell.app.providers.refresh() }
-                    refresh()
+                    renderAll()
                 }
             }
             val row = VBox(6.0).apply {

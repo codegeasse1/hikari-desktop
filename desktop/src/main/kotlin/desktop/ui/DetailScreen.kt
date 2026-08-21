@@ -89,6 +89,7 @@ class DetailScreenView(private val item: MediaItem) {
 
     private fun renderMeta(meta: MediaItem) {
         body.children.clear()
+        val headerImage = bannerFor(meta)
         val titleRow = VBox(4.0).apply {
             children.addAll(
                 Theme.label(meta.title, size = 24.0, bold = true),
@@ -109,7 +110,25 @@ class DetailScreenView(private val item: MediaItem) {
         streamsBox.children.clear()
         streamsBox.children.add(Theme.label("Loading sources…", dim = true))
         val streamsSection = VBox(8.0, Theme.label("Sources", size = 17.0, bold = true), streamsBox)
+        if (headerImage != null) body.children.add(headerImage)
         body.children.addAll(titleRow, overview, streamsSection)
+    }
+
+    /** Wide backdrop banner at the top of the detail view (backdrop first,
+     *  poster as fallback), styled to fill the content width. */
+    private fun bannerFor(meta: MediaItem): Node? {
+        val url = meta.backdropUrl ?: meta.posterUrl
+        if (url.isNullOrBlank()) return null
+        val img = javafx.scene.image.ImageView().apply {
+            fitHeight = 230.0
+            isPreserveRatio = false
+            isSmooth = true
+            styleClass.add("detail-banner")
+            val w = root.widthProperty()
+            fitWidthProperty().bind(w)
+        }
+        desktop.img.ImageLoader.loadAsync(url) { fx -> img.image = fx }
+        return VBox(img)
     }
 
     private fun renderEpisodes(eps: List<Episode>) {
