@@ -132,7 +132,7 @@ object DexJarSelfTest {
             // the plugin's getMainPage expects (resolved via the parent
             // classloader), so a direct instance works with the reflective call.
             val req: Any? = runCatching {
-                com.lagradost.cloudstream3.MainPageRequest(null, null, false)
+                com.lagradost.cloudstream3.MainPageRequest("", "", false)
             }.getOrNull()
             if (req == null) {
                 println("WARN: couldn't build MainPageRequest for ${reqClass.name}")
