@@ -20,6 +20,8 @@ import javafx.scene.media.MediaView
 import javafx.stage.Stage
 import javafx.util.Duration
 
+private fun Duration.isUnknownDur(): Boolean = isUnknown || isIndefinite
+
 /**
  * Desktop player window. JavaFX Media plays HLS (m3u8) and MP4; every stream
  * goes through [HlsRelay] so Referer/Cookie/UA headers are honored.
@@ -160,7 +162,7 @@ object DesktopPlayer {
         }
         player.currentTimeProperty().addListener { _, _, cur ->
             val dur = player.totalDuration
-            if (dur.isInfinite) {
+            if (dur.isUnknownDur()) {
                 posLabel.text = fmt(cur)
                 slider.isDisable = true
             } else {
@@ -171,14 +173,14 @@ object DesktopPlayer {
         }
         slider.valueProperty().addListener { _, _, v ->
             val dur = player.totalDuration
-            if (!slider.isValueChanging && !dur.isInfinite && dur.toMillis() > 0) {
-                player.seek(Duration(dur.toMillis() * v))
+            if (!slider.isValueChanging && !dur.isUnknownDur() && dur.toMillis() > 0) {
+                player.seek(Duration(dur.toMillis() * v.toDouble()))
             }
         }
-        slider.isValueChangingProperty().addListener { _, _, changing ->
+        slider.valueChangingProperty().addListener { _, _, changing ->
             if (!changing) {
                 val dur = player.totalDuration
-                if (!dur.isInfinite && dur.toMillis() > 0) {
+                if (!dur.isUnknownDur() && dur.toMillis() > 0) {
                     player.seek(Duration(dur.toMillis() * slider.value))
                 }
             }
