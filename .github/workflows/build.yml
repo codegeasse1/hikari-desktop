@@ -60,6 +60,32 @@ jobs:
           ls -la "Hikari"
         shell: bash
 
+      - name: Diagnose packaged runtime
+        run: |
+          {
+            echo "===== app image root ====="
+            ls -la Hikari
+            echo "===== app/ ====="
+            ls -la Hikari/app
+            echo "===== Hikari.cfg ====="
+            cat Hikari/app/Hikari.cfg
+            echo "===== runtime/bin (jvm-related) ====="
+            ls Hikari/runtime/bin | grep -iE 'java|jvm|server' || echo "(no match)"
+            echo "===== runtime/bin/server ====="
+            ls -la Hikari/runtime/bin/server 2>&1 | head -20
+            echo "===== bundled java.exe -version ====="
+            Hikari/runtime/bin/java.exe -version 2>&1 | head -6
+            echo "===== bundled java --list-modules (javafx + jdk.crypto) ====="
+            Hikari/runtime/bin/java.exe --list-modules 2>&1 | grep -iE 'javafx|jdk.crypto|jdk.httpserver' || echo "(none)"
+            echo "===== launch test (12s): expect javaw.exe child ====="
+            (cd Hikari && ./Hikari.exe >/dev/null 2>&1 &)
+            sleep 12
+            tasklist | grep -iE 'hikari|javaw' || echo "(no hikari/javaw processes)"
+            taskkill //F //IM Hikari.exe //IM javaw.exe >/dev/null 2>&1 || true
+          } > diagnose.log 2>&1
+          cat diagnose.log
+        shell: bash
+
       - name: Zip the app image
         run: |
           powershell -Command "Compress-Archive -Path Hikari -DestinationPath hikari-windows.zip -Force"
@@ -91,7 +117,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-log
-          path: gradle-build.log
+          path: |
+            gradle-build.log
+            diagnose.log
           if-no-files-found: ignore
 
       - name: Upload artifacts
