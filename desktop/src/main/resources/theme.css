@@ -243,9 +243,96 @@
     -fx-background-color: #ffffff;
 }
 
+.combo-box {
+    -fx-background-color: #12151d;
+    -fx-border-color: #262b3c;
+    -fx-border-radius: 9;
+    -fx-background-radius: 9;
+    -fx-padding: 2 4 2 4;
+}
+
+.combo-box .list-cell {
+    -fx-background-color: transparent;
+    -fx-text-fill: #eceff4;
+    -fx-padding: 7 10 7 10;
+}
+
+.combo-box .arrow-button {
+    -fx-background-color: transparent;
+    -fx-padding: 0 8 0 4;
+}
+
+.combo-box .arrow {
+    -fx-background-color: #8b91a3;
+}
+
+.combo-box-popup .list-view {
+    -fx-background-color: #171a23;
+    -fx-background-radius: 10;
+    -fx-border-color: #2a2f42;
+    -fx-border-radius: 10;
+    -fx-padding: 4;
+}
+
+.combo-box-popup .list-view .list-cell {
+    -fx-background-color: transparent;
+    -fx-text-fill: #d8dbe6;
+    -fx-padding: 8 14 8 14;
+    -fx-background-radius: 7;
+}
+
+.combo-box-popup .list-view .list-cell:hover {
+    -fx-background-color: #221d3a;
+}
+
+.combo-box-popup .list-view .list-cell:filled:selected {
+    -fx-background-color: #2a1f4d;
+    -fx-text-fill: #c4b0ff;
+}
+
 .tooltip {
     -fx-background-color: #1e2230;
     -fx-text-fill: #eceff4;
     -fx-background-radius: 6;
     -fx-font-size: 12px;
+}
+
+/* ---- Custom window chrome (frameless stage) ---- */
+
+.win-titlebar {
+    -fx-background-color: #0e1118;
+    -fx-border-color: #1f2431;
+    -fx-border-width: 0 0 1 0;
+}
+
+.win-title {
+    -fx-text-fill: #cfd3de;
+    -fx-font-size: 13px;
+    -fx-font-weight: 600;
+    -fx-padding: 0 0 0 14;
+}
+
+.win-btn {
+    -fx-background-color: transparent;
+    -fx-text-fill: #9aa0ae;
+    -fx-font-size: 14px;
+    -fx-min-width: 46;
+    -fx-min-height: 38;
+    -fx-background-radius: 0;
+    -fx-padding: 0;
+    -fx-cursor: hand;
+}
+
+.win-btn:hover {
+    -fx-background-color: #1b2030;
+    -fx-text-fill: #eceff4;
+}
+
+.win-btn-max {
+    -fx-font-size: 13px;
+}
+
+.win-btn-close:hover {
+    -fx-background-color: #c42b1c;
+    -fx-text-fill: #ffffff;
 }
