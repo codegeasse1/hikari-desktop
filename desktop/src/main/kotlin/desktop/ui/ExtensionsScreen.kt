@@ -89,18 +89,42 @@ class ExtensionsScreenView {
     private fun Section(title: String, body: VBox): VBox =
         VBox(8.0, Theme.label(title, size = 16.0, bold = true), body)
 
-    private fun hikariRepoRow(): HBox {
+    private fun hikariRepoRow(): VBox {
+        val defaultUrl = "https://github.com/codegeasse1/hikari-extensions"
+        val input = TextField().apply {
+            styleClass.add("field")
+            promptText = "Hikari repo URL"
+            prefWidth = 420.0
+            text = defaultUrl
+        }
+        val addBtn = Button("Add").apply {
+            styleClass.addAll("btn", "btn-primary")
+            setOnAction {
+                val url = Http.normalizeUrl(input.text)
+                if (url.isNotBlank()) addRepo(url)
+            }
+        }
+        val cancelBtn = Button("Cancel").apply {
+            styleClass.add("btn")
+            setOnAction {
+                urlBox.isVisible = false
+                urlBox.isManaged = false
+            }
+        }
+        val urlBox = HBox(10.0, input, addBtn, cancelBtn).apply {
+            alignment = Pos.CENTER_LEFT
+            isVisible = false
+            isManaged = false
+        }
         val btn = Button("＋ Add Hikari repo (codegeasse1/hikari-extensions)").apply {
             styleClass.addAll("btn", "btn-primary")
             setOnAction {
-                if (AppShell.app.store.repos().any { it.url.contains("codegeasse1/hikari-extensions") }) {
-                    setStatus("The Hikari repo is already added.", isError = true)
-                } else {
-                    addRepo("https://github.com/codegeasse1/hikari-extensions")
-                }
+                urlBox.isVisible = !urlBox.isVisible
+                urlBox.isManaged = urlBox.isVisible
+                if (urlBox.isVisible) input.requestFocus()
             }
         }
-        return HBox(10.0, btn).apply { alignment = Pos.CENTER_LEFT }
+        return VBox(8.0, btn, urlBox).apply { alignment = Pos.CENTER_LEFT }
     }
 
     private fun addStremioRow(): HBox {
@@ -169,7 +193,11 @@ class ExtensionsScreenView {
             styleClass.add("btn")
             setOnAction {
                 val url = Http.normalizeUrl(input.text)
-                if (url.isNotBlank()) browseRepo(url)
+                if (url.isBlank()) {
+                    setStatus("Type a repo.json URL first, then press Browse.", isError = true)
+                } else {
+                    browseRepo(url)
+                }
             }
         }
         return HBox(10.0, input, add, load).apply { alignment = Pos.CENTER_LEFT }
@@ -275,7 +303,8 @@ class ExtensionsScreenView {
     }
 
     /** Validates a repo.json by fetching it (via URL candidates), then saves it
-     *  under the resolved URL and lists its plugins immediately. */
+     *  under the resolved URL and lists its plugins immediately. Adding a repo
+     *  whose resolved URL (or display name) already exists is a no-op. */
     private fun addRepo(url: String) {
         busy.isVisible = true
         setStatus("Checking $url…")
@@ -293,6 +322,13 @@ class ExtensionsScreenView {
                 }
                 val resolved = pair.first
                 val name = Http.repoDisplayName(resolved)
+                val already = AppShell.app.store.repos().any {
+                    it.url == resolved || Http.repoDisplayName(it.url) == name
+                }
+                if (already) {
+                    setStatus("That repo is already added.", isError = true)
+                    return@run
+                }
                 AppShell.app.store.addCs3Repo(
                     Cs3Repo(url = resolved, name = name, kind = com.hikari.app.data.RepoKind.HIKARI)
                 )
