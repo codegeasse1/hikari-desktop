@@ -1,0 +1,144 @@
+.root {
+    -fx-background-color: #0e0f13;
+    -fx-font-family: "Segoe UI", "Inter", sans-serif;
+    -fx-font-size: 14px;
+}
+
+.sidebar {
+    -fx-background-color: #10121a;
+    -fx-border-color: #262a36;
+    -fx-border-width: 0 1 0 0;
+}
+
+.nav-btn {
+    -fx-background-color: transparent;
+    -fx-text-fill: #9aa0ae;
+    -fx-font-size: 14px;
+    -fx-padding: 10 18 10 18;
+    -fx-background-radius: 8;
+    -fx-alignment: center-left;
+}
+
+.nav-btn:hover {
+    -fx-background-color: #1d2028;
+    -fx-text-fill: #e8eaf0;
+}
+
+.nav-btn-selected {
+    -fx-background-color: #28213a;
+    -fx-text-fill: #b06aff;
+    -fx-font-weight: bold;
+}
+
+.card {
+    -fx-background-color: #1d2028;
+    -fx-background-radius: 10;
+    -fx-border-color: #2a2e3a;
+    -fx-border-radius: 10;
+}
+
+.card:hover {
+    -fx-border-color: #b06aff;
+}
+
+.poster-img {
+    -fx-background-color: #14161d;
+    -fx-background-radius: 8;
+}
+
+.poster-title {
+    -fx-text-fill: #e8eaf0;
+    -fx-font-size: 12.5px;
+    -fx-max-width: 150px;
+}
+
+.section-title {
+    -fx-text-fill: #e8eaf0;
+    -fx-font-size: 17px;
+    -fx-font-weight: bold;
+}
+
+.field {
+    -fx-background-color: #171922;
+    -fx-text-fill: #e8eaf0;
+    -fx-prompt-text-fill: #5c6270;
+    -fx-border-color: #2a2e3a;
+    -fx-border-radius: 8;
+    -fx-background-radius: 8;
+    -fx-padding: 8 12 8 12;
+}
+
+.btn {
+    -fx-background-color: #3a2f55;
+    -fx-text-fill: #efe9ff;
+    -fx-font-size: 13.5px;
+    -fx-background-radius: 8;
+    -fx-padding: 8 16 8 16;
+    -fx-cursor: hand;
+}
+
+.btn:hover {
+    -fx-background-color: #4a3c6e;
+}
+
+.btn-danger {
+    -fx-background-color: #3a1d22;
+    -fx-text-fill: #ffb3ba;
+}
+
+.btn-danger:hover {
+    -fx-background-color: #572a31;
+}
+
+.list-row {
+    -fx-background-color: #171922;
+    -fx-background-radius: 8;
+    -fx-padding: 10 14 10 14;
+}
+
+.episode-chip {
+    -fx-background-color: #20232c;
+    -fx-text-fill: #cfd3dd;
+    -fx-background-radius: 6;
+    -fx-padding: 5 10 5 10;
+    -fx-cursor: hand;
+}
+
+.episode-chip-selected {
+    -fx-background-color: #b06aff;
+    -fx-text-fill: #16001f;
+    -fx-font-weight: bold;
+}
+
+.progress-bar > .bar {
+    -fx-background-color: #b06aff;
+}
+
+.progress-bar > .track {
+    -fx-background-color: #262a36;
+}
+
+.scroll-pane {
+    -fx-background-color: transparent;
+}
+
+.scroll-pane > .viewport {
+    -fx-background-color: transparent;
+}
+
+.scroll-bar:vertical, .scroll-bar:horizontal {
+    -fx-background-color: transparent;
+}
+
+.scroll-bar .thumb {
+    -fx-background-color: #3a3f4d;
+    -fx-background-radius: 4;
+}
+
+.text-area {
+    -fx-background-color: #171922;
+    -fx-text-fill: #e8eaf0;
+    -fx-border-color: #2a2e3a;
+    -fx-border-radius: 8;
+    -fx-background-radius: 8;
+}
