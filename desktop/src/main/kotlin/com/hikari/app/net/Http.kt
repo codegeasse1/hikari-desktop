@@ -71,6 +71,62 @@ object Http {
         return u
     }
 
+    private fun ghRaw(out: MutableSet<String>, user: String, repo: String, branch: String) {
+        out.add("https://raw.githubusercontent.com/$user/$repo/$branch/repo.json")
+        out.add("https://cdn.jsdelivr.net/gh/$user/$repo@$branch/repo.json")
+    }
+
+    /**
+     * Candidate URLs for a repo.json. Accepts a direct repo.json URL, a raw
+     * GitHub URL (with or without the full path) or a github.com repo page —
+     * trying main/master and a jsDelivr mirror — so pasting the repo's GitHub
+     * page just works instead of 404ing.
+     */
+    fun repoJsonCandidates(raw: String): List<String> {
+        val url = normalizeUrl(raw)
+        val out = linkedSetOf(url)
+        Regex("^https?://github\\.com/([^/]+)/([^/]+?)(?:/tree/([^/]+))?(?:/.*)?$")
+            .matchEntire(url)?.let { m ->
+                val user = m.groupValues[1]
+                val repo = m.groupValues[2]
+                val branch = m.groupValues[3].ifBlank { "main" }
+                ghRaw(out, user, repo, branch)
+                if (branch != "main") ghRaw(out, user, repo, "main")
+                ghRaw(out, user, repo, "master")
+            }
+        Regex("^https?://raw\\.githubusercontent\\.com/([^/]+)/([^/]+)(?:/([^/]+))?(?:/(.*))?$")
+            .matchEntire(url)?.let { m ->
+                val user = m.groupValues[1]
+                val repo = m.groupValues[2]
+                val branch = m.groupValues[3]
+                val path = m.groupValues[4]
+                if (branch.isNotBlank()) {
+                    if (path.isBlank()) {
+                        ghRaw(out, user, repo, branch)
+                    } else {
+                        out.add("https://cdn.jsdelivr.net/gh/$user/$repo@$branch/$path")
+                        if (!path.endsWith(".json")) ghRaw(out, user, repo, branch)
+                    }
+                } else {
+                    ghRaw(out, user, repo, "main")
+                    ghRaw(out, user, repo, "master")
+                }
+            }
+        return out.toList()
+    }
+
+    /** Fetches a repo.json, trying every candidate URL. Returns the URL that
+     *  worked together with its body. */
+    fun fetchRepoJson(raw: String): Result<Pair<String, String>> {
+        var last: Throwable = Exception("No candidate URL worked")
+        for (u in repoJsonCandidates(raw)) {
+            val r = fetchStringRobust(u)
+            if (r.isSuccess) return Result.success(u to r.getOrThrow())
+            r.exceptionOrNull()?.let { last = it }
+        }
+        return Result.failure(last)
+    }
+
     fun getString(url: String, headers: Map<String, String> = emptyMap()): String? =
         try {
             get(url, headers).use { if (it.isSuccessful) it.body?.string() else null }
