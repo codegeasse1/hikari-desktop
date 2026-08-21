@@ -95,6 +95,7 @@ object DesktopPlayer {
                             // stderr, so the most useful lines are at the end).
                             val err = tail.toString().trim().lineSequence()
                                 .filter { it.isNotBlank() }
+                                .toList()
                                 .takeLast(10)
                                 .joinToString("\n")
                             Fx.run {

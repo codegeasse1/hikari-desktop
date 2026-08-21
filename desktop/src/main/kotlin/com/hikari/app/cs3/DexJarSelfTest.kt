@@ -138,6 +138,10 @@ object DexJarSelfTest {
             val outcome = runCatching {
                 if (method.parameterCount == 3) {
                     // Suspend fun getMainPage(int, MainPageRequest, Continuation).
+                    // resumeWith is invoked exactly once — synchronously when the
+                    // coroutine completes without suspending, later from another
+                    // thread when it suspends — so unconditionally awaiting the
+                    // latch covers both cases.
                     val latch = java.util.concurrent.CountDownLatch(1)
                     val box = java.util.concurrent.atomic.AtomicReference<Any?>()
                     val thrown = java.util.concurrent.atomic.AtomicReference<Throwable?>()
@@ -150,10 +154,14 @@ object DexJarSelfTest {
                             latch.countDown()
                         }
                     }
-                    val returned = method.invoke(api, 0, req, cont)
-                    if (returned === kotlin.coroutines.intrinsics.CoroutineSingletons.COROUTINE_SUSPENDED &&
-                        !latch.await(90, java.util.concurrent.TimeUnit.SECONDS)
-                    ) {
+                    val invokeErr: Throwable? = try {
+                        method.invoke(api, 0, req, cont)
+                        null
+                    } catch (t: Throwable) {
+                        t
+                    }
+                    if (invokeErr != null) throw invokeErr
+                    if (!latch.await(90, java.util.concurrent.TimeUnit.SECONDS)) {
                         return@runCatching "catalog probe timed out (90s)"
                     }
                     thrown.get()?.let { throw it }
