@@ -126,30 +126,14 @@ object DexJarSelfTest {
                 return
             }
             val reqClass = method.parameterTypes[1]
-            // Build the request generically: CS3's MainPageRequest shape varies
-            // by version (page/url vs name/id/isMovie), so try every constructor
-            // with zero-filled primitives/null refs until one instantiates.
-            val req = reqClass.constructors
-                .map { it to it.parameterTypes.size }
-                .sortedBy { it.second }
-                .firstNotNullOfOrNull { (c, _) ->
-                    runCatching {
-                        val args: Array<Any?> = c.parameterTypes.map { t ->
-                            when {
-                                t == java.lang.Integer.TYPE -> 0
-                                t == java.lang.Long.TYPE -> 0L
-                                t == java.lang.Boolean.TYPE -> false
-                                t == java.lang.Double.TYPE -> 0.0
-                                t == java.lang.Float.TYPE -> 0.0f
-                                t == java.lang.Short.TYPE -> 0.toShort()
-                                t == java.lang.Byte.TYPE -> 0.toByte()
-                                t == java.lang.Character.TYPE -> 0.toChar()
-                                else -> null
-                            }
-                        }.toTypedArray()
-                        c.newInstance(*args)
-                    }.getOrNull()
-                }
+            // Build the home-catalog request directly. This CS3 build's
+            // MainPageRequest is a data class (name, data, isHorizontal) — no
+            // page/url — and a null name means "home page". It's the same class
+            // the plugin's getMainPage expects (resolved via the parent
+            // classloader), so a direct instance works with the reflective call.
+            val req: Any? = runCatching {
+                com.lagradost.cloudstream3.MainPageRequest(null, null, false)
+            }.getOrNull()
             if (req == null) {
                 println("WARN: couldn't build MainPageRequest for ${reqClass.name}")
                 return
