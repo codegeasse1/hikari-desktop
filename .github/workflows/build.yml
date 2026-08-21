@@ -66,6 +66,26 @@ jobs:
           ls -la hikari-windows.zip
         shell: bash
 
+      - name: Install WiX (for the .exe installer)
+        run: choco install wixtoolset -y --no-progress
+        shell: bash
+
+      - name: Package .exe installer
+        run: |
+          jpackage --type exe -n Hikari \
+            --input jpackage-input \
+            --main-jar hikari-desktop.jar \
+            --main-class desktop.MainKt \
+            --module-path jmods/javafx-jmods-21.0.8 \
+            --add-modules javafx.controls,javafx.media,javafx.web,javafx.graphics,javafx.base,jdk.crypto.ec,jdk.httpserver,java.desktop \
+            --java-options "-Dfile.encoding=UTF-8" \
+            --app-version 0.1.0 \
+            --win-menu --win-dir-chooser
+          EXE=$(ls -1 *.exe | head -n 1)
+          echo "installer: $EXE"
+          ls -la "$EXE"
+        shell: bash
+
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
@@ -78,18 +98,21 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: hikari-windows
-          path: hikari-windows.zip
+          path: |
+            hikari-windows.zip
+            *.exe
           if-no-files-found: error
 
       - name: Publish to continuous release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          EXE=$(ls -1 *.exe | head -n 1)
           if gh release view continuous --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload continuous hikari-windows.zip --repo "$GITHUB_REPOSITORY" --clobber
+            gh release upload continuous hikari-windows.zip "$EXE" --repo "$GITHUB_REPOSITORY" --clobber
           else
-            gh release create continuous hikari-windows.zip --repo "$GITHUB_REPOSITORY" \
+            gh release create continuous hikari-windows.zip "$EXE" --repo "$GITHUB_REPOSITORY" \
               --title "Continuous build" \
-              --notes "Hikari for Windows (app image zip), auto-built from main." || true
+              --notes "Hikari for Windows (app image zip + .exe installer), auto-built from main." || true
           fi
         shell: bash
