@@ -137,8 +137,8 @@ class DetailScreenView(private val item: MediaItem) {
         }
         val wrap = ScrollPane(episodesBox).apply {
             isFitToHeight = true
-            isHbarPolicy = ScrollPane.ScrollBarPolicy.AS_NEEDED
-            isVbarPolicy = ScrollPane.ScrollBarPolicy.NEVER
+            hbarPolicy = ScrollPane.ScrollBarPolicy.AS_NEEDED
+            vbarPolicy = ScrollPane.ScrollBarPolicy.NEVER
             styleClass.add("scroll-pane")
         }
         body.children.add(1, title)
@@ -181,7 +181,7 @@ class DetailScreenView(private val item: MediaItem) {
                             title = meta.title,
                             posterUrl = meta.posterUrl,
                             episodeId = selectedEpisode?.id ?: "",
-                            episodeName = selectedEpisode?.name,
+                            episodeName = selectedEpisode?.name ?: "",
                             watchedAt = System.currentTimeMillis(),
                         )
                     )
