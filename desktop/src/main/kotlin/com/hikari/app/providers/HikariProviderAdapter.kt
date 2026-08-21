@@ -124,7 +124,7 @@ class HikariProviderAdapter(override val config: ProviderConfig) : ContentProvid
 
     private fun HikariStream.toApp(): StreamSource = StreamSource(
         name = name,
-        url = url,
+        url = com.hikari.app.net.Http.sanitizeStreamUrl(url),
         headers = headers,
         subtitles = subtitles.map { SubtitleSource(it.lang, it.url) },
         isTorrent = isTorrent,

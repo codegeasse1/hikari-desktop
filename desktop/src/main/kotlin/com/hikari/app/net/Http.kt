@@ -281,6 +281,34 @@ object Http {
             .ifBlank { "unknown network error" }
     }
 
+    /** Fixes stream URLs that some providers hand back half-escaped or relative:
+     *  JSON `\/`/`\uXXXX` escapes, stray quotes/whitespace, and chaturbate's
+     *  root-relative signed LL-HLS path (which comes back as e.g.
+     *  `\/v1\/edge\/streams\/…m3u8?session=…` with no scheme or host). Returns
+     *  the clean, playable URL. */
+    fun sanitizeStreamUrl(raw: String): String {
+        var u = raw.trim().trim('"', '\'')
+        if (u.isBlank()) return u
+        // JSON escapes a JS-embedded URL commonly carries (before \\ → \ so the
+        // \uXXXX patterns still match).
+        u = u
+            .replace("\\u002f", "/").replace("\\u0026", "&")
+            .replace("\\u003d", "=").replace("\\u003f", "?")
+            .replace("\\u0025", "%").replace("\\u0023", "#")
+            .replace("\\/", "/")
+            .replace("\\\\", "\\")
+            .replace("\\\"", "\"")
+        if (!u.startsWith("http://") && !u.startsWith("https://")) {
+            // chaturbate serves the signed LL-HLS playlist as a root-relative
+            // path on its edge host.
+            val rel = u.trimStart('/', '\\')
+            if (rel.startsWith("v1/edge/streams/") || rel.startsWith("v1\\edge\\streams\\")) {
+                u = "https://edge-hls.chaturbate.com/edge-hls/$rel"
+            }
+        }
+        return u
+    }
+
     /** Human-friendly repo name from a URL: "codegeasse1/hikari-extensions"
      *  for github/raw URLs, the host otherwise. */
     fun repoDisplayName(url: String): String {

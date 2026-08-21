@@ -31,26 +31,30 @@ object DesktopPlayer {
 
     fun play(title: String, stream: StreamSource) {
         Fx.run {
+            // Sanitize here too so a malformed URL from ANY provider (chaturbate's
+            // root-relative escaped HLS path, stray quotes, JSON escapes) can't
+            // reach mpv or the browser as garbage.
+            val url = com.hikari.app.net.Http.sanitizeStreamUrl(stream.url)
             if (stream.externalUrl) {
-                DesktopUi.open(stream.url)
+                DesktopUi.open(url)
                 return@run
             }
             if (stream.ytId != null) {
                 DesktopUi.open("https://www.youtube.com/watch?v=${stream.ytId}")
                 return@run
             }
-            if (stream.isMpd || stream.url.endsWith(".mpd")) {
-                showBrowserFallback(title, stream.url, "This stream uses DASH, which the bundled player can't play yet.")
+            if (stream.isMpd || url.endsWith(".mpd")) {
+                showBrowserFallback(title, url, "This stream uses DASH, which the bundled player can't play yet.")
                 return@run
             }
             if (stream.isTorrent || stream.infoHash != null) {
-                showBrowserFallback(title, stream.url.ifBlank { "magnet stream (infoHash ${stream.infoHash})" },
+                showBrowserFallback(title, url.ifBlank { "magnet stream (infoHash ${stream.infoHash})" },
                     "This is a torrent stream, which the bundled player can't play yet.")
                 return@run
             }
             val mpv = findMpv()
             if (mpv == null) {
-                showBrowserFallback(title, stream.url,
+                showBrowserFallback(title, url,
                     "The video player (mpv) wasn't found next to the app — re-download the latest release.")
                 return@run
             }
@@ -73,11 +77,11 @@ object DesktopPlayer {
                 for ((k, v) in stream.headers) {
                     if (k.isNotBlank() && v.isNotBlank()) add("--http-header-fields=$k: $v")
                 }
-                add(stream.url)
+                add(url)
             }
             val p = runCatching { ProcessBuilder(args).redirectErrorStream(true).start() }.getOrNull()
             if (p == null) {
-                showBrowserFallback(title, stream.url, "Couldn't launch the video player. Open it in your browser instead?")
+                showBrowserFallback(title, url, "Couldn't launch the video player. Open it in your browser instead?")
                 return@run
             }
             proc?.let { runCatching { it.destroy() } }
@@ -100,7 +104,7 @@ object DesktopPlayer {
                                 .joinToString("\n")
                             Fx.run {
                                 showBrowserFallback(
-                                    title, stream.url,
+                                    title, url,
                                     buildString {
                                         append("The player closed with an error")
                                         if (err.isNotBlank()) append(":\n").append(err.take(1600))
