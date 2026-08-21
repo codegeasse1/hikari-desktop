@@ -43,14 +43,14 @@ object ImageLoader {
         kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
             val img = load(url)
             Fx.run {
-                mem[url] = img
+                if (img != null) mem[url] = img
                 val list = inFlight.remove(url) ?: emptyList()
                 list.forEach { it(img) }
             }
         }
     }
 
-    fun load(url: String): Image? = withContext(Dispatchers.IO) {
+    private suspend fun load(url: String): Image? = withContext(Dispatchers.IO) {
         runCatching {
             val bytes = fetchBytes(url) ?: return@withContext null
             Image(ByteArrayInputStream(bytes))
