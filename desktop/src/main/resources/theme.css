@@ -136,6 +136,34 @@
     -fx-border-color: #2c3350;
 }
 
+.repo-folder {
+    -fx-background-color: #1a1e2b;
+    -fx-text-fill: #eceff4;
+    -fx-font-size: 14px;
+    -fx-font-weight: 600;
+    -fx-background-radius: 10;
+    -fx-padding: 11 14 11 14;
+    -fx-alignment: center-left;
+    -fx-cursor: hand;
+}
+
+.repo-folder:hover {
+    -fx-background-color: #222840;
+}
+
+.repo-btn {
+    -fx-background-color: #211d33;
+    -fx-text-fill: #ded7f8;
+    -fx-font-size: 13px;
+    -fx-background-radius: 9;
+    -fx-padding: 8 12 8 12;
+    -fx-cursor: hand;
+}
+
+.repo-btn:hover {
+    -fx-background-color: #2c2646;
+}
+
 .episode-chip {
     -fx-background-color: #1c2030;
     -fx-text-fill: #c6cbd8;
