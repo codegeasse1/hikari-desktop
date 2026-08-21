@@ -21,9 +21,7 @@ class HikariDesktopApp : Application() {
         Fx.onStart()
         stage.title = "Hikari"
         val root = AppShell.create()
-        stage.scene = Scene(root, 1280.0, 780.0).apply {
-            fill = javafx.scene.paint.Color.web(Theme.BG)
-        }
+        stage.scene = Theme.style(Scene(root, 1280.0, 780.0))
         stage.minWidth = 960.0
         stage.minHeight = 620.0
         stage.show()
