@@ -188,7 +188,7 @@ fun posterCard(media: MediaItem, onClick: () -> Unit): VBox {
         isPreserveRatio = true
         styleClass.add("poster-img")
     }
-    desktop.img.ImageLoader.loadAsync(media.posterUrl, w = 300, h = 410) { fx -> img.image = fx }
+    desktop.img.ImageLoader.loadAsync(media.posterUrl, onReady = { fx -> img.image = fx }, w = 300, h = 410)
     val title = Label(media.title).apply {
         styleClass.add("poster-title")
         isWrapText = true
