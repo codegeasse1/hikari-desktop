@@ -19,7 +19,7 @@ class AppStore(private val dir: File) {
 
     private val file = File(dir, "hikari.json")
     private val lock = Any()
-    private val json = JSONObject()
+    private var json = JSONObject()
     private val version = MutableStateFlow(0L)
 
     init {
