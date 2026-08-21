@@ -126,11 +126,31 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           EXE=$(ls -1 *.exe | head -n 1)
-          if gh release view continuous --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload continuous hikari-windows.zip "$EXE" --repo "$GITHUB_REPOSITORY" --clobber
-          else
-            gh release create continuous hikari-windows.zip "$EXE" --repo "$GITHUB_REPOSITORY" \
-              --title "Continuous build" \
-              --notes "Hikari for Windows (app image zip + .exe installer), auto-built from main." || true
+          echo "assets: hikari-windows.zip, $EXE"
+          published=0
+          for attempt in 1 2 3 4 5; do
+            if gh release view continuous --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              if gh release upload continuous hikari-windows.zip "$EXE" --repo "$GITHUB_REPOSITORY" --clobber; then
+                published=1
+                echo "published (attempt $attempt)"
+                break
+              fi
+              echo "upload failed (attempt $attempt) — recreating the release"
+              gh release delete continuous --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag >/dev/null 2>&1 || true
+              sleep 5
+            fi
+            if gh release create continuous hikari-windows.zip "$EXE" --repo "$GITHUB_REPOSITORY" \
+                --title "Continuous build" \
+                --notes "Hikari for Windows (app image zip + .exe installer), auto-built from main."; then
+              published=1
+              echo "release created (attempt $attempt)"
+              break
+            fi
+            echo "release create failed (attempt $attempt) — retrying in 10s"
+            sleep 10
+          done
+          if [ "$published" != "1" ]; then
+            echo "FAILED to publish release after retries"
+            exit 1
           fi
         shell: bash
