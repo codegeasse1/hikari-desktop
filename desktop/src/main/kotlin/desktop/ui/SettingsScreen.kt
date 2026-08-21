@@ -21,6 +21,8 @@ class SettingsScreenView {
 
     private val app = HikariApp.instance
 
+    fun onShown() {}
+
     init {
         val title = Theme.label("Settings", size = 26.0, bold = true)
         root.children.addAll(
@@ -35,7 +37,7 @@ class SettingsScreenView {
     }
 
     private fun crashBanner(): Label? {
-        val crash = app.lastCrash ?: return null
+        val crash = HikariApp.lastCrash ?: return null
         val l = Theme.label("A previous crash was recorded:\n$crash", size = 12.0, dim = true)
         l.isWrapText = true
         l.style = l.style + "; -fx-text-fill: #ff9a9a;"
@@ -100,7 +102,7 @@ class SettingsScreenView {
 
     private fun historyRow(): HBox {
         val clear = Button("Clear watch history").apply {
-            styleClass.add("btn", "btn-danger")
+            styleClass.addAll("btn", "btn-danger")
             setOnAction {
                 app.store.clearHistory()
             }
