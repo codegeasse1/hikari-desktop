@@ -114,8 +114,8 @@ class HomeScreenView {
             }
             val scroller = ScrollPane(cardRow).apply {
                 isFitToHeight = true
-                isHbarPolicy = ScrollPane.ScrollBarPolicy.AS_NEEDED
-                isVbarPolicy = ScrollPane.ScrollBarPolicy.NEVER
+                hbarPolicy = ScrollPane.ScrollBarPolicy.AS_NEEDED
+                vbarPolicy = ScrollPane.ScrollBarPolicy.NEVER
                 styleClass.add("scroll-pane")
             }
             rowsBox.children.add(VBox(10.0, head, scroller))
@@ -140,7 +140,7 @@ fun posterCard(media: MediaItem, onClick: () -> Unit): VBox {
     }
     val box = VBox(8.0, img, title).apply {
         cursor = javafx.scene.Cursor.HAND
-        tooltip = Tooltip(media.title)
+        Tooltip.install(this, Tooltip(media.title))
         onMouseClicked = { onClick() }
     }
     return box
