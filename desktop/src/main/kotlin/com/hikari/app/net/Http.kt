@@ -72,6 +72,11 @@ object Http {
     }
 
     private fun ghRaw(out: MutableSet<String>, user: String, repo: String, branch: String) {
+        // Desktop first: the desktop app runs JVM .jar extensions, and the
+        // official repos publish repo-desktop.json with jar URLs. Fall back to
+        // the dex (.hiki) repo.json only when no desktop variant exists.
+        out.add("https://raw.githubusercontent.com/$user/$repo/$branch/repo-desktop.json")
+        out.add("https://cdn.jsdelivr.net/gh/$user/$repo@$branch/repo-desktop.json")
         out.add("https://raw.githubusercontent.com/$user/$repo/$branch/repo.json")
         out.add("https://cdn.jsdelivr.net/gh/$user/$repo@$branch/repo.json")
     }
