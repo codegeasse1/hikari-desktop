@@ -134,7 +134,7 @@ object DexJarSelfTest {
                 .sortedBy { it.second }
                 .firstNotNullOfOrNull { (c, _) ->
                     runCatching {
-                        val args = c.parameterTypes.map { t ->
+                        val args: Array<Any?> = c.parameterTypes.map { t ->
                             when {
                                 t == java.lang.Integer.TYPE -> 0
                                 t == java.lang.Long.TYPE -> 0L
