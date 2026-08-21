@@ -91,6 +91,11 @@ class ExtensionsScreenView {
 
     private fun hikariRepoRow(): VBox {
         val defaultUrl = "https://github.com/codegeasse1/hikari-extensions"
+        val urlBox = HBox(10.0).apply {
+            alignment = Pos.CENTER_LEFT
+            isVisible = false
+            isManaged = false
+        }
         val input = TextField().apply {
             styleClass.add("field")
             promptText = "Hikari repo URL"
@@ -111,11 +116,7 @@ class ExtensionsScreenView {
                 urlBox.isManaged = false
             }
         }
-        val urlBox = HBox(10.0, input, addBtn, cancelBtn).apply {
-            alignment = Pos.CENTER_LEFT
-            isVisible = false
-            isManaged = false
-        }
+        urlBox.children.addAll(input, addBtn, cancelBtn)
         val btn = Button("＋ Add Hikari repo (codegeasse1/hikari-extensions)").apply {
             styleClass.addAll("btn", "btn-primary")
             setOnAction {
