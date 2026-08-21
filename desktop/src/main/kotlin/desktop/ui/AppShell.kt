@@ -35,7 +35,7 @@ object AppShell {
     private val extensionsScreen = ExtensionsScreenView()
     private val settingsScreen = SettingsScreenView()
 
-    fun create(): Region {
+    fun create(stage: javafx.stage.Stage): Region {
         centerStack = StackPane()
         centerStack.style = "-fx-background-color: ${Theme.BG};"
 
@@ -72,10 +72,11 @@ object AppShell {
         sidebar.children.add(spacer)
         refreshNav()
 
-        return BorderPane().apply {
+        val appPane = BorderPane().apply {
             left = sidebar
             center = centerStack
         }
+        return WindowChrome(stage).build(appPane)
     }
 
     fun show(screen: Screen) {
