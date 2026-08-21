@@ -78,22 +78,33 @@ class HomeScreenView {
                     delay(500)
                     attempts++
                 }
-                val enabled = AppShell.app.store.providers().filter { it.enabled }
+                val enabled = AppShell.app.store.providers().filter { it.enabled }.distinctBy { it.name }
                 val providerNames = enabled.map { it.name }
-                Fx.run {
+                // Resolve the ACTIVE choice on the FX thread from the ComboBox's
+                // LIVE value. JavaFX can deliver a popup's action event before
+                // the chosen item is committed to `value`, so a value captured at
+                // load() start can be stale ("All providers") and would clobber
+                // the user's pick back to "All providers". Reading it here, a
+                // beat later, is reliable — and a valid in-progress selection is
+                // never overwritten.
+                val (chosen, filterId) = Fx.runBlock {
+                    val items = providerBox.items
                     val all = listOf("All providers") + providerNames
-                    providerBox.items.setAll(all)
-                    providerBox.value = selected.takeIf { it in all } ?: "All providers"
+                    for (n in all) if (!items.contains(n)) items.add(n)
+                    val current = providerBox.value
+                    val c = when {
+                        current != null && current in items -> current
+                        selected in items -> selected
+                        else -> "All providers"
+                    }
+                    providerBox.value = c
+                    val cfg = enabled.firstOrNull { it.name == c }
+                    c to cfg?.id?.takeIf { c != "All providers" }
                 }
-                // The dropdown shows provider NAMES, but the repository matches
-                // providers by ID — resolve the selected name to its id so
-                // choosing one actually filters the rows.
-                val selectedCfg = enabled.firstOrNull { it.name == selected }
-                val filterId = selectedCfg?.id?.takeIf { selected != "All providers" }
                 val rows = AppShell.app.repository.homeRows(filterId)
                 Fx.run {
                     loading.isVisible = false
-                    render(rows, filterId)
+                    render(rows, filterId, chosen)
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
@@ -107,7 +118,7 @@ class HomeScreenView {
         }
     }
 
-    private fun render(rows: List<CatalogRow>, filterId: String?) {
+    private fun render(rows: List<CatalogRow>, filterId: String?, chosen: String? = null) {
         rowsBox.children.clear()
         statusLabel.text = ""
         val statuses = AppShell.app.providers.statuses.value
@@ -124,7 +135,8 @@ class HomeScreenView {
             }
         } else if (rows.isEmpty()) {
             errorLabel.text = ""
-            val who = statuses.firstOrNull { it.id == filterId }?.name
+            val who = chosen?.takeIf { it != "All providers" }
+                ?: statuses.firstOrNull { it.id == filterId }?.name
             statusLabel.text = (if (who != null) "'$who' returned no catalog rows" else "No catalog rows loaded") +
                 " — the addon may be offline, or block this network."
         } else {

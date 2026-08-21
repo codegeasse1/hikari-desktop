@@ -111,6 +111,15 @@ object Http {
                     } else {
                         out.add("https://cdn.jsdelivr.net/gh/$user/$repo@$branch/$path")
                         if (!path.endsWith(".json")) ghRaw(out, user, repo, branch)
+                        else if (path.contains("repo.json") && !path.contains("repo-desktop.json")) {
+                            // A repo.json path on any branch (e.g. builds/repo.json)
+                            // is usually the dex-only Android repo. Also offer the
+                            // desktop repo-desktop.json on the same branch and on
+                            // main, so the desktop app finds the .jar build
+                            // instead of dead .hiki URLs.
+                            ghRaw(out, user, repo, branch)
+                            ghRaw(out, user, repo, "main")
+                        }
                     }
                 } else {
                     ghRaw(out, user, repo, "main")
@@ -122,10 +131,17 @@ object Http {
 
     /** Fetches a repo.json, trying every candidate URL. Only accepts a response
      *  that is actually a JSON object with a "plugins" key — a github.com HTML
-     *  page or a CDN error body is skipped instead of being passed to the UI. */
+     *  page or a CDN error body is skipped instead of being passed to the UI.
+     *
+     *  repo-desktop.json candidates are tried before repo.json ones: the desktop
+     *  app runs JVM jars, and the desktop repos publish repo-desktop.json with
+     *  .jar URLs — plain repo.json is the Android dex repo. */
     fun fetchRepoJson(raw: String): Result<Pair<String, String>> {
+        val candidates = repoJsonCandidates(raw)
+        val ordered = candidates.filter { it.contains("repo-desktop.json") } +
+            candidates.filter { !it.contains("repo-desktop.json") }
         var last: Throwable = Exception("No candidate URL served a valid repo.json")
-        for (u in repoJsonCandidates(raw)) {
+        for (u in ordered) {
             val r = fetchStringRobust(u)
             if (r.isSuccess) {
                 val text = r.getOrThrow()

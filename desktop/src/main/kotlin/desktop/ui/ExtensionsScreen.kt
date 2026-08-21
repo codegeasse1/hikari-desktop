@@ -387,13 +387,17 @@ class ExtensionsScreenView {
             )
             return
         }
+        // `plugins` is already a JSONArray (org.json's `new JSONArray(jsonArray)`
+        // throws, so never re-wrap an existing array — that bug made every valid
+        // repo look like "no plugins listed").
         val plugins = when (val p = root.opt("plugins")) {
             null -> JSONArray()
+            is JSONArray -> p
             else -> runCatching { JSONArray(p) }.getOrNull() ?: JSONArray()
         }
         if (plugins.length() == 0) {
             pluginListBox.children.add(
-                Theme.label("That repo.json has no plugins array. Showing its raw content:", dim = true)
+                Theme.label("That repo.json has an empty plugins list. Showing its raw content:", dim = true)
             )
             pluginListBox.children.add(Theme.label(jsonText.take(500), size = 11.0, dim = true))
             pluginListBox.children.add(
@@ -401,14 +405,22 @@ class ExtensionsScreenView {
             )
             return
         }
+        val dexUrls = (0 until plugins.length()).any {
+            plugins.optJSONObject(it)?.optString("url").orEmpty().endsWith(".hiki")
+        }
+        val note = if (dexUrls) " — Android .hiki listed; installing the matching .jar for desktop" else ""
         pluginListBox.children.add(
-            Theme.label("${plugins.length()} plugins found in ${Http.repoDisplayName(repoUrl)}:", size = 12.5, dim = true)
+            Theme.label("${plugins.length()} plugins found in ${Http.repoDisplayName(repoUrl)}$note:", size = 12.5, dim = true)
         )
         for (i in 0 until plugins.length()) {
             val p = plugins.optJSONObject(i) ?: continue
             val name = p.optString("name")
-            val url = p.optString("url")
+            var url = p.optString("url")
             if (name.isBlank() || url.isBlank()) continue
+            // The desktop build of every extension ships as <name>.jar next to
+            // the Android .hiki in the same release — swap the extension so a
+            // dex-only repo still installs a working desktop plugin.
+            if (url.endsWith(".hiki")) url = url.removeSuffix(".hiki") + ".jar"
             val desc = p.optString("description")
             val row = HBox(10.0).apply { alignment = Pos.CENTER_LEFT; styleClass.add("list-row") }
             val info = VBox(2.0).apply {
