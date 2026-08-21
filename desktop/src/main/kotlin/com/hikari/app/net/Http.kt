@@ -63,6 +63,14 @@ object Http {
         null
     }
 
+    /** Adds https:// when a scheme is missing and trims stray quotes. */
+    fun normalizeUrl(raw: String): String {
+        var u = raw.trim().trim('"', '\'')
+        if (u.isBlank()) return u
+        if (!u.startsWith("http://") && !u.startsWith("https://")) u = "https://$u"
+        return u
+    }
+
     fun getString(url: String, headers: Map<String, String> = emptyMap()): String? =
         try {
             get(url, headers).use { if (it.isSuccessful) it.body?.string() else null }
@@ -112,8 +120,7 @@ object Http {
         false
     }
 
-    fun getStringStrict(url: String, headers: Map<String, String> = emptyMap()): Result<String> =
-        try {
+    fun getStringStrict(url: String, headers: Map<String, String> = emptyMap()): Result<String> =        try {
             get(url, headers).use { r ->
                 if (r.isSuccessful) Result.success(r.body?.string() ?: "")
                 else Result.failure(Exception("HTTP ${r.code} for $url"))
@@ -171,6 +178,30 @@ object Http {
             }
         }
         return null
+    }
+
+    /**
+     * Streams a download to [dest], trying the jsDelivr mirror for
+     * raw.githubusercontent.com URLs when the primary URL fails. Mirrors
+     * [downloadTo]'s signature and semantics.
+     */
+    fun downloadToRobust(
+        url: String,
+        dest: java.io.File,
+        headers: Map<String, String> = emptyMap(),
+        onProgress: ((Long, Long) -> Unit)? = null,
+    ): Boolean {
+        for (u in urlVariants(url)) {
+            for (attempt in 0 until 2) {
+                if (downloadTo(u, dest, headers, onProgress)) return true
+                try {
+                    Thread.sleep(300L)
+                } catch (e: InterruptedException) {
+                    return false
+                }
+            }
+        }
+        return false
     }
 
     /**
