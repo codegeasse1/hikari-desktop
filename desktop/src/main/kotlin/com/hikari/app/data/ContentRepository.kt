@@ -34,7 +34,7 @@ class ContentRepository(private val manager: ProviderManager) {
 
     private data class CachedRow(val row: CatalogRow, val at: Long)
     private val rowCache = HashMap<String, CachedRow>()
-    private const val ROW_CACHE_TTL_MS = 5 * 60_000L
+    private val ROW_CACHE_TTL_MS = 5 * 60_000L
 
     /**
      * Loads Home rows. Catalogs inside a provider are fetched IN PARALLEL but
