@@ -70,7 +70,14 @@ data class HikariStream(
  * `manifest.json` with a `"mainClass"` entry naming a class implementing this
  * interface, and install the `.hiki` file (Extensions → Install .hiki). See
  * docs/HIKARI_EXTENSIONS.md in the repo for the full guide.
+ *
+ * @JvmDefaultWithCompatibility: extension jars are compiled with
+ * `-jvm-default=disable` (legacy mode) and call default methods through
+ * `HikariProvider$DefaultImpls`. Keep emitting that compatibility class even
+ * though this module compiles with `-Xjvm-default=all`, or installed
+ * extensions fail with NoClassDefFoundError.
  */
+@kotlin.jvm.JvmDefaultWithCompatibility
 interface HikariProvider {
     /** Stable unique slug, e.g. "yts". */
     val id: String
