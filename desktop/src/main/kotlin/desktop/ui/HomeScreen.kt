@@ -40,10 +40,13 @@ class HomeScreenView {
     }
 
     private fun header(): HBox {
-        val title = Theme.label("Browse", size = 26.0, bold = true)
+        val title = Theme.label("Browse", size = 26.0, bold = true).apply {
+            cursor = javafx.scene.Cursor.HAND
+            Tooltip.install(this, Tooltip("Click to reload"))
+            setOnMouseClicked { load() }
+        }
         providerBox.run {
             minWidth = 220.0
-            styleClass.add("field")
             setOnAction { load() }
         }
         val refresh = Button("Refresh").apply { styleClass.add("btn"); setOnAction { load() } }
@@ -73,14 +76,19 @@ class HomeScreenView {
                     delay(1000)
                     attempts++
                 }
-                val providerNames = AppShell.app.store.providers().filter { it.enabled }.map { it.name }
+                val enabled = AppShell.app.store.providers().filter { it.enabled }
+                val providerNames = enabled.map { it.name }
                 Fx.run {
                     val all = listOf("All providers") + providerNames
                     providerBox.items.setAll(all)
                     providerBox.value = selected.takeIf { it in all } ?: "All providers"
                 }
-                val filter = selected.takeIf { it != "All providers" }
-                val rows = AppShell.app.repository.homeRows(filter)
+                // The dropdown shows provider NAMES, but the repository matches
+                // providers by ID — resolve the selected name to its id so
+                // choosing one actually filters the rows.
+                val selectedCfg = enabled.firstOrNull { it.name == selected }
+                val filterId = selectedCfg?.id?.takeIf { selected != "All providers" }
+                val rows = AppShell.app.repository.homeRows(filterId)
                 Fx.run {
                     loading.isVisible = false
                     render(rows)
