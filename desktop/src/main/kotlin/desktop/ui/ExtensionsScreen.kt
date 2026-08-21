@@ -40,6 +40,11 @@ class ExtensionsScreenView {
 
     private val extDir: File = File(HikariApp.instance.filesDir, "extensions").apply { mkdirs() }
 
+    private fun setStatus(text: String, isError: Boolean = false) {
+        statusLabel.text = text
+        statusLabel.style = "-fx-text-fill: ${if (isError) "#ff8f8f" else Theme.FG_DIM};"
+    }
+
     init {
         val title = Theme.label("Extensions", size = 26.0, bold = true)
         root.children.addAll(
@@ -47,6 +52,7 @@ class ExtensionsScreenView {
             addStremioRow(),
             addScraperRow(),
             repoRow(),
+            installUrlRow(),
             Section(title = "Repositories", body = reposBox),
             Section(title = "Repository plugins", body = pluginListBox),
             Section(title = "Installed providers", body = installedBox),
@@ -67,9 +73,9 @@ class ExtensionsScreenView {
             prefWidth = 420.0
         }
         val btn = Button("Add addon").apply {
-            styleClass.add("btn")
+            styleClass.addAll("btn", "btn-primary")
             setOnAction {
-                val url = input.text.trim()
+                val url = Http.normalizeUrl(input.text)
                 if (url.isNotBlank()) {
                     val name = url.substringAfter("://").substringBefore("/")
                     AppShell.app.store.addProvider(
@@ -90,9 +96,9 @@ class ExtensionsScreenView {
             prefWidth = 420.0
         }
         val btn = Button("Add scraper").apply {
-            styleClass.add("btn")
+            styleClass.addAll("btn", "btn-primary")
             setOnAction {
-                val url = input.text.trim()
+                val url = Http.normalizeUrl(input.text)
                 if (url.isNotBlank()) {
                     val name = url.substringAfter("://").substringBefore("/")
                     AppShell.app.store.addProvider(
@@ -113,9 +119,9 @@ class ExtensionsScreenView {
             prefWidth = 420.0
         }
         val add = Button("Add repo").apply {
-            styleClass.add("btn")
+            styleClass.addAll("btn", "btn-primary")
             setOnAction {
-                val url = input.text.trim()
+                val url = Http.normalizeUrl(input.text)
                 if (url.isNotBlank()) {
                     AppShell.app.store.addCs3Repo(
                         Cs3Repo(url = url, name = url.substringAfter("://").substringBefore("/"), kind = com.hikari.app.data.RepoKind.HIKARI)
@@ -128,15 +134,38 @@ class ExtensionsScreenView {
         val load = Button("Browse").apply {
             styleClass.add("btn")
             setOnAction {
-                val url = input.text.trim()
+                val url = Http.normalizeUrl(input.text)
                 if (url.isNotBlank()) browseRepo(url)
             }
         }
         return HBox(10.0, input, add, load).apply { alignment = Pos.CENTER_LEFT }
     }
 
+    private fun installUrlRow(): HBox {
+        val input = TextField().apply {
+            styleClass.add("field")
+            promptText = "Direct .jar URL (GitHub raw / jsDelivr / Google Drive)"
+            prefWidth = 420.0
+        }
+        val btn = Button("Install from URL").apply {
+            styleClass.addAll("btn", "btn-primary")
+            setOnAction {
+                val raw = input.text.trim()
+                if (raw.isNotBlank()) {
+                    val url = Http.normalizeUrl(raw)
+                    val fileName = url.substringAfterLast('/').substringBefore('?').ifBlank { "ext.jar" }
+                    val safeName = fileName.removeSuffix(".jar").lowercase()
+                        .replace(Regex("[^a-z0-9]+"), "-").trim('-').ifBlank { "ext" }
+                    installPlugin(safeName, url)
+                    input.clear()
+                }
+            }
+        }
+        return HBox(10.0, input, btn).apply { alignment = Pos.CENTER_LEFT }
+    }
+
     private fun installFileRow(): HBox {
-        val btn = Button("Install .jar extension…").apply {
+        val btn = Button("Install .jar from file…").apply {
             styleClass.add("btn")
             setOnAction { installFromDisk() }
         }
@@ -212,17 +241,21 @@ class ExtensionsScreenView {
 
     private fun browseRepo(repoUrl: String) {
         busy.isVisible = true
-        statusLabel.text = "Fetching $repoUrl…"
+        setStatus("Fetching $repoUrl…")
         pluginListBox.children.clear()
         AppShell.uiScope.launch {
-            val text = Http.getString(repoUrl)
+            val result = Http.fetchStringRobust(repoUrl)
             Fx.run {
                 busy.isVisible = false
+                val text = result.getOrNull()
                 if (text == null) {
-                    statusLabel.text = "Failed to fetch repo.json"
+                    setStatus(
+                        "Failed to fetch repo.json — ${result.exceptionOrNull()?.message ?: "network error"}",
+                        isError = true,
+                    )
                     return@run
                 }
-                statusLabel.text = ""
+                setStatus("")
                 renderPlugins(repoUrl, text)
             }
         }
@@ -253,7 +286,7 @@ class ExtensionsScreenView {
                 )
             }
             val install = Button("Install").apply {
-                styleClass.add("btn")
+                styleClass.addAll("btn", "btn-primary")
                 setOnAction { installPlugin(name, url) }
             }
             row.children.addAll(info, install)
@@ -263,18 +296,18 @@ class ExtensionsScreenView {
 
     private fun installPlugin(name: String, url: String) {
         busy.isVisible = true
-        statusLabel.text = "Installing $name…"
+        setStatus("Installing $name…")
         AppShell.uiScope.launch {
-            val fileName = url.substringAfterLast('/').ifBlank { "ext.jar" }
+            val fileName = url.substringAfterLast('/').substringBefore('?').ifBlank { "ext.jar" }
             val safeName = name.lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-').ifBlank { "ext" }
             val dest = File(extDir, "$safeName.jar")
-            val ok = Http.downloadTo(url, dest)
+            val ok = Http.downloadToRobust(url, dest)
             val (kind, err) = if (ok) resolveKind(dest) else null to "Download failed for $url"
             AppShell.app.providers.refresh()
             Fx.run {
                 busy.isVisible = false
                 if (kind == null) {
-                    statusLabel.text = err ?: "unknown reason"
+                    setStatus(err ?: "unknown reason", isError = true)
                     return@run
                 }
                 val cfg = when (kind) {
@@ -293,7 +326,7 @@ class ExtensionsScreenView {
                     )
                 }
                 AppShell.app.store.addProvider(cfg)
-                statusLabel.text = "Installed $name ($kind). Reloading providers…"
+                setStatus("Installed $name ($kind). Reloading providers…")
                 renderInstalled()
             }
         }
@@ -306,7 +339,7 @@ class ExtensionsScreenView {
         }
         val file = chooser.showOpenDialog(null) ?: return
         busy.isVisible = true
-        statusLabel.text = "Installing ${file.name}…"
+        setStatus("Installing ${file.name}…")
         AppShell.uiScope.launch {
             val dest = File(extDir, file.name.lowercase().replace(Regex("[^a-z0-9.]+"), "-"))
             val copied = runCatching { file.copyTo(dest, overwrite = true) }.isSuccess
@@ -315,7 +348,7 @@ class ExtensionsScreenView {
             Fx.run {
                 busy.isVisible = false
                 if (kind == null) {
-                    statusLabel.text = err ?: "unknown reason"
+                    setStatus(err ?: "unknown reason", isError = true)
                     return@run
                 }
                 val base = file.nameWithoutExtension
@@ -335,7 +368,7 @@ class ExtensionsScreenView {
                     )
                 }
                 AppShell.app.store.addProvider(cfg)
-                statusLabel.text = "Installed $base ($kind)."
+                setStatus("Installed $base ($kind).")
                 renderInstalled()
             }
         }
