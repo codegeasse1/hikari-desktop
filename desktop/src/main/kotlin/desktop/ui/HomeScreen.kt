@@ -28,11 +28,12 @@ class HomeScreenView {
     private val rowsBox = VBox(22.0)
     private val loading = ProgressBar(-1.0)
     private val errorLabel = Theme.label("", dim = true)
+    private val statusLabel = Theme.label("", size = 12.5, dim = true)
 
     private var loadJob: Job? = null
 
     init {
-        root.children.addAll(header(), loading, errorLabel, ScrollPane(rowsBox).apply {
+        root.children.addAll(header(), loading, statusLabel, errorLabel, ScrollPane(rowsBox).apply {
             VBox.setVgrow(this, Priority.ALWAYS)
             isFitToWidth = true
             styleClass.add("scroll-pane")
@@ -67,13 +68,14 @@ class HomeScreenView {
                 Fx.run {
                     loading.isVisible = true
                     errorLabel.text = ""
+                    statusLabel.text = "Loading…"
                     rowsBox.children.clear()
                 }
-                // Providers refresh asynchronously at startup — wait for them
-                // before the first row load, so the very first screen isn't empty.
+                // The startup provider refresh runs in the background — wait for
+                // it to finish once, so the first screen reflects real state.
                 var attempts = 0
-                while (attempts < 10 && AppShell.app.providers.providers.value.isEmpty()) {
-                    delay(1000)
+                while (attempts < 12 && !AppShell.app.providers.initialized.value) {
+                    delay(500)
                     attempts++
                 }
                 val enabled = AppShell.app.store.providers().filter { it.enabled }
@@ -91,21 +93,43 @@ class HomeScreenView {
                 val rows = AppShell.app.repository.homeRows(filterId)
                 Fx.run {
                     loading.isVisible = false
-                    render(rows)
+                    render(rows, filterId)
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (t: Throwable) {
                 Fx.run {
                     loading.isVisible = false
+                    statusLabel.text = ""
                     errorLabel.text = "Failed to load home rows: ${t.message}"
                 }
             }
         }
     }
 
-    private fun render(rows: List<CatalogRow>) {
+    private fun render(rows: List<CatalogRow>, filterId: String?) {
         rowsBox.children.clear()
+        statusLabel.text = ""
+        val statuses = AppShell.app.providers.statuses.value
+        val failed = statuses.filter { !it.loaded }
+        val enabledCount = statuses.size
+        if (enabledCount == 0) {
+            errorLabel.text = ""
+            statusLabel.text = "No providers installed or enabled yet. Open the Extensions tab to add one — or add a Stremio addon."
+        } else if (failed.isNotEmpty()) {
+            errorLabel.text = ""
+            statusLabel.text = buildString {
+                append("${enabledCount} provider(s) enabled, ${statuses.count { it.loaded }} loaded, ${failed.size} failed to start: ")
+                append(failed.joinToString(" | ") { "${it.name}: ${it.error ?: "unknown error"}" })
+            }
+        } else if (rows.isEmpty()) {
+            errorLabel.text = ""
+            val who = statuses.firstOrNull { it.id == filterId }?.name
+            statusLabel.text = (if (who != null) "'$who' returned no catalog rows" else "No catalog rows loaded") +
+                " — the addon may be offline, or block this network."
+        } else {
+            errorLabel.text = ""
+        }
         if (rows.isEmpty()) {
             rowsBox.children.add(Theme.label("Nothing loaded yet — add extensions or a Stremio addon.", dim = true))
             return

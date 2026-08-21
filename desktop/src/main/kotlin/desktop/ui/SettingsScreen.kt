@@ -37,6 +37,7 @@ class SettingsScreenView {
             uaRow(),
             updateRow(),
             historyRow(),
+            resetRow(),
             aboutRow(),
         )
     }
@@ -115,9 +116,22 @@ class SettingsScreenView {
         return HBox(12.0, clear).apply { alignment = Pos.CENTER_LEFT; styleClass.add("list-row") }
     }
 
+    private fun resetRow(): HBox {
+        val status = Theme.label("", size = 12.5, dim = true)
+        val reset = Button("Reset all data (providers, repos, extensions)").apply {
+            styleClass.addAll("btn", "btn-danger")
+            setOnAction {
+                app.store.reset()
+                AppShell.uiScope.launch { app.providers.refresh() }
+                status.text = "Cleared. Default providers (YTS Hikari + YTS Stremio) are re-added on next launch."
+            }
+        }
+        return HBox(12.0, reset, status).apply { alignment = Pos.CENTER_LEFT; styleClass.add("list-row") }
+    }
+
     private fun aboutRow(): Label =
         Theme.label(
-            "Hikari Desktop · built from the Hikari streaming stack (Stremio addons, universal scrapers, CloudStream .cs3 plugins, Hikari extensions). " +
+            "Hikari Desktop · v${desktop.Build.VERSION} (${desktop.Build.DATE}) · built from the Hikari streaming stack (Stremio addons, universal scrapers, CloudStream .cs3 plugins, Hikari extensions). " +
                 "Data lives in ${app.filesDir.absolutePath}.",
             size = 12.0,
             dim = true,

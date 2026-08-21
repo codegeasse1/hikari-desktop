@@ -258,6 +258,15 @@ class ExtensionsScreenView {
                 isWrapText = true
             }
             val type = Theme.label(cfg.type.name, size = 11.0, dim = true)
+            val status = AppShell.app.providers.statuses.value.firstOrNull { it.id == cfg.id }
+            val failedStatus = status?.takeIf { !it.loaded }
+            val failedHint = if (failedStatus != null) {
+                Theme.label("⚠ failed to load: ${failedStatus.error ?: "unknown error"}", size = 11.0, dim = true).apply {
+                    style = style + "; -fx-text-fill: #ff9a9a;"
+                }
+            } else {
+                Theme.label("", size = 11.0, dim = true)
+            }
             val toggle = CheckBox("Enabled").apply { isSelected = cfg.enabled }
             toggle.setOnAction { AppShell.app.store.setEnabled(cfg.id, toggle.isSelected); refresh() }
             val remove = Button("Remove").apply {
@@ -275,6 +284,9 @@ class ExtensionsScreenView {
                 alignment = Pos.CENTER_LEFT
                 styleClass.add("list-row")
             })
+            if (failedHint.text.isNotBlank()) {
+                installedBox.children.add(failedHint)
+            }
         }
     }
 
@@ -364,8 +376,15 @@ class ExtensionsScreenView {
 
     private fun renderPlugins(repoUrl: String, jsonText: String) {
         pluginListBox.children.clear()
-        val root = runCatching { JSONObject(jsonText) }.getOrNull() ?: run {
-            pluginListBox.children.add(Theme.label("Invalid repo.json", dim = true))
+        val root = runCatching { JSONObject(jsonText) }.getOrNull()
+        if (root == null) {
+            pluginListBox.children.add(
+                Theme.label("That URL did not return valid JSON. This is what the server sent:", dim = true)
+            )
+            pluginListBox.children.add(Theme.label(jsonText.take(500), size = 11.0, dim = true))
+            pluginListBox.children.add(
+                Theme.label("Fetched from: $repoUrl", size = 11.0, dim = true)
+            )
             return
         }
         val plugins = when (val p = root.opt("plugins")) {
@@ -373,9 +392,18 @@ class ExtensionsScreenView {
             else -> runCatching { JSONArray(p) }.getOrNull() ?: JSONArray()
         }
         if (plugins.length() == 0) {
-            pluginListBox.children.add(Theme.label("No plugins listed in this repo.json.", dim = true))
+            pluginListBox.children.add(
+                Theme.label("That repo.json has no plugins array. Showing its raw content:", dim = true)
+            )
+            pluginListBox.children.add(Theme.label(jsonText.take(500), size = 11.0, dim = true))
+            pluginListBox.children.add(
+                Theme.label("Fetched from: $repoUrl", size = 11.0, dim = true)
+            )
             return
         }
+        pluginListBox.children.add(
+            Theme.label("${plugins.length()} plugins found in ${Http.repoDisplayName(repoUrl)}:", size = 12.5, dim = true)
+        )
         for (i in 0 until plugins.length()) {
             val p = plugins.optJSONObject(i) ?: continue
             val name = p.optString("name")

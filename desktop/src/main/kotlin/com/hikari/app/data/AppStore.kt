@@ -254,6 +254,15 @@ class AppStore(private val dir: File) {
 
     fun providersFlow(): Flow<List<ProviderConfig>> = flowOf { providers() }
     fun providers(): List<ProviderConfig> = parseProviders(get(K.PROVIDERS))
+
+    /** Wipes every stored setting/provider/repo and deletes downloaded
+     *  extensions, restoring the factory-fresh state (defaults re-added on the
+     *  next app start). */
+    fun reset() {
+        synchronized(lock) { json = JSONObject() }
+        save()
+        runCatching { File(dir, "extensions").deleteRecursively() }
+    }
     fun saveProviders(list: List<ProviderConfig>) {
         put(K.PROVIDERS, encodeProviders(list))
     }
