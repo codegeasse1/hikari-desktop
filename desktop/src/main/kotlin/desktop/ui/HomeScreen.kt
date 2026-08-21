@@ -60,34 +60,38 @@ class HomeScreenView {
         loadJob?.cancel()
         val selected = providerBox.value ?: ""
         loadJob = AppShell.uiScope.launch {
-            Fx.run {
-                loading.isVisible = true
-                errorLabel.text = ""
-                rowsBox.children.clear()
-            }
-            // Providers refresh asynchronously at startup — wait for them
-            // before the first row load, so the very first screen isn't empty.
-            var attempts = 0
-            while (attempts < 10 && AppShell.app.providers.providers.value.isEmpty()) {
-                delay(1000)
-                attempts++
-            }
-            val providerNames = AppShell.app.store.providers().filter { it.enabled }.map { it.name }
-            Fx.run {
-                val all = listOf("All providers") + providerNames
-                providerBox.items.setAll(all)
-                providerBox.value = selected.takeIf { it in all } ?: "All providers"
-            }
-            val filter = selected.takeIf { it != "All providers" }
-            val rows = runCatching {
-                AppShell.app.repository.homeRows(filter)
-            }.getOrElse { t ->
-                Fx.run { errorLabel.text = "Failed to load home rows: ${t.message}" }
-                emptyList()
-            }
-            Fx.run {
-                loading.isVisible = false
-                render(rows)
+            try {
+                Fx.run {
+                    loading.isVisible = true
+                    errorLabel.text = ""
+                    rowsBox.children.clear()
+                }
+                // Providers refresh asynchronously at startup — wait for them
+                // before the first row load, so the very first screen isn't empty.
+                var attempts = 0
+                while (attempts < 10 && AppShell.app.providers.providers.value.isEmpty()) {
+                    delay(1000)
+                    attempts++
+                }
+                val providerNames = AppShell.app.store.providers().filter { it.enabled }.map { it.name }
+                Fx.run {
+                    val all = listOf("All providers") + providerNames
+                    providerBox.items.setAll(all)
+                    providerBox.value = selected.takeIf { it in all } ?: "All providers"
+                }
+                val filter = selected.takeIf { it != "All providers" }
+                val rows = AppShell.app.repository.homeRows(filter)
+                Fx.run {
+                    loading.isVisible = false
+                    render(rows)
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                Fx.run {
+                    loading.isVisible = false
+                    errorLabel.text = "Failed to load home rows: ${t.message}"
+                }
             }
         }
     }
