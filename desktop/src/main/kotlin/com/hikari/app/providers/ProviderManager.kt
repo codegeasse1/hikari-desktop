@@ -17,7 +17,15 @@ class ProviderManager(private val store: AppStore) {
 
     suspend fun refresh() = withContext(Dispatchers.IO) {
         val configs = store.providers()
-        _providers.value = configs.mapNotNull { instantiate(it) }
+        _providers.value = configs.mapNotNull { c ->
+            try {
+                instantiate(c)
+            } catch (t: Throwable) {
+                // One broken addon must never blank the whole list — skip it.
+                System.err.println("Provider init failed for ${c.name} (${c.type}): $t")
+                null
+            }
+        }
     }
 
     fun instantiate(c: ProviderConfig): ContentProvider? = when (c.type) {
