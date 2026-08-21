@@ -156,7 +156,26 @@ object DesktopPlayer {
             }
         }
 
-        fun attachPlayer(p: MediaPlayer) {
+        // Creates a player for the next candidate URL and wires it up. On an
+        // error it disposes and recurses to the next candidate; when every
+        // candidate has failed it offers to open the stream in the browser.
+        fun tryNext() {
+            if (attempt >= candidateUrls.size) {
+                s.close()
+                if (stage === s) stage = null
+                showBrowserFallback(title, originalUrl,
+                    "The stream failed to play${if (lastError != null) " ($lastError)" else ""}. Open it in your browser instead?")
+                return
+            }
+            val url = candidateUrls[attempt]
+            attempt++
+            val media = runCatching { Media(url) }.getOrNull()
+            if (media == null) {
+                lastError = "could not read media from $url"
+                tryNext()
+                return
+            }
+            val p = MediaPlayer(media)
             mediaView.mediaPlayer = p
             p.isAutoPlay = true
             stall.playFromStart()
@@ -191,7 +210,7 @@ object DesktopPlayer {
                 runCatching { p.dispose() }
                 mediaView.mediaPlayer = null
                 stall.stop()
-                next()
+                tryNext()
             }
             p.setOnEndOfMedia {
                 playBtn.text = "Replay"
@@ -239,26 +258,6 @@ object DesktopPlayer {
             }
         }
 
-        fun next() {
-            if (attempt >= candidateUrls.size) {
-                s.close()
-                if (stage === s) stage = null
-                showBrowserFallback(title, originalUrl,
-                    "The stream failed to play${if (lastError != null) " ($lastError)" else ""}. Open it in your browser instead?")
-                return
-            }
-            val url = candidateUrls[attempt]
-            attempt++
-            val media = runCatching { Media(url) }.getOrNull()
-            if (media == null) {
-                lastError = "could not read media from $url"
-                next()
-                return
-            }
-            val player = MediaPlayer(media)
-            attachPlayer(player)
-        }
-
         s.scene = Theme.style(Scene(root, 960.0, 540.0))
         s.setOnCloseRequest {
             mediaView.mediaPlayer?.let { p ->
@@ -270,7 +269,7 @@ object DesktopPlayer {
             if (stage === s) stage = null
         }
         s.show()
-        next()
+        tryNext()
     }
 
     fun closeAll() {
