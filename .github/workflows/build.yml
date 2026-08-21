@@ -1,0 +1,95 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: "8.11.1"
+          cache-disabled: true
+
+      - name: Build app
+        run: |
+          gradle desktop:jpackageInput --no-daemon --stacktrace > gradle-build.log 2>&1
+          code=$?
+          if [ $code -ne 0 ]; then
+            echo "==== BUILD FAILED (exit $code) ===="
+            tail -n 200 gradle-build.log
+            echo "==== KOTLIN ERRORS ===="
+            grep -E "^e: " gradle-build.log | head -n 60
+            grep -E "^e: " gradle-build.log | head -n 60 | sed -E 's/^e: (.+): \(([0-9]+), ([0-9]+)\): (.*)/::error file=\1,line=\2,col=\3::\4/' || true
+            exit $code
+          fi
+        shell: bash
+
+      - name: Download JavaFX jmods (for jpackage)
+        run: |
+          curl -L -o jfx-jmods.zip https://download2.gluonhq.com/openjfx/21.0.8/openjfx-21.0.8_windows-x64_bin-jmods.zip
+          mkdir -p jmods
+          cd jmods && unzip -o ../jfx-jmods.zip && cd ..
+        shell: bash
+
+      - name: Package exe (app image)
+        run: |
+          mkdir -p jpackage-input
+          cp -r desktop/build/jpackage-input/* jpackage-input/
+          jpackage --type app-image -n Hikari \
+            --input jpackage-input \
+            --main-jar hikari-desktop.jar \
+            --main-class desktop.MainKt \
+            --module-path jmods/javafx-jmods-21.0.8 \
+            --add-modules javafx.controls,javafx.media,javafx.web,javafx.graphics,javafx.base,jdk.crypto.ec,jdk.httpserver,java.desktop \
+            --java-options "-Dfile.encoding=UTF-8" \
+            --app-version 0.1.0
+          ls -la "Hikari"
+        shell: bash
+
+      - name: Zip the app image
+        run: |
+          powershell -Command "Compress-Archive -Path Hikari -DestinationPath hikari-windows.zip -Force"
+          ls -la hikari-windows.zip
+        shell: bash
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: gradle-build.log
+          if-no-files-found: ignore
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hikari-windows
+          path: hikari-windows.zip
+          if-no-files-found: error
+
+      - name: Publish to continuous release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view continuous --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload continuous hikari-windows.zip --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create continuous hikari-windows.zip --repo "$GITHUB_REPOSITORY" \
+              --title "Continuous build" \
+              --notes "Hikari for Windows (app image zip), auto-built from main." || true
+          fi
+        shell: bash
