@@ -27,6 +27,11 @@ object ImageLoader {
 
     private val inFlight = mutableMapOf<String, MutableList<(Image?) -> Unit>>()
 
+    /** Cap on simultaneous network image fetches — Home renders hundreds of
+     *  posters at once and firing them all concurrently starves the IO pool
+     *  and makes the UI lag on weak networks. */
+    private val gate = kotlinx.coroutines.sync.Semaphore(6)
+
     fun loadAsync(url: String?, onReady: (Image?) -> Unit) {
         Fx.requireFx()
         if (url.isNullOrBlank()) {
@@ -41,7 +46,7 @@ object ImageLoader {
         pending.add(onReady)
         if (pending.size > 1) return
         kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
-            val img = load(url)
+            val img = runCatching { gate.withPermit { load(url) } }.getOrNull()
             Fx.run {
                 if (img != null) mem[url] = img
                 val list = inFlight.remove(url) ?: emptyList()

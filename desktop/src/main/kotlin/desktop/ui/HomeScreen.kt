@@ -44,13 +44,13 @@ class HomeScreenView {
         val title = Theme.label("Browse", size = 26.0, bold = true).apply {
             cursor = javafx.scene.Cursor.HAND
             Tooltip.install(this, Tooltip("Click to reload"))
-            setOnMouseClicked { load() }
+            setOnMouseClicked { load(force = true) }
         }
         providerBox.run {
             minWidth = 220.0
-            setOnAction { load() }
+            setOnAction { load(force = true) }
         }
-        val refresh = Button("Refresh").apply { styleClass.add("btn"); setOnAction { load() } }
+        val refresh = Button("Refresh").apply { styleClass.add("btn"); setOnAction { load(force = true) } }
         return HBox(14.0, title, providerBox, refresh).apply {
             alignment = Pos.CENTER_LEFT
         }
@@ -60,9 +60,12 @@ class HomeScreenView {
         load()
     }
 
-    fun load() {
+    private var gen = 0
+
+    fun load(force: Boolean = false) {
         loadJob?.cancel()
         val selected = providerBox.value ?: ""
+        val myGen = ++gen
         loadJob = AppShell.uiScope.launch {
             try {
                 Fx.run {
@@ -101,7 +104,14 @@ class HomeScreenView {
                     val cfg = enabled.firstOrNull { it.name == c }
                     c to cfg?.id?.takeIf { c != "All providers" }
                 }
-                val rows = AppShell.app.repository.homeRows(filterId)
+                // Rows render the moment each catalog lands, so Home fills in
+                // progressively and "All providers" never sits on a spinner
+                // waiting for the slowest addon.
+                val rows = AppShell.app.repository.homeRows(filterId, force = force) { row ->
+                    Fx.run {
+                        if (myGen == gen) rowsBox.children.add(buildRow(row))
+                    }
+                }
                 Fx.run {
                     loading.isVisible = false
                     render(rows, filterId, chosen)
@@ -119,7 +129,6 @@ class HomeScreenView {
     }
 
     private fun render(rows: List<CatalogRow>, filterId: String?, chosen: String? = null) {
-        rowsBox.children.clear()
         statusLabel.text = ""
         val statuses = AppShell.app.providers.statuses.value
         val failed = statuses.filter { !it.loaded }
@@ -142,32 +151,32 @@ class HomeScreenView {
         } else {
             errorLabel.text = ""
         }
-        if (rows.isEmpty()) {
+        if (rows.isEmpty() && rowsBox.children.isEmpty()) {
             rowsBox.children.add(Theme.label("Nothing loaded yet — add extensions or a Stremio addon.", dim = true))
-            return
         }
-        rows.forEach { row ->
-            val head = HBox(10.0).apply {
-                children.addAll(
-                    Theme.label(row.title, size = 17.0, bold = true),
-                    Theme.label(row.providerName, size = 12.5, dim = true),
-                )
-                alignment = Pos.BASELINE_LEFT
-            }
-            val cardRow = HBox(14.0).apply { alignment = Pos.CENTER_LEFT }
-            row.items.forEach { item ->
-                cardRow.children.add(posterCard(item) {
-                    AppShell.openDetail(item)
-                })
-            }
-            val scroller = ScrollPane(cardRow).apply {
-                isFitToHeight = true
-                hbarPolicy = ScrollPane.ScrollBarPolicy.AS_NEEDED
-                vbarPolicy = ScrollPane.ScrollBarPolicy.NEVER
-                styleClass.add("scroll-pane")
-            }
-            rowsBox.children.add(VBox(10.0, head, scroller))
+    }
+
+    private fun buildRow(row: CatalogRow): VBox {
+        val head = HBox(10.0).apply {
+            children.addAll(
+                Theme.label(row.title, size = 17.0, bold = true),
+                Theme.label(row.providerName, size = 12.5, dim = true),
+            )
+            alignment = Pos.BASELINE_LEFT
         }
+        val cardRow = HBox(14.0).apply { alignment = Pos.CENTER_LEFT }
+        row.items.forEach { item ->
+            cardRow.children.add(posterCard(item) {
+                AppShell.openDetail(item)
+            })
+        }
+        val scroller = ScrollPane(cardRow).apply {
+            isFitToHeight = true
+            hbarPolicy = ScrollPane.ScrollBarPolicy.AS_NEEDED
+            vbarPolicy = ScrollPane.ScrollBarPolicy.NEVER
+            styleClass.add("scroll-pane")
+        }
+        return VBox(10.0, head, scroller)
     }
 }
 

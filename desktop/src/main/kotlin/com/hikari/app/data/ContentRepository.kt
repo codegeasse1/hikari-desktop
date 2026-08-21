@@ -32,6 +32,10 @@ class ContentRepository(private val manager: ProviderManager) {
             Result.failure(t)
         }
 
+    private data class CachedRow(val row: CatalogRow, val at: Long)
+    private val rowCache = HashMap<String, CachedRow>()
+    private const val ROW_CACHE_TTL_MS = 5 * 60_000L
+
     /**
      * Loads Home rows. Catalogs inside a provider are fetched IN PARALLEL but
      * through a small semaphore so a slow network can't flood the IO pool with
@@ -40,8 +44,18 @@ class ContentRepository(private val manager: ProviderManager) {
      * whole provider's budget, and rows carry a stable unique key so addons
      * with several same-named catalogs (e.g. "Streaming Catalogs" → movies +
      * series both called "Netflix") can never crash the LazyColumn.
+     *
+     * Rows are delivered through [onRow] the moment each catalog finishes, so
+     * the Home screen fills in progressively instead of waiting for the
+     * slowest provider (the old all-or-nothing behaviour made "All providers"
+     * sit on a spinner for a long time). Finished rows are cached (5 min TTL)
+     * so re-visiting Home is instant; pass [force] to bypass the cache.
      */
-    suspend fun homeRows(providerId: String? = null): List<CatalogRow> = withContext(Dispatchers.IO) {
+    suspend fun homeRows(
+        providerId: String? = null,
+        force: Boolean = false,
+        onRow: (CatalogRow) -> Unit = {},
+    ): List<CatalogRow> = withContext(Dispatchers.IO) {
         val active = manager.providers.value.filter {
             it.config.enabled && (providerId == null || it.config.id == providerId)
         }
@@ -52,6 +66,7 @@ class ContentRepository(private val manager: ProviderManager) {
         // 8 catalog fetches exist across the whole app at once.
         val providerGate = Semaphore(3)
         val catalogGate = Semaphore(8)
+        val now = System.currentTimeMillis()
         val rows = coroutineScope {
             active.map { p ->
                 async {
@@ -65,31 +80,43 @@ class ContentRepository(private val manager: ProviderManager) {
                                     catalogs.map { c ->
                                         async {
                                             catalogGate.withPermit {
+                                                val key = "${p.config.id}|${c.type}|${c.id}"
+                                                val cached = rowCache[key]
+                                                if (!force && cached != null && now - cached.at < ROW_CACHE_TTL_MS) {
+                                                    onRow(cached.row)
+                                                    return@async cached.row
+                                                }
                                                 val items = withTimeoutOrNull(60_000) {
                                                     cancellableCatching { p.getCatalog(c, 1) }.getOrDefault(emptyList())
                                                 }.orEmpty().distinctBy { it.uniqueId }.take(40)
                                                 if (items.isEmpty()) null
-                                                else CatalogRow(
-                                                    providerId = p.config.id,
-                                                    providerName = p.config.name,
-                                                    title = c.name,
-                                                    items = items,
-                                                    key = "${p.config.id}|${c.type}|${c.id}",
-                                                    catalogId = c.id,
-                                                    type = c.type,
-                                                    rawType = c.rawType,
-                                                )
+                                                else {
+                                                    val raw = CatalogRow(
+                                                        providerId = p.config.id,
+                                                        providerName = p.config.name,
+                                                        title = c.name,
+                                                        items = items,
+                                                        key = key,
+                                                        catalogId = c.id,
+                                                        type = c.type,
+                                                        rawType = c.rawType,
+                                                    )
+                                                    val row = translateRows(listOf(raw))[0]
+                                                    rowCache[key] = CachedRow(row, System.currentTimeMillis())
+                                                    onRow(row)
+                                                    row
+                                                }
                                             }
+                                        }
                                     }
                                 }.awaitAll().filterNotNull()
                             }
                         } ?: emptyList()
-                        }
                     }.getOrDefault(emptyList())
                 }
             }.awaitAll().flatten()
         }
-        translateRows(rows)
+        rows
     }
 
     /** Searches across every enabled provider, or only the given subset.

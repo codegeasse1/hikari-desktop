@@ -38,6 +38,15 @@ jobs:
           fi
         shell: bash
 
+      - name: Bundle mpv player (video engine)
+        run: |
+          curl -fsSL -o mpv.7z "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20260814/mpv-x86_64-20260814-git-7b8915bc1d.7z"
+          7z x -bso0 -bsp0 -ompv-tmp mpv.7z
+          mkdir -p jpackage-input/mpv
+          cp -r mpv-tmp/* jpackage-input/mpv/
+          echo "mpv bundled:"; ls jpackage-input/mpv | head -40
+        shell: bash
+
       - name: Package exe (app image)
         run: |
           mkdir -p jpackage-input
