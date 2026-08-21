@@ -24,11 +24,14 @@ object Theme {
                     (if (bold) "-fx-font-weight: bold;" else "")
         }
 
-    fun scene(root: javafx.scene.Parent): Scene = Scene(root).apply {
+    /** Applies the global theme (fill + theme.css) to an existing Scene. */
+    fun style(scene: Scene): Scene = scene.apply {
         fill = javafx.scene.paint.Color.web(BG)
         val css = Theme::class.java.getResource("/theme.css")
         if (css != null) stylesheets.add(css.toExternalForm())
     }
+
+    fun scene(root: javafx.scene.Parent): Scene = style(Scene(root))
 
     fun centerBox(vararg children: javafx.scene.Node): VBox = VBox(12.0, *children).apply {
         alignment = Pos.CENTER
