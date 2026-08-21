@@ -41,6 +41,7 @@ object DexJarSelfTest {
             if (converted == null) {
                 println("FAIL: dex conversion returned null: ${DexJar.lastError}")
                 System.exit(1)
+                return
             }
             println("converted -> $converted (${converted.length()} bytes)")
 

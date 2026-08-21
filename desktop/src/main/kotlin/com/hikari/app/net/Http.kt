@@ -378,7 +378,7 @@ object DoH {
                 val url = "$ep?name=${URLEncoder.encode(host, StandardCharsets.UTF_8)}&type=A"
                 val req = HttpRequest.newBuilder(URI.create(url))
                     .header("accept", "application/dns-json")
-                    .header("User-Agent", UA)
+                    .header("User-Agent", Http.UA)
                     .GET()
                     .build()
                 val resp = client.send(req, HttpResponse.BodyHandlers.ofString())
