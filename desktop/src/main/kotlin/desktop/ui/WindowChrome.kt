@@ -157,28 +157,28 @@ class WindowChrome(private val stage: Stage) {
                 var ny = wy
                 var nw = ww
                 var nh = wh
-                if (edge and 1 != 0) {
+                if ((edge and 1) != 0) {
                     nw = ww - dx
                     nx = wx + dx
                 }
-                if (edge and 2 != 0) {
+                if ((edge and 2) != 0) {
                     nw = ww + dx
                 }
-                if (edge and 4 != 0) {
+                if ((edge and 4) != 0) {
                     nh = wh - dy
                     ny = wy + dy
                 }
-                if (edge and 8 != 0) {
+                if ((edge and 8) != 0) {
                     nh = wh + dy
                 }
                 val minW = stage.minWidth
                 val minH = stage.minHeight
                 if (nw < minW) {
-                    if (edge and 1 != 0) nx = wx + ww - minW
+                    if ((edge and 1) != 0) nx = wx + ww - minW
                     nw = minW
                 }
                 if (nh < minH) {
-                    if (edge and 4 != 0) ny = wy + wh - minH
+                    if ((edge and 4) != 0) ny = wy + wh - minH
                     nh = minH
                 }
                 stage.x = nx
