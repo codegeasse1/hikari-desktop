@@ -26,16 +26,26 @@ jobs:
 
       - name: Build app
         run: |
-          gradle desktop:jpackageInput --no-daemon --stacktrace > gradle-build.log 2>&1
-          code=$?
-          if [ $code -ne 0 ]; then
-            echo "==== BUILD FAILED (exit $code) ===="
-            tail -n 200 gradle-build.log
-            echo "==== KOTLIN ERRORS ===="
-            grep -E "^e: " gradle-build.log | head -n 60
-            grep -E "^e: " gradle-build.log | head -n 60 | sed -E 's/^e: (.+): \(([0-9]+), ([0-9]+)\): (.*)/::error file=\1,line=\2,col=\3::\4/' || true
-            exit $code
-          fi
+          # Maven Central / plugins.gradle.org occasionally rate-limit runner IPs
+          # with HTTP 429 — retry the build a few times (Gradle caches what it
+          # already downloaded, so later attempts usually succeed).
+          for attempt in 1 2 3 4; do
+            gradle desktop:jpackageInput --no-daemon --stacktrace > gradle-build.log 2>&1
+            code=$?
+            if [ $code -eq 0 ]; then
+              echo "==== BUILD OK (attempt $attempt) ===="
+              exit 0
+            fi
+            echo "==== BUILD FAILED (attempt $attempt, exit $code) — retrying in 20s ===="
+            grep -E "Received status code 429|Could not GET" gradle-build.log | head -n 5 || true
+            sleep 20
+          done
+          echo "==== BUILD FAILED (all attempts) ===="
+          tail -n 200 gradle-build.log
+          echo "==== KOTLIN ERRORS ===="
+          grep -E "^e: " gradle-build.log | head -n 60
+          grep -E "^e: " gradle-build.log | head -n 60 | sed -E 's/^e: (.+): \(([0-9]+), ([0-9]+)\): (.*)/::error file=\1,line=\2,col=\3::\4/' || true
+          exit 1
         shell: bash
 
       - name: Bundle mpv player (video engine)
