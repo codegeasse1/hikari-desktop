@@ -321,7 +321,7 @@ class ExtensionsScreenView {
         busy.isVisible = true
         setStatus("Fetching repo…")
         AppShell.uiScope.launch {
-            val result = Http.fetchRepoJson(url)
+            val result = Http.fetchRepoJson(url) { step -> Fx.run { setStatus(step) } }
             Fx.run {
                 busy.isVisible = false
                 val pair = result.getOrNull()
@@ -375,7 +375,7 @@ class ExtensionsScreenView {
         busy.isVisible = true
         setStatus("Checking $url…")
         AppShell.uiScope.launch {
-            val result = Http.fetchRepoJson(url)
+            val result = Http.fetchRepoJson(url) { step -> Fx.run { setStatus(step) } }
             Fx.run {
                 busy.isVisible = false
                 val pair = result.getOrNull()

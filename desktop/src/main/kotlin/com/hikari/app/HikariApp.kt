@@ -156,9 +156,31 @@ class HikariApp : Application() {
                 .followRedirects(true)
                 .followSslRedirects(true)
                 .retryOnConnectionFailure(true)
-                .connectTimeout(20, TimeUnit.SECONDS)
-                .readTimeout(30, TimeUnit.SECONDS)
-                .apply { if (ignoreSSL) ignoreAllSSLErrors() }
+                .connectTimeout(15, TimeUnit.SECONDS)
+                .readTimeout(25, TimeUnit.SECONDS)
+                // Plugins fetch their catalogs/streams through these clients, so
+                // they must behave like the app's own network layer: DoH-first
+                // DNS + the OS system proxy (fixes filtered-resolver / proxy-only
+                // networks), and the JDK TLS stack for the secure client so
+                // Conscrypt's BoringSSL handshake quirks can't break fetches.
+                .dns(com.hikari.app.net.HikariDns)
+                .proxySelector(java.net.ProxySelector.getDefault())
+                .apply {
+                    if (ignoreSSL) {
+                        ignoreAllSSLErrors()
+                    } else {
+                        runCatching {
+                            val ctx = javax.net.ssl.SSLContext.getInstance("TLS", "SunJSSE")
+                            val tmf = javax.net.ssl.TrustManagerFactory.getInstance("X509", "SunJSSE")
+                            tmf.init(null as java.security.KeyStore?)
+                            ctx.init(null, tmf.trustManagers, null)
+                            sslSocketFactory(
+                                ctx.socketFactory,
+                                tmf.trustManagers[0] as javax.net.ssl.X509TrustManager,
+                            )
+                        }
+                    }
+                }
                 .cache(Cache(File(context.cacheDir, "http_cache"), 50L * 1024 * 1024))
                 .build()
 

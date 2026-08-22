@@ -195,6 +195,15 @@ object Http {
         return out.toList()
     }
 
+    /** Mirrors of official repos on a CDN that works even where GitHub is slow
+     *  or blocked. Regenerate whenever the source repo.json changes. */
+    private const val HIKARI_REPO_MIRROR = "https://user.uploads.dev/file/7873f4a3c5717dbe566045a9e347facb.json"
+    private const val CLOUDSTREAM_REPO_MIRROR = "https://user.uploads.dev/file/42f88079718447227d8bf7ccc5a5e286.txt"
+
+    /** Hard cap for a repo fetch so a slow/blocked network fails with a clear
+     *  error instead of leaving the UI stuck on "Checking…" for minutes. */
+    private const val REPO_FETCH_DEADLINE_MS = 60_000L
+
     /** Fetches a repo.json, trying every candidate URL. Only accepts a response
      *  that is actually a JSON object with a "plugins" key — or a CloudStream v2
      *  manifest whose "pluginLists" files hold the plugins array — a github.com
@@ -202,8 +211,9 @@ object Http {
      *
      *  repo-desktop.json candidates are tried before repo.json ones: the desktop
      *  app runs JVM jars, and the desktop repos publish repo-desktop.json with
-     *  .jar URLs — plain repo.json is the Android dex repo. */
-    fun fetchRepoJson(raw: String): Result<Pair<String, String>> {
+     *  .jar URLs — plain repo.json is the Android dex repo. [onStep] reports
+     *  progress so the UI can show which candidate is being tried. */
+    fun fetchRepoJson(raw: String, onStep: ((String) -> Unit)? = null): Result<Pair<String, String>> {
         val candidates = repoJsonCandidates(raw)
         val ordered = candidates.filter { it.contains("repo-desktop.json") } +
             candidates.filter { !it.contains("repo-desktop.json") }
@@ -213,12 +223,23 @@ object Http {
             // on networks where GitHub (github.com + raw + jsDelivr) is blocked
             // or refused by the app's HTTP stack. Regenerate the mirror whenever
             // the official repo.json changes.
-            listOf("https://user.uploads.dev/file/7873f4a3c5717dbe566045a9e347facb.json") + ordered
+            listOf(HIKARI_REPO_MIRROR) + ordered
+        } else if (ordered.any { it.contains("codegeasse1/codegeasse-cloudstream-repos") }) {
+            listOf(CLOUDSTREAM_REPO_MIRROR) + ordered
         } else {
             ordered
         }
+        val deadline = System.currentTimeMillis() + REPO_FETCH_DEADLINE_MS
         var last: Throwable = Exception("No candidate URL served a valid repo.json")
+        var tried = 0
         for (u in list) {
+            if (System.currentTimeMillis() > deadline) {
+                return Result.failure(
+                    Exception("Timed out after ${REPO_FETCH_DEADLINE_MS / 1000}s — the repo host is unreachable from this network.")
+                )
+            }
+            tried++
+            onStep?.invoke("Fetching repo… ($tried/${list.size}) $u")
             val r = fetchStringRobust(u)
             if (r.isSuccess) {
                 val text = r.getOrThrow()
@@ -300,10 +321,11 @@ object Http {
             .replace("\\\"", "\"")
         if (!u.startsWith("http://") && !u.startsWith("https://")) {
             // chaturbate serves the signed LL-HLS playlist as a root-relative
-            // path on its edge host.
+            // path on its edge host (often slash-escaped, sometimes with plain
+            // backslashes instead of slashes).
             val rel = u.trimStart('/', '\\')
             if (rel.startsWith("v1/edge/streams/") || rel.startsWith("v1\\edge\\streams\\")) {
-                u = "https://edge-hls.chaturbate.com/edge-hls/$rel"
+                u = "https://edge-hls.chaturbate.com/edge-hls/" + rel.replace("\\", "/")
             }
         }
         return u
