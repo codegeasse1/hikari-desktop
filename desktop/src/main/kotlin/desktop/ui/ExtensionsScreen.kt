@@ -240,9 +240,9 @@ class ExtensionsScreenView {
         "Hikari repo URL",
         "Add",
         initial = "https://github.com/codegeasse1/hikari-extensions",
-    ) { addRepo(Http.normalizeUrl(it)) }
+    ) { addRepo(Http.normalizeUrl(it), com.hikari.app.data.RepoKind.HIKARI) }
 
-    private fun csRepoInput(): HBox = urlInput("repo.json URL (CloudStream)", "Add repo") { addRepo(Http.normalizeUrl(it)) }
+    private fun csRepoInput(): HBox = urlInput("repo.json URL (CloudStream)", "Add repo") { addRepo(Http.normalizeUrl(it), com.hikari.app.data.RepoKind.CS3) }
 
     private fun stremioInput(): HBox = urlInput("Stremio addon manifest URL (e.g. https://…/manifest.json)", "Add addon") {
         val url = Http.normalizeUrl(it)
@@ -380,8 +380,11 @@ class ExtensionsScreenView {
     }
 
     /** Validates + stores a repo, then opens its folder so the plugins appear
-     *  immediately (Android behaviour). */
-    private fun addRepo(url: String) {
+     *  immediately (Android behaviour). [kind] is the row the user pressed
+     *  (Hikari repo vs CloudStream repo); a CloudStream v2 manifest
+     *  (`pluginLists`) is always stored as CS3 even if pasted into the Hikari
+     *  row, so the kind always reflects what the repo actually is. */
+    private fun addRepo(url: String, kind: com.hikari.app.data.RepoKind) {
         if (url.isBlank()) return
         busy.isVisible = true
         setStatus("Checking $url…")
@@ -399,8 +402,20 @@ class ExtensionsScreenView {
                 }
                 val resolved = pair.first
                 val name = Http.repoDisplayName(resolved)
+                val root = runCatching { JSONObject(pair.second) }.getOrNull()
+                // The two official repos are both served from the same CDN host
+                // (user.uploads.dev), so display-name matching ALONE would treat
+                // the CloudStream repo as the already-added Hikari repo and just
+                // open it instead of adding it. Match the kind too — a Hikari
+                // repo can never satisfy a CloudStream add (or vice-versa).
+                val effKind = if (root?.has("pluginLists") == true) {
+                    com.hikari.app.data.RepoKind.CS3
+                } else {
+                    kind
+                }
                 val existing = AppShell.app.store.repos().firstOrNull {
-                    it.url == resolved || Http.repoDisplayName(it.url) == name
+                    it.url == resolved ||
+                        (it.kind == effKind && Http.repoDisplayName(it.url) == name)
                 }
                 if (existing != null) {
                     openRepo = existing
@@ -410,17 +425,16 @@ class ExtensionsScreenView {
                     return@run
                 }
                 AppShell.app.store.addCs3Repo(
-                    Cs3Repo(url = resolved, name = name, kind = com.hikari.app.data.RepoKind.HIKARI)
+                    Cs3Repo(url = resolved, name = name, kind = effKind)
                 )
                 // Seed the cache with the already-fetched data and open it.
-                val root = runCatching { JSONObject(pair.second) }.getOrNull()
                 repoData[resolved] = RepoData(
                     url = resolved,
                     name = root?.optString("name").orEmpty().ifBlank { name },
                     description = root?.optString("description").orEmpty(),
                     plugins = parsePlugins(root),
                 )
-                openRepo = Cs3Repo(url = resolved, name = name, kind = com.hikari.app.data.RepoKind.HIKARI)
+                openRepo = Cs3Repo(url = resolved, name = name, kind = effKind)
                 setStatus("")
                 renderAll()
             }

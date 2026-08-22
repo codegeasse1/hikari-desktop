@@ -21,6 +21,11 @@ object FxWebView {
     private var webView: WebView? = null
     private var initializing = false
 
+    /** The embedded WebEngine is a single shared resource — every navigation
+     *  (rendered HTML, request capture, image capture) is serialized through
+     *  this lock so two callers can't clobber each other's in-flight page. */
+    private val engineLock = Any()
+
     fun ensure() {
         Fx.runBlock {
             if (webView == null && !initializing) {
@@ -54,7 +59,7 @@ object FxWebView {
         }
 
     /** Loads [url] and returns the rendered DOM HTML (null on failure/timeout). */
-    fun renderedHtml(url: String, timeoutMs: Long = 25_000): String? {
+    fun renderedHtml(url: String, timeoutMs: Long = 25_000): String? = synchronized(engineLock) {
         ensure()
         Fx.runBlock {
             runCatching { engine.load(url) }
@@ -78,6 +83,69 @@ object FxWebView {
         return lastHtml
     }
 
+    /**
+     * Fetches an image's bytes through the embedded WebEngine — the app's
+     * plain OkHttp stack is TLS-fingerprinted (Cloudflare etc.) on several
+     * poster CDNs that serve real browsers fine, so this is the fallback the
+     * poster loader uses when its own HTTP request fails or returns a
+     * challenge page. The image URL is loaded AS THE DOCUMENT (making it the
+     * document's origin, so a same-origin canvas is never tainted), drawn to a
+     * canvas and returned as a base64 JPEG data URL — null on failure/timeout.
+     */
+    fun imageBytes(url: String, timeoutMs: Long = 20_000): ByteArray? = synchronized(engineLock) {
+        ensure()
+        Fx.runBlock {
+            runCatching { engine.load(url) }
+        }
+        val deadline = System.currentTimeMillis() + timeoutMs
+        var emptiesAfterLoad = 0
+        while (System.currentTimeMillis() < deadline) {
+            Thread.sleep(300)
+            val state = Fx.runBlock { loadState() }
+            val v = Fx.runBlock {
+                runCatching { engine.executeScript(IMAGE_BYTES_JS) as? String }.getOrNull()
+            }
+            if (!v.isNullOrBlank()) {
+                val comma = v.indexOf(',')
+                if (comma < 0) return null
+                return runCatching {
+                    java.util.Base64.getDecoder().decode(v.substring(comma + 1))
+                }.getOrNull()
+            }
+            // A WAF/error page is usually served as a *document* that loads in
+            // well under a second — once the load has SUCCEEDED and still has
+            // no drawable image a few polls later, it's a page, not a poster.
+            // Fail fast instead of holding the shared engine for the full
+            // timeout on every doomed poster.
+            if (state == "FAILED") return null
+            if (state == "SUCCEEDED") {
+                emptiesAfterLoad++
+                if (emptiesAfterLoad >= 8) return null
+            }
+        }
+        null
+    }
+
+    private val IMAGE_BYTES_JS = """
+        (function(){
+          try {
+            var img = null;
+            try { img = document.querySelector('img'); } catch(e){}
+            if (!img) { try { img = document.images[0]; } catch(e){} }
+            if (!img && document.body && document.body.tagName === 'IMG') img = document.body;
+            if (!img || !img.naturalWidth || !img.naturalHeight) return '';
+            var w = Math.min(img.naturalWidth, 640);
+            var h = Math.max(1, Math.round(img.naturalHeight * (w / img.naturalWidth)));
+            var c = document.createElement('canvas');
+            c.width = w; c.height = h;
+            c.getContext('2d').drawImage(img, 0, 0, w, h);
+            var url = c.toDataURL('image/jpeg', 0.85);
+            if (url && url.length > 64) return url;
+            return '';
+          } catch(e) { return ''; }
+        })();
+    """.trimIndent()
+
     /** Result of a request-capture run. */
     data class Capture(
         val requests: List<CapturedRequest> = emptyList(),
@@ -96,7 +164,7 @@ object FxWebView {
         additional: List<Regex>,
         script: String?,
         timeoutMs: Long,
-    ): Capture {
+    ): Capture = synchronized(engineLock) {
         ensure()
         Fx.runBlock {
             runCatching { engine.load(url) }
@@ -121,7 +189,7 @@ object FxWebView {
                 Fx.runBlock { runCatching { engine.executeScript(script) } }
             }
         }
-        return Capture(
+        Capture(
             requests = (hits + lastAll).distinctBy { it.url },
             cookie = cookie,
         )
