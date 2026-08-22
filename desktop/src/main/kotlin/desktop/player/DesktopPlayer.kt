@@ -29,29 +29,51 @@ object DesktopPlayer {
 
     private var proc: Process? = null
 
+    /** True once the current launch has shown its failure dialog (mpv error or
+     *  stream-probe fallback), so the two can't double-popup. Reset per launch. */
+    @Volatile private var dialogShown = false
+
     fun play(title: String, stream: StreamSource) {
+        // Sanitize here too so a malformed URL from ANY provider (chaturbate's
+        // root-relative escaped HLS path, stray quotes, JSON escapes) can't
+        // reach mpv or the browser as garbage.
+        val url = com.hikari.app.net.Http.sanitizeStreamUrl(stream.url)
+        if (stream.externalUrl) {
+            Fx.run { DesktopUi.open(url) }
+            return
+        }
+        if (stream.ytId != null) {
+            Fx.run { DesktopUi.open("https://www.youtube.com/watch?v=${stream.ytId}") }
+            return
+        }
+        if (stream.isMpd || url.endsWith(".mpd")) {
+            Fx.run { showBrowserFallback(title, url, "This stream uses DASH, which the bundled player can't play yet.") }
+            return
+        }
+        if (stream.isTorrent || stream.infoHash != null) {
+            Fx.run {
+                showBrowserFallback(
+                    title, url.ifBlank { "magnet stream (infoHash ${stream.infoHash})" },
+                    "This is a torrent stream, which the bundled player can't play yet.",
+                )
+            }
+            return
+        }
+        // mpv has no handler for browser-only blob:/data: URLs.
+        if (url.startsWith("blob:") || url.startsWith("data:")) {
+            Fx.run {
+                showBrowserFallback(
+                    title, url,
+                    "This source uses a web-only video URL (blob:), which only a browser can play. Try another source, or open it in your browser.",
+                )
+            }
+            return
+        }
+        launchMpv(title, url, stream)
+    }
+
+    private fun launchMpv(title: String, url: String, stream: StreamSource) {
         Fx.run {
-            // Sanitize here too so a malformed URL from ANY provider (chaturbate's
-            // root-relative escaped HLS path, stray quotes, JSON escapes) can't
-            // reach mpv or the browser as garbage.
-            val url = com.hikari.app.net.Http.sanitizeStreamUrl(stream.url)
-            if (stream.externalUrl) {
-                DesktopUi.open(url)
-                return@run
-            }
-            if (stream.ytId != null) {
-                DesktopUi.open("https://www.youtube.com/watch?v=${stream.ytId}")
-                return@run
-            }
-            if (stream.isMpd || url.endsWith(".mpd")) {
-                showBrowserFallback(title, url, "This stream uses DASH, which the bundled player can't play yet.")
-                return@run
-            }
-            if (stream.isTorrent || stream.infoHash != null) {
-                showBrowserFallback(title, url.ifBlank { "magnet stream (infoHash ${stream.infoHash})" },
-                    "This is a torrent stream, which the bundled player can't play yet.")
-                return@run
-            }
             val mpv = findMpv()
             if (mpv == null) {
                 showBrowserFallback(title, url,
@@ -87,6 +109,9 @@ object DesktopPlayer {
             proc?.let { runCatching { it.destroy() } }
             proc = p
             val startedAt = System.currentTimeMillis()
+            // Only the FIRST explanation per launch shows: the mpv error path and
+            // the stream probe both try to explain a dead player, never both.
+            dialogShown = false
             Thread(
                 {
                     val tail = StringBuilder()
@@ -103,6 +128,8 @@ object DesktopPlayer {
                                 .takeLast(10)
                                 .joinToString("\n")
                             Fx.run {
+                                if (dialogShown || proc !== p) return@run
+                                dialogShown = true
                                 showBrowserFallback(
                                     title, url,
                                     buildString {
@@ -116,6 +143,44 @@ object DesktopPlayer {
                     }
                 },
                 "hikari-mpv-drain",
+            ).apply { isDaemon = true; start() }
+            // Pre-flight probe: while mpv starts, fetch the first bytes of the
+            // stream. If the server answers with a web page or JSON instead of
+            // media (the real cause of mpv's "file format not supported"), kill
+            // mpv before it errors and offer a clear fallback instead.
+            val myProc = p
+            Thread(
+                {
+                    val verdict = com.hikari.app.net.Http.probeStreamUrl(url, stream.headers)
+                    if (verdict != com.hikari.app.net.Http.StreamProbe.HLS &&
+                        verdict != com.hikari.app.net.Http.StreamProbe.VIDEO &&
+                        verdict != com.hikari.app.net.Http.StreamProbe.UNKNOWN
+                    ) {
+                        Fx.run {
+                            if (dialogShown || proc !== myProc || !myProc.isAlive) return@run
+                            dialogShown = true
+                            runCatching { myProc.destroy() }
+                            when (verdict) {
+                                com.hikari.app.net.Http.StreamProbe.DASH -> showBrowserFallback(
+                                    title, url,
+                                    "This stream uses DASH, which the bundled player can't play yet.",
+                                )
+                                com.hikari.app.net.Http.StreamProbe.HTML -> showBrowserFallback(
+                                    title, url,
+                                    "That source's server returned a web page instead of a video (login or anti-bot page). Try another source, or open it in your browser.",
+                                    tryAnyway = { launchMpv(title, url, stream) },
+                                )
+                                com.hikari.app.net.Http.StreamProbe.JSON -> showBrowserFallback(
+                                    title, url,
+                                    "That source's server returned JSON data instead of a video. Try another source.",
+                                    tryAnyway = { launchMpv(title, url, stream) },
+                                )
+                                else -> {}
+                            }
+                        }
+                    }
+                },
+                "hikari-stream-probe",
             ).apply { isDaemon = true; start() }
         }
     }
@@ -134,7 +199,7 @@ object DesktopPlayer {
         return rels.firstOrNull { it.isFile }
     }
 
-    private fun showBrowserFallback(title: String, url: String, reason: String? = null) {
+    private fun showBrowserFallback(title: String, url: String, reason: String? = null, tryAnyway: (() -> Unit)? = null) {
         val stage = Stage()
         stage.title = title
         val label = Label(reason?.takeIf { it.isNotBlank() } ?: "Open it in your browser instead?").apply {
@@ -147,7 +212,9 @@ object DesktopPlayer {
             }
         }
         val closeBtn = Button("Close").apply { setOnAction { stage.close() } }
-        val box = VBox(14.0, label, HBox(10.0, openBtn, closeBtn)).apply {
+        val buttons = HBox(10.0, openBtn, closeBtn)
+        tryAnyway?.let { t -> buttons.children.add(Button("Try anyway").apply { setOnAction { stage.close(); t() } }) }
+        val box = VBox(14.0, label, buttons).apply {
             alignment = Pos.CENTER
             padding = Insets(24.0)
         }

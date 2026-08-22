@@ -331,6 +331,66 @@ object Http {
         return u
     }
 
+    /** Verdict on a stream URL before the player commits to it. mpv answers a
+     *  source whose server returns a web page, a JSON error body, or a
+     *  browser-only blob:/data: URL with a cryptic "file format not supported"
+     *  — so probe the first bytes and classify. */
+    enum class StreamProbe { HLS, VIDEO, DASH, HTML, JSON, UNKNOWN }
+
+    /** Fast classifier client: short timeouts, system resolver (no DoH) so a
+     *  filtered network fails fast as UNKNOWN and the player's own DoH proxy
+     *  path takes over instead of stalling playback. */
+    private val probeClient: OkHttpClient? by lazy {
+        try {
+            OkHttpClient.Builder()
+                .proxySelector(java.net.ProxySelector.getDefault())
+                .followRedirects(true)
+                .followSslRedirects(true)
+                .connectTimeout(6, TimeUnit.SECONDS)
+                .readTimeout(6, TimeUnit.SECONDS)
+                .build()
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    /** Fetches the first bytes of a stream URL (with the provider's Referer /
+     *  Cookie / UA headers) and classifies the response. Only definite answers
+     *  are trusted — an HTTP error, a non-2xx, or anything ambiguous returns
+     *  UNKNOWN, meaning "let the player try" (the player often succeeds where a
+     *  bare probe is refused). */
+    fun probeStreamUrl(raw: String, headers: Map<String, String> = emptyMap()): StreamProbe {
+        val url = raw.trim().trim('"', '\'')
+        if (url.startsWith("blob:") || url.startsWith("data:")) return StreamProbe.HTML
+        if (!url.startsWith("http://") && !url.startsWith("https://")) return StreamProbe.UNKNOWN
+        val pc = probeClient ?: return StreamProbe.UNKNOWN
+        return try {
+            val b = Request.Builder().url(url)
+                .header("User-Agent", UA)
+                .header("Range", "bytes=0-2047")
+            headers.forEach { (k, v) -> if (k.isNotBlank() && v.isNotBlank()) b.header(k, v) }
+            pc.newCall(b.build()).execute().use { resp ->
+                if (!resp.isSuccessful) return StreamProbe.UNKNOWN
+                val ct = (resp.header("Content-Type") ?: "").lowercase()
+                if (ct.contains("mpegurl") || ct.contains("hls")) return StreamProbe.HLS
+                if (ct.contains("dash+xml") || ct.endsWith("/mpd")) return StreamProbe.DASH
+                if (ct.startsWith("text/html") || ct.contains("html")) return StreamProbe.HTML
+                if (ct.contains("json")) return StreamProbe.JSON
+                if (ct.startsWith("video/") || ct.startsWith("audio/")) return StreamProbe.VIDEO
+                val body = runCatching { resp.body?.bytes() }.getOrNull() ?: ByteArray(0)
+                val head = String(body, 0, minOf(body.size, 2048), Charsets.UTF_8)
+                    .trimStart('\uFEFF', ' ', '\t', '\r', '\n')
+                if (head.startsWith("#EXTM3U")) return StreamProbe.HLS
+                if (head.startsWith("<!doctype") || head.startsWith("<html") || head.startsWith("<head")) return StreamProbe.HTML
+                if (head.startsWith("<?xml") && head.contains("<MPD")) return StreamProbe.DASH
+                if (head.startsWith("{") || head.startsWith("[")) return StreamProbe.JSON
+                StreamProbe.UNKNOWN
+            }
+        } catch (e: Exception) {
+            StreamProbe.UNKNOWN
+        }
+    }
+
     /** Human-friendly repo name from a URL: "codegeasse1/hikari-extensions"
      *  for github/raw URLs, the host otherwise. */
     fun repoDisplayName(url: String): String {
