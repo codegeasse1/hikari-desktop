@@ -11,11 +11,22 @@ import java.util.concurrent.Executors
 
 /**
  * Tiny local HTTP relay that fronts a remote stream (HLS manifest or direct
- * file) and forwards it to the JavaFX media stack. JavaFX's Media can't send
- * custom headers (Referer/Cookie/UA), which many CDNs require, so the player
- * plays `http://127.0.0.1:PORT/x/<key>` instead and this relay fetches the
- * real URL with the required headers, rewriting HLS playlist lines to point
- * back at the relay. Also sidesteps mixed-content/CORS-type issues.
+ * file) and serves it to the player. The player plays
+ * `http://127.0.0.1:PORT/x/<key>` and this relay fetches the real URL with the
+ * required headers (Referer/Cookie/UA) through the app's own OkHttp stack,
+ * rewriting HLS playlist lines to point back at the relay.
+ *
+ * Why this exists:
+ *  - Many CDNs (chaturbate's mmcdn, myspacecat, ...) 403 the player's direct
+ *    connections: signed tokens are single-use (the manifest can only be
+ *    fetched once) and the player's TLS/HTTP fingerprint gets blocked. The
+ *    app's own HTTP stack fetches the same URLs fine.
+ *  - chaturbate's LL-HLS manifests reference their media playlists and
+ *    segments as root-relative BACKSLASH paths (`\v1\edge\streams\…`), which
+ *    the player misreads as a protocol ("No protocol handler"). The relay
+ *    normalizes and resolves them.
+ *  - single-use manifests are cached, so the player re-fetching the master
+ *    playlist gets the cached copy instead of a 403.
  */
 object HlsRelay {
 
@@ -26,6 +37,7 @@ object HlsRelay {
     private val routes = ConcurrentHashMap<String, Route>()
     private val keys = ConcurrentHashMap<String, String>()
     private val counter = java.util.concurrent.atomic.AtomicLong(0)
+    private val masterCache = ConcurrentHashMap<String, ByteArray>()
 
     @Synchronized
     private fun ensureServer() {
@@ -60,6 +72,17 @@ object HlsRelay {
                 ex.close()
                 return
             }
+            // Single-use master playlists are cached: the player re-opens the
+            // master after the first read, and the token URL 403s on a second
+            // fetch — serve the cached (rewritten) copy instead.
+            if (key.startsWith("k")) {
+                masterCache[key]?.let { cached ->
+                    ex.responseHeaders.set("Content-Type", "application/vnd.apple.mpegurl")
+                    ex.sendResponseHeaders(200, cached.size.toLong())
+                    ex.responseBody.use { it.write(cached) }
+                    return
+                }
+            }
             // Segment-level keys look like <base64>, resolved against the root URL.
             var targetUrl = route.url
             if (parts.size > 1) {
@@ -83,19 +106,21 @@ object HlsRelay {
             val ct = resp.header("Content-Type") ?: "application/octet-stream"
             if (ct.contains("mpegurl") || ct.contains("application/vnd.apple.mpegurl") ||
                 ct.contains("text/plain") || ct.contains("application/x-mpegurl") ||
-                path.endsWith(".m3u8")
+                path.endsWith(".m3u8") || targetUrl.contains(".m3u8")
             ) {
                 val text = body?.string() ?: ""
-                val rewritten = rewritePlaylist(text, route.url, route.headers)
+                val rewritten = rewritePlaylist(text, targetUrl, route.headers)
                 val bytes = rewritten.toByteArray(StandardCharsets.UTF_8)
+                if (key.startsWith("k")) masterCache[key] = bytes
                 ex.responseHeaders.set("Content-Type", "application/vnd.apple.mpegurl")
                 ex.sendResponseHeaders(200, bytes.size.toLong())
                 ex.responseBody.use { it.write(bytes) }
             } else {
-                val bytes = body?.bytes() ?: ByteArray(0)
                 ex.responseHeaders.set("Content-Type", ct)
-                ex.sendResponseHeaders(200, bytes.size.toLong())
-                ex.responseBody.use { it.write(bytes) }
+                val len = body?.contentLength() ?: -1L
+                if (len >= 0) ex.sendResponseHeaders(200, len) else ex.sendResponseHeaders(200, 0)
+                body?.byteStream()?.use { input -> input.copyTo(ex.responseBody) }
+                runCatching { ex.responseBody.close() }
             }
             resp.close()
         } catch (t: Throwable) {
@@ -107,14 +132,13 @@ object HlsRelay {
     private fun rewritePlaylist(text: String, base: String, headers: Map<String, String>): String {
         val root = runCatching { URI(base) }.getOrNull() ?: return text
         val out = StringBuilder()
-        var segIdx = 0
         for (line in text.lines()) {
             val trimmed = line.trim()
             if (trimmed.isEmpty() || trimmed.startsWith("#")) {
                 // rewrite key URIs inside #EXT-X-KEY
                 val keyUri = Regex("""URI="([^"]+)"""").find(line)
                 if (keyUri != null && !keyUri.groupValues[1].startsWith("http")) {
-                    val u = root.resolve(keyUri.groupValues[1]).toString()
+                    val u = root.resolve(keyUri.groupValues[1].replace('\\', '/')).toString()
                     out.append(line.replaceRange(keyUri.range, "URI=\"$u\""))
                 } else {
                     out.append(line)
@@ -122,12 +146,14 @@ object HlsRelay {
                 out.append('\n')
                 continue
             }
-            if (trimmed.startsWith("http")) {
-                out.append(trimmed).append('\n')
-                continue
-            }
-            // relative segment/media URI → relay-local path
-            val resolved = runCatching { root.resolve(trimmed).toString() }.getOrNull()
+            // chaturbate LL-HLS manifests reference their media playlists and
+            // segments as root-relative BACKSLASH paths (e.g. \v1\edge\streams\…)
+            // and occasionally as absolute https URLs. Both are served through
+            // the relay so every request goes through the app's own HTTP stack
+            // (which the CDNs accept) instead of the player's direct connection
+            // (which they 403).
+            val normalized = trimmed.replace('\\', '/')
+            val resolved = runCatching { root.resolve(normalized).toString() }.getOrNull()
             if (resolved == null) {
                 out.append(line).append('\n')
                 continue
@@ -135,9 +161,7 @@ object HlsRelay {
             val segKey = "s${counter.incrementAndGet()}"
             keys[segKey] = resolved
             routes["$segKey"] = Route(resolved, headers)
-            val baseRelay = "http://127.0.0.1:$port/x/$segKey"
-            // keep media segments grouped under the root for M3U8 ordering
-            out.append(line.replace(trimmed, baseRelay)).append('\n')
+            out.append("http://127.0.0.1:$port/x/$segKey").append('\n')
         }
         return out.toString()
     }

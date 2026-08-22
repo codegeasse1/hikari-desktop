@@ -97,9 +97,17 @@ object DesktopPlayer {
             // .hikari/hikari-player.log (e.g. a lookalike separator that the
             // URL fixer missed).
             val logDir = File(System.getProperty("user.home"), ".hikari").apply { mkdirs() }
+            // Play through the app's own HTTP stack (HlsRelay): the CDNs that
+            // serve these streams (chaturbate's mmcdn, myspacecat, …) 403 the
+            // player's direct connections — single-use signed tokens and TLS
+            // fingerprint blocking — while the app's OkHttp fetches the same
+            // URLs fine. The relay also rewrites chaturbate's backslash
+            // root-relative playlist lines into proper URLs.
+            val playUrl = HlsRelay.urlFor(url, stream.headers)
             File(logDir, "hikari-player.log").appendText(
                 "[" + java.time.Instant.now() + "] raw=" + debugEscaped(stream.url) +
-                    "\n  san=" + debugEscaped(url) + "\n"
+                    "\n  san=" + debugEscaped(url) +
+                    "\n  ply=" + debugEscaped(playUrl) + "\n"
             )
             val args = buildList {
                 add(mpv.absolutePath)
@@ -109,12 +117,8 @@ object DesktopPlayer {
                 // CDNs and only adds confusing [ytdl_hook] errors to the dialog.
                 add("--no-ytdl")
                 add("--title=" + title.take(200).replace('\n', ' '))
-                // Route mpv's own HTTP(S) through the app's loopback proxy so
-                // HLS/CDN domains blocked by the OS resolver still resolve (the
-                // proxy uses the same DoH-first DNS as the rest of the app).
-                val proxyPort = LocalProxy.start()
-                add("--http-proxy=127.0.0.1:$proxyPort")
-                add("--log-file=${File(logDir, "mpv.log").absolutePath}")
+                val logDir2 = logDir
+                add("--log-file=${File(logDir2, "mpv.log").absolutePath}")
                 // Providers may ship stream headers (Referer/Cookie/UA) their
                 // CDN validates — hand them straight to mpv. If no User-Agent is
                 // among them, force a desktop-browser one: mpv's default
@@ -127,7 +131,7 @@ object DesktopPlayer {
                     }
                 }
                 if (!hasUA) add("--user-agent=" + com.hikari.app.net.Http.UA)
-                add(url)
+                add(playUrl)
             }
             val p = runCatching { ProcessBuilder(args).redirectErrorStream(true).start() }.getOrNull()
             if (p == null) {
