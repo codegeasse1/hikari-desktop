@@ -92,6 +92,15 @@ object DesktopPlayer {
             }
             val url = com.hikari.app.net.Http.sanitizeStreamUrl(stream.url)
             val signed = isSignedStreamUrl(url)
+            // Debug: record the EXACT characters of the provider URL and the
+            // playable URL, so a failed stream always leaves a real reason in
+            // .hikari/hikari-player.log (e.g. a lookalike separator that the
+            // URL fixer missed).
+            val logDir = File(System.getProperty("user.home"), ".hikari").apply { mkdirs() }
+            File(logDir, "hikari-player.log").appendText(
+                "[" + java.time.Instant.now() + "] raw=" + debugEscaped(stream.url) +
+                    "\n  san=" + debugEscaped(url) + "\n"
+            )
             val args = buildList {
                 add(mpv.absolutePath)
                 add("--force-window=yes")
@@ -105,7 +114,6 @@ object DesktopPlayer {
                 // proxy uses the same DoH-first DNS as the rest of the app).
                 val proxyPort = LocalProxy.start()
                 add("--http-proxy=127.0.0.1:$proxyPort")
-                val logDir = File(System.getProperty("user.home"), ".hikari").apply { mkdirs() }
                 add("--log-file=${File(logDir, "mpv.log").absolutePath}")
                 // Providers may ship stream headers (Referer/Cookie/UA) their
                 // CDN validates — hand them straight to mpv. If no User-Agent is
@@ -239,6 +247,17 @@ object DesktopPlayer {
             File("mpv/mpv.exe"),
         )
         return rels.firstOrNull { it.isFile }
+    }
+
+    /** For the debug log: show a string with every non-ASCII character as a
+     *  \\uXXXX escape, so a lookalike separator (e.g. a yen sign instead of a
+     *  backslash) is actually visible in the log. */
+    private fun debugEscaped(s: String): String = buildString {
+        for (c in s) {
+            val cp = c.code
+            if (cp < 32 || cp > 126) append("\\u").append(cp.toString(16).padStart(4, '0'))
+            else append(c)
+        }
     }
 
     private fun showBrowserFallback(title: String, url: String, reason: String? = null, tryAnyway: (() -> Unit)? = null, retry: (() -> Unit)? = null) {

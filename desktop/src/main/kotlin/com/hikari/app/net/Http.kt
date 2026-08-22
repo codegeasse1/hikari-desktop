@@ -295,7 +295,7 @@ object Http {
         var u = raw.trim().trim('"', '\'')
         if (u.isBlank()) return u
         // JSON escapes a JS-embedded URL commonly carries (before \\ → \\ so the
-        // \uXXXX patterns still match).
+        // \\uXXXX patterns still match).
         u = u
             // Decode EVERY \uXXXX escape (chaturbate's dossier escapes quotes
             // as \u0022 and may escape any other char too) BEFORE collapsing
@@ -306,44 +306,37 @@ object Http {
             .replace("\\/", "/")
             .replace("\\\\", "\\")
             .replace("\\\"", "\"")
+        // RFC 3986 URL characters. EVERYTHING else (real backslashes, escaped
+        // slashes, or the lookalike Unicode separators chaturbate's dossier can
+        // slip in) is treated as a path separator.
+        val safe = "[^0-9A-Za-z._~:/?#\\[\\]@!'()*+,;=%&-]"
+        // A chaturbate edge stream, found wherever it hides in the string and
+        // whatever junk/separator precedes it — match ANY non-URL character
+        // between the path segments, then rebuild it on the edge host.
+        val edgeMatch = Regex("v1$safe+edge$safe+streams$safe+(.+)$").find(u)
+        if (edgeMatch != null) {
+            val host = run {
+                var h = u.substringBefore(edgeMatch.value).trim().trimStart('/')
+                if (h.startsWith("https://")) h = h.removePrefix("https://")
+                else if (h.startsWith("http://")) h = h.removePrefix("http://")
+                h = h.substringBefore('/').substringBefore('?').substringBefore('#')
+                h.takeIf {
+                    it.isNotBlank() && it.contains('.') &&
+                        it.all { c -> c.isLetterOrDigit() || c == '.' || c == '-' }
+                }
+            } ?: "edge-hls.chaturbate.com"
+            val cleanPath = edgeMatch.value.replace(Regex(safe), "/").replace(Regex("/{2,}"), "/")
+            return "https://$host/edge-hls/$cleanPath"
+        }
         if (u.startsWith("http://") || u.startsWith("https://")) {
-            // Backslashes are never legal in a URL; a CDN that escaped `/` as
-            // `\/` in a JS blob leaks them here. Normalize everything after the
-            // scheme://host so mpv never sees them.
+            // Separators that are never legal in a URL (backslashes, escaped
+            // slashes, lookalikes) normalize to `/` so mpv never sees them.
             val hostEnd = u.indexOf('/', u.indexOf("://") + 3)
             return if (hostEnd > 0) {
-                u.substring(0, hostEnd + 1).replace('\\', '/') +
-                    u.substring(hostEnd + 1).replace('\\', '/')
+                u.substring(0, hostEnd + 1) + u.substring(hostEnd + 1).replace(Regex(safe), "/")
             } else {
-                u.replace('\\', '/')
+                u.replace(Regex(safe), "/")
             }
-        }
-        // Scheme-less. chaturbate serves the signed LL-HLS playlist as a
-        // root-relative path on its edge host (backslashes or escaped slashes),
-        // sometimes prefixed by the bare host with no scheme.
-        val norm = u.replace('\\', '/').trimStart('/')
-        if (norm.startsWith("v1/edge/streams/")) {
-            return "https://edge-hls.chaturbate.com/edge-hls/" + norm
-        }
-        if (norm.contains("/v1/edge/streams/")) {
-            val hostPart = norm.substringBefore("/v1/edge/streams/")
-            val path = norm.substringAfter("/v1/edge/streams/")
-            val host = hostPart.takeIf {
-                it.isNotBlank() && it.contains('.') &&
-                    it.all { c -> c.isLetterOrDigit() || c == '.' || c == '-' }
-            } ?: "edge-hls.chaturbate.com"
-            return "https://$host/edge-hls/v1/edge/streams/$path"
-        }
-        // Last resort: a scheme-less URL that still clearly is a chaturbate edge
-        // stream (whatever junk precedes it) — rebuild it on the edge host.
-        val edgeMatch = Regex("v1[\\\\/]+edge[\\\\/]+streams[\\\\/]+(.+)$").find(norm)
-        if (edgeMatch != null) {
-            val hostPart = norm.substringBefore(edgeMatch.value).trim().trimStart('/')
-            val host = hostPart.takeIf {
-                it.isNotBlank() && it.contains('.') &&
-                    it.all { c -> c.isLetterOrDigit() || c == '.' || c == '-' }
-            } ?: "edge-hls.chaturbate.com"
-            return "https://$host/edge-hls/" + edgeMatch.value
         }
         return u
     }
