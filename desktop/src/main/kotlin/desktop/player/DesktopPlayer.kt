@@ -83,6 +83,10 @@ object DesktopPlayer {
             val args = buildList {
                 add(mpv.absolutePath)
                 add("--force-window=yes")
+                // No youtube-dl hook: for direct HLS/MP4 URLs it fires a SECOND,
+                // header-less probe (no Referer/Cookie) that 403s on protected
+                // CDNs and only adds confusing [ytdl_hook] errors to the dialog.
+                add("--no-ytdl")
                 add("--title=" + title.take(200).replace('\n', ' '))
                 // Route mpv's own HTTP(S) through the app's loopback proxy so
                 // HLS/CDN domains blocked by the OS resolver still resolve (the

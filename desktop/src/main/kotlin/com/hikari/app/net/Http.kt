@@ -38,10 +38,7 @@ object Http {
         // (or a local proxy/VPN must be used), the system ProxySelector and the
         // DoH-first resolver below let the app reach what the user's browser can.
         System.setProperty("java.net.useSystemProxies", "true")
-        client = OkHttpClient.Builder()
-            // Use the OS proxy exactly like the browser does. Without this a
-            // proxy-only network MITMs the direct connection and TLS fails with
-            // an opaque BoringSSL DECODE_ERROR.
+        client = applyConscryptTls(OkHttpClient.Builder())
             .proxySelector(java.net.ProxySelector.getDefault())
             .dns(HikariDns)
             .followRedirects(true)
@@ -51,48 +48,35 @@ object Http {
             .build()
     }
 
-    /** Secondary client pinned to the JDK's own TLS stack (SunJSSE). Conscrypt's
-     *  BoringSSL is the JVM default (installed by initCloudStream) and a few CDN
-     *  TLS 1.3 handshakes fail against it with an opaque DECODE_ERROR; this
-     *  client retries the same request over the JDK TLS implementation, which
-     *  usually succeeds where BoringSSL choked. */
-    private val jdkTlsClient: OkHttpClient? by lazy {
+    /** Explicitly pins every client to Conscrypt (BoringSSL). This is critical:
+     *  the JVM's lazy `sun.security.ssl.SSLSessionImpl` class-init can fail
+     *  fatally on Windows (NoClassDefFoundError) once Conscrypt is installed as
+     *  the default provider, so the JDK SSL stack must never be touched at all —
+     *  a plain `.sslSocketFactory` from the JDK default context is a landmine. */
+    fun applyConscryptTls(builder: OkHttpClient.Builder): OkHttpClient.Builder {
         try {
-            val ctx = javax.net.ssl.SSLContext.getInstance("TLS", "SunJSSE")
-            val tmf = javax.net.ssl.TrustManagerFactory.getInstance("X509", "SunJSSE")
+            if (java.security.Security.getProvider("Conscrypt") == null) {
+                java.security.Security.insertProviderAt(org.conscrypt.Conscrypt.newProvider(), 1)
+            }
+            val tmf = javax.net.ssl.TrustManagerFactory.getInstance("X509")
             tmf.init(null as java.security.KeyStore?)
-            // SunJSSE trust managers too, so cert validation doesn't route back
-            // through the Conscrypt provider that just failed.
+            val ctx = javax.net.ssl.SSLContext.getInstance("TLS")
             ctx.init(null, tmf.trustManagers, null)
-            OkHttpClient.Builder()
-                .proxySelector(java.net.ProxySelector.getDefault())
-                .dns(HikariDns)
-                .followRedirects(true)
-                .followSslRedirects(true)
-                .connectTimeout(20, TimeUnit.SECONDS)
-                .readTimeout(30, TimeUnit.SECONDS)
-                .sslSocketFactory(
-                    ctx.socketFactory,
-                    tmf.trustManagers[0] as javax.net.ssl.X509TrustManager,
-                )
-                .build()
+            return builder.sslSocketFactory(
+                ctx.socketFactory,
+                tmf.trustManagers[0] as javax.net.ssl.X509TrustManager,
+            )
         } catch (t: Throwable) {
-            null
+            System.err.println("applyConscryptTls failed: $t")
+            return builder
         }
     }
 
-    /** Runs the call, retrying once over the JDK TLS stack when the default
-     *  (Conscrypt/BoringSSL) client fails — so a TLS quirk can't break repo
-     *  fetches, installs or playback probing. */
-    private fun execute(client: OkHttpClient, request: Request): Response {
-        try {
-            return client.newCall(request).execute()
-        } catch (e: java.io.IOException) {
-            val fb = jdkTlsClient
-            if (fb == null || fb === client) throw e
-            return fb.newCall(request).execute()
-        }
-    }
+    /** Runs the call. No JDK-TLS retry: the Conscrypt stack above is the one and
+     *  only TLS path — a broken alternative that touches sun.security.ssl can
+     *  poison the JVM (NoClassDefFoundError: SSLSessionImpl). */
+    private fun execute(client: OkHttpClient, request: Request): Response =
+        client.newCall(request).execute()
 
     fun get(url: String, headers: Map<String, String> = emptyMap()): Response {
         val builder = Request.Builder().url(url).header("User-Agent", UA)
@@ -304,13 +288,13 @@ object Http {
 
     /** Fixes stream URLs that some providers hand back half-escaped or relative:
      *  JSON `\/`/`\uXXXX` escapes, stray quotes/whitespace, and chaturbate's
-     *  root-relative signed LL-HLS path (which comes back as e.g.
-     *  `\/v1\/edge\/streams\/…m3u8?session=…` with no scheme or host). Returns
-     *  the clean, playable URL. */
+     *  signed LL-HLS path — which arrives scheme-less with backslash separators,
+     *  an escaped root-relative path, or a bare host prefix with no scheme.
+     *  Returns the clean, playable URL (an unrewriteable value passes through). */
     fun sanitizeStreamUrl(raw: String): String {
         var u = raw.trim().trim('"', '\'')
         if (u.isBlank()) return u
-        // JSON escapes a JS-embedded URL commonly carries (before \\ → \ so the
+        // JSON escapes a JS-embedded URL commonly carries (before \\ → \\ so the
         // \uXXXX patterns still match).
         u = u
             .replace("\\u002f", "/").replace("\\u0026", "&")
@@ -319,14 +303,33 @@ object Http {
             .replace("\\/", "/")
             .replace("\\\\", "\\")
             .replace("\\\"", "\"")
-        if (!u.startsWith("http://") && !u.startsWith("https://")) {
-            // chaturbate serves the signed LL-HLS playlist as a root-relative
-            // path on its edge host (often slash-escaped, sometimes with plain
-            // backslashes instead of slashes).
-            val rel = u.trimStart('/', '\\')
-            if (rel.startsWith("v1/edge/streams/") || rel.startsWith("v1\\edge\\streams\\")) {
-                u = "https://edge-hls.chaturbate.com/edge-hls/" + rel.replace("\\", "/")
+        if (u.startsWith("http://") || u.startsWith("https://")) {
+            // Backslashes are never legal in a URL; a CDN that escaped `/` as
+            // `\/` in a JS blob leaks them here. Normalize everything after the
+            // scheme://host so mpv never sees them.
+            val hostEnd = u.indexOf('/', u.indexOf("://") + 3)
+            return if (hostEnd > 0) {
+                u.substring(0, hostEnd + 1).replace('\\', '/') +
+                    u.substring(hostEnd + 1).replace('\\', '/')
+            } else {
+                u.replace('\\', '/')
             }
+        }
+        // Scheme-less. chaturbate serves the signed LL-HLS playlist as a
+        // root-relative path on its edge host (backslashes or escaped slashes),
+        // sometimes prefixed by the bare host with no scheme.
+        val norm = u.replace('\\', '/').trimStart('/')
+        if (norm.startsWith("v1/edge/streams/")) {
+            return "https://edge-hls.chaturbate.com/edge-hls/" + norm
+        }
+        if (norm.contains("/v1/edge/streams/")) {
+            val hostPart = norm.substringBefore("/v1/edge/streams/")
+            val path = norm.substringAfter("/v1/edge/streams/")
+            val host = hostPart.takeIf {
+                it.isNotBlank() && it.contains('.') &&
+                    it.all { c -> c.isLetterOrDigit() || c == '.' || c == '-' }
+            } ?: "edge-hls.chaturbate.com"
+            return "https://$host/edge-hls/v1/edge/streams/$path"
         }
         return u
     }
@@ -342,7 +345,7 @@ object Http {
      *  path takes over instead of stalling playback. */
     private val probeClient: OkHttpClient? by lazy {
         try {
-            OkHttpClient.Builder()
+            applyConscryptTls(OkHttpClient.Builder())
                 .proxySelector(java.net.ProxySelector.getDefault())
                 .followRedirects(true)
                 .followSslRedirects(true)
