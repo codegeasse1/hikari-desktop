@@ -18,6 +18,7 @@ import javafx.scene.control.ProgressBar
 import javafx.scene.control.ScrollPane
 import javafx.scene.control.TextField
 import javafx.scene.control.Tooltip
+import javafx.scene.input.KeyCode
 import javafx.scene.layout.HBox
 import javafx.scene.layout.Priority
 import javafx.scene.layout.VBox
@@ -166,11 +167,10 @@ class ExtensionsScreenView {
                 styleClass.addAll("btn", if (primary) "btn-primary" else "")
                 maxWidth = Double.MAX_VALUE
                 setOnAction {
-                    inputRow.isVisible = !inputRow.isVisible
-                    inputRow.isManaged = inputRow.isVisible
-                    if (inputRow.isVisible) {
-                        inputRow.lookupAll(".field").firstOrNull()?.let { it.requestFocus() }
-                    }
+                    // Always reveal the row — never hide a row the user filled in.
+                    inputRow.isVisible = true
+                    inputRow.isManaged = true
+                    inputRow.lookupAll(".field").firstOrNull()?.let { it.requestFocus() }
                 }
             }
             return VBox(8.0, btn, inputRow).apply { alignment = Pos.CENTER_LEFT }
@@ -206,16 +206,27 @@ class ExtensionsScreenView {
             text = initial
             // Wide enough that long repo/plugin URLs are fully visible instead
             // of clipped with a hidden horizontal scroll.
-            prefWidth = 520.0
-            minWidth = 320.0
+            prefWidth = 360.0
+            minWidth = 200.0
             HBox.setHgrow(this, Priority.ALWAYS)
             // Selecting the whole URL on focus shows the tail (the meaningful
             // part) even in a narrow window, and makes retyping/retrying easy.
             focusedProperty().addListener { _, _, focused -> if (focused) selectAll() }
+            // Enter submits.
             setOnAction { onGo(text) }
+            // Pasting a URL submits immediately — the user never has to hunt
+            // for the button (the button is there too, and can't collapse).
+            setOnKeyReleased { e ->
+                val pasted = (e.code == KeyCode.V && e.isControlDown) ||
+                    (e.code == KeyCode.INSERT && e.isShiftDown)
+                if (pasted && text.isNotBlank()) onGo(text)
+            }
         }
         val btn = Button(buttonText).apply {
             styleClass.addAll("btn", "btn-primary")
+            // Never let layout shrink the label to a clipped "…" — the button
+            // must always read as the submit action.
+            minWidth = 110.0
             setOnAction { onGo(input.text) }
         }
         return HBox(8.0, input, btn).apply { alignment = Pos.CENTER_LEFT }
