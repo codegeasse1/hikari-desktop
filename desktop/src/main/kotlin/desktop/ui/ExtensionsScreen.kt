@@ -62,6 +62,10 @@ class ExtensionsScreenView {
     /** The repo whose plugin list is currently shown (folder drill-down). */
     private var openRepo: Cs3Repo? = null
 
+    /** Per-repo-plugin install outcome, shown right under its row so a failed
+     *  install says why where the user is looking. Keyed by plugin URL. */
+    private val installErrors = HashMap<String, String>()
+
     private fun setStatus(text: String, isError: Boolean = false) {
         statusLabel.text = text
         statusLabel.style = "-fx-text-fill: ${if (isError) "#ff8f8f" else Theme.FG_DIM};"
@@ -147,11 +151,24 @@ class ExtensionsScreenView {
                             if (installed.isEmpty()) installPlugin(pname, purl) else uninstallPlugin(pname, purl)
                         }
                     }
-                    pluginsBox.children.add(HBox(10.0, info, btn).apply {
+                    val row = HBox(10.0, info, btn).apply {
                         VBox.setVgrow(info, Priority.ALWAYS)
                         alignment = Pos.CENTER_LEFT
                         styleClass.add("list-row")
-                    })
+                    }
+                    val cell = VBox(4.0).apply {
+                        children.add(row)
+                        // Per-plugin result — an install that failed must say
+                        // WHY right where the button is, not only in the tiny
+                        // status line at the bottom of the page.
+                        installErrors[purl]?.let { err ->
+                            children.add(
+                                Theme.label("⚠ $err", size = 11.0, dim = true)
+                                    .apply { style = style + "; -fx-text-fill: #ff9a9a;" }
+                            )
+                        }
+                    }
+                    pluginsBox.children.add(cell)
                 }
             }
         }
@@ -454,10 +471,12 @@ class ExtensionsScreenView {
     }
 
     /** Providers installed from a given repo plugin URL (bundle providers all
-     *  share the download URL as their extra prefix). */
+     *  share the download URL as their extra prefix). Covers both Hikari jars
+     *  and CloudStream .cs3 installs — both record the source URL in extra. */
     private fun providersFor(url: String): List<ProviderConfig> =
         AppShell.app.store.providers().filter {
-            it.type == ProviderType.HIKARI && it.extra?.startsWith("$url|") == true
+            it.type in setOf(ProviderType.HIKARI, ProviderType.CS3) &&
+                it.extra?.startsWith("$url|") == true
         }
 
     /** Downloads (auto-swapping .hiki → .jar), loads, and registers every
@@ -466,6 +485,7 @@ class ExtensionsScreenView {
     private fun installPlugin(name: String, url: String) {
         var dl = url
         if (dl.endsWith(".hiki")) dl = dl.removeSuffix(".hiki") + ".jar"
+        installErrors.remove(url)
         busy.isVisible = true
         setStatus("Installing $name…")
         AppShell.uiScope.launch {
@@ -503,6 +523,7 @@ class ExtensionsScreenView {
             AppShell.app.providers.refresh()
             Fx.run {
                 busy.isVisible = false
+                if (isErr) installErrors[url] = statusText else installErrors.remove(url)
                 setStatus(statusText, isErr)
                 renderAll()
             }
@@ -533,15 +554,28 @@ class ExtensionsScreenView {
         }
         val cs3 = Cs3PluginManager.reload(HikariApp.instance, dest)
         if (cs3.isNotEmpty()) {
-            AppShell.app.store.addProvider(
-                ProviderConfig(
-                    id = "cs3|$safeName|0",
-                    name = name,
-                    type = ProviderType.CS3,
-                    url = dest.absolutePath,
+            // A .cs3 can register several MainAPIs (one plugin archive, many
+            // providers) — register each with its own config so every one is
+            // individually disableable/uninstallable, and record the source
+            // URL in extra (matches providersFor, so the repo row flips to
+            // "Uninstall" after a successful install).
+            cs3.forEachIndexed { idx, api ->
+                val display = if (cs3.size > 1) {
+                    "$name · ${api.name.ifBlank { "Provider ${idx + 1}" }}"
+                } else {
+                    name
+                }
+                AppShell.app.store.addProvider(
+                    ProviderConfig(
+                        id = "cs3|$safeName|$idx",
+                        name = display,
+                        type = ProviderType.CS3,
+                        url = dest.absolutePath,
+                        extra = "$sourceUrl|$idx",
+                    )
                 )
-            )
-            return "Installed $name (CS3)."
+            }
+            return "Installed $name (${cs3.size} provider${if (cs3.size > 1) "s" else ""})."
         }
         return null
     }

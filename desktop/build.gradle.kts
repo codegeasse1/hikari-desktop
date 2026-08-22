@@ -66,6 +66,7 @@ dependencies {
     implementation(libs.kotlin.reflect)
     implementation(libs.conscrypt.openjdk)
     implementation(libs.orgjson)
+    implementation(libs.imageio.webp)
 }
 
 // The exe launcher on Windows (jpackage) needs every runtime jar in one input

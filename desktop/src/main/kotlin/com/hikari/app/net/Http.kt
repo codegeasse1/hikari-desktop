@@ -499,6 +499,10 @@ object Http {
             val branch = m.groupValues[3]
             val path = m.groupValues[4]
             variants.add("https://cdn.jsdelivr.net/gh/$user/$repo@$branch/$path")
+            // raw.githack mirrors raw.githubusercontent 1:1 on a different CDN —
+            // a useful last resort when GitHub raw is blocked or refusing the
+            // app's HTTP stack.
+            variants.add("https://raw.githack.com/$user/$repo/$branch/$path")
         }
         return variants
     }

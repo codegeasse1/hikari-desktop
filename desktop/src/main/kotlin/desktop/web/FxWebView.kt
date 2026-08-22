@@ -281,6 +281,10 @@ object FxWebView {
         return CHALLENGE_MARKERS.any { probe.contains(it, ignoreCase = true) }
     }
 
+    /** Shared WAF-challenge detection (used by the image loader and the
+     *  CloudStream HTTP interceptor). */
+    fun isChallengeHtml(html: String): Boolean = looksLikeChallengePage(html)
+
     private val CHALLENGE_MARKERS = listOf(
         "cf-chl-", "challenge-platform", "cdn-cgi/challenge-platform",
         "cf-browser-verification", "cf-mitigated", "cf-turnstile",

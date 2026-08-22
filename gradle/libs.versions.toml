@@ -17,6 +17,7 @@ cryptography = "0.6.0"
 serializationJson = "1.11.0"
 conscrypt = "2.5.2"
 orgjson = "20240303"
+twelvemonkeys = "3.10.1"
 
 [libraries]
 kotlinx-coroutines-core = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-core", version.ref = "coroutines" }
@@ -39,6 +40,7 @@ kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-
 kotlin-reflect = { group = "org.jetbrains.kotlin", name = "kotlin-reflect", version.ref = "kotlin" }
 conscrypt-openjdk = { group = "org.conscrypt", name = "conscrypt-openjdk-uber", version.ref = "conscrypt" }
 orgjson = { group = "org.json", name = "json", version.ref = "orgjson" }
+imageio-webp = { group = "com.twelvemonkeys.imageio", name = "imageio-webp", version.ref = "twelvemonkeys" }
 
 [plugins]
 kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }

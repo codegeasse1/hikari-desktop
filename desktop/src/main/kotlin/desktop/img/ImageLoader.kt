@@ -101,20 +101,30 @@ object ImageLoader {
             val comma = url.indexOf(',')
             if (comma <= 0) return null
             val raw = url.substring(comma + 1)
-            return runCatching { android.util.Base64.decode(raw, android.util.Base64.DEFAULT) }.getOrNull()
+            val b = runCatching { android.util.Base64.decode(raw, android.util.Base64.DEFAULT) }.getOrNull()
+                ?: return null
+            // JavaFX can't decode every format an extension can embed (webp).
+            return makeDecodable(b, url)
         }
         val disk = diskFile(url)
         disk.takeIf { it.exists() && it.length() > 0 }?.let {
             val cached = runCatching { it.readBytes() }.getOrNull()
-            if (cached != null && isImageBytes(cached)) return cached
+            if (cached != null && isImageBytes(cached)) {
+                val decodable = makeDecodable(cached, url)
+                if (decodable != null) return decodable
+            }
             // A stale corrupt cache entry (a WAF challenge page cached by an
-            // older build) must never be served — drop it and re-fetch.
+            // older build, or a format even the converters can't open) must
+            // never be served — drop it and re-fetch.
             runCatching { disk.delete() }
         }
-        val plain = plainFetch(url)?.takeIf { isImageBytes(it) }
-        if (plain != null) {
-            writeDisk(disk, plain)
-            return plain
+        val plain = plainFetch(url)
+        if (plain != null && isImageBytes(plain)) {
+            val decodable = makeDecodable(plain, url)
+            if (decodable != null) {
+                writeDisk(disk, decodable)
+                return decodable
+            }
         }
         if (shouldTryWebView(url)) {
             val wv = desktop.web.FxWebView.imageBytes(url)
@@ -126,6 +136,43 @@ object ImageLoader {
         }
         return null
     }
+
+    /** Ensures bytes can be decoded by JavaFX Image (png/jpeg/gif/bmp only).
+     *  Everything else (webp, avif, …) is converted in-process to a PNG — the
+     *  platform poster CDNs serve webp heavily and JavaFX silently blanks on
+     *  it — with the embedded WebEngine canvas re-encode as the fallback. */
+    private fun makeDecodable(bytes: ByteArray, url: String): ByteArray? {
+        if (isJavaFxDecodable(bytes)) return bytes
+        return convertImageIO(bytes) ?: desktop.web.FxWebView.imageBytes(url)
+    }
+
+    /** In-process decode + downscale via ImageIO (TwelveMonkeys registers a
+     *  WebP reader). Bounds the decode like the WebView path so a full-res
+     *  poster can't spike memory. */
+    private fun convertImageIO(bytes: ByteArray): ByteArray? = runCatching {
+        val src = javax.imageio.ImageIO.read(java.io.ByteArrayInputStream(bytes)) ?: return null
+        val maxDim = 640
+        val w = src.width
+        val h = src.height
+        val scale = minOf(1.0, maxDim.toDouble() / maxOf(1, maxOf(w, h)))
+        val tw = maxOf(1, (w * scale).toInt())
+        val th = maxOf(1, (h * scale).toInt())
+        val out = if (scale < 1.0) {
+            val bmp = java.awt.image.BufferedImage(tw, th, java.awt.image.BufferedImage.TYPE_INT_RGB)
+            val g = bmp.createGraphics()
+            try {
+                g.drawImage(src, 0, 0, tw, th, null)
+            } finally {
+                g.dispose()
+            }
+            bmp
+        } else {
+            src
+        }
+        val bos = java.io.ByteArrayOutputStream()
+        if (!javax.imageio.ImageIO.write(out, "png", bos)) return null
+        bos.toByteArray()
+    }.getOrNull()
 
     /** OkHttp fetch with the headers the image host actually expects: the
      *  exact per-poster headers CloudStream plugins declared, else the per-host
@@ -184,6 +231,20 @@ object ImageLoader {
                 b[8] == 'W'.code.toByte() && b[9] == 'E'.code.toByte() && b[10] == 'B'.code.toByte() && b[11] == 'P'.code.toByte() -> true
             u(0) == 'B'.code && u(1) == 'M'.code -> true
             u(4) == 'f'.code && u(5) == 't'.code && u(6) == 'y'.code && u(7) == 'p'.code -> true
+            else -> false
+        }
+    }
+
+    /** Formats JavaFX's Image can decode natively — everything else must be
+     *  converted first (see [makeDecodable]). */
+    private fun isJavaFxDecodable(b: ByteArray): Boolean {
+        if (b.size < 4) return false
+        val u = { i: Int -> b[i].toInt() and 0xFF }
+        return when {
+            u(0) == 0x89 && b[1] == 'P'.code.toByte() && b[2] == 'N'.code.toByte() && b[3] == 'G'.code.toByte() -> true
+            u(0) == 0xFF && u(1) == 0xD8 -> true
+            u(0) == 'G'.code && u(1) == 'I'.code && u(2) == 'F'.code && u(3) == '8'.code -> true
+            u(0) == 'B'.code && u(1) == 'M'.code -> true
             else -> false
         }
     }

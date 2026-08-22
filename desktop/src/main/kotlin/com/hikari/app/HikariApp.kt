@@ -173,8 +173,12 @@ class HikariApp : Application() {
                 // lazy sun.security.ssl class-init fails fatally on Windows
                 // (NoClassDefFoundError: SSLSessionImpl) once Conscrypt is the
                 // default provider, so the JDK TLS stack is never touched.
+                // The WebView fallback interceptor re-fetches WAF challenge
+                // pages (Cloudflare etc.) inside the real browser so plugins
+                // get content instead of an empty catalog.
                 .dns(com.hikari.app.net.HikariDns)
                 .proxySelector(java.net.ProxySelector.getDefault())
+                .addInterceptor(com.hikari.app.net.WebViewFallbackInterceptor())
                 .apply {
                     if (ignoreSSL) ignoreAllSSLErrors()
                     else com.hikari.app.net.Http.applyConscryptTls(this)
