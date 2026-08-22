@@ -193,6 +193,15 @@ class HikariApp : Application() {
             }
             wire("getApp", ignoreSSL = false)
             wire("getInsecureApp", ignoreSSL = true)
+            // The CloudStream PRODUCTION client the plugins themselves call through
+            // (`com.lagradost.cloudstream3.app`) is a SEPARATE Requests object from
+            // getApp/getInsecureApp — unless it's pointed at the same resilient
+            // stack it keeps a bare default OkHttpClient: system DNS (can be ISP-
+            // filtered), no system proxy, and no WAF fallback — so catalogs from
+            // Cloudflare-fronted anime/tube/… sites come back empty even after a
+            // successful install. Route it through the same DoH+proxy+Conscrypt+
+            // WebView-fallback client used everywhere else.
+            runCatching { com.lagradost.cloudstream3.app.baseClient = build(false) }
             MainAPI.settingsForProvider = SettingsJson()
 
             CoroutineScope(Dispatchers.IO).launch {

@@ -550,16 +550,19 @@ object Http {
         headers: Map<String, String> = emptyMap(),
         onProgress: ((Long, Long) -> Unit)? = null,
     ): Boolean {
+        var lastFailure: Exception? = null
         for (u in urlVariants(url)) {
-            for (attempt in 0 until 2) {
+            for (attempt in 0 until 3) {
                 if (downloadTo(u, dest, headers, onProgress)) return true
+                lastFailure = lastFailure ?: Exception("failed $u")
                 try {
-                    Thread.sleep(300L)
+                    Thread.sleep(500L)
                 } catch (e: InterruptedException) {
                     return false
                 }
             }
         }
+        lastFailure?.printStackTrace()
         return false
     }
 
