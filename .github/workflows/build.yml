@@ -138,7 +138,7 @@ jobs:
           {
             EXE=$(ls -1 *.exe | head -n 1)
             echo "=== silent install of: $EXE ==="
-            "$EXE" /quiet /norestart
+            timeout 180 "./$EXE" /quiet /norestart
             echo "install exit: $?"
             sleep 10
             echo "=== installed files (head) ==="
