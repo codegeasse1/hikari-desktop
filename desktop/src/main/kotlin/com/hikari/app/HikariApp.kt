@@ -113,11 +113,12 @@ class HikariApp : Application() {
             val file = File(cacheDir, "crash.log")
             if (file.exists()) {
                 val text = file.readText()
-                // Only surface crashes from THIS build — a stale report from an
-                // older build (e.g. one with a bug that's since been fixed) just
-                // confuses the user into thinking the current build crashed.
+                // Surface the crash on the launch right after it happened, then
+                // clear it — a crash report from an older launch must not keep
+                // announcing itself on every startup (it makes a working build
+                // look broken, and a stale report from a fixed bug confuses).
                 if (text.contains(desktop.Build.DATE)) lastCrash = text.take(1600)
-                else file.delete()
+                file.delete()
             }
         }
         Thread.setDefaultUncaughtExceptionHandler { thread, t ->

@@ -231,7 +231,19 @@ class DetailScreenView(private val item: MediaItem) {
                             watchedAt = System.currentTimeMillis(),
                         )
                     )
-                    DesktopPlayer.play("${meta.title} — ${s.name}", s)
+                    // refresh: refetch the provider's stream list and relaunch
+                    // with a fresh URL — signed live links (chaturbate) expire
+                    // or get consumed within seconds, so a 403 is retried with a
+                    // brand-new link instead of an error dialog.
+                    DesktopPlayer.play(
+                        "${meta.title} — ${s.name}",
+                        s,
+                        refresh = {
+                            runCatching {
+                                kotlinx.coroutines.runBlocking { AppShell.app.repository.streamsFor(meta, selectedEpisode) }
+                            }.getOrNull()?.firstOrNull()
+                        },
+                    )
                 }
             }
             val open = Button("Browser").apply {
