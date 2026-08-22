@@ -568,10 +568,19 @@ object Http {
  */
 object DoH {
 
-    private val client = HttpClient.newBuilder()
-        .connectTimeout(Duration.ofSeconds(8))
-        .followRedirects(HttpClient.Redirect.NORMAL)
-        .build()
+    // Own OkHttp client on Conscrypt TLS. The JDK's java.net.http client runs
+    // on sun.security.ssl, whose class-init fails fatally on Windows
+    // (NoClassDefFoundError: SSLSessionImpl) once Conscrypt is installed — so
+    // even DNS-over-HTTPS must stay on Conscrypt. Uses the SYSTEM resolver,
+    // not [HikariDns] (that would recurse back into DoH).
+    private val client: OkHttpClient by lazy {
+        Http.applyConscryptTls(OkHttpClient.Builder())
+            .proxySelector(java.net.ProxySelector.getDefault())
+            .followRedirects(true)
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(8, TimeUnit.SECONDS)
+            .build()
+    }
 
     private val ENDPOINTS = listOf(
         "https://cloudflare-dns.com/dns-query",
@@ -588,26 +597,26 @@ object DoH {
         for (ep in ENDPOINTS) {
             try {
                 val url = "$ep?name=${URLEncoder.encode(host, StandardCharsets.UTF_8)}&type=A"
-                val req = HttpRequest.newBuilder(URI.create(url))
+                val req = Request.Builder().url(url)
                     .header("accept", "application/dns-json")
                     .header("User-Agent", Http.UA)
-                    .GET()
                     .build()
-                val resp = client.send(req, HttpResponse.BodyHandlers.ofString())
-                if (resp.statusCode() == 200) {
-                    val obj = org.json.JSONObject(resp.body())
-                    val answers = obj.optJSONArray("Answer")
-                    if (answers != null) {
-                        val ips = mutableListOf<InetAddress>()
-                        for (i in 0 until answers.length()) {
-                            val a = answers.optJSONObject(i) ?: continue
-                            if (a.optInt("type") == 1) {
-                                a.optString("data").takeIf { it.isNotBlank() }?.let { raw ->
-                                    runCatching { ips.add(InetAddress.getByName(raw)) }
+                client.newCall(req).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        val obj = org.json.JSONObject(resp.body?.string() ?: "")
+                        val answers = obj.optJSONArray("Answer")
+                        if (answers != null) {
+                            val ips = mutableListOf<InetAddress>()
+                            for (i in 0 until answers.length()) {
+                                val a = answers.optJSONObject(i) ?: continue
+                                if (a.optInt("type") == 1) {
+                                    a.optString("data").takeIf { it.isNotBlank() }?.let { raw ->
+                                        runCatching { ips.add(InetAddress.getByName(raw)) }
+                                    }
                                 }
                             }
+                            if (ips.isNotEmpty()) { addrs = ips; break }
                         }
-                        if (ips.isNotEmpty()) { addrs = ips; break }
                     }
                 }
             } catch (e: Exception) {

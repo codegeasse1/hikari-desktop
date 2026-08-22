@@ -111,11 +111,18 @@ class HikariApp : Application() {
     private fun installCrashHandler() {
         runCatching {
             val file = File(cacheDir, "crash.log")
-            if (file.exists()) lastCrash = file.readText().take(1600)
+            if (file.exists()) {
+                val text = file.readText()
+                // Only surface crashes from THIS build — a stale report from an
+                // older build (e.g. one with a bug that's since been fixed) just
+                // confuses the user into thinking the current build crashed.
+                if (text.contains(desktop.Build.DATE)) lastCrash = text.take(1600)
+                else file.delete()
+            }
         }
         Thread.setDefaultUncaughtExceptionHandler { thread, t ->
             runCatching {
-                val trace = "${t.javaClass.simpleName}: ${t.message}\n" +
+                val trace = "[${desktop.Build.DATE}] ${t.javaClass.simpleName}: ${t.message}\n" +
                     t.stackTrace.take(12).joinToString("\n") { "    at $it" }
                 File(cacheDir, "crash.log").writeText(trace)
                 lastCrash = trace
