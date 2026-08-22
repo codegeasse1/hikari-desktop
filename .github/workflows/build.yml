@@ -68,7 +68,7 @@ jobs:
             --icon packaging/hikari.ico \
             --java-options "-Dfile.encoding=UTF-8" \
             --java-options "-Djava.net.useSystemProxies=true" \
-            --app-version 0.1.0
+            --app-version "0.1.${{ github.run_number }}"
           ls -la "Hikari"
         shell: bash
 
@@ -124,13 +124,33 @@ jobs:
             --icon packaging/hikari.ico \
             --java-options "-Dfile.encoding=UTF-8" \
             --java-options "-Djava.net.useSystemProxies=true" \
-            --app-version 0.1.0 \
+            --app-version "0.1.${{ github.run_number }}" \
             --win-menu --win-dir-chooser
           EXE=$(ls -1 *.exe | head -n 1)
           echo "installer: $EXE"
           ls -la "$EXE"
         shell: bash
 
+
+      - name: Install & launch test (real WiX installer)
+        run: |
+          set +e
+          {
+            EXE=$(ls -1 *.exe | head -n 1)
+            echo "=== silent install of: $EXE ==="
+            "$EXE" /quiet /norestart
+            echo "install exit: $?"
+            sleep 10
+            echo "=== installed files (head) ==="
+            ls -la "C:/Program Files/Hikari/" 2>&1 | head -n 12
+            echo "=== launch installed app (18s) ==="
+            "C:/Program Files/Hikari/Hikari.exe" >/dev/null 2>&1 &
+            sleep 18
+            tasklist | grep -iE 'hikari|javaw' || echo "(NO hikari/javaw process — INSTALL OR LAUNCH BROKEN)"
+            taskkill //F //IM Hikari.exe //IM javaw.exe >/dev/null 2>&1 || true
+          } > install-test.log 2>&1
+          cat install-test.log
+        shell: bash
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
@@ -139,6 +159,7 @@ jobs:
           path: |
             gradle-build.log
             diagnose.log
+            install-test.log
           if-no-files-found: ignore
 
       - name: Upload artifacts
