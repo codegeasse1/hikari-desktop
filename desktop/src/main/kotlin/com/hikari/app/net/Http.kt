@@ -297,9 +297,12 @@ object Http {
         // JSON escapes a JS-embedded URL commonly carries (before \\ → \\ so the
         // \uXXXX patterns still match).
         u = u
-            .replace("\\u002f", "/").replace("\\u0026", "&")
-            .replace("\\u003d", "=").replace("\\u003f", "?")
-            .replace("\\u0025", "%").replace("\\u0023", "#")
+            // Decode EVERY \uXXXX escape (chaturbate's dossier escapes quotes
+            // as \u0022 and may escape any other char too) BEFORE collapsing
+            // the JSON backslash escapes.
+            .replace(Regex("\\\\u([0-9a-fA-F]{4})")) { m ->
+                m.groupValues[1].toInt(16).toChar().toString()
+            }
             .replace("\\/", "/")
             .replace("\\\\", "\\")
             .replace("\\\"", "\"")
@@ -330,6 +333,17 @@ object Http {
                     it.all { c -> c.isLetterOrDigit() || c == '.' || c == '-' }
             } ?: "edge-hls.chaturbate.com"
             return "https://$host/edge-hls/v1/edge/streams/$path"
+        }
+        // Last resort: a scheme-less URL that still clearly is a chaturbate edge
+        // stream (whatever junk precedes it) — rebuild it on the edge host.
+        val edgeMatch = Regex("v1[\\\\/]+edge[\\\\/]+streams[\\\\/]+(.+)$").find(norm)
+        if (edgeMatch != null) {
+            val hostPart = norm.substringBefore(edgeMatch.value).trim().trimStart('/')
+            val host = hostPart.takeIf {
+                it.isNotBlank() && it.contains('.') &&
+                    it.all { c -> c.isLetterOrDigit() || c == '.' || c == '-' }
+            } ?: "edge-hls.chaturbate.com"
+            return "https://$host/edge-hls/" + edgeMatch.value
         }
         return u
     }
@@ -373,7 +387,20 @@ object Http {
                 .header("Range", "bytes=0-2047")
             headers.forEach { (k, v) -> if (k.isNotBlank() && v.isNotBlank()) b.header(k, v) }
             pc.newCall(b.build()).execute().use { resp ->
-                if (!resp.isSuccessful) return StreamProbe.UNKNOWN
+                if (!resp.isSuccessful) {
+                    // A 403 with an HTML body is a WAF/geo/login page — classify
+                    // it so the player shows a clean message instead of raw
+                    // [curl]/[ytdl_hook] error noise.
+                    if (resp.code == 403) {
+                        val body = runCatching { resp.body?.bytes() }.getOrNull() ?: ByteArray(0)
+                        val head = String(body, 0, minOf(body.size, 2048), Charsets.UTF_8)
+                            .trimStart('\uFEFF', ' ', '\t', '\r', '\n')
+                        if (head.startsWith("<!doctype") || head.startsWith("<html") || head.startsWith("<head")) {
+                            return StreamProbe.HTML
+                        }
+                    }
+                    return StreamProbe.UNKNOWN
+                }
                 val ct = (resp.header("Content-Type") ?: "").lowercase()
                 if (ct.contains("mpegurl") || ct.contains("hls")) return StreamProbe.HLS
                 if (ct.contains("dash+xml") || ct.endsWith("/mpd")) return StreamProbe.DASH
