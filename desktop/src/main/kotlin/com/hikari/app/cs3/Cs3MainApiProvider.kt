@@ -248,21 +248,28 @@ class Cs3MainApiProvider(override val config: ProviderConfig) : ContentProvider 
                     a.getMainPage(page, MainPageRequest(ref.name, ref.id, false))
                 } catch (e2: Throwable) {
                     if (e2 is CancellationException) throw e2
-                    catalogErrors[config.id] = fullCause(e2)
+                    val reason = fullCause(e2)
+                    catalogErrors[config.id] = reason
+                    com.hikari.app.util.LiveLogs.error("catalog/${config.name}", "getMainPage failed for '${ref.name}': $reason", e2)
                     return@withContext emptyList()
                 }
             }
             if (resp == null) {
-                catalogErrors[config.id] = "getMainPage returned null for ${ref.id}"
+                val reason = "getMainPage returned null for ${ref.id}"
+                catalogErrors[config.id] = reason
+                com.hikari.app.util.LiveLogs.error("catalog/${config.name}", reason)
                 return@withContext emptyList()
             }
             val items = resp.items.orEmpty().flatMap { row ->
                 row.list.orEmpty().mapNotNull { it.toMediaItem() }
             }
             if (items.isEmpty()) {
-                catalogErrors[config.id] = "Page fetched but no items parsed from ${ref.id}"
+                val reason = "Page fetched (${resp.items.size} row(s)) but no items parsed from ${ref.id}"
+                catalogErrors[config.id] = reason
+                com.hikari.app.util.LiveLogs.warn("catalog/${config.name}", reason)
             } else {
                 catalogErrors.remove(config.id)
+                com.hikari.app.util.LiveLogs.log("catalog/${config.name}", "Got ${items.size} item(s) for '${ref.name}'")
             }
             items
         }

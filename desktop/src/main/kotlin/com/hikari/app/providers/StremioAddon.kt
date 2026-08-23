@@ -180,10 +180,21 @@ class StremioAddon(override val config: ProviderConfig) : ContentProvider {
     override suspend fun getCatalog(ref: CatalogRef, page: Int): List<MediaItem> {
         val extra = if (page > 1) "skip=${(page - 1) * 100}" else null
         val url = resUrl("catalog", typeSegment(ref.rawType, ref.type), ref.id, extra)
-        val items = parseMetas(getJson(url), ref.rawType)
+        val json = try {
+            getJson(url)
+        } catch (t: kotlinx.coroutines.CancellationException) {
+            throw t
+        } catch (t: Throwable) {
+            catalogErrors[config.id] =
+                "Catalog '${ref.name}' request failed: ${t.javaClass.simpleName}: ${t.message}"
+            com.hikari.app.util.LiveLogs.error("catalog/${config.name}", "Request failed for ${url.take(160)}…", t)
+            return emptyList()
+        }
+        val items = parseMetas(json, ref.rawType)
         if (items.isEmpty()) {
             catalogErrors[config.id] =
                 "Catalog '${ref.name}' returned no items from ${url.take(140)}…"
+            com.hikari.app.util.LiveLogs.warn("catalog/${config.name}", "No items parsed from ${url.take(160)}…")
         } else {
             catalogErrors.remove(config.id)
         }

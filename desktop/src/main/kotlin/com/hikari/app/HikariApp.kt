@@ -65,6 +65,7 @@ class HikariApp : Application() {
 
     fun init() {
         instance = this
+        com.hikari.app.util.LiveLogs.install()
         installCrashHandler()
         initCloudStream(this)
         store = AppStore(filesDir)

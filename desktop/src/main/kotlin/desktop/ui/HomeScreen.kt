@@ -29,6 +29,14 @@ class HomeScreenView {
     private val loading = ProgressBar(-1.0)
     private val errorLabel = Theme.label("", dim = true)
     private val statusLabel = Theme.label("", size = 12.5, dim = true)
+    private val logsLabel = Theme.label("", size = 11.0, dim = true).apply {
+        style = "-fx-font-family: 'Consolas', monospace;"
+        isWrapText = true
+    }
+    private val logsScroll = ScrollPane(logsLabel).apply { prefHeight = 240.0; isFitToWidth = true }
+    private val logsBtn = Button("Logs").apply {
+        styleClass.add("btn"); isFocusTraversable = false
+    }
 
     private var loadJob: Job? = null
 
@@ -37,7 +45,25 @@ class HomeScreenView {
             VBox.setVgrow(this, Priority.ALWAYS)
             isFitToWidth = true
             styleClass.add("scroll-pane")
-        })
+        }, logsScroll)
+        logsScroll.isVisible = false
+        logsBtn.setOnAction {
+            logsScroll.isVisible = !logsScroll.isVisible
+            if (logsScroll.isVisible) refreshLogs()
+        }
+        refreshLogsButton()
+    }
+
+    private fun refreshLogsButton() {
+        val newLines = com.hikari.app.util.LiveLogs.recentText()
+        logsBtn.text = "Logs (${newLines.count { it == '\n' } + 1})"
+    }
+
+    private fun refreshLogs() {
+        refreshLogsButton()
+        logsLabel.text = com.hikari.app.util.LiveLogs.recentText(400)
+        if (logsLabel.text.isBlank()) logsLabel.text = "(no logs captured yet — load a catalog first)"
+        logsScroll.vvalue = 1.0
     }
 
     private fun header(): HBox {
@@ -51,7 +77,7 @@ class HomeScreenView {
             setOnAction { load(force = true) }
         }
         val refresh = Button("Refresh").apply { styleClass.add("btn"); setOnAction { load(force = true) } }
-        return HBox(14.0, title, providerBox, refresh).apply {
+        return HBox(14.0, title, providerBox, refresh, logsBtn).apply {
             alignment = Pos.CENTER_LEFT
         }
     }
@@ -148,10 +174,13 @@ class HomeScreenView {
             val who = chosen?.takeIf { it != "All providers" }
                 ?: statuses.firstOrNull { it.id == filterId }?.name
             statusLabel.text = (if (who != null) "'$who' returned no catalog rows" else "No catalog rows loaded") +
-                " — the addon may be offline, or block this network."
+                " — see the logs below for the real reason."
+            logsScroll.isVisible = true
+            refreshLogs()
         } else {
             errorLabel.text = ""
         }
+        refreshLogsButton()
         if (rows.isEmpty() && rowsBox.children.isEmpty()) {
             rowsBox.children.add(Theme.label("Nothing loaded yet — add extensions or a Stremio addon.", dim = true))
         }

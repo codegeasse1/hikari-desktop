@@ -35,14 +35,36 @@ class WebViewFallbackInterceptor : Interceptor {
             if (!FxWebView.isChallengeHtml(String(peek, Charsets.UTF_8))) return response
             // A real browser can usually beat the challenge — render the page.
             val url = request.url.toString()
+            com.hikari.app.util.LiveLogs.warn(
+                "waf",
+                "Challenge/bot-check page (HTTP $code, ${ct}, ${peek.size} bytes) for $url — re-fetching in a real browser…"
+            )
             val rendered = runCatching {
                 Fx.runBlock {
                     runCatching { FxWebView.setUserAgent(HikariApp.instance.effectiveWebViewUa()) }
                 }
                 FxWebView.renderedHtml(url, 30_000)
             }.getOrNull()
-            if (rendered.isNullOrBlank()) return response // hand back the challenge page
+            if (rendered.isNullOrBlank()) {
+                response.close()
+                com.hikari.app.util.LiveLogs.error(
+                    "waf",
+                    "Browser pass for $url returned nothing — serving the raw challenge page back to the plugin (catalog may be empty)."
+                )
+                return Response.Builder()
+                    .request(request)
+                    .protocol(response.protocol)
+                    .code(code)
+                    .message(response.message)
+                    .header("Content-Type", "text/html; charset=utf-8")
+                    .body(String(peek, Charsets.UTF_8).toResponseBody("text/html; charset=utf-8".toMediaType()))
+                    .build()
+            }
             response.close()
+            com.hikari.app.util.LiveLogs.log(
+                "waf",
+                "Browser passed the check for $url — serving ${rendered.length} rendered bytes back to the plugin."
+            )
             return Response.Builder()
                 .request(request)
                 .protocol(response.protocol)
