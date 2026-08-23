@@ -45,9 +45,30 @@ class HikariProviderAdapter(override val config: ProviderConfig) : ContentProvid
             }
         }
 
-    override suspend fun catalogs(): List<CatalogRef> =
-        provider?.catalogs()?.map { CatalogRef(config.id, it.type.toApp(), it.id, it.name, it.rawType) }
-            ?: emptyList()
+    override suspend fun catalogs(): List<CatalogRef> {
+        val p = provider
+        if (p == null) {
+            val err = com.hikari.app.hiki.HikariPluginManager.lastError
+                ?: com.hikari.app.cs3.Cs3PluginManager.lastError
+            com.hikari.app.util.LiveLogs.error("catalog/${config.name}",
+                "HIKARI provider did not resolve — no catalog rows. ${err ?: "no error captured"}")
+            return emptyList()
+        }
+        return try {
+            p.catalogs().also { list ->
+                if (list.isEmpty()) {
+                    val dexErr = com.hikari.app.cs3.DexJar.lastError
+                    com.hikari.app.util.LiveLogs.warn("catalog/${config.name}",
+                        "HIKARI provider resolved but catalogs() returned 0 rows (url=${config.url})" +
+                            if (dexErr != null) " | dex: $dexErr" else "")
+                }
+            }.map { CatalogRef(config.id, it.type.toApp(), it.id, it.name, it.rawType) }
+        } catch (t: Throwable) {
+            com.hikari.app.util.LiveLogs.error("catalog/${config.name}",
+                "catalogs() threw: ${t.javaClass.simpleName}: ${t.message}", t)
+            emptyList()
+        }
+    }
 
     override suspend fun getCatalog(ref: CatalogRef, page: Int): List<MediaItem> =
         provider?.getCatalog(HikariCatalog(ref.id, ref.name, ref.type.toExt(), ref.rawType), page)
