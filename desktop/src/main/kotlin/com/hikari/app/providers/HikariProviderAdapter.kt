@@ -14,6 +14,8 @@ import com.hikari.ext.HikariMedia
 import com.hikari.ext.HikariMediaType
 import com.hikari.ext.HikariProvider
 import com.hikari.ext.HikariStream
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * Adapts a [HikariProvider] (bundled or loaded from a .hiki jar) to the app's
@@ -45,16 +47,16 @@ class HikariProviderAdapter(override val config: ProviderConfig) : ContentProvid
             }
         }
 
-    override suspend fun catalogs(): List<CatalogRef> {
+    override suspend fun catalogs(): List<CatalogRef> = withContext(Dispatchers.IO) {
         val p = provider
         if (p == null) {
             val err = com.hikari.app.hiki.HikariPluginManager.lastError
                 ?: com.hikari.app.cs3.Cs3PluginManager.lastError
             com.hikari.app.util.LiveLogs.error("catalog/${config.name}",
                 "HIKARI provider did not resolve — no catalog rows. ${err ?: "no error captured"}")
-            return emptyList()
+            return@withContext emptyList()
         }
-        return try {
+        try {
             p.catalogs().also { list ->
                 if (list.isEmpty()) {
                     val dexErr = com.hikari.app.cs3.DexJar.lastError
