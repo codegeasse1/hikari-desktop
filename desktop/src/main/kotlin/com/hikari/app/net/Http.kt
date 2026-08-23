@@ -181,7 +181,7 @@ object Http {
 
     /** Mirrors of official repos on a CDN that works even where GitHub is slow
      *  or blocked. Regenerate whenever the source repo.json changes. */
-    private const val HIKARI_REPO_MIRROR = "https://user.uploads.dev/file/8db9d049ca3e67e8ac4a607e0a4a6bc3.json"
+    private const val HIKARI_REPO_MIRROR = "https://user.uploads.dev/file/160d14f91512b838449f155070cb0c58.json"
     private const val CLOUDSTREAM_REPO_MIRROR = "https://user.uploads.dev/file/42f88079718447227d8bf7ccc5a5e286.txt"
 
     /** Hard cap for a repo fetch so a slow/blocked network fails with a clear
@@ -201,10 +201,18 @@ object Http {
         val candidates = repoJsonCandidates(raw)
         val ordered = candidates.filter { it.contains("repo-desktop.json") } +
             candidates.filter { !it.contains("repo-desktop.json") }
-        // Use the repo's own GitHub URLs as-is. GitHub (github.com + raw +
-        // jsDelivr + githack) is the normal, always-current source; no
-        // redirection to external mirrors.
-        val list = ordered
+        val list = if (ordered.any { it.contains("codegeasse1/hikari-extensions") }) {
+            // The official repo resolves to the CDN mirror FIRST: the mirror
+            // serves every plugin's jar from user.uploads.dev, which works even
+            // on networks where GitHub (github.com + raw + jsDelivr) is blocked
+            // or refused by the app's HTTP stack. Regenerate the mirror whenever
+            // the official repo.json changes.
+            listOf(HIKARI_REPO_MIRROR) + ordered
+        } else if (ordered.any { it.contains("codegeasse1/codegeasse-cloudstream-repos") }) {
+            listOf(CLOUDSTREAM_REPO_MIRROR) + ordered
+        } else {
+            ordered
+        }
         val deadline = System.currentTimeMillis() + REPO_FETCH_DEADLINE_MS
         var last: Throwable = Exception("No candidate URL served a valid repo.json")
         var tried = 0
@@ -478,25 +486,34 @@ object Http {
 
     private val GITHUB_RAW =
         Regex("^https://raw\\.githubusercontent\\.com/([^/]+)/([^/]+)/([^/]+)/(.+)$")
+    private val GITHUB_RAW_B = Regex("^https://github\\.com/([^/]+)/([^/]+)/raw/([^/]+)/(.+)$")
 
     /**
-     * URL + a jsDelivr CDN mirror (global CDN, reachable where GitHub raw often isn't),
-     * each retried once. Returns the first success or the last failure.
+     * Download sources for a URL. For GitHub-hosted files the global jsDelivr CDN is
+     * tried FIRST: it mirrors a repo's files across a worldwide CDN and — unlike
+     * raw.githubusercontent.com, which rate-limits unauthenticated desktop HTTP clients
+     * to ~60 req/hr/IP — jsDelivr returns the file reliably on every request. The raw
+     * URL itself and raw.githack stay as always-available fallbacks.
      */
     private fun urlVariants(url: String): List<String> {
-        val variants = mutableListOf(url)
+        val jsdelivr = mutableListOf<String>()
+        val rest = mutableListOf<String>()
         GITHUB_RAW.matchEntire(url)?.let { m ->
-            val user = m.groupValues[1]
-            val repo = m.groupValues[2]
-            val branch = m.groupValues[3]
-            val path = m.groupValues[4]
-            variants.add("https://cdn.jsdelivr.net/gh/$user/$repo@$branch/$path")
-            // raw.githack mirrors raw.githubusercontent 1:1 on a different CDN —
-            // a useful last resort when GitHub raw is blocked or refusing the
-            // app's HTTP stack.
-            variants.add("https://raw.githack.com/$user/$repo/$branch/$path")
+            val (u, r, b, p) = m.destructured
+            jsdelivr.add("https://cdn.jsdelivr.net/gh/$u/$r@$b/$p")
+            rest.add("https://raw.githack.com/$u/$r/$b/$p")
         }
-        return variants
+        GITHUB_RAW_B.matchEntire(url)?.let { m ->
+            val (u, r, b, p) = m.destructured
+            jsdelivr.add("https://cdn.jsdelivr.net/gh/$u/$r@$b/$p")
+            rest.add("https://raw.githubusercontent.com/$u/$r/$b/$p")
+        }
+        val all = linkedSetOf<String>().apply {
+            addAll(jsdelivr)
+            add(url)
+            addAll(rest)
+        }
+        return all.toList()
     }
 
     fun fetchStringRobust(url: String, headers: Map<String, String> = emptyMap()): Result<String> {
