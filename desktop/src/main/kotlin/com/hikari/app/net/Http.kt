@@ -181,7 +181,7 @@ object Http {
 
     /** Mirrors of official repos on a CDN that works even where GitHub is slow
      *  or blocked. Regenerate whenever the source repo.json changes. */
-    private const val HIKARI_REPO_MIRROR = "https://user.uploads.dev/file/160d14f91512b838449f155070cb0c58.json"
+    private const val HIKARI_REPO_MIRROR = "https://user.uploads.dev/file/8db9d049ca3e67e8ac4a607e0a4a6bc3.json"
     private const val CLOUDSTREAM_REPO_MIRROR = "https://user.uploads.dev/file/42f88079718447227d8bf7ccc5a5e286.txt"
 
     /** Hard cap for a repo fetch so a slow/blocked network fails with a clear
