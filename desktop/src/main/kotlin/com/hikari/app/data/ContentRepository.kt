@@ -82,7 +82,7 @@ class ContentRepository(private val manager: ProviderManager) {
                 async {
                     cancellableCatching {
                         providerGate.withPermit {
-                            withTimeoutOrNull(45_000) {
+                            withTimeoutOrNull(180_000) {
                                 val catalogs = p.catalogs()
                                     .distinctBy { it.type to it.id }
                                     .take(catalogsLimit)
@@ -96,7 +96,7 @@ class ContentRepository(private val manager: ProviderManager) {
                                                     onRow(cached.row)
                                                     return@async cached.row
                                                 }
-                                                val items = withTimeoutOrNull(25_000) {
+                                                val items = withTimeoutOrNull(120_000) {
                                                     cancellableCatching { p.getCatalog(c, 1) }.getOrDefault(emptyList())
                                                 }.orEmpty().distinctBy { it.uniqueId }.take(itemsLimit)
                                                 if (items.isEmpty()) null
