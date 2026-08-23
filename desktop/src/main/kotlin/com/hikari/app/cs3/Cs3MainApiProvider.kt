@@ -215,12 +215,42 @@ class Cs3MainApiProvider(override val config: ProviderConfig) : ContentProvider 
     private val loadCache = ConcurrentHashMap<String, LoadResponse>()
 
     override suspend fun catalogs(): List<CatalogRef> = withContext(Dispatchers.IO) {
+        val a = try {
+            api
+        } catch (t: Throwable) {
+            com.hikari.app.util.LiveLogs.error("catalog/${config.name}",
+                "Resolving the provider api threw: ${t.javaClass.simpleName}: ${t.message}", t)
+            return@withContext emptyList()
+        }
+        if (a == null) {
+            val reason = apiFailureReason()
+            com.hikari.app.util.LiveLogs.error("catalog/${config.name}",
+                "catalogs() got a NULL api — cannot discover catalogue rows. $reason")
+            return@withContext emptyList()
+        }
+        val mp = try {
+            a.mainPage
+        } catch (t: Throwable) {
+            com.hikari.app.util.LiveLogs.error("catalog/${config.name}",
+                "Reading .mainPage threw: ${t.javaClass.simpleName}: ${t.message}", t)
+            emptyList()
+        } ?: run {
+            com.hikari.app.util.LiveLogs.warn("catalog/${config.name}", ".mainPage is null for this provider (mainUrl=${a.mainUrl})")
+            emptyList()
+        }
+        if (mp.isEmpty()) {
+            com.hikari.app.util.LiveLogs.warn("catalog/${config.name}",
+                "mainPage is EMPTY (0 rows) for mainUrl=${a.mainUrl} — so there are no catalog rows to fetch.")
+        } else {
+            com.hikari.app.util.LiveLogs.log("catalog/${config.name}",
+                "mainPage has ${mp.size} row(s), first='${mp.firstOrNull()?.name}' data='${mp.firstOrNull()?.data}'")
+        }
         // CloudStream's MainPageData field order is (name, data, horizontalImages),
         // so use the fields explicitly — destructuring (url, label) would swap them
         // and getMainPage would then try to fetch the catalog's *name* as the URL.
-        api?.mainPage?.map { page ->
+        mp.map { page ->
             CatalogRef(config.id, catalogType(), page.data, page.name.ifBlank { page.data })
-        } ?: emptyList()
+        }
     }
 
     private fun catalogType(): MediaType {
