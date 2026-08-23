@@ -29,9 +29,44 @@ object DesktopPlayer {
 
     private var proc: Process? = null
 
+    /** Non-modal "Player is loading…" indicator shown from Play-click until the
+     *  mpv window is up (or an error/fallback dialog takes over). Without it
+     *  Play appeared to do nothing for the ~1-3s mpv takes to launch. */
+    private var loadingStage: javafx.stage.Stage? = null
+
     /** True once the current launch has shown its failure dialog (mpv error or
      *  stream-probe fallback), so the two can't double-popup. Reset per launch. */
     @Volatile private var dialogShown = false
+
+    private fun closeLoading() {
+        Fx.run {
+            runCatching { loadingStage?.close() }
+            loadingStage = null
+        }
+    }
+
+    private fun showLoading(title: String) {
+        Fx.run {
+            runCatching { loadingStage?.close() }
+            val s = javafx.stage.Stage()
+            val spin = javafx.scene.control.ProgressBar(-1.0)
+            spin.prefWidth = 220.0
+            val lbl = Label("Player is loading…").apply {
+                style = "-fx-text-fill: white; -fx-font-size: 15px;"
+                isWrapText = true
+            }
+            val box = javafx.scene.layout.VBox(14.0, spin, lbl).apply {
+                alignment = Pos.CENTER
+                padding = Insets(26.0)
+            }
+            box.style = "-fx-background-color: ${Theme.BG_ELEV};"
+            s.scene = Theme.scene(box)
+            s.width = 300.0
+            s.height = 150.0
+            loadingStage = s
+            s.show()
+        }
+    }
 
     /** Signed, short-lived stream URLs (chaturbate's `mmcdn.com`/`edge-hls`
      *  LL-HLS links) — their token is single-use and expires in seconds, so:
@@ -83,6 +118,7 @@ object DesktopPlayer {
 
     private fun launchMpv(title: String, stream: StreamSource, refresh: (() -> StreamSource?)?, attemptsLeft: Int) {
         Fx.run {
+            showLoading(title)
             val mpv = findMpv()
             if (mpv == null) {
                 val url = com.hikari.app.net.Http.sanitizeStreamUrl(stream.url)
@@ -140,6 +176,10 @@ object DesktopPlayer {
             }
             proc?.let { runCatching { it.destroy() } }
             proc = p
+            // mpv is up — drop the loading indicator so it doesn't linger over
+            // the playing video.
+            Thread({ try { Thread.sleep(2500) } catch (e: InterruptedException) {}; closeLoading() }, "hikari-loading-close")
+                .apply { isDaemon = true; start() }
             // Only the FIRST explanation per launch shows: the mpv error path and
             // the stream probe both try to explain a dead player, never both.
             dialogShown = false
@@ -218,16 +258,16 @@ object DesktopPlayer {
                                         title, url,
                                         "This stream uses DASH, which the bundled player can't play yet.",
                                     )
-                                    com.hikari.app.net.Http.StreamProbe.HTML -> showBrowserFallback(
-                                        title, url,
-                                        "That source's server returned a web page instead of a video (login or anti-bot page). Try another source, or open it in your browser.",
-                                        tryAnyway = { launchMpv(title, stream, refresh, attemptsLeft) },
-                                    )
-                                    com.hikari.app.net.Http.StreamProbe.JSON -> showBrowserFallback(
-                                        title, url,
-                                        "That source's server returned JSON data instead of a video. Try another source.",
-                                        tryAnyway = { launchMpv(title, stream, refresh, attemptsLeft) },
-                                    )
+                                    com.hikari.app.net.Http.StreamProbe.HTML ->
+                                        // A web page usually means the CDN/embed host served an
+                                        // anti-bot or JS-built player page — which plays fine in a
+                                        // real browser. Render it in the embedded WebEngine, capture
+                                        // the ACTUAL media URL the page produces, and hand that to
+                                        // mpv. Only give up (with the browser path) if the page
+                                        // yields nothing playable.
+                                        resolveAndPlay(title, url, stream, refresh, attemptsLeft)
+                                    com.hikari.app.net.Http.StreamProbe.JSON ->
+                                        resolveAndPlay(title, url, stream, refresh, attemptsLeft)
                                     else -> {}
                                 }
                             }
@@ -237,6 +277,48 @@ object DesktopPlayer {
                 ).apply { isDaemon = true; start() }
             }
         }
+    }
+
+    /**
+     * The source URL served a web page (or JSON) — an embed/anti-bot host
+     * that plays fine in a browser but dies in the direct player. This runs off
+     * the FX thread: render the page in the embedded WebEngine so its JS runs,
+     * capture the real media URL it produces, and relaunch mpv with THAT. If
+     * the page yields nothing playable, fall back to the browser dialog.
+     */
+    private fun resolveAndPlay(title: String, url: String, stream: StreamSource, refresh: (() -> StreamSource?)?, attemptsLeft: Int) {
+        Thread(
+            {
+                val resolved = runCatching { desktop.web.FxWebView.resolveStreamUrl(url, 30_000) }.getOrNull()
+                Fx.run {
+                    if (dialogShown) return@run
+                    closeLoading()
+                    if (resolved != null && resolved.url.isNotBlank()) {
+                        val merged = mergeHeaders(stream.headers, resolved.cookie)
+                        launchMpv(title, stream.copy(url = resolved.url, headers = merged), refresh, attemptsLeft)
+                    } else {
+                        showBrowserFallback(
+                            title, url,
+                            "That source's server returned a web page instead of a video, and nothing playable could be extracted from it. Try another source, or open it in your browser.",
+                            tryAnyway = { launchMpv(title, stream, refresh, attemptsLeft) },
+                        )
+                    }
+                }
+            },
+            "hikari-resolve",
+        ).apply { isDaemon = true; start() }
+    }
+
+    /** Merges any cookies the player page set into the stream headers, so the
+     *  player re-fetching the resolved manifest sends the session cookie the
+     *  CDN issued to the browser. */
+    private fun mergeHeaders(base: Map<String, String>, cookie: String): Map<String, String> {
+        val merged = HashMap(base)
+        if (cookie.isNotBlank()) {
+            val existing = merged["Cookie"].orEmpty()
+            merged["Cookie"] = if (existing.isBlank()) cookie else "$existing; $cookie"
+        }
+        return merged
     }
 
     /** `app/mpv/mpv.exe` inside the installed app (jpackage layout), with a
@@ -265,6 +347,7 @@ object DesktopPlayer {
     }
 
     private fun showBrowserFallback(title: String, url: String, reason: String? = null, tryAnyway: (() -> Unit)? = null, retry: (() -> Unit)? = null) {
+        closeLoading()
         val stage = Stage()
         stage.title = title
         val label = Label(reason?.takeIf { it.isNotBlank() } ?: "Open it in your browser instead?").apply {

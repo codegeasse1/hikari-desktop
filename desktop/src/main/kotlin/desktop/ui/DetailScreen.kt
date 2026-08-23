@@ -104,7 +104,7 @@ class DetailScreenView(private val item: MediaItem) {
             )
         }
         val overview = if (!meta.overview.isNullOrBlank()) {
-            Theme.label(meta.overview, size = 14.0).apply { isWrapText = true }
+            Theme.label(htmlToPlain(meta.overview), size = 14.0).apply { isWrapText = true }
         } else Label()
         streamsBox.children.clear()
         streamsBox.children.add(Theme.label("Loading sources…", dim = true))
@@ -131,6 +131,12 @@ class DetailScreenView(private val item: MediaItem) {
     }
 
     private fun renderEpisodes(eps: List<Episode>) {
+        // One episode may be returned under both its raw id and a rewritten
+        // canonical url (and some providers emit the same episode twice) — show
+        // each unique episode only once.
+        val unique = linkedMapOf<String?, Episode>()
+        eps.forEach { unique[it.id ?: it.name] = it }
+        if (unique.size < eps.size) renderEpisodes(unique.values.toList())
         val title = Theme.label("Episodes", size = 17.0, bold = true)
         val section = VBox(10.0, title)
         val group = 30
@@ -163,15 +169,16 @@ class DetailScreenView(private val item: MediaItem) {
         body.children.add(1, section)
     }
 
-    private fun buildChipScroller(eps: List<Episode>, start: Int, end: Int): ScrollPane {
-        val box = HBox(8.0).apply {
-            alignment = Pos.CENTER_LEFT
-            styleClass.add("list-row")
+    private fun buildChipScroller(eps: List<Episode>, start: Int, end: Int): VBox {
+        val box = VBox(6.0).apply {
+            styleClass.add("episodes-column")
         }
         for (i in start until end) {
             val ep = eps[i]
-            val chip = Button(ep.name ?: "Ep ${ep.number}").apply {
+            val label = if (ep.name != null && ep.name.isNotBlank()) ep.name else "Episode ${ep.number}"
+            val chip = Button(label).apply {
                 styleClass.add("episode-chip")
+                maxWidth = Double.MAX_VALUE
                 if (selectedEpisode?.id == ep.id) styleClass.add("episode-chip-selected")
                 userData = ep
                 setOnAction {
@@ -183,13 +190,21 @@ class DetailScreenView(private val item: MediaItem) {
             }
             box.children.add(chip)
         }
-        return ScrollPane(box).apply {
-            isFitToHeight = true
-            hbarPolicy = ScrollPane.ScrollBarPolicy.AS_NEEDED
-            vbarPolicy = ScrollPane.ScrollBarPolicy.NEVER
-            styleClass.add("scroll-pane")
-        }
+        return box
     }
+
+    private fun htmlToPlain(html: String): String = html
+        .replace(Regex("<br\\s*/?>", RegexOption.IGNORE_CASE), "\n")
+        .replace(Regex("</?[a-zA-Z][^>]*>"), "")
+        // decode the handful of common entities the sources emit
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
+        .replace(Regex("\\s+"), " ")
+        .trim()
 
     private fun loadStreams(meta: MediaItem) {
         Fx.requireFx()

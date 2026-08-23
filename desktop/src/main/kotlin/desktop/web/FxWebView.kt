@@ -276,6 +276,38 @@ object FxWebView {
         }.getOrDefault(Capture())
     }
 
+    /** A playable media URL extracted from a rendered page, plus any cookies
+     *  the page set (many player/embed hosts require the session cookie when the
+     *  player fetches the manifest back). */
+    data class StreamResolved(val url: String, val cookie: String = "")
+
+    /**
+     * A source URL that returned a WEB PAGE instead of video (a Cloudflare /
+     * anti-bot page, or an HTML embed player) plays fine in a real browser
+     * but dies in the direct player. Load the page in the embedded WebEngine
+     * — a real browser that runs the page's JS, passes the challenge, and lets
+     * the player build its HLS/manifest — then capture the ACTUAL media URL
+     * the page produces (a `<video src>`, a fetch/XHR of an .m3u8/.mpd, a
+     * manifest in the DOM) and hand THAT to the player. Returns the first
+     * solid candidate (HLS preferred, then DASH, then a direct video). Null
+     * if the page produced nothing playable.
+     */
+    fun resolveStreamUrl(url: String, timeoutMs: Long = 30_000): StreamResolved? = try {
+        val cap = resolve(url, Regex(".*"), emptyList(), null, timeoutMs)
+        val scored = cap.requests
+            .filter { it.url.startsWith("http") }
+            .sortedWith(compareBy(
+                { if (it.url.contains(".m3u8") || it.url.contains("mpegurl")) 0
+                   else if (it.url.contains(".mpd")) 1
+                   else if (it.url.contains(".mp4")) 2
+                   else if (it.url.contains("video")) 3 else 4 },
+                { if (it.method == "video") 0 else if (it.method == "fetch") 1 else 2 },
+            ))
+        scored.firstOrNull()?.let { StreamResolved(it.url, cap.cookie) }
+    } catch (t: Throwable) {
+        null
+    }
+
     private fun looksLikeChallengePage(html: String): Boolean {
         val probe = html.take(40_000)
         return CHALLENGE_MARKERS.any { probe.contains(it, ignoreCase = true) }

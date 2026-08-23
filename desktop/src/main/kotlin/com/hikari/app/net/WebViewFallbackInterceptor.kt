@@ -22,7 +22,13 @@ class WebViewFallbackInterceptor : Interceptor {
         val request = chain.request()
         val response = chain.proceed(request)
         try {
-            if (response.code != 200) return response
+            // WAFs answer with statuses other than 200 too — a 200
+            // "Just a moment" page, or a 401/403/429/502/503 bot-check —
+            // every one of those is an HTML page the plugin can't parse into a
+            // catalog. Any HTML challenge body is re-fetched in a real browser.
+            val code = response.code
+            val challengeStatus = code == 200 || code == 401 || code == 403 || code == 429 || code == 502 || code == 503
+            if (!challengeStatus) return response
             val ct = (response.header("Content-Type") ?: "").lowercase()
             if (!ct.contains("html")) return response
             val peek = response.peekBody(200 * 1024).bytes()
