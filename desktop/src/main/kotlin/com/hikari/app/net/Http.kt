@@ -201,18 +201,10 @@ object Http {
         val candidates = repoJsonCandidates(raw)
         val ordered = candidates.filter { it.contains("repo-desktop.json") } +
             candidates.filter { !it.contains("repo-desktop.json") }
-        val list = if (ordered.any { it.contains("codegeasse1/hikari-extensions") }) {
-            // The official repo resolves to the CDN mirror FIRST: the mirror
-            // serves every plugin's jar from user.uploads.dev, which works even
-            // on networks where GitHub (github.com + raw + jsDelivr) is blocked
-            // or refused by the app's HTTP stack. Regenerate the mirror whenever
-            // the official repo.json changes.
-            listOf(HIKARI_REPO_MIRROR) + ordered
-        } else if (ordered.any { it.contains("codegeasse1/codegeasse-cloudstream-repos") }) {
-            listOf(CLOUDSTREAM_REPO_MIRROR) + ordered
-        } else {
-            ordered
-        }
+        // Use the repo's own GitHub URLs as-is. GitHub (github.com + raw +
+        // jsDelivr + githack) is the normal, always-current source; no
+        // redirection to external mirrors.
+        val list = ordered
         val deadline = System.currentTimeMillis() + REPO_FETCH_DEADLINE_MS
         var last: Throwable = Exception("No candidate URL served a valid repo.json")
         var tried = 0
