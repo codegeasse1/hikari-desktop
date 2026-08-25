@@ -230,7 +230,7 @@ object EmbeddedPlayer {
         val logDir = File(System.getProperty("user.home"), ".hikari").apply { mkdirs() }
         val playUrl = HlsRelay.urlFor(url, stream.headers)
         val ipcPipeName = "mpv-${System.currentTimeMillis()}-${(0..9999).random()}"
-        val ipcPath = "\\.\pipe\$ipcPipeName"
+        val ipcPath = """\\.\pipe\${ipcPipeName}"""
         val subFiles = downloadSubtitles(stream, logDir)
 
         logToFile("Launching mpv embedded: hwnd=$hwnd playUrl=$playUrl ipcPipe=$ipcPath")
