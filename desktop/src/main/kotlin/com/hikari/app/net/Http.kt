@@ -596,10 +596,13 @@ object Http {
      *
      *  1. jsDelivr — global CDN mirror of GitHub files (rate-limit-free),
      *  2. the original URL as typed,
-     *  3. the canonical raw URL (refs/heads forms normalized),
+     *  3. the canonical raw URL (refs/heads forms normalized, query stripped),
      *  4. statically.io — a second independent CDN,
      *  5. raw.githack.com — a third,
-     *  6. github.com's own /raw/ path (serves the bytes, follows redirects).
+     *  6. github.com's own /raw/ path (serves the bytes, follows redirects),
+     *  7-8. GitHub proxy frontdoors (ghfast.top, ghproxy.net) — different
+     *     hostnames that stream the same raw files, for networks that
+     *     SNI-block/TLS-break every GitHub-family host. Last resort only.
      *
      * Google Drive share links are rewritten to the direct-download form
      * first (otherwise the "file" downloaded is a virus-scan HTML page).
@@ -607,13 +610,23 @@ object Http {
     private fun urlVariants(url: String): List<String> {
         val base = normalizeDriveUrl(url.trim())
         val gh = parseGhTarget(base) ?: return listOf(base)
+        // Mirror URLs are built from the bare path — a query string that is
+        // fine on raw.githubusercontent ("…?token=x") makes CDN/proxy mirrors
+        // answer HTTP 400, so it never leaks into generated variants.
+        val p = gh.path.substringBefore('?')
+        val raw = "https://raw.githubusercontent.com/${gh.user}/${gh.repo}/${gh.ref}/$p"
         val out = linkedSetOf<String>()
-        out.add("https://cdn.jsdelivr.net/gh/${gh.user}/${gh.repo}@${gh.ref}/${gh.path}")
+        out.add("https://cdn.jsdelivr.net/gh/${gh.user}/${gh.repo}@${gh.ref}/$p")
         out.add(base)
-        out.add("https://raw.githubusercontent.com/${gh.user}/${gh.repo}/${gh.ref}/${gh.path}")
-        out.add("https://cdn.statically.io/gh/${gh.user}/${gh.repo}/${gh.ref}/${gh.path}")
-        out.add("https://raw.githack.com/${gh.user}/${gh.repo}/${gh.ref}/${gh.path}")
-        out.add("https://github.com/${gh.user}/${gh.repo}/raw/${gh.ref}/${gh.path}")
+        out.add(raw)
+        out.add("https://cdn.statically.io/gh/${gh.user}/${gh.repo}/${gh.ref}/$p")
+        out.add("https://raw.githack.com/${gh.user}/${gh.repo}/${gh.ref}/$p")
+        out.add("https://github.com/${gh.user}/${gh.repo}/raw/${gh.ref}/$p")
+        // Frontdoors for networks where TLS to every GitHub-family host dies
+        // (the classic "SSL protocol error" on raw + jsDelivr while normal
+        // sites still load). Different hostnames, same files.
+        out.add("https://ghfast.top/$raw")
+        out.add("https://ghproxy.net/$raw")
         return out.toList()
     }
 
@@ -642,6 +655,32 @@ object Http {
             .connectTimeout(20, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
             .build()
+    }
+
+    /** Final rescue client: Conscrypt TLS pinned to TLS 1.2, no proxy. Some
+     *  Windows machines/networks fail every TLS 1.3 handshake inside
+     *  Conscrypt ("Read error: Failure in SSL library, usually a protocol
+     *  error") while TLS 1.2 goes through — and a broken system proxy can
+     *  compound it. Still Conscrypt (never JDK TLS — see applyConscryptTls:
+     *  the JDK SSL stack's lazy class-init can kill the JVM once Conscrypt is
+     *  the default provider). */
+    private val rescueClient: OkHttpClient by lazy {
+        try {
+            val tls12 = okhttp3.ConnectionSpec.Builder(okhttp3.ConnectionSpec.MODERN_TLS)
+                .tlsVersions(okhttp3.TlsVersion.TLS_1_2)
+                .build()
+            applyConscryptTls(OkHttpClient.Builder())
+                .proxy(java.net.Proxy.NO_PROXY)
+                .connectionSpecs(listOf(tls12))
+                .dns(HikariDns)
+                .followRedirects(true)
+                .followSslRedirects(true)
+                .connectTimeout(20, TimeUnit.SECONDS)
+                .readTimeout(30, TimeUnit.SECONDS)
+                .build()
+        } catch (t: Throwable) {
+            noProxyClient
+        }
     }
 
     fun fetchStringRobust(url: String, headers: Map<String, String> = emptyMap()): Result<String> {
@@ -752,6 +791,22 @@ object Http {
                 }
                 onAttempt?.invoke(u, false, "$reason (no proxy)")
             }
+        }
+        // Final rescue: TLS 1.2 pinned + no proxy, ALWAYS tried — not gated
+        // on a proxy being configured, because the failure it fixes (TLS 1.3
+        // "SSL protocol error" inside Conscrypt) happens with no proxy at all.
+        for (u in variants) {
+            if (System.currentTimeMillis() > deadline) break
+            val reason = try {
+                downloadToReason(u, dest, headers, onProgress, rescueClient)
+            } catch (t: Throwable) {
+                humanMessage(t)
+            }
+            if (reason == null) {
+                onAttempt?.invoke(u, true, "(TLS 1.2)")
+                return true
+            }
+            onAttempt?.invoke(u, false, "$reason (TLS 1.2)")
         }
         System.err.println("downloadToRobust failed for $url")
         return false
