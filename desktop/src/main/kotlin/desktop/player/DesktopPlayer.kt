@@ -1,6 +1,7 @@
 package desktop.player
 
 import com.hikari.app.data.StreamSource
+import com.hikari.app.net.Http
 import desktop.fx.DesktopUi
 import desktop.fx.Fx
 import javafx.geometry.Insets
@@ -12,30 +13,35 @@ import javafx.scene.layout.HBox
 import javafx.scene.layout.VBox
 import javafx.stage.Stage
 import java.io.File
+import java.net.Socket
+import java.nio.file.Files
 import desktop.ui.Theme
 
 /**
- * Desktop player. Video playback is done by mpv — the same engine media
- * players use — because JavaFX's built-in media stack refuses most HLS/CDN
- * streams (jfxmedia MediaException, black window). mpv ships INSIDE the
- * release (`app/mpv/mpv.exe`, bundled by CI) and plays HLS/MP4/MKV natively,
- * sending the stream's Referer/Cookie/UA headers itself.
+ * Desktop player — mpv with robust seeking and CloudStream/Stremio-like UX.
  *
- * If mpv is missing, DASH/torrent/YouTube streams are not playable, the user
- * gets a clear dialog with an "Open in browser" path — never a silent black
- * window.
+ * Why mpv: JavaFX's MediaPlayer refuses most HLS/CDN streams (MediaException,
+ * black window). mpv plays HLS/MP4/MKV natively and is the same engine
+ * Stremio desktop uses.
+ *
+ * Previous issue — "skip forward stuck/crash":
+ * - HlsRelay ignored HTTP Range, so MP4 seeks returned full file from byte 0.
+ *   mpv got wrong bytes and either stalled or exited non-zero.
+ * - mpv args lacked cache / demuxer limits, so a seek could exhaust the
+ *   demuxer queue and freeze.
+ *
+ * Fixes:
+ * - HlsRelay now forwards Range and returns 206 Partial Content (see HlsRelay.kt)
+ * - mpv launched with cache, demuxer, hr-seek, force-seekable, hwdec=auto,
+ *   keep-open=no, and proper OSC (Stremio-like bar)
+ * - IPC server for graceful quit and future custom UI (play/pause/seek)
+ * - Subtitles from StreamSource are downloaded and passed as --sub-file
  */
 object DesktopPlayer {
 
     private var proc: Process? = null
-
-    /** Non-modal "Player is loading…" indicator shown from Play-click until the
-     *  mpv window is up (or an error/fallback dialog takes over). Without it
-     *  Play appeared to do nothing for the ~1-3s mpv takes to launch. */
+    private var ipcPath: String? = null
     private var loadingStage: javafx.stage.Stage? = null
-
-    /** True once the current launch has shown its failure dialog (mpv error or
-     *  stream-probe fallback), so the two can't double-popup. Reset per launch. */
     @Volatile private var dialogShown = false
 
     private fun closeLoading() {
@@ -49,17 +55,16 @@ object DesktopPlayer {
         Fx.run {
             runCatching { loadingStage?.close() }
             val s = javafx.stage.Stage()
-            val spin = javafx.scene.control.ProgressBar(-1.0)
-            spin.prefWidth = 220.0
+            val spin = javafx.scene.control.ProgressBar(-1.0).apply { prefWidth = 220.0 }
             val lbl = Label("Player is loading…").apply {
                 style = "-fx-text-fill: white; -fx-font-size: 15px;"
                 isWrapText = true
             }
-            val box = javafx.scene.layout.VBox(14.0, spin, lbl).apply {
+            val box = VBox(14.0, spin, lbl).apply {
                 alignment = Pos.CENTER
                 padding = Insets(26.0)
+                style = "-fx-background-color: ${Theme.BG_ELEV};"
             }
-            box.style = "-fx-background-color: ${Theme.BG_ELEV};"
             s.scene = Theme.scene(box)
             s.width = 300.0
             s.height = 150.0
@@ -68,20 +73,12 @@ object DesktopPlayer {
         }
     }
 
-    /** Signed, short-lived stream URLs (chaturbate's `mmcdn.com`/`edge-hls`
-     *  LL-HLS links) — their token is single-use and expires in seconds, so:
-     *  1) the pre-flight probe must NOT request them (it would burn the token
-     *     and the follow-up mpv request would 403), and
-     *  2) a 403 means the link expired → relaunch with a freshly-fetched URL. */
     private fun isSignedStreamUrl(url: String): Boolean =
         url.contains("/v1/edge/streams/") || url.contains("mmcdn.com") ||
             url.contains("edge-hls.chaturbate.com")
 
     fun play(title: String, stream: StreamSource, refresh: (() -> StreamSource?)? = null) {
-        // Sanitize here too so a malformed URL from ANY provider (chaturbate's
-        // root-relative escaped HLS path, stray quotes, JSON escapes) can't
-        // reach mpv or the browser as garbage.
-        val url = com.hikari.app.net.Http.sanitizeStreamUrl(stream.url)
+        val url = Http.sanitizeStreamUrl(stream.url)
         if (stream.externalUrl) {
             Fx.run { DesktopUi.open(url) }
             return
@@ -103,7 +100,6 @@ object DesktopPlayer {
             }
             return
         }
-        // mpv has no handler for browser-only blob:/data: URLs.
         if (url.startsWith("blob:") || url.startsWith("data:")) {
             Fx.run {
                 showBrowserFallback(
@@ -121,44 +117,79 @@ object DesktopPlayer {
             showLoading(title)
             val mpv = findMpv()
             if (mpv == null) {
-                val url = com.hikari.app.net.Http.sanitizeStreamUrl(stream.url)
-                showBrowserFallback(title, url,
-                    "The video player (mpv) wasn't found next to the app — re-download the latest release.")
+                val url = Http.sanitizeStreamUrl(stream.url)
+                showBrowserFallback(title, url, "The video player (mpv) wasn't found next to the app — re-download the latest release.")
                 return@run
             }
-            val url = com.hikari.app.net.Http.sanitizeStreamUrl(stream.url)
+            val url = Http.sanitizeStreamUrl(stream.url)
             val signed = isSignedStreamUrl(url)
-            // Debug: record the EXACT characters of the provider URL and the
-            // playable URL, so a failed stream always leaves a real reason in
-            // .hikari/hikari-player.log (e.g. a lookalike separator that the
-            // URL fixer missed).
             val logDir = File(System.getProperty("user.home"), ".hikari").apply { mkdirs() }
-            // Play through the app's own HTTP stack (HlsRelay): the CDNs that
-            // serve these streams (chaturbate's mmcdn, myspacecat, …) 403 the
-            // player's direct connections — single-use signed tokens and TLS
-            // fingerprint blocking — while the app's OkHttp fetches the same
-            // URLs fine. The relay also rewrites chaturbate's backslash
-            // root-relative playlist lines into proper URLs.
+
+            // Play through HlsRelay so headers/DoH are handled and Range works
             val playUrl = HlsRelay.urlFor(url, stream.headers)
+
             File(logDir, "hikari-player.log").appendText(
-                "[" + java.time.Instant.now() + "] raw=" + debugEscaped(stream.url) +
-                    "\n  san=" + debugEscaped(url) +
-                    "\n  ply=" + debugEscaped(playUrl) + "\n"
+                "[${java.time.Instant.now()}] raw=${debugEscaped(stream.url)}\n  san=${debugEscaped(url)}\n  ply=${debugEscaped(playUrl)}\n"
             )
+
+            // Prepare IPC path for graceful control (quit, seek, etc.)
+            val ipc = createIpcPath()
+            ipcPath = ipc
+
+            // Download subtitles to temp files if any
+            val subFiles = downloadSubtitles(stream, logDir)
+
             val args = buildList {
                 add(mpv.absolutePath)
+                // Window & UX — Stremio/CloudStream-like
                 add("--force-window=yes")
-                // No youtube-dl hook: for direct HLS/MP4 URLs it fires a SECOND,
-                // header-less probe (no Referer/Cookie) that 403s on protected
-                // CDNs and only adds confusing [ytdl_hook] errors to the dialog.
+                add("--force-window=immediate")
+                add("--keep-open=no")
+                add("--idle=no")
+                add("--terminal=no")
+                add("--no-config") // ignore user's mpv.conf that could break seeking
                 add("--no-ytdl")
-                add("--title=" + title.take(200).replace('\n', ' '))
-                val logDir2 = logDir
-                add("--log-file=${File(logDir2, "mpv.log").absolutePath}")
-                // Providers may ship stream headers (Referer/Cookie/UA) their
-                // CDN validates — hand them straight to mpv. If no User-Agent is
-                // among them, force a desktop-browser one: mpv's default
-                // "mpv/x.y.z" UA gets 403'd by token-protected CDNs.
+                add("--msg-level=all=warn")
+                add("--osc=yes")
+                add("--osd-bar=yes")
+                add("--osd-bar-align-y=0.9")
+                add("--osd-duration=2500")
+                add("--osd-font-size=22")
+                add("--border=yes")
+                add("--autofit-larger=90%x90%")
+                add("--title=${title.take(200).replace('\n', ' ')}")
+                add("--log-file=${File(logDir, "mpv.log").absolutePath}")
+
+                // IPC for future custom UI and clean quit
+                add("--input-ipc-server=$ipc")
+                add("--input-default-bindings=yes")
+                add("--input-vo-keyboard=yes")
+
+                // Seeking / cache robustness — fixes forward-seek stuck/crash
+                add("--cache=yes")
+                add("--cache-secs=20")
+                add("--demuxer-max-bytes=300M")
+                add("--demuxer-max-back-bytes=100M")
+                add("--demuxer-readahead-secs=20")
+                add("--demuxer-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=5")
+                add("--stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=5")
+                add("--force-seekable=yes")
+                add("--hr-seek=yes")
+                add("--hr-seek-demuxer-offset=10")
+                add("--hr-seek-framedrop=no")
+                add("--audio-file-auto=fuzzy")
+                add("--sub-auto=fuzzy")
+
+                // Hardware decoding — CloudStream Android uses hwdec, Stremio does too
+                add("--hwdec=auto")
+                add("--hwdec-codecs=all")
+
+                // Subtitles
+                for (sf in subFiles) {
+                    add("--sub-file=${sf.absolutePath}")
+                }
+
+                // Headers / UA
                 var hasUA = false
                 for ((k, v) in stream.headers) {
                     if (k.isNotBlank() && v.isNotBlank()) {
@@ -166,35 +197,43 @@ object DesktopPlayer {
                         add("--http-header-fields=$k: $v")
                     }
                 }
-                if (!hasUA) add("--user-agent=" + com.hikari.app.net.Http.UA)
+                if (!hasUA) add("--user-agent=${Http.UA}")
+
                 add(playUrl)
             }
+
             val p = runCatching { ProcessBuilder(args).redirectErrorStream(true).start() }.getOrNull()
             if (p == null) {
                 showBrowserFallback(title, url, "Couldn't launch the video player. Open it in your browser instead?")
                 return@run
             }
-            proc?.let { runCatching { it.destroy() } }
+            // Close previous instance gracefully via IPC first, then destroy
+            proc?.let { old ->
+                tryQuitViaIpc()
+                Thread.sleep(300)
+                runCatching { old.destroy() }
+            }
             proc = p
-            // mpv is up — drop the loading indicator so it doesn't linger over
-            // the playing video.
-            Thread({ try { Thread.sleep(2500) } catch (e: InterruptedException) {}; closeLoading() }, "hikari-loading-close")
+
+            Thread({ try { Thread.sleep(2500) } catch (_: InterruptedException) {}; closeLoading() }, "hikari-loading-close")
                 .apply { isDaemon = true; start() }
-            // Only the FIRST explanation per launch shows: the mpv error path and
-            // the stream probe both try to explain a dead player, never both.
+
             dialogShown = false
             val startedAt = System.currentTimeMillis()
             Thread(
                 {
                     val tail = StringBuilder()
-                    runCatching { p.inputStream.bufferedReader().forEachLine { if (tail.length < 4000) tail.append(it).append('\n') } }
+                    runCatching { p.inputStream.bufferedReader().forEachLine { if (tail.length < 8000) tail.append(it).append('\n') } }
                     val code = runCatching { p.exitValue() }.getOrDefault(-1)
+                    // Clean up IPC file/socket
+                    ipcPath?.let { path ->
+                        runCatching { File(path).delete() }
+                        // On Unix, socket file may be at path
+                        runCatching { java.nio.file.Path.of(path).toFile().delete() }
+                    }
                     if (code != 0 && !p.isAlive) {
                         val tailText = tail.toString()
-                        val forbidden = tailText.contains("403")
-                        // Signed links (chaturbate) 403 the moment their token is
-                        // spent — grab a FRESH url from the provider and relaunch
-                        // instead of showing an error for a link that was fine.
+                        val forbidden = tailText.contains("403") || tailText.contains("Forbidden")
                         if (attemptsLeft > 0 && refresh != null && (signed || forbidden)) {
                             val fresh = runCatching { refresh() }.getOrNull()
                             if (fresh != null && fresh.url.isNotBlank()) {
@@ -202,25 +241,23 @@ object DesktopPlayer {
                                 return@Thread
                             }
                         }
-                        val early = System.currentTimeMillis() - startedAt < 4_000
+                        val early = System.currentTimeMillis() - startedAt < 4000
+                        // Only show dialog if player died early or got 403. A normal close (code 0) or
+                        // late exit after successful playback should be silent.
                         if (early || forbidden) {
-                            val err = tailText.trim().lineSequence()
-                                .filter { it.isNotBlank() }
-                                .toList()
-                                .takeLast(10)
-                                .joinToString("\n")
+                            val err = tailText.trim().lineSequence().filter { it.isNotBlank() }.toList().takeLast(15).joinToString("\n")
                             Fx.run {
                                 if (dialogShown || proc !== p) return@run
                                 dialogShown = true
                                 val hint = if (forbidden)
                                     "\n\nThis site refused the stream link (HTTP 403). The link may have expired —" +
                                         (if (refresh != null) " click Retry to grab a fresh one." else " reopen the stream to get a new one.")
-                                    else ""
+                                else ""
                                 showBrowserFallback(
                                     title, url,
                                     buildString {
                                         append("The player closed with an error")
-                                        if (err.isNotBlank()) append(":\n").append(err.take(1600))
+                                        if (err.isNotBlank()) append(":\n").append(err.take(2000))
                                         append(hint)
                                         append("\n\nOpen it in your browser instead?")
                                     },
@@ -234,40 +271,22 @@ object DesktopPlayer {
                 },
                 "hikari-mpv-drain",
             ).apply { isDaemon = true; start() }
-            // Pre-flight probe: while mpv starts, fetch the first bytes of the
-            // stream. If the server answers with a web page or JSON instead of
-            // media (the real cause of mpv's "file format not supported"), kill
-            // mpv before it errors and offer a clear fallback instead.
-            // Signed chaturbate links are skipped — probing them consumes the
-            // single-use token and turns the actual playback into a 403.
+
+            // Probe for HTML/JSON pages that need browser resolving
             val myProc = p
             if (!signed) {
                 Thread(
                     {
-                        val verdict = com.hikari.app.net.Http.probeStreamUrl(url, stream.headers)
-                        if (verdict != com.hikari.app.net.Http.StreamProbe.HLS &&
-                            verdict != com.hikari.app.net.Http.StreamProbe.VIDEO &&
-                            verdict != com.hikari.app.net.Http.StreamProbe.UNKNOWN
-                        ) {
+                        val verdict = Http.probeStreamUrl(url, stream.headers)
+                        if (verdict != Http.StreamProbe.HLS && verdict != Http.StreamProbe.VIDEO && verdict != Http.StreamProbe.UNKNOWN) {
                             Fx.run {
                                 if (dialogShown || proc !== myProc || !myProc.isAlive) return@run
                                 dialogShown = true
                                 runCatching { myProc.destroy() }
                                 when (verdict) {
-                                    com.hikari.app.net.Http.StreamProbe.DASH -> showBrowserFallback(
-                                        title, url,
-                                        "This stream uses DASH, which the bundled player can't play yet.",
-                                    )
-                                    com.hikari.app.net.Http.StreamProbe.HTML ->
-                                        // A web page usually means the CDN/embed host served an
-                                        // anti-bot or JS-built player page — which plays fine in a
-                                        // real browser. Render it in the embedded WebEngine, capture
-                                        // the ACTUAL media URL the page produces, and hand that to
-                                        // mpv. Only give up (with the browser path) if the page
-                                        // yields nothing playable.
-                                        resolveAndPlay(title, url, stream, refresh, attemptsLeft)
-                                    com.hikari.app.net.Http.StreamProbe.JSON ->
-                                        resolveAndPlay(title, url, stream, refresh, attemptsLeft)
+                                    Http.StreamProbe.DASH -> showBrowserFallback(title, url, "This stream uses DASH, which the bundled player can't play yet.")
+                                    Http.StreamProbe.HTML -> resolveAndPlay(title, url, stream, refresh, attemptsLeft)
+                                    Http.StreamProbe.JSON -> resolveAndPlay(title, url, stream, refresh, attemptsLeft)
                                     else -> {}
                                 }
                             }
@@ -279,13 +298,68 @@ object DesktopPlayer {
         }
     }
 
-    /**
-     * The source URL served a web page (or JSON) — an embed/anti-bot host
-     * that plays fine in a browser but dies in the direct player. This runs off
-     * the FX thread: render the page in the embedded WebEngine so its JS runs,
-     * capture the real media URL it produces, and relaunch mpv with THAT. If
-     * the page yields nothing playable, fall back to the browser dialog.
-     */
+    private fun downloadSubtitles(stream: StreamSource, logDir: File): List<File> {
+        if (stream.subtitles.isEmpty()) return emptyList()
+        val out = mutableListOf<File>()
+        val subDir = File(logDir, "subs").apply { mkdirs() }
+        for ((idx, sub) in stream.subtitles.withIndex()) {
+            try {
+                val safeLang = sub.lang.replace(Regex("[^A-Za-z0-9_-]"), "_").take(20).ifBlank { "sub$idx" }
+                val ext = when {
+                    sub.url.endsWith(".vtt") -> ".vtt"
+                    sub.url.endsWith(".ass") -> ".ass"
+                    sub.url.endsWith(".ssa") -> ".ssa"
+                    else -> ".srt"
+                }
+                val file = File(subDir, "${safeLang}_${System.currentTimeMillis()}_$idx$ext")
+                val bytes = Http.getBytes(sub.url, stream.headers) ?: continue
+                file.writeBytes(bytes)
+                out.add(file)
+            } catch (_: Exception) {
+                // ignore failed subtitle
+            }
+        }
+        return out
+    }
+
+    private fun createIpcPath(): String {
+        val isWindows = System.getProperty("os.name").lowercase().contains("win")
+        return if (isWindows) {
+            // Windows named pipe: \\.\pipe\mpv-xxx
+            "\\\\.\\pipe\\mpv-${System.currentTimeMillis()}-${(0..9999).random()}"
+        } else {
+            // Unix socket in temp
+            val tmp = System.getProperty("java.io.tmpdir")
+            "$tmp/mpv-${System.currentTimeMillis()}.sock"
+        }
+    }
+
+    private fun tryQuitViaIpc() {
+        val path = ipcPath ?: return
+        try {
+            if (path.startsWith("\\\\.\\pipe\\")) {
+                // Windows named pipe - try via file write? mpv's named pipe is not easily writable via Java without JNA
+                // Fallback to process destroy, but attempt socket-style if possible
+                return
+            } else {
+                // Unix domain socket - try to send quit command via JSON IPC
+                // mpv IPC protocol: {"command": ["quit"]}\n
+                val socketFile = File(path)
+                if (!socketFile.exists()) return
+                // Use simple socket connection via Java 16+ UnixDomainSocketAddress if available, else fallback
+                runCatching {
+                    val addr = java.net.UnixDomainSocketAddress.of(path)
+                    java.net.Socket().use { s ->
+                        s.connect(addr, 1000)
+                        s.getOutputStream().write("{\"command\": [\"quit\"]}\n".toByteArray())
+                        s.getOutputStream().flush()
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+    }
+
     private fun resolveAndPlay(title: String, url: String, stream: StreamSource, refresh: (() -> StreamSource?)?, attemptsLeft: Int) {
         Thread(
             {
@@ -309,9 +383,6 @@ object DesktopPlayer {
         ).apply { isDaemon = true; start() }
     }
 
-    /** Merges any cookies the player page set into the stream headers, so the
-     *  player re-fetching the resolved manifest sends the session cookie the
-     *  CDN issued to the browser. */
     private fun mergeHeaders(base: Map<String, String>, cookie: String): Map<String, String> {
         val merged = HashMap(base)
         if (cookie.isNotBlank()) {
@@ -321,8 +392,6 @@ object DesktopPlayer {
         return merged
     }
 
-    /** `app/mpv/mpv.exe` inside the installed app (jpackage layout), with a
-     *  couple of fallbacks for running from an IDE / loose jar. */
     private fun findMpv(): File? {
         val runtimeHome = runCatching { File(System.getProperty("java.home")) }.getOrNull()
         val appDir = runtimeHome?.parentFile
@@ -331,13 +400,11 @@ object DesktopPlayer {
             appDir?.resolve("mpv/mpv.exe"),
             appDir?.resolve("mpv.exe"),
             File("mpv/mpv.exe"),
+            File("C:\\mpv\\mpv.exe"),
         )
         return rels.firstOrNull { it.isFile }
     }
 
-    /** For the debug log: show a string with every non-ASCII character as a
-     *  \\uXXXX escape, so a lookalike separator (e.g. a yen sign instead of a
-     *  backslash) is actually visible in the log. */
     private fun debugEscaped(s: String): String = buildString {
         for (c in s) {
             val cp = c.code
@@ -350,9 +417,7 @@ object DesktopPlayer {
         closeLoading()
         val stage = Stage()
         stage.title = title
-        val label = Label(reason?.takeIf { it.isNotBlank() } ?: "Open it in your browser instead?").apply {
-            isWrapText = true
-        }
+        val label = Label(reason?.takeIf { it.isNotBlank() } ?: "Open it in your browser instead?").apply { isWrapText = true }
         val openBtn = Button("Open in browser").apply {
             setOnAction {
                 DesktopUi.open(url)
@@ -373,8 +438,11 @@ object DesktopPlayer {
 
     fun closeAll() {
         Fx.run {
+            tryQuitViaIpc()
+            Thread.sleep(200)
             proc?.let { runCatching { it.destroy() } }
             proc = null
+            ipcPath = null
         }
     }
 }

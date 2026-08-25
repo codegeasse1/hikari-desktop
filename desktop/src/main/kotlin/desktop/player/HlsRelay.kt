@@ -8,25 +8,19 @@ import java.net.URI
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 
 /**
- * Tiny local HTTP relay that fronts a remote stream (HLS manifest or direct
- * file) and serves it to the player. The player plays
- * `http://127.0.0.1:PORT/x/<key>` and this relay fetches the real URL with the
- * required headers (Referer/Cookie/UA) through the app's own OkHttp stack,
- * rewriting HLS playlist lines to point back at the relay.
+ * Local HTTP relay that fronts remote streams and serves them to mpv.
  *
- * Why this exists:
- *  - Many CDNs (chaturbate's mmcdn, myspacecat, ...) 403 the player's direct
- *    connections: signed tokens are single-use (the manifest can only be
- *    fetched once) and the player's TLS/HTTP fingerprint gets blocked. The
- *    app's own HTTP stack fetches the same URLs fine.
- *  - chaturbate's LL-HLS manifests reference their media playlists and
- *    segments as root-relative BACKSLASH paths (`\v1\edge\streams\…`), which
- *    the player misreads as a protocol ("No protocol handler"). The relay
- *    normalizes and resolves them.
- *  - single-use manifests are cached, so the player re-fetching the master
- *    playlist gets the cached copy instead of a 403.
+ * Fixes for seeking / crashing:
+ * - Properly forwards `Range` header to upstream and returns `206 Partial Content`
+ *   with `Content-Range` / `Accept-Ranges` so mpv can seek in MP4 files.
+ * - Handles HEAD requests (mpv probes with HEAD before seeking).
+ * - Streams bodies instead of buffering fully, and always closes exchanges.
+ * - Caches only master HLS playlists (when no Range), not media segments.
+ * - Rewrites HLS playlists to local URLs so every segment goes through OkHttp
+ *   (DoH + headers) instead of mpv's direct connection.
  */
 object HlsRelay {
 
@@ -36,7 +30,7 @@ object HlsRelay {
     private var port = 0
     private val routes = ConcurrentHashMap<String, Route>()
     private val keys = ConcurrentHashMap<String, String>()
-    private val counter = java.util.concurrent.atomic.AtomicLong(0)
+    private val counter = AtomicLong(0)
     private val masterCache = ConcurrentHashMap<String, ByteArray>()
 
     @Synchronized
@@ -52,7 +46,6 @@ object HlsRelay {
         port = s.address.port
     }
 
-    /** Returns the local relay URL to hand to the player. */
     fun urlFor(url: String, headers: Map<String, String>): String {
         ensureServer()
         val key = "k${counter.incrementAndGet()}"
@@ -63,8 +56,14 @@ object HlsRelay {
 
     private fun handle(ex: HttpExchange) {
         try {
+            val method = ex.requestMethod.uppercase()
             val path = ex.requestURI.path
-            val parts = path.removePrefix("/x/").split("/")
+            val parts = path.removePrefix("/x/").split("/").filter { it.isNotEmpty() }
+            if (parts.isEmpty()) {
+                ex.sendResponseHeaders(404, -1)
+                ex.close()
+                return
+            }
             val key = parts[0]
             val route = routes[key]
             if (route == null) {
@@ -72,18 +71,22 @@ object HlsRelay {
                 ex.close()
                 return
             }
-            // Single-use master playlists are cached: the player re-opens the
-            // master after the first read, and the token URL 403s on a second
-            // fetch — serve the cached (rewritten) copy instead.
-            if (key.startsWith("k")) {
+
+            val rangeHeader = ex.requestHeaders.getFirst("Range")
+
+            // Serve cached master playlist only for plain GET without Range
+            if (key.startsWith("k") && method == "GET" && rangeHeader == null) {
                 masterCache[key]?.let { cached ->
                     ex.responseHeaders.set("Content-Type", "application/vnd.apple.mpegurl")
+                    ex.responseHeaders.set("Accept-Ranges", "none")
+                    ex.responseHeaders.set("Cache-Control", "no-cache")
                     ex.sendResponseHeaders(200, cached.size.toLong())
                     ex.responseBody.use { it.write(cached) }
                     return
                 }
             }
-            // Segment-level keys look like <base64>, resolved against the root URL.
+
+            // Resolve target URL: either direct route or a previously mapped segment
             var targetUrl = route.url
             if (parts.size > 1) {
                 val segKey = parts[1]
@@ -91,38 +94,150 @@ object HlsRelay {
                 if (segUrl != null) {
                     targetUrl = segUrl
                 } else {
-                    val root = URI(route.url)
-                    targetUrl = root.resolve(segKey).toString()
+                    // Fallback: resolve relative to root (should not happen often)
+                    targetUrl = runCatching { URI(route.url).resolve(segKey).toString() }.getOrDefault(route.url)
                 }
             }
-            val resp = Http.get(targetUrl, route.headers)
-            if (!resp.isSuccessful) {
-                ex.sendResponseHeaders(resp.code, -1)
-                resp.close()
+
+            // Build upstream headers, forwarding Range if mpv asked for it
+            val upstreamHeaders = HashMap(route.headers)
+            if (rangeHeader != null) {
+                upstreamHeaders["Range"] = rangeHeader
+            }
+            // Ensure we always send a UA (some CDNs 403 mpv's default UA even via relay if missing)
+            if (upstreamHeaders.keys.none { it.equals("User-Agent", ignoreCase = true) }) {
+                upstreamHeaders["User-Agent"] = Http.UA
+            }
+
+            val resp = runCatching { Http.get(targetUrl, upstreamHeaders) }.getOrNull()
+            if (resp == null) {
+                ex.sendResponseHeaders(502, -1)
                 ex.close()
                 return
             }
-            val body = resp.body
-            val ct = resp.header("Content-Type") ?: "application/octet-stream"
-            if (ct.contains("mpegurl") || ct.contains("application/vnd.apple.mpegurl") ||
-                ct.contains("text/plain") || ct.contains("application/x-mpegurl") ||
-                path.endsWith(".m3u8") || targetUrl.contains(".m3u8")
-            ) {
-                val text = body?.string() ?: ""
-                val rewritten = rewritePlaylist(text, targetUrl, route.headers)
-                val bytes = rewritten.toByteArray(StandardCharsets.UTF_8)
-                if (key.startsWith("k")) masterCache[key] = bytes
-                ex.responseHeaders.set("Content-Type", "application/vnd.apple.mpegurl")
-                ex.sendResponseHeaders(200, bytes.size.toLong())
-                ex.responseBody.use { it.write(bytes) }
-            } else {
-                ex.responseHeaders.set("Content-Type", ct)
-                val len = body?.contentLength() ?: -1L
-                if (len >= 0) ex.sendResponseHeaders(200, len) else ex.sendResponseHeaders(200, 0)
-                body?.byteStream()?.use { input -> input.copyTo(ex.responseBody) }
-                runCatching { ex.responseBody.close() }
+
+            resp.use { r ->
+                if (!r.isSuccessful && r.code != 206) {
+                    // Forward error code as-is (403, 404, etc.)
+                    ex.sendResponseHeaders(r.code, -1)
+                    ex.close()
+                    return
+                }
+
+                val contentType = r.header("Content-Type") ?: "application/octet-stream"
+                val isPlaylist = contentType.contains("mpegurl", ignoreCase = true) ||
+                    contentType.contains("application/vnd.apple.mpegurl", ignoreCase = true) ||
+                    contentType.contains("application/x-mpegurl", ignoreCase = true) ||
+                    contentType.contains("text/plain", ignoreCase = true) && targetUrl.contains(".m3u8") ||
+                    path.endsWith(".m3u8") || targetUrl.contains(".m3u8") ||
+                    r.header("Content-Type")?.contains("text/plain") == true && targetUrl.contains(".m3u8")
+
+                // More robust playlist detection: also check body start for #EXTM3U if content-type is ambiguous
+                var bodyForCheck: ByteArray? = null
+                if (!isPlaylist && method == "GET") {
+                    // Peek first bytes for HLS tag without consuming fully if possible
+                    // We'll read fully for playlists anyway
+                }
+
+                if (isPlaylist || targetUrl.contains(".m3u8") || contentType.contains("mpegurl") || contentType.contains("hls", ignoreCase = true)) {
+                    // For playlists, we always rewrite and return 200 (ignore Range)
+                    val text = r.body?.string() ?: ""
+                    // If body is actually a video (mis-detected), fall through to video handling
+                    if (text.trimStart().startsWith("#EXTM3U")) {
+                        val rewritten = rewritePlaylist(text, targetUrl, route.headers)
+                        val bytes = rewritten.toByteArray(StandardCharsets.UTF_8)
+                        if (key.startsWith("k") && method == "GET" && rangeHeader == null) {
+                            masterCache[key] = bytes
+                        }
+                        ex.responseHeaders.set("Content-Type", "application/vnd.apple.mpegurl")
+                        ex.responseHeaders.set("Accept-Ranges", "none")
+                        ex.responseHeaders.set("Cache-Control", "no-cache")
+                        ex.responseHeaders.set("Access-Control-Allow-Origin", "*")
+                        if (method == "HEAD") {
+                            ex.sendResponseHeaders(200, -1)
+                            ex.close()
+                        } else {
+                            ex.sendResponseHeaders(200, bytes.size.toLong())
+                            ex.responseBody.use { it.write(bytes) }
+                        }
+                        return
+                    }
+                    // If not actually a playlist, treat as video below - need to re-fetch? We already consumed body.
+                    // For simplicity, if we consumed body as text but it's not playlist, send it as video bytes
+                    val bytes = text.toByteArray(StandardCharsets.UTF_8)
+                    ex.responseHeaders.set("Content-Type", contentType)
+                    ex.responseHeaders.set("Accept-Ranges", "bytes")
+                    ex.responseHeaders.set("Access-Control-Allow-Origin", "*")
+                    if (method == "HEAD") {
+                        ex.sendResponseHeaders(r.code, -1)
+                        ex.close()
+                    } else {
+                        // If original was 206, preserve it, else 200
+                        val codeToSend = if (r.code == 206) 206 else 200
+                        r.header("Content-Range")?.let { ex.responseHeaders.set("Content-Range", it) }
+                        ex.sendResponseHeaders(codeToSend, bytes.size.toLong())
+                        ex.responseBody.use { it.write(bytes) }
+                    }
+                    return
+                }
+
+                // --- Video / segment handling (MP4, TS, etc.) with Range support ---
+                ex.responseHeaders.set("Content-Type", contentType)
+                ex.responseHeaders.set("Accept-Ranges", r.header("Accept-Ranges") ?: "bytes")
+                ex.responseHeaders.set("Access-Control-Allow-Origin", "*")
+                r.header("Content-Length")?.let { ex.responseHeaders.set("Content-Length", it) }
+                r.header("Content-Range")?.let { ex.responseHeaders.set("Content-Range", it) }
+                r.header("Cache-Control")?.let { ex.responseHeaders.set("Cache-Control", it) }
+                // CORS for mpv (not strictly needed but harmless)
+                ex.responseHeaders.set("Access-Control-Allow-Headers", "Range, Content-Type, Accept")
+
+                val responseCode = r.code // 200 or 206
+
+                if (method == "HEAD") {
+                    // For HEAD, we must not send body, but need to send headers with correct code
+                    ex.sendResponseHeaders(responseCode, -1)
+                    ex.close()
+                    return
+                }
+
+                // Stream body to client
+                val body = r.body
+                if (body == null) {
+                    ex.sendResponseHeaders(responseCode, -1)
+                    ex.close()
+                    return
+                }
+
+                val contentLength = body.contentLength()
+                if (responseCode == 206 || contentLength >= 0) {
+                    // If we know length, send it; otherwise chunked (0)
+                    if (contentLength >= 0) {
+                        ex.sendResponseHeaders(responseCode, contentLength)
+                    } else {
+                        // Unknown length (e.g., live HLS segment) - use chunked
+                        ex.sendResponseHeaders(responseCode, 0)
+                    }
+                } else {
+                    ex.sendResponseHeaders(responseCode, 0)
+                }
+
+                try {
+                    body.byteStream().use { input ->
+                        ex.responseBody.use { output ->
+                            val buf = ByteArray(64 * 1024)
+                            while (true) {
+                                val n = input.read(buf)
+                                if (n < 0) break
+                                output.write(buf, 0, n)
+                            }
+                        }
+                    }
+                } catch (_: Exception) {
+                    // Client closed connection (mpv seeked / closed) - ignore
+                } finally {
+                    runCatching { ex.responseBody.close() }
+                }
             }
-            resp.close()
         } catch (t: Throwable) {
             runCatching { ex.sendResponseHeaders(502, -1) }
             runCatching { ex.close() }
@@ -131,27 +246,33 @@ object HlsRelay {
 
     private fun rewritePlaylist(text: String, base: String, headers: Map<String, String>): String {
         val root = runCatching { URI(base) }.getOrNull() ?: return text
-        val out = StringBuilder()
+        val out = StringBuilder(text.length + 1024)
         for (line in text.lines()) {
             val trimmed = line.trim()
-            if (trimmed.isEmpty() || trimmed.startsWith("#")) {
-                // rewrite key URIs inside #EXT-X-KEY
-                val keyUri = Regex("""URI="([^"]+)"""").find(line)
-                if (keyUri != null && !keyUri.groupValues[1].startsWith("http")) {
-                    val u = root.resolve(keyUri.groupValues[1].replace('\\', '/')).toString()
-                    out.append(line.replaceRange(keyUri.range, "URI=\"$u\""))
-                } else {
-                    out.append(line)
-                }
+            if (trimmed.isEmpty()) {
                 out.append('\n')
                 continue
             }
-            // chaturbate LL-HLS manifests reference their media playlists and
-            // segments as root-relative BACKSLASH paths (e.g. \v1\edge\streams\…)
-            // and occasionally as absolute https URLs. Both are served through
-            // the relay so every request goes through the app's own HTTP stack
-            // (which the CDNs accept) instead of the player's direct connection
-            // (which they 403).
+            if (trimmed.startsWith("#")) {
+                // Rewrite URI inside #EXT-X-KEY, #EXT-X-MAP, etc.
+                val keyUriMatch = Regex("""URI="([^"]+)"""").find(line)
+                if (keyUriMatch != null) {
+                    val orig = keyUriMatch.groupValues[1]
+                    if (!orig.startsWith("http://") && !orig.startsWith("https://")) {
+                        val resolved = runCatching { root.resolve(orig.replace('\\', '/')).toString() }.getOrNull() ?: orig
+                        val segKey = "s${counter.incrementAndGet()}"
+                        keys[segKey] = resolved
+                        routes[segKey] = Route(resolved, headers)
+                        val local = "http://127.0.0.1:$port/x/$segKey"
+                        out.append(line.replace(orig, local))
+                        out.append('\n')
+                        continue
+                    }
+                }
+                out.append(line).append('\n')
+                continue
+            }
+            // Media segment line
             val normalized = trimmed.replace('\\', '/')
             val resolved = runCatching { root.resolve(normalized).toString() }.getOrNull()
             if (resolved == null) {
@@ -160,7 +281,7 @@ object HlsRelay {
             }
             val segKey = "s${counter.incrementAndGet()}"
             keys[segKey] = resolved
-            routes["$segKey"] = Route(resolved, headers)
+            routes[segKey] = Route(resolved, headers)
             out.append("http://127.0.0.1:$port/x/$segKey").append('\n')
         }
         return out.toString()
