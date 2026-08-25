@@ -229,31 +229,38 @@ object EmbeddedPlayer {
         val url = Http.sanitizeStreamUrl(stream.url)
         val logDir = File(System.getProperty("user.home"), ".hikari").apply { mkdirs() }
         val playUrl = HlsRelay.urlFor(url, stream.headers)
+        // Use named pipe on Windows for reliable IPC (TCP sometimes not supported in shinchiro builds)
+        val isWindows = System.getProperty("os.name").lowercase().contains("win")
         val ipcPort = findFreePort()
-        val ipcPath = "tcp://127.0.0.1:$ipcPort"
+        val ipcPipeName = "mpv-${System.currentTimeMillis()}-${(0..9999).random()}"
+        val ipcPath = if (isWindows) "\\\\.\\pipe\\$ipcPipeName" else "/tmp/$ipcPipeName.sock"
+        // For TCP fallback, also keep tcp path as alternative if pipe fails, but we will try pipe first
+        val ipcTcpPath = "tcp://127.0.0.1:$ipcPort"
         val subFiles = downloadSubtitles(stream, logDir)
 
-        logToFile("Launching mpv embedded: hwnd=$hwnd playUrl=$playUrl ipc=$ipcPath")
+        logToFile("Launching mpv embedded: hwnd=$hwnd playUrl=$playUrl ipcPipe=$ipcPath ipcTcp=$ipcTcpPath")
 
-        val args = buildList {
+        // Try multiple vo/gpu-context combos for embedding compatibility
+        // First attempt: gpu + win (most compatible for AWT Canvas), hwdec=no to avoid black screen
+        val baseArgs = mutableListOf<String>().apply {
             add(mpv.absolutePath)
-            // Critical for embedding on Windows
             add("--wid=$hwnd")
+            // Video output - try gpu with win context (works best for embedding into child HWND)
             add("--vo=gpu")
-            add("--gpu-context=d3d11")
-            add("--gpu-api=d3d11")
-            add("--hwdec=auto")
-            add("--hwdec-codecs=all")
+            add("--gpu-context=win")
+            add("--gpu-api=auto")
+            add("--hwdec=no") // start with no hwdec to avoid black screen, will try auto if this works
             add("--force-window=no")
             add("--keep-open=no")
             add("--idle=no")
             add("--terminal=no")
             add("--no-config")
             add("--no-ytdl")
-            add("--msg-level=all=v") // verbose for debugging embed issues
+            add("--msg-level=all=v")
             add("--osc=no")
             add("--osd-bar=no")
             add("--input-ipc-server=$ipcPath")
+            add("--input-ipc-server=$ipcTcpPath") // also try TCP as second server
             add("--cache=yes")
             add("--cache-secs=20")
             add("--demuxer-max-bytes=300M")
@@ -277,8 +284,9 @@ object EmbeddedPlayer {
                 }
             }
             if (!hasUA) add("--user-agent=${Http.UA}")
-            add(playUrl)
         }
+
+        val args = baseArgs + playUrl
 
         logToFile("mpv args: ${args.joinToString(" ")}")
 
@@ -295,11 +303,12 @@ object EmbeddedPlayer {
         ipcClient = client
         Thread({
             var connected = false
-            for (i in 0..50) {
+            // Try pipe first, then TCP
+            for (i in 0..60) {
                 Thread.sleep(300)
-                if (client.connectTcp("127.0.0.1", ipcPort)) {
+                if (client.connectAuto(ipcPath) || client.connectAuto(ipcTcpPath)) {
                     connected = true
-                    logToFile("IPC connected on attempt $i")
+                    logToFile("IPC connected on attempt $i via ${if (client.connected) "pipe/tcp" else "unknown"}")
                     break
                 }
                 if (!proc.isAlive) {
@@ -308,8 +317,9 @@ object EmbeddedPlayer {
                 }
             }
             if (!connected) {
-                logToFile("IPC failed to connect after 50 attempts")
-                // Check if mpv is still alive - if yes, video might still be playing without controls
+                logToFile("IPC failed to connect after 60 attempts - video may still play without controls")
+                // Don't fallback immediately if mpv is alive and playing audio - user reported sound works
+                // But if mpv died, fallback
                 if (!proc.isAlive) {
                     Platform.runLater {
                         close()
