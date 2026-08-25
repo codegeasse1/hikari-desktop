@@ -124,6 +124,27 @@
     -fx-background-color: #200f19;
 }
 
+/* Compact toggle chips for the search tab's extension picker. */
+.chip {
+    -fx-background-color: #211d33;
+    -fx-text-fill: #ded7f8;
+    -fx-font-size: 12px;
+    -fx-background-radius: 999;
+    -fx-padding: 4 12 4 12;
+    -fx-cursor: hand;
+}
+
+.chip-plain:hover {
+    -fx-background-color: #2c2646;
+}
+
+.chip-selected,
+.chip-selected:hover {
+    -fx-background-color: linear-gradient(to right, #7c4dff, #4d9fff);
+    -fx-text-fill: #ffffff;
+    -fx-font-weight: 600;
+}
+
 .list-row {
     -fx-background-color: #171a23;
     -fx-background-radius: 10;
