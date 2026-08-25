@@ -365,7 +365,7 @@ class ExtensionsScreenView {
                 val root = runCatching { JSONObject(text) }.getOrNull()
                 val name = root?.optString("name").orEmpty().ifBlank { Http.repoDisplayName(resolved) }
                 val description = root?.optString("description").orEmpty()
-                val plugins = parsePlugins(root)
+                val plugins = parsePlugins(root, resolved)
                 repoData[url] = RepoData(resolved, name, description, plugins)
                 if (resolved != url) repoData[resolved] = repoData[url]!!
                 setStatus("")
@@ -374,10 +374,12 @@ class ExtensionsScreenView {
         }
     }
 
-    /** Reads the repo's `plugins` array, converting .hiki plugin URLs to their
-     *  .jar desktop builds. `plugins` is already a JSONArray — org.json's
-     *  `new JSONArray(jsonArray)` throws, so never re-wrap an existing array. */
-    private fun parsePlugins(root: JSONObject?): List<Pair<String, String>> {
+    /** Reads the repo's `plugins` array, resolving relative plugin URLs
+     *  against the repo.json ([baseUrl] — the URL that actually served it) and
+     *  converting .hiki plugin URLs to their .jar desktop builds.
+     *  `plugins` is already a JSONArray — org.json's `new JSONArray(jsonArray)`
+     *  throws, so never re-wrap an existing array. */
+    private fun parsePlugins(root: JSONObject?, baseUrl: String = ""): List<Pair<String, String>> {
         root ?: return emptyList()
         val plugins = when (val p = root.opt("plugins")) {
             null -> JSONArray()
@@ -390,6 +392,11 @@ class ExtensionsScreenView {
             val name = p.optString("name")
             var url = p.optString("url")
             if (name.isBlank() || url.isBlank()) continue
+            // CloudStream v2 plugin lists may carry paths relative to the
+            // plugins.json/repo.json that referenced them — resolve them the
+            // way the Android client does instead of handing OkHttp a
+            // scheme-less URL it must reject.
+            if (baseUrl.isNotBlank()) url = Http.resolveRelativeTo(url, baseUrl)
             if (url.endsWith(".hiki")) url = url.removeSuffix(".hiki") + ".jar"
             out += name to url
         }
@@ -457,7 +464,7 @@ class ExtensionsScreenView {
                     url = resolved,
                     name = root?.optString("name").orEmpty().ifBlank { name },
                     description = root?.optString("description").orEmpty(),
-                    plugins = parsePlugins(root),
+                    plugins = parsePlugins(root, resolved),
                 )
                 openRepo = Cs3Repo(url = resolved, name = name, kind = effKind)
                 setStatus("")
@@ -503,7 +510,33 @@ class ExtensionsScreenView {
                 val safeName = name.lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-').ifBlank { "ext" }
                 val dest = File(extDir, "$safeName.jar")
                 dest.delete()
-                val ok = Http.downloadToRobust(dl, dest)
+                // CloudStream repos publish the same plugin side by side as a
+                // dex .cs3 and a JVM .jar (Hikari repos: .hiki/.jar). When the
+                // preferred form 404s or is blocked on some mirror, the sibling
+                // in the same folder is the same plugin — and both DexJar and
+                // the URLClassLoader can load whichever one arrives.
+                val stem = dl.substringBeforeLast('.')
+                val candidates = linkedSetOf(dl)
+                if (dl.endsWith(".jar")) {
+                    candidates.add("$stem.cs3")
+                    candidates.add("$stem.hiki")
+                } else if (dl.endsWith(".cs3")) {
+                    candidates.add("$stem.jar")
+                }
+                var ok = false
+                val attempts = StringBuilder()
+                for (c in candidates) {
+                    val why = StringBuilder()
+                    ok = Http.downloadToRobust(c, dest) { tried, success, reason ->
+                        if (!success) {
+                            val host = tried.substringAfter("//").substringBefore('/')
+                            if (why.isNotEmpty()) why.append(";  ")
+                            why.append("$host — ${reason?.take(70) ?: "failed"}")
+                        }
+                    }
+                    if (ok) break
+                    if (why.isNotEmpty()) attempts.append(why).append('\n')
+                }
                 if (ok) {
                     // A blocked/misbehaving network can serve an HTML error page
                     // with a 200 — a real extension is always a zip (PK header).
@@ -514,6 +547,9 @@ class ExtensionsScreenView {
                     if (!isZip) {
                         statusText = "Downloaded file is not an extension (the network may have served an error page instead of the jar)."
                     } else {
+                        // Record the row's primary URL (not whichever sibling
+                        // format arrived) so the Install/Uninstall state and
+                        // providersFor() keep matching this row afterwards.
                         val registered = registerExtension(name, safeName, dest, dl)
                         if (registered != null) {
                             statusText = registered
@@ -523,7 +559,9 @@ class ExtensionsScreenView {
                         }
                     }
                 } else {
-                    statusText = "Download failed for $name — check the URL and that the repo host is reachable from your network."
+                    statusText = "Download failed for $name — no mirror served the file:" +
+                        (if (attempts.isEmpty()) " (no reasons reported)" else "\n$attempts") +
+                        "If several hosts above say “blocked”/“unknown host”, your network or DNS filters GitHub-family hosts — use a VPN, or a repo that mirrors plugins (the built-in Hikari repo does)."
                 }
             } catch (t: Throwable) {
                 statusText = "Install failed: ${t.message?.take(300) ?: t.javaClass.simpleName}"
@@ -531,7 +569,7 @@ class ExtensionsScreenView {
             AppShell.app.providers.refresh()
             Fx.run {
                 busy.isVisible = false
-                if (isErr) installErrors[url] = statusText else installErrors.remove(url)
+                if (isErr) installErrors[url] = statusText.take(700) else installErrors.remove(url)
                 setStatus(statusText, isErr)
                 renderAll()
             }
