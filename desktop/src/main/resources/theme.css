@@ -482,3 +482,50 @@
 .episodes-column {
     -fx-background-color: transparent;
 }
+
+/* ---- Enhanced player (Stremio / CloudStream-like) ---- */
+
+.seek-slider {
+    -fx-background-color: transparent;
+}
+
+.seek-slider .track {
+    -fx-background-color: #232838;
+    -fx-background-radius: 4;
+    -fx-pref-height: 6;
+}
+
+.seek-slider .thumb {
+    -fx-background-color: #7c4dff;
+    -fx-background-radius: 999;
+    -fx-pref-width: 14;
+    -fx-pref-height: 14;
+    -fx-effect: dropshadow(gaussian, rgba(124,77,255,0.4), 6, 0, 0, 1);
+}
+
+.seek-slider:hover .track {
+    -fx-background-color: #2a2f42;
+}
+
+.seek-slider .filled-track {
+    -fx-background-color: linear-gradient(to right, #7c4dff, #4d9fff);
+    -fx-background-radius: 4;
+}
+
+/* Volume slider smaller */
+.slider .track {
+    -fx-background-color: #232838;
+    -fx-background-radius: 3;
+    -fx-pref-height: 4;
+}
+
+.slider .thumb {
+    -fx-background-color: #9aa0ae;
+    -fx-background-radius: 999;
+    -fx-pref-width: 10;
+    -fx-pref-height: 10;
+}
+
+.slider .thumb:hover {
+    -fx-background-color: #c4b0ff;
+}

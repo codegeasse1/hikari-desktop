@@ -8,6 +8,7 @@ import com.hikari.app.data.MediaType
 import com.hikari.app.data.StreamSource
 import desktop.fx.Fx
 import desktop.player.DesktopPlayer
+import desktop.player.EnhancedPlayer
 import javafx.geometry.Insets
 import javafx.geometry.Pos
 import javafx.scene.Node
@@ -93,7 +94,6 @@ class DetailScreenView(private val item: MediaItem) {
 
     private fun renderMeta(meta: MediaItem) {
         body.children.clear()
-        // keep reference to old grid? body is cleared, so drop it
         episodeGrid = null
         val headerImage = bannerFor(meta)
         val titleRow = VBox(4.0).apply {
@@ -120,8 +120,6 @@ class DetailScreenView(private val item: MediaItem) {
         body.children.addAll(titleRow, overview, streamsSection)
     }
 
-    /** Wide backdrop banner at the top of the detail view (backdrop first,
-     *  poster as fallback), styled to fill the content width. */
     private fun bannerFor(meta: MediaItem): Node? {
         val url = meta.backdropUrl ?: meta.posterUrl
         if (url.isNullOrBlank()) return null
@@ -138,9 +136,6 @@ class DetailScreenView(private val item: MediaItem) {
     }
 
     private fun renderEpisodes(meta: MediaItem, eps: List<Episode>) {
-        // One episode may be returned under both its raw id and a rewritten
-        // canonical url (and some providers emit the same episode twice) — show
-        // each unique episode only once.
         val unique = linkedMapOf<String, Episode>()
         eps.forEach { ep ->
             val key = ep.id.ifBlank { ep.name ?: ep.number.toString() }
@@ -152,7 +147,6 @@ class DetailScreenView(private val item: MediaItem) {
             return
         }
 
-        // Remove any previous episode grid (e.g. when meta reloads or dedup recurses).
         episodeGrid?.let { old -> body.children.remove(old.root) }
         body.children.removeIf { node -> node.styleClass.contains("episodes-section") }
 
@@ -166,15 +160,12 @@ class DetailScreenView(private val item: MediaItem) {
         )
         episodeGrid = grid
 
-        // Restore previous selection if any.
         selectedEpisode?.let { prev ->
             if (deduped.any { it.id == prev.id }) {
                 grid.select(prev)
             }
         }
 
-        // Insert after the banner / title — same spot the old ComboBox list used.
-        // body = [banner?, titleRow, overview, streamsSection]
         val insertAt = 1.coerceAtMost(body.children.size)
         body.children.add(insertAt, grid.root)
     }
@@ -182,7 +173,6 @@ class DetailScreenView(private val item: MediaItem) {
     private fun htmlToPlain(html: String): String = html
         .replace(Regex("<br\\s*/?>", RegexOption.IGNORE_CASE), "\n")
         .replace(Regex("</?[a-zA-Z][^>]*>"), "")
-        // decode the handful of common entities the sources emit
         .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
@@ -218,33 +208,9 @@ class DetailScreenView(private val item: MediaItem) {
         streams.forEach { s ->
             val name = Label(s.name).apply { maxWidth = 420.0; isWrapText = true }
             val play = Button("Play").apply {
-                styleClass.add("btn")
+                styleClass.addAll("btn", "btn-primary")
                 setOnAction {
-                    HikariApp.instance.store.addHistory(
-                        HistoryEntry(
-                            providerId = meta.providerId,
-                            mediaId = meta.id,
-                            type = meta.type,
-                            title = meta.title,
-                            posterUrl = meta.posterUrl,
-                            episodeId = selectedEpisode?.id ?: "",
-                            episodeName = selectedEpisode?.name ?: "",
-                            watchedAt = System.currentTimeMillis(),
-                        )
-                    )
-                    // refresh: refetch the provider's stream list and relaunch
-                    // with a fresh URL — signed live links (chaturbate) expire
-                    // or get consumed within seconds, so a 403 is retried with a
-                    // brand-new link instead of an error dialog.
-                    DesktopPlayer.play(
-                        "${meta.title} — ${s.name}",
-                        s,
-                        refresh = {
-                            runCatching {
-                                kotlinx.coroutines.runBlocking { AppShell.app.repository.streamsFor(meta, selectedEpisode) }
-                            }.getOrNull()?.firstOrNull()
-                        },
-                    )
+                    playStream(meta, s)
                 }
             }
             val open = Button("Browser").apply {
@@ -265,6 +231,85 @@ class DetailScreenView(private val item: MediaItem) {
             val full = VBox(2.0, row)
             if (badges != null) full.children.add(Theme.label(badges, size = 11.0, dim = true))
             streamsBox.children.add(full)
+        }
+    }
+
+    private fun playStream(meta: MediaItem, stream: StreamSource) {
+        // Save history
+        HikariApp.instance.store.addHistory(
+            HistoryEntry(
+                providerId = meta.providerId,
+                mediaId = meta.id,
+                type = meta.type,
+                title = meta.title,
+                posterUrl = meta.posterUrl,
+                episodeId = selectedEpisode?.id ?: "",
+                episodeName = selectedEpisode?.name ?: "",
+                watchedAt = System.currentTimeMillis(),
+            )
+        )
+
+        val allEps = episodes
+        val currentEp = selectedEpisode
+
+        // Enhanced player with custom controls, next-episode, and fixed seeking
+        // Falls back to DesktopPlayer if IPC fails
+        try {
+            EnhancedPlayer.play(
+                title = "${meta.title} — ${selectedEpisode?.let { "Ep ${it.number} " } ?: ""}${stream.name}",
+                stream = stream,
+                episodes = allEps,
+                currentEpisode = currentEp,
+                onEpisodeChanged = { nextEp ->
+                    Fx.run {
+                        selectedEpisode = nextEp
+                        episodeGrid?.select(nextEp)
+                        // Save history for next ep
+                        HikariApp.instance.store.addHistory(
+                            HistoryEntry(
+                                providerId = meta.providerId,
+                                mediaId = meta.id,
+                                type = meta.type,
+                                title = meta.title,
+                                posterUrl = meta.posterUrl,
+                                episodeId = nextEp.id,
+                                episodeName = nextEp.name ?: "",
+                                watchedAt = System.currentTimeMillis(),
+                            )
+                        )
+                        // Fetch streams for next ep and auto-play first
+                        scope.launch {
+                            val nextStreams = runCatching {
+                                AppShell.app.repository.streamsFor(meta, nextEp)
+                            }.getOrNull()
+                            val first = nextStreams?.firstOrNull()
+                            Fx.run {
+                                if (first != null) {
+                                    playStream(meta, first)
+                                } else {
+                                    loadStreams(meta)
+                                }
+                            }
+                        }
+                    }
+                },
+                refresh = {
+                    runCatching {
+                        kotlinx.coroutines.runBlocking { AppShell.app.repository.streamsFor(meta, selectedEpisode) }
+                    }.getOrNull()?.firstOrNull()
+                }
+            )
+        } catch (e: Exception) {
+            // Fallback to old player if enhanced fails
+            DesktopPlayer.play(
+                "${meta.title} — ${stream.name}",
+                stream,
+                refresh = {
+                    runCatching {
+                        kotlinx.coroutines.runBlocking { AppShell.app.repository.streamsFor(meta, selectedEpisode) }
+                    }.getOrNull()?.firstOrNull()
+                },
+            )
         }
     }
 }
