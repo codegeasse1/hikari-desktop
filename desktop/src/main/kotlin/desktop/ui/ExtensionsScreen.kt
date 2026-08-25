@@ -51,7 +51,19 @@ class ExtensionsScreenView {
         val url: String,
         val name: String,
         val description: String,
-        val plugins: List<Pair<String, String>>,
+        val plugins: List<PluginRef>,
+    )
+
+    /** One installable entry from a repo's plugin list. The hashes are the
+     *  repo's own sha256 signatures ("sha256-<hex>") — fileHash for the dex
+     *  archive (.cs3/.hiki), jarHash for the JVM .jar build. When present
+     *  they're verified after download (Android-app parity), so a broken
+     *  mirror or proxy frontdoor can never install a tampered plugin. */
+    private data class PluginRef(
+        val name: String,
+        val url: String,
+        val fileHash: String?,
+        val jarHash: String?,
     )
 
     private val repoData = HashMap<String, RepoData>()
@@ -139,16 +151,20 @@ class ExtensionsScreenView {
                 if (data.description.isNotBlank()) {
                     pluginsBox.children.add(Theme.label(data.description, size = 11.5, dim = true))
                 }
-                data.plugins.forEach { (pname, purl) ->
+                data.plugins.forEach { pr ->
                     val info = VBox(2.0).apply {
-                        children.add(Theme.label(pname, size = 14.0, bold = true))
-                        children.add(Theme.label(purl, size = 10.5, dim = true))
+                        children.add(Theme.label(pr.name, size = 14.0, bold = true))
+                        children.add(Theme.label(pr.url, size = 10.5, dim = true))
                     }
-                    val installed = providersFor(purl)
+                    val installed = providersFor(pr.url)
                     val btn = Button(if (installed.isEmpty()) "Install" else "Uninstall (${installed.size})").apply {
                         styleClass.addAll("btn", if (installed.isEmpty()) "btn-primary" else "btn-danger")
                         setOnAction {
-                            if (installed.isEmpty()) installPlugin(pname, purl) else uninstallPlugin(pname, purl)
+                            if (installed.isEmpty()) {
+                                installPlugin(pr.name, pr.url, pr.fileHash, pr.jarHash)
+                            } else {
+                                uninstallPlugin(pr.name, pr.url)
+                            }
                         }
                     }
                     val row = HBox(10.0, info, btn).apply {
@@ -161,7 +177,7 @@ class ExtensionsScreenView {
                         // Per-plugin result — an install that failed must say
                         // WHY right where the button is, not only in the tiny
                         // status line at the bottom of the page.
-                        installErrors[purl]?.let { err ->
+                        installErrors[pr.url]?.let { err ->
                             children.add(
                                 Theme.label("⚠ $err", size = 11.0, dim = true)
                                     .apply { style = style + "; -fx-text-fill: #ff9a9a;" }
@@ -375,18 +391,19 @@ class ExtensionsScreenView {
     }
 
     /** Reads the repo's `plugins` array, resolving relative plugin URLs
-     *  against the repo.json ([baseUrl] — the URL that actually served it) and
-     *  converting .hiki plugin URLs to their .jar desktop builds.
+     *  against the repo.json ([baseUrl] — the URL that actually served it),
+     *  converting .hiki plugin URLs to their .jar desktop builds, and keeping
+     *  the repo's sha256 signatures for post-download verification.
      *  `plugins` is already a JSONArray — org.json's `new JSONArray(jsonArray)`
      *  throws, so never re-wrap an existing array. */
-    private fun parsePlugins(root: JSONObject?, baseUrl: String = ""): List<Pair<String, String>> {
+    private fun parsePlugins(root: JSONObject?, baseUrl: String = ""): List<PluginRef> {
         root ?: return emptyList()
         val plugins = when (val p = root.opt("plugins")) {
             null -> JSONArray()
             is JSONArray -> p
             else -> runCatching { JSONArray(p) }.getOrNull() ?: JSONArray()
         }
-        val out = mutableListOf<Pair<String, String>>()
+        val out = mutableListOf<PluginRef>()
         for (i in 0 until plugins.length()) {
             val p = plugins.optJSONObject(i) ?: continue
             val name = p.optString("name")
@@ -398,7 +415,12 @@ class ExtensionsScreenView {
             // scheme-less URL it must reject.
             if (baseUrl.isNotBlank()) url = Http.resolveRelativeTo(url, baseUrl)
             if (url.endsWith(".hiki")) url = url.removeSuffix(".hiki") + ".jar"
-            out += name to url
+            out += PluginRef(
+                name = name,
+                url = url,
+                fileHash = p.optString("fileHash").ifBlank { null },
+                jarHash = p.optString("jarHash").ifBlank { null },
+            )
         }
         return out
     }
@@ -495,9 +517,11 @@ class ExtensionsScreenView {
         }
 
     /** Downloads (auto-swapping .hiki → .jar), loads, and registers every
-     *  provider inside the extension. Every path ends with a visible status —
-     *  nothing ever fails silently. */
-    private fun installPlugin(name: String, url: String) {
+     *  provider inside the extension. Every candidate is verified (zip header
+     *  + the repo's sha256 when it publishes one) BEFORE it is loaded, and a
+     *  bad candidate falls through to the next one. Every path ends with a
+     *  visible status — nothing ever fails silently. */
+    private fun installPlugin(name: String, url: String, fileHash: String? = null, jarHash: String? = null) {
         var dl = url
         if (dl.endsWith(".hiki")) dl = dl.removeSuffix(".hiki") + ".jar"
         installErrors.remove(url)
@@ -523,45 +547,53 @@ class ExtensionsScreenView {
                 } else if (dl.endsWith(".cs3")) {
                     candidates.add("$stem.jar")
                 }
-                var ok = false
                 val attempts = StringBuilder()
+                var registered: String? = null
+                var loadFailure: String? = null
                 for (c in candidates) {
                     val why = StringBuilder()
-                    ok = Http.downloadToRobust(c, dest) { tried, success, reason ->
+                    val ok = Http.downloadToRobust(c, dest) { tried, success, reason ->
                         if (!success) {
                             val host = tried.substringAfter("//").substringBefore('/')
                             if (why.isNotEmpty()) why.append(";  ")
                             why.append("$host — ${reason?.take(70) ?: "failed"}")
                         }
                     }
-                    if (ok) break
-                    if (why.isNotEmpty()) attempts.append(why).append('\n')
+                    if (!ok) {
+                        if (why.isNotEmpty()) attempts.append(why).append('\n')
+                        continue
+                    }
+                    // A blocked/misbehaving network (or one of the proxy
+                    // frontdoors) can serve an HTML error page or a tampered
+                    // file with a 200 — a real extension is always a zip (PK
+                    // header), and when the repo publishes a sha256 for this
+                    // build it must match before the file is ever loaded.
+                    val verifyFail = verifyDownload(dest, c, fileHash, jarHash)
+                    if (verifyFail != null) {
+                        attempts.append("${c.substringAfterLast('/').substringBefore('?')} — $verifyFail\n")
+                        dest.delete()
+                        continue
+                    }
+                    // Record the row's primary URL (not whichever sibling
+                    // format arrived) so the Install/Uninstall state and
+                    // providersFor() keep matching this row afterwards.
+                    val result = registerExtension(name, safeName, dest, dl)
+                    if (result != null) {
+                        registered = result
+                        break
+                    }
+                    loadFailure = HikariPluginManager.lastError ?: Cs3PluginManager.lastError ?: "not an extension"
+                    attempts.append("${c.substringAfterLast('/')} — not loadable (${loadFailure?.take(90)})\n")
                 }
-                if (ok) {
-                    // A blocked/misbehaving network can serve an HTML error page
-                    // with a 200 — a real extension is always a zip (PK header).
-                    val isZip = dest.inputStream().use { s ->
-                        val h = s.readNBytes(4)
-                        h.size == 4 && h[0] == 'P'.code.toByte() && h[1] == 'K'.code.toByte()
-                    }
-                    if (!isZip) {
-                        statusText = "Downloaded file is not an extension (the network may have served an error page instead of the jar)."
-                    } else {
-                        // Record the row's primary URL (not whichever sibling
-                        // format arrived) so the Install/Uninstall state and
-                        // providersFor() keep matching this row afterwards.
-                        val registered = registerExtension(name, safeName, dest, dl)
-                        if (registered != null) {
-                            statusText = registered
-                            isErr = false
-                        } else {
-                            statusText = "Couldn't load $name: ${HikariPluginManager.lastError ?: Cs3PluginManager.lastError ?: "not an extension"}"
-                        }
-                    }
+                if (registered != null) {
+                    statusText = registered!!
+                    isErr = false
+                } else if (loadFailure != null && attempts.indexOf("not loadable") >= 0) {
+                    statusText = "Couldn't load $name: ${loadFailure!!.take(300)}"
                 } else {
                     statusText = "Download failed for $name — no mirror served the file:" +
                         (if (attempts.isEmpty()) " (no reasons reported)" else "\n$attempts") +
-                        "If several hosts above say “blocked”/“unknown host”, your network or DNS filters GitHub-family hosts — use a VPN, or a repo that mirrors plugins (the built-in Hikari repo does)."
+                        "If several hosts above say “blocked”/“SSL”, your network or DNS filters GitHub-family hosts — the ghfast.top/ghproxy.net rows should still get through; if nothing does, use a VPN or a repo that mirrors plugins (the built-in Hikari repo does)."
                 }
             } catch (t: Throwable) {
                 statusText = "Install failed: ${t.message?.take(300) ?: t.javaClass.simpleName}"
@@ -575,6 +607,40 @@ class ExtensionsScreenView {
             }
         }
     }
+
+    /** Null = the downloaded file is a plausible, untampered extension; a
+     *  string says why it isn't. Checks the zip (PK) header and — when the
+     *  repo publishes one — the sha256 for the downloaded format (fileHash
+     *  for dex archives, jarHash for JVM jars; the Android app's rule). */
+    private fun verifyDownload(dest: File, url: String, fileHash: String?, jarHash: String?): String? {
+        val isZip = dest.inputStream().use { s ->
+            val h = s.readNBytes(4)
+            h.size == 4 && h[0] == 'P'.code.toByte() && h[1] == 'K'.code.toByte()
+        }
+        if (!isZip) return "served an error page, not an extension"
+        val expected = when {
+            url.endsWith(".cs3") || url.endsWith(".hiki") -> fileHash
+            url.endsWith(".jar") -> jarHash ?: fileHash
+            else -> null
+        } ?: return null
+        val want = expected.removePrefix("sha256-").lowercase()
+        if (want.length != 64) return null // not a sha256-<hex> value — nothing to enforce
+        val got = sha256Hex(dest) ?: return null
+        return if (got != want) "checksum mismatch (file corrupted or tampered)" else null
+    }
+
+    private fun sha256Hex(f: File): String? = runCatching {
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        f.inputStream().use { s ->
+            val buf = ByteArray(64 * 1024)
+            while (true) {
+                val n = s.read(buf)
+                if (n < 0) break
+                md.update(buf, 0, n)
+            }
+        }
+        md.digest().joinToString("") { "%02x".format(it) }
+    }.getOrNull()
 
     /** Registers every provider inside [dest] as its own provider config.
      *  Bundle extensions (a manifest with several mainClass entries) become
