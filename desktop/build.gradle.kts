@@ -9,7 +9,7 @@ version = "1.0.0"
 
 javafx {
     version = libs.versions.javafx.get()
-    modules = listOf("javafx.controls", "javafx.media", "javafx.web", "javafx.swing")
+    modules = listOf("javafx.controls", "javafx.media", "javafx.web")
 }
 
 kotlin {
@@ -67,8 +67,6 @@ dependencies {
     implementation(libs.conscrypt.openjdk)
     implementation(libs.orgjson)
     implementation(libs.imageio.webp)
-    implementation("net.java.dev.jna:jna:5.14.0")
-    implementation("net.java.dev.jna:jna-platform:5.14.0")
 }
 
 // The exe launcher on Windows (jpackage) needs every runtime jar in one input
