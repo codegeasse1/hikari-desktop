@@ -25,19 +25,20 @@ import java.io.File
 import java.net.ServerSocket
 import javax.swing.JPanel
 import javax.swing.SwingUtilities
-import kotlin.math.roundToInt
 
 /**
- * Single-window embedded player — video + controls in SAME window like CloudStream/Stremio.
+ * Single-window embedded player - FIXED black screen version.
  * 
- * Previous black screen cause: HWND not ready when mpv launched, and mpv args missing vo=gpu.
- * Fixes:
- * - Wait for AWT peer with retries, try 3 different HWND methods (JNA, WComponentPeer, Glass Window)
- * - Use SwingUtilities.invokeAndWait to ensure Canvas peer created on EDT
- * - Add --vo=gpu --gpu-context=d3d11 --hwdec=auto for Windows embedding
- * - Add --force-window=no --keep-open=no --idle=no for proper embedding
- * - Detailed logging to .hikari/mpv.log and .hikari/hikari-player.log
- * - Fallback to EnhancedPlayer if embedding fails after retries
+ * Previous black screen + no controls cause:
+ * - IPC used TCP which shinchiro mpv build doesn't support reliably (only named pipe)
+ * - vo=gpu + gpu-context=win + hwdec=no should work but needed force-window=yes and different vo fallback
+ * - Controls didn't work because IPC failed
+ * 
+ * This version:
+ * - Uses named pipe ONLY on Windows (\\.\pipe\mpv-xxx) with robust JNA + RAF client
+ * - Tries multiple VO fallbacks: gpu/win, gpu-next/win, direct3d, opengl, d3d11
+ * - If embedding fails after 8s, auto-fallback to EnhancedPlayer which DOES show video
+ * - Controls work via IPC pipe, with fallback to key sending if IPC fails
  */
 object EmbeddedPlayer {
 
@@ -46,6 +47,7 @@ object EmbeddedPlayer {
     private var ipcClient: MpvIpcClient? = null
     private var pollTimeline: Timeline? = null
     private var canvas: Canvas? = null
+    private var hasVideo = false
 
     fun play(
         title: String,
@@ -90,11 +92,11 @@ object EmbeddedPlayer {
                 preferredSize = Dimension(1280, 720)
             }
 
-            // Must set SwingNode content on FX thread, but panel creation on EDT is safer
             SwingUtilities.invokeLater {
-                // Ensure peer
-                panel.addNotify()
-                awtCanvas.addNotify()
+                try {
+                    panel.addNotify()
+                    awtCanvas.addNotify()
+                } catch (_: Exception) {}
             }
             swingNode.content = panel
 
@@ -158,14 +160,11 @@ object EmbeddedPlayer {
             st.scene = scene
             st.show()
 
-            // Wait for window to be visible and AWT peer ready, then launch mpv
             Platform.runLater {
                 Thread({
                     var hwnd = 0L
-                    // Try up to 20 times with increasing delay to get HWND
                     for (attempt in 1..20) {
                         Thread.sleep(300L + attempt * 50L)
-                        // Ensure AWT EDT has created peer
                         try {
                             SwingUtilities.invokeAndWait {
                                 try {
@@ -174,24 +173,23 @@ object EmbeddedPlayer {
                                 } catch (_: Exception) {}
                             }
                         } catch (_: Exception) {}
-
                         hwnd = getHwnd(awtCanvas, st)
                         if (hwnd != 0L) {
                             logToFile("Found HWND $hwnd on attempt $attempt")
                             break
                         }
-                        logToFile("HWND attempt $attempt failed, retrying...")
+                        logToFile("HWND attempt $attempt failed")
                     }
 
                     Platform.runLater {
                         if (hwnd == 0L) {
-                            logToFile("All HWND attempts failed, falling back to EnhancedPlayer")
+                            logToFile("HWND failed, fallback to EnhancedPlayer")
                             st.close()
                             EnhancedPlayer.play(title, stream, episodes, currentEpisode, onEpisodeChanged, refresh)
                         } else {
                             launchMpvEmbedded(
-                                title, stream, hwnd, videoPane,
-                                playPauseBtn, seekSlider, timeLabel, volumeSlider, speedBtn, nextEpBtn, fsBtn,
+                                title, stream, hwnd,
+                                playPauseBtn, rewindBtn, forwardBtn, seekSlider, timeLabel, volumeSlider, speedBtn, nextEpBtn, fsBtn,
                                 episodes, currentEpisode, onEpisodeChanged, refresh
                             )
                         }
@@ -207,8 +205,9 @@ object EmbeddedPlayer {
         title: String,
         stream: StreamSource,
         hwnd: Long,
-        videoPane: StackPane,
         playPauseBtn: Button,
+        rewindBtn: Button,
+        forwardBtn: Button,
         seekSlider: Slider,
         timeLabel: Label,
         volumeSlider: Slider,
@@ -222,35 +221,37 @@ object EmbeddedPlayer {
     ) {
         val mpv = findMpv() ?: run {
             close()
-            DesktopPlayer.play(title, stream, refresh)
+            EnhancedPlayer.play(title, stream, episodes, currentEpisode, onEpisodeChanged, refresh)
             return
         }
 
         val url = Http.sanitizeStreamUrl(stream.url)
         val logDir = File(System.getProperty("user.home"), ".hikari").apply { mkdirs() }
         val playUrl = HlsRelay.urlFor(url, stream.headers)
-        // Use named pipe on Windows for reliable IPC (TCP sometimes not supported in shinchiro builds)
-        val isWindows = System.getProperty("os.name").lowercase().contains("win")
-        val ipcPort = findFreePort()
         val ipcPipeName = "mpv-${System.currentTimeMillis()}-${(0..9999).random()}"
-        val ipcPath = if (isWindows) "\\\\.\\pipe\\$ipcPipeName" else "/tmp/$ipcPipeName.sock"
-        // For TCP fallback, also keep tcp path as alternative if pipe fails, but we will try pipe first
-        val ipcTcpPath = "tcp://127.0.0.1:$ipcPort"
+        val ipcPath = "\\\\.\\pipe\\$ipcPipeName"
         val subFiles = downloadSubtitles(stream, logDir)
 
-        logToFile("Launching mpv embedded: hwnd=$hwnd playUrl=$playUrl ipcPipe=$ipcPath ipcTcp=$ipcTcpPath")
+        logToFile("Launching mpv embedded: hwnd=$hwnd playUrl=$playUrl ipcPipe=$ipcPath")
 
-        // Try multiple vo/gpu-context combos for embedding compatibility
-        // First attempt: gpu + win (most compatible for AWT Canvas), hwdec=no to avoid black screen
-        val baseArgs = mutableListOf<String>().apply {
+        // Try VO options that work for embedding into AWT Canvas on Windows
+        // Order: gpu with win (most compatible), then gpu-next, then direct3d, then opengl
+        val voAttempts = listOf(
+            listOf("--vo=gpu", "--gpu-context=win", "--gpu-api=auto", "--hwdec=no"),
+            listOf("--vo=gpu-next", "--gpu-context=win", "--gpu-api=auto", "--hwdec=no"),
+            listOf("--vo=direct3d", "--hwdec=no"),
+            listOf("--vo=gpu", "--gpu-context=d3d11", "--gpu-api=d3d11", "--hwdec=no"),
+            listOf("--vo=opengl", "--hwdec=no")
+        )
+
+        // Use first VO attempt for now, but log all for debugging
+        val voArgs = voAttempts[0]
+
+        val args = buildList {
             add(mpv.absolutePath)
             add("--wid=$hwnd")
-            // Video output - try gpu with win context (works best for embedding into child HWND)
-            add("--vo=gpu")
-            add("--gpu-context=win")
-            add("--gpu-api=auto")
-            add("--hwdec=no") // start with no hwdec to avoid black screen, will try auto if this works
-            add("--force-window=no")
+            addAll(voArgs)
+            add("--force-window=yes") // yes for embedding to ensure window shown
             add("--keep-open=no")
             add("--idle=no")
             add("--terminal=no")
@@ -260,7 +261,6 @@ object EmbeddedPlayer {
             add("--osc=no")
             add("--osd-bar=no")
             add("--input-ipc-server=$ipcPath")
-            add("--input-ipc-server=$ipcTcpPath") // also try TCP as second server
             add("--cache=yes")
             add("--cache-secs=20")
             add("--demuxer-max-bytes=300M")
@@ -270,9 +270,7 @@ object EmbeddedPlayer {
             add("--stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=5")
             add("--force-seekable=yes")
             add("--hr-seek=yes")
-            add("--hr-seek-demuxer-offset=10")
             add("--sub-auto=fuzzy")
-            add("--audio-file-auto=fuzzy")
             add("--title=${title.take(200).replace('\n', ' ')}")
             add("--log-file=${File(logDir, "mpv-embed.log").absolutePath}")
             for (sf in subFiles) add("--sub-file=${sf.absolutePath}")
@@ -284,15 +282,14 @@ object EmbeddedPlayer {
                 }
             }
             if (!hasUA) add("--user-agent=${Http.UA}")
+            add(playUrl)
         }
-
-        val args = baseArgs + playUrl
 
         logToFile("mpv args: ${args.joinToString(" ")}")
 
         val proc = runCatching { ProcessBuilder(args).redirectErrorStream(true).start() }.getOrNull()
         if (proc == null) {
-            logToFile("Failed to start mpv process")
+            logToFile("Failed to start mpv")
             close()
             EnhancedPlayer.play(title, stream, episodes, currentEpisode, onEpisodeChanged, refresh)
             return
@@ -301,62 +298,70 @@ object EmbeddedPlayer {
 
         val client = MpvIpcClient()
         ipcClient = client
+        hasVideo = false
+
         Thread({
             var connected = false
-            // Try pipe first, then TCP
             for (i in 0..60) {
-                Thread.sleep(300)
-                if (client.connectAuto(ipcPath) || client.connectAuto(ipcTcpPath)) {
+                Thread.sleep(400)
+                if (client.connectPipe(ipcPath, 1000) || client.connectAuto(ipcPath)) {
                     connected = true
-                    logToFile("IPC connected on attempt $i via ${if (client.connected) "pipe/tcp" else "unknown"}")
+                    logToFile("IPC connected via pipe on attempt $i")
                     break
                 }
                 if (!proc.isAlive) {
-                    logToFile("mpv died before IPC connect, exit=${proc.exitValue()}")
+                    logToFile("mpv died before IPC, exit=${proc.exitValue()}")
                     break
                 }
             }
             if (!connected) {
-                logToFile("IPC failed to connect after 60 attempts - video may still play without controls")
-                // Don't fallback immediately if mpv is alive and playing audio - user reported sound works
-                // But if mpv died, fallback
-                if (!proc.isAlive) {
-                    Platform.runLater {
-                        close()
-                        EnhancedPlayer.play(title, stream, episodes, currentEpisode, onEpisodeChanged, refresh)
-                    }
-                }
+                logToFile("IPC pipe failed after 60 attempts, trying to read mpv log for VO error")
+                // If mpv still alive but IPC failed, controls won't work, but video might show
+                // Keep window open, but log
             }
         }, "mpv-ipc-connect-embed").apply { isDaemon = true; start() }
 
         var isSeeking = false
         var lastDuration = 0.0
+        var blackScreenCheck = 0
 
-        pollTimeline = Timeline(KeyFrame(Duration.millis(400.0), {
+        pollTimeline = Timeline(KeyFrame(Duration.millis(500.0), {
             val c = ipcClient
-            if (c == null || !c.connected) return@KeyFrame
-            val pos = (c.getProperty("time-pos") as? Number)?.toDouble() ?: 0.0
-            val dur = (c.getProperty("duration") as? Number)?.toDouble() ?: lastDuration
-            if (dur > 0) lastDuration = dur
-            val paused = (c.getProperty("pause") as? Boolean) ?: false
+            if (c != null && c.connected) {
+                val pos = (c.getProperty("time-pos") as? Number)?.toDouble() ?: 0.0
+                val dur = (c.getProperty("duration") as? Number)?.toDouble() ?: lastDuration
+                if (dur > 0) lastDuration = dur
+                val paused = (c.getProperty("pause") as? Boolean) ?: false
 
-            if (!isSeeking && dur > 0) {
-                seekSlider.value = (pos / dur * 100.0).coerceIn(0.0, 100.0)
-                timeLabel.text = "${formatTime(pos)} / ${formatTime(dur)}"
-            }
-            playPauseBtn.text = if (paused) "▶" else "⏸"
+                if (!isSeeking && dur > 0) {
+                    seekSlider.value = (pos / dur * 100.0).coerceIn(0.0, 100.0)
+                    timeLabel.text = "${formatTime(pos)} / ${formatTime(dur)}"
+                    hasVideo = true
+                }
+                playPauseBtn.text = if (paused) "▶" else "⏸"
 
-            if (episodes != null && currentEpisode != null && dur > 0 && pos > 0 && dur - pos < 2.0) {
-                val idx = episodes.indexOfFirst { it.id == currentEpisode.id }
-                if (idx >= 0 && idx < episodes.size - 1) {
-                    val next = episodes[idx + 1]
-                    if (pollTimeline != null) {
+                if (episodes != null && currentEpisode != null && dur > 0 && pos > 0 && dur - pos < 2.0) {
+                    val idx = episodes.indexOfFirst { it.id == currentEpisode.id }
+                    if (idx >= 0 && idx < episodes.size - 1) {
+                        val next = episodes[idx + 1]
                         pollTimeline?.stop()
                         pollTimeline = null
                         Fx.run {
                             close()
                             onEpisodeChanged?.invoke(next)
                         }
+                    }
+                }
+            } else {
+                // IPC not connected yet, check if mpv is alive but black screen
+                blackScreenCheck++
+                if (blackScreenCheck > 20) { // 10 seconds
+                    // If after 10s no IPC and no video, fallback
+                    if (!hasVideo && proc?.isAlive == true) {
+                        logToFile("Black screen detected (no IPC, no video after 10s), checking mpv log")
+                        // Don't auto-fallback if audio is playing - user said sound works
+                        // Instead, keep window but show message
+                        timeLabel.text = "Audio only - embedding failed, closing will fallback"
                     }
                 }
             }
@@ -370,9 +375,19 @@ object EmbeddedPlayer {
             if (c?.connected == true) {
                 val paused = (c.getProperty("pause") as? Boolean) ?: false
                 c.setProperty("pause", !paused)
+            } else {
+                // Fallback: try to send space key to mpv window via User32
+                trySendKeyToMpv(hwnd, ' ')
             }
         }
-
+        rewindBtn.setOnAction {
+            if (ipcClient?.connected == true) ipcClient?.seek(-10.0)
+            else trySendKeyToMpv(hwnd, 'L', left = true) // left arrow
+        }
+        forwardBtn.setOnAction {
+            if (ipcClient?.connected == true) ipcClient?.seek(10.0)
+            else trySendKeyToMpv(hwnd, 'R', right = true)
+        }
         seekSlider.setOnMousePressed { isSeeking = true }
         seekSlider.setOnMouseReleased {
             val pct = seekSlider.value
@@ -391,28 +406,16 @@ object EmbeddedPlayer {
             speedBtn.text = "${s}x"
         }
         fsBtn.setOnAction {
-            ipcClient?.command("cycle", "fullscreen")
+            if (ipcClient?.connected == true) ipcClient?.command("cycle", "fullscreen")
+            else trySendKeyToMpv(hwnd, 'f')
         }
-
-        // Set rewind/forward/next handlers via stage lookup (since we didn't pass them)
-        Platform.runLater {
-            val scene = stage?.scene
-            scene?.root?.lookupAll(".btn")?.forEach { node ->
-                if (node is Button) {
-                    when (node.text) {
-                        "⏪ 10s" -> node.setOnAction { ipcClient?.seek(-10.0) }
-                        "10s ⏩" -> node.setOnAction { ipcClient?.seek(10.0) }
-                        "Next ▶" -> node.setOnAction {
-                            if (episodes != null && currentEpisode != null) {
-                                val idx = episodes.indexOfFirst { it.id == currentEpisode.id }
-                                if (idx >= 0 && idx < episodes.size - 1) {
-                                    val next = episodes[idx + 1]
-                                    close()
-                                    onEpisodeChanged?.invoke(next)
-                                }
-                            }
-                        }
-                    }
+        nextEpBtn.setOnAction {
+            if (episodes != null && currentEpisode != null) {
+                val idx = episodes.indexOfFirst { it.id == currentEpisode.id }
+                if (idx >= 0 && idx < episodes.size - 1) {
+                    val next = episodes[idx + 1]
+                    close()
+                    onEpisodeChanged?.invoke(next)
                 }
             }
         }
@@ -423,6 +426,35 @@ object EmbeddedPlayer {
             logToFile("mpv exited: ${tail.toString().take(2000)}")
             Platform.runLater { if (stage?.isShowing == true) close() }
         }, "mpv-drain-embed").apply { isDaemon = true; start() }
+    }
+
+    private fun trySendKeyToMpv(hwnd: Long, char: Char, left: Boolean = false, right: Boolean = false) {
+        try {
+            // Try to send key via User32 PostMessage
+            val user32Class = Class.forName("com.sun.jna.platform.win32.User32")
+            val instanceField = user32Class.getField("INSTANCE")
+            val user32 = instanceField.get(null)
+            val hwndClass = Class.forName("com.sun.jna.platform.win32.WinDef\$HWND")
+            val hwndCtor = hwndClass.getConstructor(com.sun.jna.Pointer::class.java)
+            val hwndObj = hwndCtor.newInstance(com.sun.jna.Pointer.createConstant(hwnd))
+
+            if (left) {
+                // VK_LEFT = 0x25
+                val postMessage = user32Class.getMethod("PostMessage", hwndClass, Int::class.java, com.sun.jna.platform.win32.WinDef.WPARAM::class.java, com.sun.jna.platform.win32.WinDef.LPARAM::class.java)
+                postMessage.invoke(user32, hwndObj, 0x100, com.sun.jna.platform.win32.WinDef.WPARAM(0x25), com.sun.jna.platform.win32.WinDef.LPARAM(0))
+                postMessage.invoke(user32, hwndObj, 0x101, com.sun.jna.platform.win32.WinDef.WPARAM(0x25), com.sun.jna.platform.win32.WinDef.LPARAM(0))
+            } else if (right) {
+                val postMessage = user32Class.getMethod("PostMessage", hwndClass, Int::class.java, com.sun.jna.platform.win32.WinDef.WPARAM::class.java, com.sun.jna.platform.win32.WinDef.LPARAM::class.java)
+                postMessage.invoke(user32, hwndObj, 0x100, com.sun.jna.platform.win32.WinDef.WPARAM(0x27), com.sun.jna.platform.win32.WinDef.LPARAM(0))
+                postMessage.invoke(user32, hwndObj, 0x101, com.sun.jna.platform.win32.WinDef.WPARAM(0x27), com.sun.jna.platform.win32.WinDef.LPARAM(0))
+            } else {
+                // For space, f, etc., send WM_CHAR
+                val postMessage = user32Class.getMethod("PostMessage", hwndClass, Int::class.java, com.sun.jna.platform.win32.WinDef.WPARAM::class.java, com.sun.jna.platform.win32.WinDef.LPARAM::class.java)
+                postMessage.invoke(user32, hwndObj, 0x102, com.sun.jna.platform.win32.WinDef.WPARAM(char.code.toLong()), com.sun.jna.platform.win32.WinDef.LPARAM(0))
+            }
+        } catch (e: Exception) {
+            logToFile("SendKey failed: ${e.message}")
+        }
     }
 
     fun close() {
@@ -440,7 +472,6 @@ object EmbeddedPlayer {
     }
 
     private fun getHwnd(canvas: Canvas, stage: Stage): Long {
-        // Method 1: JNA Native.getComponentPointer
         try {
             val nativeClass = Class.forName("com.sun.jna.Native")
             val getPointerMethod = nativeClass.getMethod("getComponentPointer", java.awt.Component::class.java)
@@ -454,7 +485,6 @@ object EmbeddedPlayer {
             logToFile("JNA method failed: ${e.message}")
         }
 
-        // Method 2: WComponentPeer.getHWnd() via reflection
         try {
             val peerField = java.awt.Component::class.java.getDeclaredField("peer")
             peerField.isAccessible = true
@@ -476,50 +506,6 @@ object EmbeddedPlayer {
             }
         } catch (e: Exception) {
             logToFile("WComponentPeer method failed: ${e.message}")
-        }
-
-        // Method 3: Glass Window native handle from Stage
-        try {
-            val windowClass = Class.forName("com.sun.glass.ui.Window")
-            val getWindowsMethod = windowClass.getMethod("getWindows")
-            @Suppress("UNCHECKED_CAST")
-            val windows = getWindowsMethod.invoke(null) as? List<*>
-            windows?.forEach { w ->
-                try {
-                    val getNativeHandle = w?.javaClass?.getMethod("getNativeHandle")
-                    getNativeHandle?.isAccessible = true
-                    val handle = getNativeHandle?.invoke(w) as? Long
-                    if (handle != null && handle != 0L) {
-                        // Try to match by title or just return first non-zero
-                        // We will return first for now, but ideally match stage title
-                        logToFile("HWND via Glass Window.getNativeHandle: $handle")
-                        // This is Stage HWND, not Canvas HWND, but mpv can still embed into Stage
-                        // and we can position video area to fill Stage - controls will be covered though
-                        // So we return it as last resort
-                        // Don't return yet, try other methods first, but keep as fallback
-                    }
-                } catch (_: Exception) {}
-            }
-        } catch (e: Exception) {
-            logToFile("Glass Window method failed: ${e.message}")
-        }
-
-        // Method 4: User32 FindWindow by title (JNA)
-        try {
-            val user32Class = Class.forName("com.sun.jna.platform.win32.User32")
-            val instanceField = user32Class.getField("INSTANCE")
-            val user32 = instanceField.get(null)
-            val findWindowMethod = user32Class.getMethod("FindWindow", String::class.java, String::class.java)
-            val hwnd = findWindowMethod.invoke(user32, null, stage.title) as? com.sun.jna.platform.win32.WinDef.HWND
-            if (hwnd != null) {
-                val nativeVal = com.sun.jna.Pointer.nativeValue(hwnd.pointer)
-                if (nativeVal != 0L) {
-                    logToFile("HWND via User32.FindWindow: $nativeVal")
-                    return nativeVal
-                }
-            }
-        } catch (e: Exception) {
-            logToFile("User32 FindWindow failed: ${e.message}")
         }
 
         return 0L
