@@ -153,8 +153,18 @@ object Http {
             .matchEntire(url)?.let { m ->
                 val user = m.groupValues[1]
                 val repo = m.groupValues[2]
-                val branch = m.groupValues[3]
-                val path = m.groupValues[4]
+                var branch = m.groupValues[3]
+                var path = m.groupValues[4]
+                // Fully-qualified refs (…/u/r/refs/heads/<branch>/p): normalize
+                // so the generated mirror URLs carry a bare branch.
+                if (branch == "refs" && (path.startsWith("heads/") || path.startsWith("tags/"))) {
+                    val rest = path.substringAfter('/')
+                    val cut = rest.indexOf('/')
+                    if (cut > 0) {
+                        branch = rest.substring(0, cut)
+                        path = rest.substring(cut + 1)
+                    }
+                }
                 if (branch.isNotBlank()) {
                     if (path.isBlank()) {
                         ghRaw(out, user, repo, branch)
@@ -169,6 +179,9 @@ object Http {
                             // instead of dead .hiki URLs.
                             ghRaw(out, user, repo, branch)
                             ghRaw(out, user, repo, "main")
+                            // CloudStream convention: the manifest lives on the
+                            // builds branch even when the pasted link says main.
+                            if (branch != "builds") ghRaw(out, user, repo, "builds")
                         }
                     }
                 } else {
@@ -187,6 +200,9 @@ object Http {
     /** Hard cap for a repo fetch so a slow/blocked network fails with a clear
      *  error instead of leaving the UI stuck on "Checking…" for minutes. */
     private const val REPO_FETCH_DEADLINE_MS = 60_000L
+
+    /** Overall budget for one extension download (all mirrors + retries). */
+    private const val DOWNLOAD_BUDGET_MS = 90_000L
 
     /** Fetches a repo.json, trying every candidate URL. Only accepts a response
      *  that is actually a JSON object with a "plugins" key — or a CloudStream v2
@@ -234,7 +250,7 @@ object Http {
                     // fetch the pluginLists file and merge its plugins array in,
                     // so callers keep seeing a plain "plugins" key.
                     if (root.has("pluginLists")) {
-                        val merged = resolvePluginLists(root)
+                        val merged = resolvePluginLists(root, u)
                         if (merged != null) return Result.success(u to merged)
                         last = Exception("repo.json listed no readable plugins list ($u)")
                         continue
@@ -248,14 +264,36 @@ object Http {
         return Result.failure(last)
     }
 
+    /** Resolves [url] against [baseUrl] when it is relative. The CloudStream
+     *  repo spec allows plugin lists ("plugins.json") and plugin URLs
+     *  ("builds/X.cs3", "X.cs3") relative to the file that referenced them —
+     *  the Android client resolves them that way, and a plain
+     *  "https://plugins.json" guess is DNS-dead, so resolving correctly is
+     *  what makes template-style v2 repos work at all. NB: a relative FILE
+     *  name contains dots ("plugins.json"), so a dot alone must NEVER be
+     *  taken as "this looks like a hostname" — anything without a scheme is
+     *  resolved against [baseUrl]. */
+    fun resolveRelativeTo(url: String, baseUrl: String): String {
+        val u = url.trim()
+        if (u.startsWith("http://") || u.startsWith("https://")) return u
+        if (baseUrl.isBlank()) return normalizeUrl(u)
+        return runCatching { java.net.URI(baseUrl.trim()).resolve(u).toString() }
+            .getOrDefault(normalizeUrl(u))
+    }
+
     /** Fetches a CloudStream v2 manifest's `pluginLists` files and returns the
-     *  manifest text with the first usable plugins array merged under a
-     *  "plugins" key (null when none of the list URLs serves plugins). */
-    private fun resolvePluginLists(root: org.json.JSONObject): String? {
+     *  manifest text with every usable plugins array merged under a "plugins"
+     *  key (null when no list URL serves plugins). List URLs and plugin URLs
+     *  may be relative to the repo.json / list file — both are resolved. */
+    private fun resolvePluginLists(root: org.json.JSONObject, repoUrl: String): String? {
         val lists = root.optJSONArray("pluginLists") ?: return null
+        val merged = org.json.JSONArray()
+        val seen = HashSet<String>()
         for (i in 0 until lists.length()) {
-            val pu = lists.optString(i).ifBlank { continue }
-            val pr = fetchStringRobust(normalizeUrl(pu))
+            val raw = lists.optString(i)
+            if (raw.isBlank()) continue
+            val listUrl = resolveRelativeTo(raw, repoUrl)
+            val pr = fetchStringRobust(listUrl)
             if (!pr.isSuccess) continue
             val text = pr.getOrThrow()
             val plugins: org.json.JSONArray? = runCatching { org.json.JSONArray(text) }.getOrNull()
@@ -267,11 +305,20 @@ object Http {
                         else -> org.json.JSONArray(p)
                     }
                 }.getOrNull()
-            if (plugins != null) {
-                return runCatching { root.put("plugins", plugins).toString() }.getOrNull()
+            if (plugins == null) continue
+            for (j in 0 until plugins.length()) {
+                val p = plugins.optJSONObject(j) ?: continue
+                val u = p.optString("url")
+                if (u.isBlank()) continue
+                // Relative plugin URLs resolve against the plugins-list file.
+                val abs = resolveRelativeTo(u, listUrl)
+                if (!seen.add(abs)) continue
+                if (abs != u) p.put("url", abs)
+                merged.put(p)
             }
         }
-        return null
+        if (merged.length() == 0) return null
+        return runCatching { root.put("plugins", merged).toString() }.getOrNull()
     }
 
     /** Short human-readable reason for a failed network call: collapses the
@@ -449,34 +496,51 @@ object Http {
         dest: java.io.File,
         headers: Map<String, String> = emptyMap(),
         onProgress: ((Long, Long) -> Unit)? = null,
-    ): Boolean = try {
-        get(url, headers).use { resp ->
-            if (!resp.isSuccessful) return false
-            val body = resp.body ?: return false
-            val total = body.contentLength()
-            dest.parentFile?.mkdirs()
-            body.byteStream().use { input ->
-                dest.outputStream().use { output ->
-                    val buf = ByteArray(64 * 1024)
-                    var done = 0L
-                    while (true) {
-                        val n = input.read(buf)
-                        if (n < 0) break
-                        output.write(buf, 0, n)
-                        done += n
-                        onProgress?.invoke(done, total)
+    ): Boolean = downloadToReason(url, dest, headers, onProgress) == null
+
+    /** [downloadTo] that reports WHY it failed: null on success, a short
+     *  human-readable reason ("HTTP 404", "UnknownHostException: …") on failure. */
+    private fun downloadToReason(
+        url: String,
+        dest: java.io.File,
+        headers: Map<String, String> = emptyMap(),
+        onProgress: ((Long, Long) -> Unit)? = null,
+        via: OkHttpClient? = null,
+    ): String? = try {
+        getOn(via ?: client, url, headers).use { resp ->
+            if (!resp.isSuccessful) {
+                "HTTP ${resp.code}"
+            } else {
+                val body = resp.body ?: return@use "empty response body"
+                val total = body.contentLength()
+                dest.parentFile?.mkdirs()
+                body.byteStream().use { input ->
+                    dest.outputStream().use { output ->
+                        val buf = ByteArray(64 * 1024)
+                        var done = 0L
+                        while (true) {
+                            val n = input.read(buf)
+                            if (n < 0) break
+                            output.write(buf, 0, n)
+                            done += n
+                            onProgress?.invoke(done, total)
+                        }
                     }
                 }
+                null
             }
-            true
         }
     } catch (e: Exception) {
-        dest.delete()
-        false
+        runCatching { dest.delete() }
+        humanMessage(e)
     }
 
-    fun getStringStrict(url: String, headers: Map<String, String> = emptyMap()): Result<String> =        try {
-            get(url, headers).use { r ->
+    fun getStringStrict(url: String, headers: Map<String, String> = emptyMap()): Result<String> =
+        getStringStrictOn(client, url, headers)
+
+    private fun getStringStrictOn(c: OkHttpClient, url: String, headers: Map<String, String> = emptyMap()): Result<String> =
+        try {
+            getOn(c, url, headers).use { r ->
                 if (r.isSuccessful) Result.success(r.body?.string() ?: "")
                 else Result.failure(Exception("HTTP ${r.code} for $url"))
             }
@@ -484,41 +548,106 @@ object Http {
             Result.failure(e)
         }
 
+    /** GET on an explicit client (see [noProxyClient]). */
+    private fun getOn(c: OkHttpClient, url: String, headers: Map<String, String> = emptyMap()): Response {
+        val builder = Request.Builder().url(url).header("User-Agent", UA)
+        headers.forEach { (k, v) -> builder.header(k, v) }
+        return execute(c, builder.build())
+    }
+
     private val GITHUB_RAW =
         Regex("^https://raw\\.githubusercontent\\.com/([^/]+)/([^/]+)/([^/]+)/(.+)$")
-    private val GITHUB_RAW_B = Regex("^https://github\\.com/([^/]+)/([^/]+)/raw/([^/]+)/(.+)$")
+    private val GITHUB_ALT =
+        Regex("^https?://(?:www\\.)?github\\.com/([^/]+)/([^/]+)/(?:raw|blob)/([^/]+)/(.+)$")
+
+    /** A GitHub raw URL split into user/repo/ref/path. */
+    private data class GhTarget(val user: String, val repo: String, val ref: String, val path: String)
 
     /**
-     * Download sources for a URL. For GitHub-hosted files the global jsDelivr CDN is
-     * tried FIRST: it mirrors a repo's files across a worldwide CDN and — unlike
-     * raw.githubusercontent.com, which rate-limits unauthenticated desktop HTTP clients
-     * to ~60 req/hr/IP — jsDelivr returns the file reliably on every request. The raw
-     * URL itself and raw.githack stay as always-available fallbacks.
+     * Parses a GitHub raw URL (`raw.githubusercontent.com/u/r/b/p` or
+     * `github.com/u/r/raw|blob/b/p`). Modern CloudStream repos hand out the
+     * fully-qualified form `…/u/r/refs/heads/<branch>/p`, which the naive
+     * regex splits as ref="refs" + path="heads/<branch>/p" — every mirror URL
+     * built from that 404s. The ref is normalized here ("refs/heads/builds"
+     * → "builds") so the CDN mirrors, which expect a bare branch, work.
+     */
+    private fun parseGhTarget(url: String): GhTarget? {
+        val m = GITHUB_RAW.matchEntire(url) ?: GITHUB_ALT.matchEntire(url) ?: return null
+        val (user, repo, ref0, path0) = m.destructured
+        var ref = ref0
+        var path = path0
+        if (ref == "refs" && (path.startsWith("heads/") || path.startsWith("tags/"))) {
+            val rest = path.substringAfter('/')
+            val cut = rest.indexOf('/')
+            if (cut > 0) {
+                ref = rest.substring(0, cut)
+                path = rest.substring(cut + 1)
+            }
+        }
+        if (path.isBlank()) return null
+        return GhTarget(user, repo, ref, path)
+    }
+
+    /**
+     * Download sources for a URL. For GitHub-hosted files a chain of public
+     * mirrors is generated so a single blocked/unreachable host can't kill an
+     * install — networks routinely block raw.githubusercontent.com or throttle
+     * it (~60 req/hr per IP) while the CDNs still work, and vice versa:
+     *
+     *  1. jsDelivr — global CDN mirror of GitHub files (rate-limit-free),
+     *  2. the original URL as typed,
+     *  3. the canonical raw URL (refs/heads forms normalized),
+     *  4. statically.io — a second independent CDN,
+     *  5. raw.githack.com — a third,
+     *  6. github.com's own /raw/ path (serves the bytes, follows redirects).
+     *
+     * Google Drive share links are rewritten to the direct-download form
+     * first (otherwise the "file" downloaded is a virus-scan HTML page).
      */
     private fun urlVariants(url: String): List<String> {
-        val jsdelivr = mutableListOf<String>()
-        val rest = mutableListOf<String>()
-        GITHUB_RAW.matchEntire(url)?.let { m ->
-            val (u, r, b, p) = m.destructured
-            jsdelivr.add("https://cdn.jsdelivr.net/gh/$u/$r@$b/$p")
-            rest.add("https://raw.githack.com/$u/$r/$b/$p")
+        val base = normalizeDriveUrl(url.trim())
+        val gh = parseGhTarget(base) ?: return listOf(base)
+        val out = linkedSetOf<String>()
+        out.add("https://cdn.jsdelivr.net/gh/${gh.user}/${gh.repo}@${gh.ref}/${gh.path}")
+        out.add(base)
+        out.add("https://raw.githubusercontent.com/${gh.user}/${gh.repo}/${gh.ref}/${gh.path}")
+        out.add("https://cdn.statically.io/gh/${gh.user}/${gh.repo}/${gh.ref}/${gh.path}")
+        out.add("https://raw.githack.com/${gh.user}/${gh.repo}/${gh.ref}/${gh.path}")
+        out.add("https://github.com/${gh.user}/${gh.repo}/raw/${gh.ref}/${gh.path}")
+        return out.toList()
+    }
+
+    /** True when the OS has an HTTP(S) proxy configured — used to decide
+     *  whether a final no-proxy rescue pass is worth trying. */    private fun systemProxyInUse(): Boolean {
+        return try {
+            java.net.ProxySelector.getDefault()
+                ?.select(java.net.URI("https://raw.githubusercontent.com/"))
+                ?.any { it.type() != java.net.Proxy.Type.DIRECT } == true
+        } catch (t: Throwable) {
+            false
         }
-        GITHUB_RAW_B.matchEntire(url)?.let { m ->
-            val (u, r, b, p) = m.destructured
-            jsdelivr.add("https://cdn.jsdelivr.net/gh/$u/$r@$b/$p")
-            rest.add("https://raw.githubusercontent.com/$u/$r/$b/$p")
-        }
-        val all = linkedSetOf<String>().apply {
-            addAll(jsdelivr)
-            add(url)
-            addAll(rest)
-        }
-        return all.toList()
+    }
+
+    /** Same stack as [client] but with the system proxy DISABLED. A leftover
+     *  OS proxy config (typical after uninstalling a VPN/Clash/Psiphon) makes
+     *  every JVM connection fail with "connection refused"/"connect timed
+     *  out" while the browser and the phone on the same network work fine —
+     *  the last-resort pass on this client rescues exactly that case. */
+    private val noProxyClient: OkHttpClient by lazy {
+        applyConscryptTls(OkHttpClient.Builder())
+            .proxy(java.net.Proxy.NO_PROXY)
+            .dns(HikariDns)
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .connectTimeout(20, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .build()
     }
 
     fun fetchStringRobust(url: String, headers: Map<String, String> = emptyMap()): Result<String> {
         var last: Throwable = Exception("Failed to fetch $url")
-        for (u in urlVariants(url)) {
+        val variants = urlVariants(url)
+        for (u in variants) {
             for (attempt in 0 until 2) {
                 val r = getStringStrict(u, headers)
                 if (r.isSuccess) return r
@@ -528,6 +657,14 @@ object Http {
                 } catch (e: InterruptedException) {
                     break
                 }
+            }
+        }
+        // Rescue pass with the system proxy bypassed (see [noProxyClient]).
+        if (systemProxyInUse()) {
+            for (u in variants) {
+                val r = getStringStrictOn(noProxyClient, u, headers)
+                if (r.isSuccess) return r
+                r.exceptionOrNull()?.let { last = it }
             }
         }
         return Result.failure(last)
@@ -545,33 +682,78 @@ object Http {
                 }
             }
         }
+        if (systemProxyInUse()) {
+            for (u in urlVariants(url)) {
+                try {
+                    getOn(noProxyClient, u, headers).use { r ->
+                        if (r.isSuccessful) return r.body?.bytes()
+                    }
+                } catch (_: Exception) {
+                }
+            }
+        }
         return null
     }
 
     /**
-     * Streams a download to [dest], trying the jsDelivr mirror for
-     * raw.githubusercontent.com URLs when the primary URL fails. Mirrors
-     * [downloadTo]'s signature and semantics.
+     * Streams a download to [dest], walking the mirror chain from
+     * [urlVariants]. [onAttempt] reports every mirror that was tried and why
+     * it failed (ok=true on the one that succeeded) so the UI can show the
+     * REAL cause instead of a generic "check your connection".
+     *
+     * A final rescue pass repeats every mirror with the system proxy
+     * bypassed ([noProxyClient]) — the classic "browser works, JVM doesn't"
+     * desktop misconfiguration.
      */
     fun downloadToRobust(
         url: String,
         dest: java.io.File,
         headers: Map<String, String> = emptyMap(),
         onProgress: ((Long, Long) -> Unit)? = null,
+        onAttempt: ((url: String, ok: Boolean, reason: String?) -> Unit)? = null,
     ): Boolean {
-        var lastFailure: Exception? = null
-        for (u in urlVariants(url)) {
-            for (attempt in 0 until 3) {
-                if (downloadTo(u, dest, headers, onProgress)) return true
-                lastFailure = lastFailure ?: Exception("failed $u")
+        val variants = urlVariants(url)
+        // Overall budget: on a black-hole network every mirror costs a full
+        // connect timeout; bound the walk so the UI doesn't sit for minutes
+        // (the Android app caps installs at 90s for the same reason). An
+        // in-flight download is never interrupted — only new attempts are.
+        val deadline = System.currentTimeMillis() + DOWNLOAD_BUDGET_MS
+        for (u in variants) {
+            if (System.currentTimeMillis() > deadline) {
+                onAttempt?.invoke(u, false, "gave up after ${DOWNLOAD_BUDGET_MS / 1000}s total")
+                break
+            }
+            var reason: String? = null
+            for (attempt in 0 until 2) {
+                reason = downloadToReason(u, dest, headers, onProgress)
+                if (reason == null) {
+                    onAttempt?.invoke(u, true, null)
+                    return true
+                }
                 try {
-                    Thread.sleep(500L)
+                    Thread.sleep(400L)
                 } catch (e: InterruptedException) {
                     return false
                 }
             }
+            onAttempt?.invoke(u, false, reason)
         }
-        lastFailure?.printStackTrace()
+        if (systemProxyInUse()) {
+            for (u in variants) {
+                if (System.currentTimeMillis() > deadline) break
+                val reason = try {
+                    downloadToReason(u, dest, headers, onProgress, noProxyClient)
+                } catch (t: Throwable) {
+                    humanMessage(t)
+                }
+                if (reason == null) {
+                    onAttempt?.invoke(u, true, "(bypassed system proxy)")
+                    return true
+                }
+                onAttempt?.invoke(u, false, "$reason (no proxy)")
+            }
+        }
+        System.err.println("downloadToRobust failed for $url")
         return false
     }
 
