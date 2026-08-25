@@ -395,42 +395,90 @@
     -fx-text-fill: #ffffff;
 }
 
-/* ---- Custom window chrome (frameless stage) ---- */
+/* ---- Episode grid (dense wrapping tiles) ---- */
 
-.win-titlebar {
-    -fx-background-color: #0e1118;
-    -fx-border-color: #1f2431;
-    -fx-border-width: 0 0 1 0;
+.episodes-section {
+    -fx-background-color: #141722;
+    -fx-background-radius: 12;
+    -fx-border-color: #232838;
+    -fx-border-radius: 12;
+    -fx-padding: 14 14 14 14;
 }
 
-.win-title {
-    -fx-text-fill: #cfd3de;
+.episode-total {
+    -fx-background-color: #211d33;
+    -fx-text-fill: #a89bd8;
+    -fx-font-size: 11px;
+    -fx-font-weight: 700;
+    -fx-background-radius: 999;
+    -fx-padding: 2 9 2 9;
+}
+
+.episode-count {
+    -fx-text-fill: #7c8191;
+    -fx-font-size: 12px;
+}
+
+.episode-tile {
+    -fx-background-color: #1c2030;
+    -fx-text-fill: #c6cbd8;
+    -fx-background-radius: 8;
+    -fx-border-radius: 8;
+    -fx-border-color: transparent;
+    -fx-padding: 8 0 8 0;
     -fx-font-size: 13px;
     -fx-font-weight: 600;
-    -fx-padding: 0 0 0 14;
-}
-
-.win-btn {
-    -fx-background-color: transparent;
-    -fx-text-fill: #9aa0ae;
-    -fx-font-size: 14px;
-    -fx-min-width: 46;
-    -fx-min-height: 38;
-    -fx-background-radius: 0;
-    -fx-padding: 0;
     -fx-cursor: hand;
+    -fx-alignment: center;
 }
 
-.win-btn:hover {
-    -fx-background-color: #1b2030;
-    -fx-text-fill: #eceff4;
+.episode-tile:hover {
+    -fx-background-color: #242a40;
+    -fx-text-fill: #e2e6f0;
+    -fx-border-color: #2e3650;
 }
 
-.win-btn-max {
-    -fx-font-size: 13px;
-}
-
-.win-btn-close:hover {
-    -fx-background-color: #c42b1c;
+.episode-tile-selected,
+.episode-tile-selected:hover {
+    -fx-background-color: linear-gradient(to right, #7c4dff, #4d9fff);
     -fx-text-fill: #ffffff;
+    -fx-font-weight: bold;
+    -fx-border-color: transparent;
+    -fx-effect: dropshadow(gaussian, rgba(124,77,255,0.28), 10, 0, 0, 2);
+}
+
+.episode-tile-wide {
+    -fx-padding: 7 12 7 12;
+    -fx-alignment: center-left;
+}
+
+.episode-tile-num {
+    -fx-background-color: #252b3f;
+    -fx-text-fill: #9aa0b8;
+    -fx-font-size: 11.5px;
+    -fx-font-weight: 700;
+    -fx-background-radius: 6;
+    -fx-padding: 2 7 2 7;
+    -fx-min-width: 28;
+    -fx-alignment: center;
+}
+
+.episode-tile-selected .episode-tile-num {
+    -fx-background-color: rgba(255,255,255,0.18);
+    -fx-text-fill: #ffffff;
+}
+
+.episode-tile-name {
+    -fx-text-fill: #d2d6e2;
+    -fx-font-size: 12.5px;
+    -fx-font-weight: 500;
+}
+
+.episode-tile-selected .episode-tile-name {
+    -fx-text-fill: #ffffff;
+}
+
+/* Legacy chip kept for other screens, but new tiles use episode-tile */
+.episodes-column {
+    -fx-background-color: transparent;
 }

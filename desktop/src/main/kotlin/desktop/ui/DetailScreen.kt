@@ -38,6 +38,8 @@ class DetailScreenView(private val item: MediaItem) {
 
     private var episodes: List<Episode>? = null
     private var selectedEpisode: Episode? = null
+    private var episodeGrid: EpisodeGrid? = null
+    private var currentMeta: MediaItem? = null
 
     init {
         root.sceneProperty().addListener { _, _, newScene ->
@@ -74,12 +76,15 @@ class DetailScreenView(private val item: MediaItem) {
                 renderMeta(meta)
                 if (eps != null && eps.isNotEmpty()) {
                     episodes = eps
-                    renderEpisodes(eps)
+                    currentMeta = meta
+                    renderEpisodes(meta, eps)
                     if (eps.size == 1) {
                         selectedEpisode = eps.first()
+                        episodeGrid?.select(eps.first())
                         loadStreams(meta)
                     }
                 } else {
+                    currentMeta = meta
                     loadStreams(meta)
                 }
             }
@@ -88,6 +93,8 @@ class DetailScreenView(private val item: MediaItem) {
 
     private fun renderMeta(meta: MediaItem) {
         body.children.clear()
+        // keep reference to old grid? body is cleared, so drop it
+        episodeGrid = null
         val headerImage = bannerFor(meta)
         val titleRow = VBox(4.0).apply {
             children.addAll(
@@ -130,67 +137,46 @@ class DetailScreenView(private val item: MediaItem) {
         return VBox(img)
     }
 
-    private fun renderEpisodes(eps: List<Episode>) {
+    private fun renderEpisodes(meta: MediaItem, eps: List<Episode>) {
         // One episode may be returned under both its raw id and a rewritten
         // canonical url (and some providers emit the same episode twice) — show
         // each unique episode only once.
-        val unique = linkedMapOf<String?, Episode>()
-        eps.forEach { unique[it.id ?: it.name] = it }
-        if (unique.size < eps.size) renderEpisodes(unique.values.toList())
-        val title = Theme.label("Episodes", size = 17.0, bold = true)
-        val section = VBox(10.0, title)
-        val group = 30
-        val selector = javafx.scene.control.ComboBox<String>()
-        selector.maxWidth = 260.0
-        selector.prefWidth = 200.0
-        selector.items.add("All episodes")
-        val groups = (eps.size + group - 1) / group
-        for (g in 0 until groups) {
-            val start = g * group
-            val end = minOf(start + group, eps.size)
-            selector.items.add("${start + 1}-${end}")
+        val unique = linkedMapOf<String, Episode>()
+        eps.forEach { ep ->
+            val key = ep.id.ifBlank { ep.name ?: ep.number.toString() }
+            unique[key] = ep
         }
-        val defaultToRange = eps.size > group
-        selector.value = if (defaultToRange) "1-${minOf(group, eps.size)}" else "All episodes"
-        section.children.addAll(
-            selector,
-            buildChipScroller(eps, 0, if (defaultToRange) group else eps.size),
-        )
-        selector.setOnAction {
-            val sel = selector.value ?: return@setOnAction
-            val replaceIdx = section.children.size - 1
-            section.children[replaceIdx] = if (sel == "All episodes") {
-                buildChipScroller(eps, 0, eps.size)
-            } else {
-                val start = sel.substringBefore("-").trim().toIntOrNull()?.minus(1) ?: return@setOnAction
-                buildChipScroller(eps, start, minOf(start + group, eps.size))
-            }
+        val deduped = unique.values.toList()
+        if (deduped.size < eps.size) {
+            renderEpisodes(meta, deduped)
+            return
         }
-        body.children.add(1, section)
-    }
 
-    private fun buildChipScroller(eps: List<Episode>, start: Int, end: Int): VBox {
-        val box = VBox(6.0).apply {
-            styleClass.add("episodes-column")
-        }
-        for (i in start until end) {
-            val ep = eps[i]
-            val label = if (ep.name != null && ep.name.isNotBlank()) ep.name else "Episode ${ep.number}"
-            val chip = Button(label).apply {
-                styleClass.add("episode-chip")
-                maxWidth = Double.MAX_VALUE
-                if (selectedEpisode?.id == ep.id) styleClass.add("episode-chip-selected")
-                userData = ep
-                setOnAction {
-                    selectedEpisode = ep
-                    box.children.forEach { it.styleClass.remove("episode-chip-selected") }
-                    styleClass.add("episode-chip-selected")
-                    loadStreams(item)
-                }
+        // Remove any previous episode grid (e.g. when meta reloads or dedup recurses).
+        episodeGrid?.let { old -> body.children.remove(old.root) }
+        body.children.removeIf { node -> node.styleClass.contains("episodes-section") }
+
+        val grid = EpisodeGrid(
+            seriesTitle = meta.title,
+            episodes = deduped,
+            onPick = { ep ->
+                selectedEpisode = ep
+                loadStreams(meta)
+            },
+        )
+        episodeGrid = grid
+
+        // Restore previous selection if any.
+        selectedEpisode?.let { prev ->
+            if (deduped.any { it.id == prev.id }) {
+                grid.select(prev)
             }
-            box.children.add(chip)
         }
-        return box
+
+        // Insert after the banner / title — same spot the old ComboBox list used.
+        // body = [banner?, titleRow, overview, streamsSection]
+        val insertAt = 1.coerceAtMost(body.children.size)
+        body.children.add(insertAt, grid.root)
     }
 
     private fun htmlToPlain(html: String): String = html
