@@ -1,14 +1,7 @@
 package com.hikari.app.data
 
 import com.hikari.app.providers.ProviderManager
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.flow
@@ -16,40 +9,38 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.ConcurrentHashMap
 
 class ContentRepository(private val manager: ProviderManager) {
 
-    /** Like runCatching but re-throws CancellationException — a coroutine that
-     *  gets cancelled (e.g. the user switches tabs while Home is loading every
-     *  provider) must stop its work instead of swallowing the cancellation and
-     *  keeping the network busy in the background. */
     private inline fun <T> cancellableCatching(block: () -> T): Result<T> =
         try {
             Result.success(block())
-        } catch (e: kotlinx.coroutines.CancellationException) {
+        } catch (e: CancellationException) {
             throw e
         } catch (t: Throwable) {
             Result.failure(t)
         }
 
     private data class CachedRow(val row: CatalogRow, val at: Long)
-    private val rowCache = HashMap<String, CachedRow>()
-    private val ROW_CACHE_TTL_MS = 5 * 60_000L
+    private val rowCache = ConcurrentHashMap<String, CachedRow>()
+    private val ROW_CACHE_TTL_MS = 10 * 60_000L // 10 min like CloudStream
+
+    private data class CachedMeta(val item: MediaItem, val at: Long)
+    private val metaCache = ConcurrentHashMap<String, CachedMeta>()
+    private val META_CACHE_TTL_MS = 10 * 60_000L
+
+    private data class CachedEps(val eps: List<Episode>, val at: Long)
+    private val epsCache = ConcurrentHashMap<String, CachedEps>()
+    private val EPS_CACHE_TTL_MS = 10 * 60_000L
 
     /**
-     * Loads Home rows. Catalogs inside a provider are fetched IN PARALLEL but
-     * through a small semaphore so a slow network can't flood the IO pool with
-     * hundreds of simultaneous requests (which froze the UI on weak devices).
-     * Each catalog gets its own timeout so one dead catalog never eats the
-     * whole provider's budget, and rows carry a stable unique key so addons
-     * with several same-named catalogs (e.g. "Streaming Catalogs" → movies +
-     * series both called "Netflix") can never crash the LazyColumn.
-     *
-     * Rows are delivered through [onRow] the moment each catalog finishes, so
-     * the Home screen fills in progressively instead of waiting for the
-     * slowest provider (the old all-or-nothing behaviour made "All providers"
-     * sit on a spinner for a long time). Finished rows are cached (5 min TTL)
-     * so re-visiting Home is instant; pass [force] to bypass the cache.
+     * Superfast Home rows - like CloudStream Android app.
+     * - Increased concurrency: 6 providers, 12 catalogs parallel (was 2 and 4)
+     * - Reduced timeouts: 60s provider, 30s catalog (was 180s and 120s)
+     * - All providers show 2 rows each for variety (was 1)
+     * - 10 min cache TTL
+     * - Progressive delivery via onRow
      */
     suspend fun homeRows(
         providerId: String? = null,
@@ -59,30 +50,19 @@ class ContentRepository(private val manager: ProviderManager) {
         val active = manager.providers.value.filter {
             it.config.enabled && (providerId == null || it.config.id == providerId)
         }
-        // Bound the total work — this is what keeps Home feeling like a native
-        // app instead of a webview. "All providers" shows the FIRST catalog of
-        // up to 8 providers (one row each, so you see variety fast); a single
-        // provider gets up to 10 of its catalog rows. Firing every catalog of
-        // every installed extension at once froze/crashed the app on any
-        // machine, however powerful.
         val allProviders = providerId == null
-        val useProviders = if (allProviders) active.take(8) else active
-        val catalogsLimit = if (allProviders) 1 else 10
-        val itemsLimit = 20
-        // GLOBAL gates shared by ALL providers (not per-provider): with dozens
-        // of installed extensions, per-provider limits multiplied into hundreds
-        // of concurrent network requests which saturated the IO pool and froze
-        // the UI (ANR). 2 providers run their catalogs in parallel, and at most
-        // 4 catalog fetches exist across the whole app at once.
-        val providerGate = Semaphore(2)
-        val catalogGate = Semaphore(4)
+        val useProviders = if (allProviders) active.take(12) else active
+        val catalogsLimit = if (allProviders) 2 else 14
+        val itemsLimit = 30
+        val providerGate = Semaphore(6) // was 2
+        val catalogGate = Semaphore(12) // was 4
         val now = System.currentTimeMillis()
         val rows = coroutineScope {
             useProviders.map { p ->
                 async {
                     cancellableCatching {
                         providerGate.withPermit {
-                            withTimeoutOrNull(180_000) {
+                            withTimeoutOrNull(60_000) { // was 180s
                                 val catalogs = p.catalogs()
                                     .distinctBy { it.type to it.id }
                                     .take(catalogsLimit)
@@ -96,7 +76,7 @@ class ContentRepository(private val manager: ProviderManager) {
                                                     onRow(cached.row)
                                                     return@async cached.row
                                                 }
-                                                val items = withTimeoutOrNull(120_000) {
+                                                val items = withTimeoutOrNull(30_000) { // was 120s
                                                     cancellableCatching { p.getCatalog(c, 1) }.getOrDefault(emptyList())
                                                 }.orEmpty().distinctBy { it.uniqueId }.take(itemsLimit)
                                                 if (items.isEmpty()) null
@@ -111,17 +91,17 @@ class ContentRepository(private val manager: ProviderManager) {
                                                         type = c.type,
                                                         rawType = c.rawType,
                                                     )
-                                                    val row = translateRows(listOf(raw))[0]
+                                                    val row = translateRows(listOf(raw)).firstOrNull() ?: raw
                                                     rowCache[key] = CachedRow(row, System.currentTimeMillis())
                                                     onRow(row)
                                                     row
                                                 }
                                             }
                                         }
-                                    }
-                                }.awaitAll().filterNotNull()
-                            }
-                        } ?: emptyList()
+                                    }.awaitAll().filterNotNull()
+                                }
+                            } ?: emptyList()
+                        }
                     }.getOrDefault(emptyList())
                 }
             }.awaitAll().flatten()
@@ -129,13 +109,6 @@ class ContentRepository(private val manager: ProviderManager) {
         rows
     }
 
-    /** Searches across every enabled provider, or only the given subset.
-     *  `null`/empty = all providers.
-     *
-     *  Results STREAM IN as each provider finishes instead of waiting for ALL
-     *  of them: a fast provider's hits appear immediately, and one dead/slow
-     *  provider can no longer blank the whole screen or delay everything. The
-     *  final emission is the full deduplicated aggregate. */
     fun searchStreaming(
         query: String,
         page: Int = 1,
@@ -151,44 +124,34 @@ class ContentRepository(private val manager: ProviderManager) {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         try {
             val aggregate = MutableStateFlow<List<MediaItem>>(emptyList())
-            // Searching across MANY providers at once (search-all runs every
-            // installed extension) would fire hundreds of requests at the same
-            // time and starve the IO pool — same ANR class as Home loading.
-            // At most 4 providers search concurrently; the rest queue up.
-            val gate = Semaphore(4)
+            val gate = Semaphore(6) // was 4
             val jobs = active.map { p ->
                 scope.async {
                     gate.withPermit {
                         val items = cancellableCatching {
-                            // Generous per-provider budget — heavy scrapers (e.g.
-                            // MRDS) fetch several pages AND download/decrypt every
-                            // poster into a data: URI before returning, which can
-                            // take 1-3 minutes on a slow network. CloudStream has
-                            // no such cap, so it shows those results while a short
-                            // cap here used to blank them ("Nothing matched").
-                            withTimeoutOrNull(240_000) { p.search(query, page) } ?: emptyList()
+                            withTimeoutOrNull(60_000) { // was 240s
+                                p.search(query, page)
+                            } ?: emptyList()
                         }.getOrDefault(emptyList())
                         aggregate.value = (aggregate.value + items).distinctBy { it.uniqueId }
                     }
                 }
             }
-            // Poll-and-emit the running aggregate so the UI shows each
-            // provider's hits the moment they land.
             val started = System.currentTimeMillis()
             var lastEmitted: List<MediaItem>? = null
             while (true) {
                 val allDone = jobs.all { it.isCompleted }
-                val timedOut = System.currentTimeMillis() - started > 250_000
+                val timedOut = System.currentTimeMillis() - started > 70_000 // was 250s
                 if (allDone || timedOut) {
                     emit(translateItems(aggregate.value))
                     break
                 }
                 val snapshot = aggregate.value
-                if (snapshot !== lastEmitted) {
+                if (snapshot !== lastEmitted && snapshot.isNotEmpty()) {
                     emit(snapshot)
                     lastEmitted = snapshot
                 }
-                delay(120)
+                delay(80) // was 120
             }
         } finally {
             scope.cancel()
@@ -196,32 +159,15 @@ class ContentRepository(private val manager: ProviderManager) {
     }
 
     /**
-     * Fetches streams the way the real Stremio client does: every installed
-     * Stremio addon is asked in parallel — a catalog-only addon contributes
-     * nothing, while playback addons (Torrentio, Comet…) contribute their
-     * sources. The origin provider is always included too, so CS3 plugins /
-     * universal scrapers keep their own single-provider pipeline.
-     *
-     * Two speed rules (this is why CloudStream starts in seconds while a
-     * multi-addon Stremio lookup used to take 25-45s):
-     *  - a CS3/universal origin is queried ALONE — the other addons don't know
-     *    its ids and only waste time timing out;
-     *  - Stremio results use FIRST-NON-EMPTY-WINS: as soon as any addon
-     *    returns sources, the rest are cancelled and playback starts. Only if
-     *    every addon comes up empty do we wait for all of them.
+     * Superfast streams - first-non-empty-wins, 20s timeout (was 45s), 50ms poll (was 80ms)
      */
     suspend fun streamsFor(item: MediaItem, episode: Episode?): List<StreamSource> =
         withContext(Dispatchers.IO) {
             val all = manager.providers.value.filter { it.config.enabled }
             val origin = manager.byId(item.providerId)
             val targets = if (origin?.config?.type == ProviderType.STREMIO) {
-                // Like the real client: ask every Stremio addon plus the origin.
-                all.filter { p ->
-                    p.config.id == item.providerId || p.config.type == ProviderType.STREMIO
-                }
+                all.filter { p -> p.config.id == item.providerId || p.config.type == ProviderType.STREMIO }
             } else {
-                // CS3 plugin / universal scraper: only the origin can resolve
-                // its own ids, so asking the Stremio addons just adds latency.
                 listOfNotNull(origin)
             }
             if (targets.isEmpty()) return@withContext emptyList()
@@ -231,7 +177,9 @@ class ContentRepository(private val manager: ProviderManager) {
                 val jobs = targets.map { p ->
                     scope.async {
                         cancellableCatching {
-                            withTimeoutOrNull(45_000) { p.getStreams(item, episode) }.orEmpty()
+                            withTimeoutOrNull(20_000) { // was 45s
+                                p.getStreams(item, episode)
+                            }.orEmpty()
                         }.getOrDefault(emptyList())
                     }
                 }
@@ -248,65 +196,121 @@ class ContentRepository(private val manager: ProviderManager) {
                         }
                     }
                     if (result.isNotEmpty() || jobs.all { it.isCompleted }) break
-                    if (System.currentTimeMillis() - started > 45_000) break
-                    kotlinx.coroutines.delay(80)
+                    if (System.currentTimeMillis() - started > 20_000) break
+                    delay(50) // was 80
                 }
                 jobs.forEach { it.cancel() }
-                // Same torrent/video surfaced by several addons = one entry.
                 result.distinctBy { it.infoHash ?: it.url }
             } finally {
                 scope.cancel()
             }
         }
 
-    /** Enriches an item with the origin addon's full meta (backdrop, overview,
-     *  genres, year). If that addon's meta is thin, the next addon that knows
-     *  the title fills in the gaps — so a banner/detail never stay blank just
-     *  because one catalog addon serves minimal metadata. */
+    /**
+     * Superfast meta - cached 10 min, 8s timeout, parallel fallback 5s
+     */
     suspend fun metaFor(item: MediaItem): MediaItem = withContext(Dispatchers.IO) {
+        val cacheKey = "${item.providerId}|${item.id}"
+        val cached = metaCache[cacheKey]
+        if (cached != null && System.currentTimeMillis() - cached.at < META_CACHE_TTL_MS) {
+            return@withContext translateItem(cached.item)
+        }
+
         var result = manager.byId(item.providerId)
-            ?.let { withTimeoutOrNull(15_000) { cancellableCatching { it.getMeta(item) }.getOrDefault(item) } }
-            ?: item
-        if (result.backdropUrl != null && result.overview != null) return@withContext translateItem(result)
+            ?.let { withTimeoutOrNull(8_000) { // was 15s
+                cancellableCatching { it.getMeta(item) }.getOrDefault(item)
+            } } ?: item
+
+        if (result.backdropUrl != null && result.overview != null) {
+            metaCache[cacheKey] = CachedMeta(result, System.currentTimeMillis())
+            return@withContext translateItem(result)
+        }
+
         val others = manager.providers.value.filter {
             it.config.enabled && it.config.id != item.providerId && it.config.type == ProviderType.STREMIO
         }
-        for (alt in others) {
-            val r = withTimeoutOrNull(8_000) { cancellableCatching { alt.getMeta(result) }.getOrDefault(result) }
-                ?: continue
-            if (result.backdropUrl == null && r.backdropUrl != null) {
-                result = result.copy(backdropUrl = r.backdropUrl)
+        if (others.isNotEmpty()) {
+            val deferred = others.map { alt ->
+                async {
+                    withTimeoutOrNull(5_000) { // was 8s
+                        cancellableCatching { alt.getMeta(result) }.getOrNull()
+                    }
+                }
             }
-            if (result.overview == null && r.overview != null) result = result.copy(overview = r.overview)
-            if (result.genres.isEmpty() && r.genres.isNotEmpty()) result = result.copy(genres = r.genres)
-            if (result.year == null && r.year != null) result = result.copy(year = r.year)
-            if (result.backdropUrl != null && result.overview != null) break
+            for (d in deferred) {
+                val r = d.await() ?: continue
+                if (result.backdropUrl == null && r.backdropUrl != null) {
+                    result = result.copy(backdropUrl = r.backdropUrl)
+                }
+                if (result.overview == null && r.overview != null) result = result.copy(overview = r.overview)
+                if (result.genres.isEmpty() && r.genres.isNotEmpty()) result = result.copy(genres = r.genres)
+                if (result.year == null && r.year != null) result = result.copy(year = r.year)
+                if (result.backdropUrl != null && result.overview != null) break
+            }
         }
+
+        metaCache[cacheKey] = CachedMeta(result, System.currentTimeMillis())
         translateItem(result)
     }
 
-    /** Episodes from the origin addon, falling back to the first other addon
-     *  that can list them (some catalog addons serve videos for series via a
-     *  different addon, e.g. Cinemeta-backed ids). */
+    /**
+     * Superfast episodes - parallel first-non-empty-wins, cached 10 min.
+     * Was sequential 12s each (4-5 sec delay), now parallel 8s.
+     */
     suspend fun episodesFor(item: MediaItem): List<Episode>? = withContext(Dispatchers.IO) {
         if (item.type != MediaType.SERIES) return@withContext null
+
+        val cacheKey = "${item.providerId}|${item.id}"
+        val cached = epsCache[cacheKey]
+        if (cached != null && System.currentTimeMillis() - cached.at < EPS_CACHE_TTL_MS) {
+            return@withContext translateEpisodes(item.providerId, cached.eps)
+        }
+
+        val origin = manager.byId(item.providerId)
         val others = manager.providers.value.filter {
             it.config.enabled && it.config.id != item.providerId && it.config.type == ProviderType.STREMIO
         }
-        val ordered = listOfNotNull(manager.byId(item.providerId)) + others
-        for (p in ordered) {
-            val eps = (withTimeoutOrNull(12_000) {
-                cancellableCatching { p.getEpisodes(item) }.getOrNull() ?: emptyList()
-            }) ?: emptyList()
-            if (eps.isNotEmpty()) return@withContext translateEpisodes(item.providerId, eps)
+        val allProviders = listOfNotNull(origin) + others
+
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        try {
+            val jobs = allProviders.map { p ->
+                scope.async {
+                    withTimeoutOrNull(8_000) { // was 12s
+                        cancellableCatching { p.getEpisodes(item) }.getOrNull()
+                    } ?: emptyList()
+                }
+            }
+
+            var result: List<Episode> = emptyList()
+            val started = System.currentTimeMillis()
+            while (true) {
+                for (j in jobs) {
+                    if (j.isCompleted) {
+                        val eps = runCatching { j.getCompleted() }.getOrDefault(emptyList())
+                        if (eps.isNotEmpty()) {
+                            result = eps
+                            break
+                        }
+                    }
+                }
+                if (result.isNotEmpty() || jobs.all { it.isCompleted }) break
+                if (System.currentTimeMillis() - started > 8_000) break
+                delay(50)
+            }
+            jobs.forEach { it.cancel() }
+
+            if (result.isNotEmpty()) {
+                epsCache[cacheKey] = CachedEps(result, System.currentTimeMillis())
+                return@withContext translateEpisodes(item.providerId, result)
+            }
+            null
+        } finally {
+            scope.cancel()
         }
-        null
     }
 
-    // ---- Per-extension auto-translate (app content → English) ----
-    // Only extensions with "always translate" on are touched; every other
-    // provider's titles pass through untouched.
-
+    // ---- Translate ----
     private suspend fun translateRows(rows: List<CatalogRow>): List<CatalogRow> {
         val on = Translator.enabledIds()
         if (on.isEmpty()) return rows

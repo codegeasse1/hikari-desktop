@@ -43,8 +43,8 @@ object Http {
             .dns(HikariDns)
             .followRedirects(true)
             .followSslRedirects(true)
-            .connectTimeout(20, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
+            .connectTimeout(10, TimeUnit.SECONDS) // was 20, now 10 for superfast
+            .readTimeout(15, TimeUnit.SECONDS) // was 30, now 15 for superfast
             .build()
     }
 
@@ -652,8 +652,8 @@ object Http {
             .dns(HikariDns)
             .followRedirects(true)
             .followSslRedirects(true)
-            .connectTimeout(20, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(15, TimeUnit.SECONDS)
             .build()
     }
 

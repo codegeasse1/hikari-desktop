@@ -51,11 +51,11 @@ class Cs3MainApiProvider(override val config: ProviderConfig) : ContentProvider 
         var lastStreamsTimeMs: Long = 0L
 
         /** Budget for the direct MovieBlast movie fallback. */
-        private const val MOVIEBLAST_CAP_MS = 20_000L
+        private const val MOVIEBLAST_CAP_MS = 12_000L
 
         /** Budget for the universal extraction engine (StreamHG sign-dance
          *  needs several requests, so it's deliberately roomy). */
-        private const val FALLBACK_CAP_MS = 20_000L
+        private const val FALLBACK_CAP_MS = 12_000L
 
         /** Matches a provider payload whose stream URL came back empty
          *  (iStreamFlare: `{"id":"…","url": null}`) — the load() API lookup
@@ -212,7 +212,9 @@ class Cs3MainApiProvider(override val config: ProviderConfig) : ContentProvider 
         runCatching { api }
     }
 
-    private val loadCache = ConcurrentHashMap<String, LoadResponse>()
+    private data class CachedLoad(val resp: LoadResponse, val at: Long)
+    private val loadCache = ConcurrentHashMap<String, CachedLoad>()
+    private val LOAD_CACHE_TTL_MS = 10 * 60_000L
 
     override suspend fun catalogs(): List<CatalogRef> = withContext(Dispatchers.IO) {
         val a = try {
@@ -369,7 +371,7 @@ class Cs3MainApiProvider(override val config: ProviderConfig) : ContentProvider 
         // CloudStream does.
         val canonicalUrl = resp.url.takeIf { it.isNotBlank() } ?: item.id
         if (canonicalUrl != item.id) {
-            loadCache[canonicalUrl] = resp
+            loadCache[canonicalUrl] = CachedLoad(resp, System.currentTimeMillis())
         }
         val mt = when (resp) {
             is MovieLoadResponse -> MediaType.MOVIE
@@ -477,12 +479,12 @@ class Cs3MainApiProvider(override val config: ProviderConfig) : ContentProvider 
             val subs = mutableListOf<SubtitleFile>()
             val worker = Thread.currentThread()
             val rawTimeout = a.loadLinksTimeoutMs
-            val pluginTimeout = if (rawTimeout != null && rawTimeout in 1..120_000L) rawTimeout else 30_000L
+            val pluginTimeout = if (rawTimeout != null && rawTimeout in 1..60_000L) rawTimeout else 20_000L
             // How long the merge loop waits in total. Extended if a fast-empty
             // plugin run triggers its one retry (below), so the retry is never
             // cut off by a deadline that assumed a single attempt.
             var deadline =
-                started + maxOf(pluginTimeout, MOVIEBLAST_CAP_MS, FALLBACK_CAP_MS) + 2_000
+                started + maxOf(pluginTimeout, MOVIEBLAST_CAP_MS, FALLBACK_CAP_MS) + 1_000
 
             // Deliberately NOT coroutineScope: it waits for children to finish
             // cancelling, which would block here while a hung plugin drains its
@@ -509,10 +511,10 @@ class Cs3MainApiProvider(override val config: ProviderConfig) : ContentProvider 
                             elapsedMs += System.currentTimeMillis() - s
                         }
                         runOnce(pluginTimeout, data)
-                        if ((completed != true || links.isEmpty()) && elapsedMs < 15_000) {
+                        if ((completed != true || links.isEmpty()) && elapsedMs < 10_000) {
                             links.clear()
-                            val retryBudget = minOf(pluginTimeout, 20_000L)
-                            deadline = maxOf(deadline, System.currentTimeMillis() + retryBudget + 1_000)
+                            val retryBudget = minOf(pluginTimeout, 12_000L)
+                            deadline = maxOf(deadline, System.currentTimeMillis() + retryBudget + 500)
                             runOnce(retryBudget, data)
                         }
                         // iStreamFlare-style providers hand loadLinks a JSON
@@ -533,10 +535,10 @@ class Cs3MainApiProvider(override val config: ProviderConfig) : ContentProvider 
                             // payload string instead of the real page.
                             val orig = originalIdOf(data) ?: item.id
                             invalidateHollow(data)
-                            val freshBudget = minOf(pluginTimeout, 25_000L)
+                            val freshBudget = minOf(pluginTimeout, 15_000L)
                             // Covers BOTH the fresh load() and the retried
                             // loadLinks, so the merge loop can't cut them off.
-                            deadline = maxOf(deadline, System.currentTimeMillis() + freshBudget * 2 + 1_000)
+                            deadline = maxOf(deadline, System.currentTimeMillis() + freshBudget * 2 + 500)
                             val fresh = withTimeoutOrNull(freshBudget) { loadResponse(orig) }
                             val freshData = fresh?.url?.takeIf {
                                 it.isNotBlank() && !isHollowPayload(it)
@@ -647,7 +649,7 @@ class Cs3MainApiProvider(override val config: ProviderConfig) : ContentProvider 
                         // raced the user into a raw-scanned "Hikari Auto" URL
                         // (403-prone) while the plugin's properly-signed
                         // StreamHG link was still one request away.
-                        val waited = now - firstSourceAt >= 2_000L
+                        val waited = now - firstSourceAt >= 1_000L
                         val openNow = when {
                             // Plugin still working → open fast only if it has
                             // already handed us servers (its later servers are
@@ -762,17 +764,12 @@ class Cs3MainApiProvider(override val config: ProviderConfig) : ContentProvider 
      *  runs — the hollow movie payload is cached under BOTH the original id
      *  and the payload itself, so clear both. */
     private fun invalidateHollow(url: String) {
-        loadCache.remove(url)
-        val it = loadCache.entries.iterator()
-        while (it.hasNext()) {
-            val (k, v) = it.next()
-            if (v.url == url) it.remove()
-        }
+        loadCache.entries.removeIf { it.key == url || it.value.resp.url == url }
     }
 
     /** Finds the original search/page id that produced a (rewritten) url. */
     private fun originalIdOf(url: String): String? {
-        for ((k, v) in loadCache) if (v.url == url) return k
+        for ((k, v) in loadCache) if (v.resp.url == url) return k
         return null
     }
 
@@ -786,12 +783,13 @@ class Cs3MainApiProvider(override val config: ProviderConfig) : ContentProvider 
     }
 
     private suspend fun loadResponse(id: String): LoadResponse? {
-        loadCache[id]?.let { return it }
+        val cached = loadCache[id]
+        if (cached != null && System.currentTimeMillis() - cached.at < LOAD_CACHE_TTL_MS) return cached.resp
         val a = api ?: return null
         // Some providers' load() walks many pages (e.g. PimpBunny model pages
         // paginate up to 50) — cap it so the detail screen can never hang.
         val r = try {
-            withTimeoutOrNull(45_000) {
+            withTimeoutOrNull(20_000) {
                 val first = tryLoad(a, id)
                 // Providers like iStreamFlare build a JSON video-id string and
                 // fill its `url` field during load(); a hollow one (url:null,
@@ -805,7 +803,7 @@ class Cs3MainApiProvider(override val config: ProviderConfig) : ContentProvider 
             if (e is CancellationException) throw e
             null
         } ?: return null
-        loadCache[id] = r
+        loadCache[id] = CachedLoad(r, System.currentTimeMillis())
         return r
     }
 
