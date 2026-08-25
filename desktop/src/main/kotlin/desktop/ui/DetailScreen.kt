@@ -9,6 +9,7 @@ import com.hikari.app.data.StreamSource
 import desktop.fx.Fx
 import desktop.player.DesktopPlayer
 import desktop.player.EnhancedPlayer
+import desktop.player.EmbeddedPlayer
 import javafx.geometry.Insets
 import javafx.geometry.Pos
 import javafx.scene.Node
@@ -252,10 +253,9 @@ class DetailScreenView(private val item: MediaItem) {
         val allEps = episodes
         val currentEp = selectedEpisode
 
-        // Enhanced player with custom controls, next-episode, and fixed seeking
-        // Falls back to DesktopPlayer if IPC fails
+        // Try embedded single-window player first (CloudStream/Stremio-like), then enhanced control bar, then basic
         try {
-            EnhancedPlayer.play(
+            EmbeddedPlayer.play(
                 title = "${meta.title} — ${selectedEpisode?.let { "Ep ${it.number} " } ?: ""}${stream.name}",
                 stream = stream,
                 episodes = allEps,
@@ -264,7 +264,6 @@ class DetailScreenView(private val item: MediaItem) {
                     Fx.run {
                         selectedEpisode = nextEp
                         episodeGrid?.select(nextEp)
-                        // Save history for next ep
                         HikariApp.instance.store.addHistory(
                             HistoryEntry(
                                 providerId = meta.providerId,
@@ -277,18 +276,11 @@ class DetailScreenView(private val item: MediaItem) {
                                 watchedAt = System.currentTimeMillis(),
                             )
                         )
-                        // Fetch streams for next ep and auto-play first
                         scope.launch {
-                            val nextStreams = runCatching {
-                                AppShell.app.repository.streamsFor(meta, nextEp)
-                            }.getOrNull()
+                            val nextStreams = runCatching { AppShell.app.repository.streamsFor(meta, nextEp) }.getOrNull()
                             val first = nextStreams?.firstOrNull()
                             Fx.run {
-                                if (first != null) {
-                                    playStream(meta, first)
-                                } else {
-                                    loadStreams(meta)
-                                }
+                                if (first != null) playStream(meta, first) else loadStreams(meta)
                             }
                         }
                     }
@@ -300,16 +292,54 @@ class DetailScreenView(private val item: MediaItem) {
                 }
             )
         } catch (e: Exception) {
-            // Fallback to old player if enhanced fails
-            DesktopPlayer.play(
-                "${meta.title} — ${stream.name}",
-                stream,
-                refresh = {
-                    runCatching {
-                        kotlinx.coroutines.runBlocking { AppShell.app.repository.streamsFor(meta, selectedEpisode) }
-                    }.getOrNull()?.firstOrNull()
-                },
-            )
+            try {
+                EnhancedPlayer.play(
+                    title = "${meta.title} — ${selectedEpisode?.let { "Ep ${it.number} " } ?: ""}${stream.name}",
+                    stream = stream,
+                    episodes = allEps,
+                    currentEpisode = currentEp,
+                    onEpisodeChanged = { nextEp ->
+                        Fx.run {
+                            selectedEpisode = nextEp
+                            episodeGrid?.select(nextEp)
+                            HikariApp.instance.store.addHistory(
+                                HistoryEntry(
+                                    providerId = meta.providerId,
+                                    mediaId = meta.id,
+                                    type = meta.type,
+                                    title = meta.title,
+                                    posterUrl = meta.posterUrl,
+                                    episodeId = nextEp.id,
+                                    episodeName = nextEp.name ?: "",
+                                    watchedAt = System.currentTimeMillis(),
+                                )
+                            )
+                            scope.launch {
+                                val nextStreams = runCatching { AppShell.app.repository.streamsFor(meta, nextEp) }.getOrNull()
+                                val first = nextStreams?.firstOrNull()
+                                Fx.run {
+                                    if (first != null) playStream(meta, first) else loadStreams(meta)
+                                }
+                            }
+                        }
+                    },
+                    refresh = {
+                        runCatching {
+                            kotlinx.coroutines.runBlocking { AppShell.app.repository.streamsFor(meta, selectedEpisode) }
+                        }.getOrNull()?.firstOrNull()
+                    }
+                )
+            } catch (e2: Exception) {
+                DesktopPlayer.play(
+                    "${meta.title} — ${stream.name}",
+                    stream,
+                    refresh = {
+                        runCatching {
+                            kotlinx.coroutines.runBlocking { AppShell.app.repository.streamsFor(meta, selectedEpisode) }
+                        }.getOrNull()?.firstOrNull()
+                    },
+                )
+            }
         }
     }
 }
