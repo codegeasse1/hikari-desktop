@@ -218,14 +218,14 @@ object Http {
         val ordered = candidates.filter { it.contains("repo-desktop.json") } +
             candidates.filter { !it.contains("repo-desktop.json") }
         val list = if (ordered.any { it.contains("codegeasse1/hikari-extensions") }) {
-            // The official repo resolves to the CDN mirror FIRST: the mirror
-            // serves every plugin's jar from user.uploads.dev, which works even
-            // on networks where GitHub (github.com + raw + jsDelivr) is blocked
-            // or refused by the app's HTTP stack. Regenerate the mirror whenever
-            // the official repo.json changes.
-            listOf(HIKARI_REPO_MIRROR) + ordered
+            // Try the LIVE repo candidates FIRST so newly published extensions
+            // show up immediately. The CDN mirror is only a LAST-RESORT
+            // fallback for networks where GitHub (github.com + raw + jsDelivr)
+            // is blocked or refused by the app's HTTP stack — it is a stale
+            // manual snapshot, so it must never shadow the real repo.
+            ordered + listOf(HIKARI_REPO_MIRROR)
         } else if (ordered.any { it.contains("codegeasse1/codegeasse-cloudstream-repos") }) {
-            listOf(CLOUDSTREAM_REPO_MIRROR) + ordered
+            ordered + listOf(CLOUDSTREAM_REPO_MIRROR)
         } else {
             ordered
         }

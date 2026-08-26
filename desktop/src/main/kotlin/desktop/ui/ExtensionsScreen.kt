@@ -333,8 +333,11 @@ class ExtensionsScreenView {
             alignment = Pos.CENTER_LEFT
             maxWidth = Double.MAX_VALUE
             setOnAction {
+                // Always re-fetch on open so the folder shows the LATEST repo
+                // contents (newly published extensions) instead of a cached
+                // copy from earlier in the session.
                 openRepo = repo
-                if (repoData[repo.url] == null) loadRepoData(repo.url)
+                loadRepoData(repo.url)
                 renderAll()
             }
         }
@@ -472,10 +475,20 @@ class ExtensionsScreenView {
                     repoData.remove(existing.url)
                 }
                 if (existing != null && existing.url == resolved) {
+                    // Re-adding the SAME link: refresh the cache with the data
+                    // just fetched instead of serving the stale session copy —
+                    // otherwise adding the link again keeps showing the old
+                    // repo contents (previously only loaded when cache was null).
+                    val root2 = runCatching { JSONObject(pair.second) }.getOrNull()
+                    repoData[existing.url] = RepoData(
+                        url = existing.url,
+                        name = root2?.optString("name").orEmpty().ifBlank { name },
+                        description = root2?.optString("description").orEmpty(),
+                        plugins = parsePlugins(root2, existing.url),
+                    )
                     openRepo = existing
-                    if (repoData[existing.url] == null) loadRepoData(existing.url)
                     renderAll()
-                    setStatus("That repo is already added — opened it.", isError = true)
+                    setStatus("That repo is already added — refreshed it.", isError = true)
                     return@run
                 }
                 AppShell.app.store.addCs3Repo(
