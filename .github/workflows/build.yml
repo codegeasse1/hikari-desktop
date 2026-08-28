@@ -95,6 +95,10 @@ jobs:
           CERT_B64: ${{ secrets.WINDOWS_SIGNING_CERT }}
           CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
         run: |
+          if [ -z "$CERT_B64" ]; then
+            echo "::error::WINDOWS_SIGNING_CERT secret is empty. Set it to the base64 of your .pfx."
+            exit 1
+          fi
           echo "$CERT_B64" | base64 -d > signing.pfx 2>/dev/null || echo "$CERT_B64" > signing.pfx
           ls -la signing.pfx
           SIGNTOOL=$(ls "C:/Program Files (x86)/Windows Kits/10/bin/"*/x64/signtool.exe 2>/dev/null | sort -V | tail -n 1)
@@ -104,7 +108,14 @@ jobs:
             exit 1
           fi
           echo "Using signtool: $SIGNTOOL"
-          "$SIGNTOOL" sign /f signing.pfx /p "$CERT_PASSWORD" /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /d "Hikari" /du "https://github.com/codegeasse1/hikari-desktop" "Hikari/Hikari.exe"
+          SIGN_ARGS=(/f signing.pfx)
+          if [ -n "$CERT_PASSWORD" ]; then
+            SIGN_ARGS+=(/p "$CERT_PASSWORD")
+          else
+            echo "::warning::WINDOWS_CERT_PASSWORD is empty — signing as a password-less .pfx. If your .pfx has a password, set that secret."
+          fi
+          SIGN_ARGS+=(/fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /d "Hikari" /du "https://github.com/codegeasse1/hikari-desktop" "Hikari/Hikari.exe")
+          "$SIGNTOOL" sign "${SIGN_ARGS[@]}"
           rm -f signing.pfx
         shell: bash
 
@@ -172,6 +183,10 @@ jobs:
           CERT_B64: ${{ secrets.WINDOWS_SIGNING_CERT }}
           CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
         run: |
+          if [ -z "$CERT_B64" ]; then
+            echo "::error::WINDOWS_SIGNING_CERT secret is empty. Set it to the base64 of your .pfx."
+            exit 1
+          fi
           echo "$CERT_B64" | base64 -d > signing.pfx 2>/dev/null || echo "$CERT_B64" > signing.pfx
           ls -la signing.pfx
           SIGNTOOL=$(ls "C:/Program Files (x86)/Windows Kits/10/bin/"*/x64/signtool.exe 2>/dev/null | sort -V | tail -n 1)
@@ -182,7 +197,15 @@ jobs:
           fi
           echo "Using signtool: $SIGNTOOL"
           INSTALLER=$(ls -1 *.exe | head -n 1)
-          "$SIGNTOOL" sign /f signing.pfx /p "$CERT_PASSWORD" /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /d "Hikari" /du "https://github.com/codegeasse1/hikari-desktop" "$INSTALLER"
+          echo "installer: $INSTALLER"
+          SIGN_ARGS=(/f signing.pfx)
+          if [ -n "$CERT_PASSWORD" ]; then
+            SIGN_ARGS+=(/p "$CERT_PASSWORD")
+          else
+            echo "::warning::WINDOWS_CERT_PASSWORD is empty — signing as a password-less .pfx. If your .pfx has a password, set that secret."
+          fi
+          SIGN_ARGS+=(/fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /d "Hikari" /du "https://github.com/codegeasse1/hikari-desktop" "$INSTALLER")
+          "$SIGNTOOL" sign "${SIGN_ARGS[@]}"
           rm -f signing.pfx
         shell: bash
 
