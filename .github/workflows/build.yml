@@ -108,14 +108,24 @@ jobs:
             exit 1
           fi
           echo "Using signtool: $SIGNTOOL"
-          SIGN_ARGS=(/f signing.pfx)
-          if [ -n "$CERT_PASSWORD" ]; then
-            SIGN_ARGS+=(/p "$CERT_PASSWORD")
-          else
-            echo "::warning::WINDOWS_CERT_PASSWORD is empty — signing as a password-less .pfx. If your .pfx has a password, set that secret."
+          FILE="Hikari/Hikari.exe"
+          BASE=(/f signing.pfx /d "Hikari" /du "https://github.com/codegeasse1/hikari-desktop")
+          if [ -n "$CERT_PASSWORD" ]; then BASE+=(/p "$CERT_PASSWORD"); fi
+          sign_ok=""
+          for v in "/fd SHA256 /tr http://timestamp.digicert.com /td SHA256" "/fd SHA256" "/fd certHash /tr http://timestamp.digicert.com /td SHA256" "/fd sha256 /tr http://timestamp.digicert.com /td SHA256"; do
+            if "$SIGNTOOL" sign "${BASE[@]}" $v "$FILE" 2>sign.err; then
+              sign_ok="$v"
+              break
+            else
+              echo "sign variant failed [$v]: $(tail -n 1 sign.err)"
+            fi
+          done
+          if [ -z "$sign_ok" ]; then
+            echo "::error::signtool could not sign $FILE (all variants failed)"
+            exit 1
           fi
-          SIGN_ARGS+=(/fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /d "Hikari" /du "https://github.com/codegeasse1/hikari-desktop" "Hikari/Hikari.exe")
-          "$SIGNTOOL" sign "${SIGN_ARGS[@]}"
+          echo "SIGN OK using: signtool sign ${BASE[@]} $sign_ok $FILE"
+          "$SIGNTOOL" verify "$FILE" >/dev/null 2>&1 && echo "verify: signature present" || echo "verify: no signature detected"
           rm -f signing.pfx
         shell: bash
 
@@ -196,16 +206,25 @@ jobs:
             exit 1
           fi
           echo "Using signtool: $SIGNTOOL"
-          INSTALLER=$(ls -1 *.exe | head -n 1)
-          echo "installer: $INSTALLER"
-          SIGN_ARGS=(/f signing.pfx)
-          if [ -n "$CERT_PASSWORD" ]; then
-            SIGN_ARGS+=(/p "$CERT_PASSWORD")
-          else
-            echo "::warning::WINDOWS_CERT_PASSWORD is empty — signing as a password-less .pfx. If your .pfx has a password, set that secret."
+          FILE=$(ls -1 *.exe | head -n 1)
+          echo "installer: $FILE"
+          BASE=(/f signing.pfx /d "Hikari" /du "https://github.com/codegeasse1/hikari-desktop")
+          if [ -n "$CERT_PASSWORD" ]; then BASE+=(/p "$CERT_PASSWORD"); fi
+          sign_ok=""
+          for v in "/fd SHA256 /tr http://timestamp.digicert.com /td SHA256" "/fd SHA256" "/fd certHash /tr http://timestamp.digicert.com /td SHA256" "/fd sha256 /tr http://timestamp.digicert.com /td SHA256"; do
+            if "$SIGNTOOL" sign "${BASE[@]}" $v "$FILE" 2>sign.err; then
+              sign_ok="$v"
+              break
+            else
+              echo "sign variant failed [$v]: $(tail -n 1 sign.err)"
+            fi
+          done
+          if [ -z "$sign_ok" ]; then
+            echo "::error::signtool could not sign $FILE (all variants failed)"
+            exit 1
           fi
-          SIGN_ARGS+=(/fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /d "Hikari" /du "https://github.com/codegeasse1/hikari-desktop" "$INSTALLER")
-          "$SIGNTOOL" sign "${SIGN_ARGS[@]}"
+          echo "SIGN OK using: signtool sign ${BASE[@]} $sign_ok $FILE"
+          "$SIGNTOOL" verify "$FILE" >/dev/null 2>&1 && echo "verify: signature present" || echo "verify: no signature detected"
           rm -f signing.pfx
         shell: bash
 
