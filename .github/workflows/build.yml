@@ -42,29 +42,6 @@ jobs:
           gradle-version: "8.11.1"
           cache-disabled: true
 
-      - name: DEBUG signtool arg parsing
-        env:
-          CERT_B64: ${{ secrets.WINDOWS_SIGNING_CERT }}
-          CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
-        run: |
-          echo "$CERT_B64" | base64 -d > signing.pfx 2>/dev/null || echo "$CERT_B64" > signing.pfx
-          ls -la signing.pfx
-          SIGNTOOL=$(ls "C:/Program Files (x86)/Windows Kits/10/bin/"*/x64/signtool.exe 2>/dev/null | sort -V | tail -n 1)
-          [ -z "$SIGNTOOL" ] && SIGNTOOL=$(command -v signtool 2>/dev/null || true)
-          echo "SIGNTOOL=$SIGNTOOL"
-          cp "$SIGNTOOL" test.exe
-          echo "=== test 1: signtool sign /fd SHA256 (no file). Expect 'Missing filename' if /fd recognized ==="
-          "$SIGNTOOL" sign /fd SHA256 2>&1 || true
-          echo "=== test 2: MSYS_NO_PATHCONV=1 real sign ==="
-          MSYS_NO_PATHCONV=1 "$SIGNTOOL" sign /f signing.pfx /p "$CERT_PASSWORD" /fd SHA256 test.exe 2>&1 || true
-          echo "=== test 3: via cmd.exe (no bash mangling) ==="
-          cmd /c "\"$SIGNTOOL\" sign /f signing.pfx /p \"$CERT_PASSWORD\" /fd SHA256 test.exe" 2>&1 || true
-          echo "=== test 4: via powershell explicit args ==="
-          powershell -NoProfile -Command "\$env:CP='$CERT_PASSWORD'; & '$SIGNTOOL' sign /f signing.pfx /p \$env:CP /fd SHA256 /d 'Hikari' /du 'https://github.com/codegeasse1/hikari-desktop' 'test.exe'" 2>&1 || true
-          rm -f signing.pfx
-          exit 1
-        shell: bash
-
       - name: Build app
         run: |
           # Maven Central / plugins.gradle.org occasionally rate-limit runner IPs
@@ -134,20 +111,8 @@ jobs:
           FILE="Hikari/Hikari.exe"
           BASE=(/f signing.pfx /d "Hikari" /du "https://github.com/codegeasse1/hikari-desktop")
           if [ -n "$CERT_PASSWORD" ]; then BASE+=(/p "$CERT_PASSWORD"); fi
-          sign_ok=""
-          for v in "/fd SHA256 /tr http://timestamp.digicert.com /td SHA256" "/fd SHA256" "/fd certHash /tr http://timestamp.digicert.com /td SHA256" "/fd sha256 /tr http://timestamp.digicert.com /td SHA256"; do
-            if "$SIGNTOOL" sign "${BASE[@]}" $v "$FILE" 2>sign.err; then
-              sign_ok="$v"
-              break
-            else
-              echo "sign variant failed [$v]: $(tail -n 1 sign.err)"
-            fi
-          done
-          if [ -z "$sign_ok" ]; then
-            echo "::error::signtool could not sign $FILE (all variants failed)"
-            exit 1
-          fi
-          echo "SIGN OK using: signtool sign ${BASE[@]} $sign_ok $FILE"
+          MSYS_NO_PATHCONV=1 "$SIGNTOOL" sign "${BASE[@]}" /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 "$FILE"
+          echo "SIGN OK: signtool sign ${BASE[@]} /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $FILE"
           "$SIGNTOOL" verify "$FILE" >/dev/null 2>&1 && echo "verify: signature present" || echo "verify: no signature detected"
           rm -f signing.pfx
         shell: bash
@@ -233,20 +198,8 @@ jobs:
           echo "installer: $FILE"
           BASE=(/f signing.pfx /d "Hikari" /du "https://github.com/codegeasse1/hikari-desktop")
           if [ -n "$CERT_PASSWORD" ]; then BASE+=(/p "$CERT_PASSWORD"); fi
-          sign_ok=""
-          for v in "/fd SHA256 /tr http://timestamp.digicert.com /td SHA256" "/fd SHA256" "/fd certHash /tr http://timestamp.digicert.com /td SHA256" "/fd sha256 /tr http://timestamp.digicert.com /td SHA256"; do
-            if "$SIGNTOOL" sign "${BASE[@]}" $v "$FILE" 2>sign.err; then
-              sign_ok="$v"
-              break
-            else
-              echo "sign variant failed [$v]: $(tail -n 1 sign.err)"
-            fi
-          done
-          if [ -z "$sign_ok" ]; then
-            echo "::error::signtool could not sign $FILE (all variants failed)"
-            exit 1
-          fi
-          echo "SIGN OK using: signtool sign ${BASE[@]} $sign_ok $FILE"
+          MSYS_NO_PATHCONV=1 "$SIGNTOOL" sign "${BASE[@]}" /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 "$FILE"
+          echo "SIGN OK: signtool sign ${BASE[@]} /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $FILE"
           "$SIGNTOOL" verify "$FILE" >/dev/null 2>&1 && echo "verify: signature present" || echo "verify: no signature detected"
           rm -f signing.pfx
         shell: bash
