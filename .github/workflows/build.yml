@@ -2,8 +2,17 @@ name: Build
 
 on:
   push:
-    branches: [ main, "arena/**" ]
+    branches: [ main ]
   workflow_dispatch:
+    inputs:
+      release:
+        description: "Create a main release (v<version>) from current main"
+        type: boolean
+        default: false
+      version:
+        description: "Release version (e.g. 1.0.0)"
+        type: string
+        default: "1.0.0"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -15,6 +24,11 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-latest
+    env:
+      # Manual releases pin the installer/app version to the requested one
+      # (e.g. 1.0.0); regular builds keep a unique per-run number so WiX
+      # major upgrades install cleanly over older builds.
+      APP_VERSION: ${{ github.event.inputs.release == 'true' && github.event.inputs.version || format('0.1.{0}', github.run_number) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -72,8 +86,26 @@ jobs:
             --icon packaging/hikari.ico \
             --java-options "-Dfile.encoding=UTF-8" \
             --java-options "-Djava.net.useSystemProxies=true" \
-            --app-version "0.1.${{ github.run_number }}"
+            --app-version "$APP_VERSION"
           ls -la "Hikari"
+        shell: bash
+
+      - name: Sign app executable
+        env:
+          CERT_B64: ${{ secrets.WINDOWS_SIGNING_CERT }}
+          CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          echo "$CERT_B64" | base64 -d > signing.pfx 2>/dev/null || echo "$CERT_B64" > signing.pfx
+          ls -la signing.pfx
+          SIGNTOOL=$(ls "C:/Program Files (x86)/Windows Kits/10/bin/"*/x64/signtool.exe 2>/dev/null | sort -V | tail -n 1)
+          [ -z "$SIGNTOOL" ] && SIGNTOOL=$(command -v signtool 2>/dev/null || true)
+          if [ -z "$SIGNTOOL" ]; then
+            echo "::error::signtool.exe not found — install Windows SDK or add it to PATH."
+            exit 1
+          fi
+          echo "Using signtool: $SIGNTOOL"
+          "$SIGNTOOL" sign /f signing.pfx /p "$CERT_PASSWORD" /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /d "Hikari" /du "https://github.com/codegeasse1/hikari-desktop" "Hikari/Hikari.exe"
+          rm -f signing.pfx
         shell: bash
 
       - name: Dex->JVM loader self-test (real .cs3 plugin)
@@ -128,11 +160,30 @@ jobs:
             --icon packaging/hikari.ico \
             --java-options "-Dfile.encoding=UTF-8" \
             --java-options "-Djava.net.useSystemProxies=true" \
-            --app-version "0.1.${{ github.run_number }}" \
+            --app-version "$APP_VERSION" \
             --win-menu --win-dir-chooser
           EXE=$(ls -1 *.exe | head -n 1)
           echo "installer: $EXE"
           ls -la "$EXE"
+        shell: bash
+
+      - name: Sign installer
+        env:
+          CERT_B64: ${{ secrets.WINDOWS_SIGNING_CERT }}
+          CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          echo "$CERT_B64" | base64 -d > signing.pfx 2>/dev/null || echo "$CERT_B64" > signing.pfx
+          ls -la signing.pfx
+          SIGNTOOL=$(ls "C:/Program Files (x86)/Windows Kits/10/bin/"*/x64/signtool.exe 2>/dev/null | sort -V | tail -n 1)
+          [ -z "$SIGNTOOL" ] && SIGNTOOL=$(command -v signtool 2>/dev/null || true)
+          if [ -z "$SIGNTOOL" ]; then
+            echo "::error::signtool.exe not found — install Windows SDK or add it to PATH."
+            exit 1
+          fi
+          echo "Using signtool: $SIGNTOOL"
+          INSTALLER=$(ls -1 *.exe | head -n 1)
+          "$SIGNTOOL" sign /f signing.pfx /p "$CERT_PASSWORD" /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /d "Hikari" /du "https://github.com/codegeasse1/hikari-desktop" "$INSTALLER"
+          rm -f signing.pfx
         shell: bash
 
 
@@ -186,5 +237,28 @@ jobs:
           if [ "$published" != "1" ]; then
             echo "FAILED to publish release after retries"
             exit 1
+          fi
+        shell: bash
+
+      # ---- MAIN RELEASE: only when manually triggered with "release" checked ----
+      - name: Publish main release (manual only)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          TAG="v${VERSION:-1.0.0}"
+          EXE=$(ls -1 *.exe | head -n 1)
+          echo "assets: hikari-windows.zip, $EXE -> $TAG"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            for i in 1 2 3; do
+              gh release upload "$TAG" hikari-windows.zip "$EXE" --repo "$GITHUB_REPOSITORY" --clobber && break
+              echo "release upload attempt $i failed, retrying..."
+              sleep 5
+            done
+          else
+            gh release create "$TAG" hikari-windows.zip "$EXE" --repo "$GITHUB_REPOSITORY" \
+              --title "Hikari $VERSION" \
+              --notes "Signed build for Windows (app image zip + .exe installer)." || true
           fi
         shell: bash
