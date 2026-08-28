@@ -109,6 +109,8 @@ jobs:
           fi
           echo "Using signtool: $SIGNTOOL"
           FILE="Hikari/Hikari.exe"
+          chmod u+w "$FILE" 2>/dev/null || true
+          attrib -R "$FILE" 2>/dev/null || true
           BASE=(/f signing.pfx /d "Hikari" /du "https://github.com/codegeasse1/hikari-desktop")
           if [ -n "$CERT_PASSWORD" ]; then BASE+=(/p "$CERT_PASSWORD"); fi
           MSYS_NO_PATHCONV=1 "$SIGNTOOL" sign "${BASE[@]}" /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 "$FILE"
@@ -196,6 +198,8 @@ jobs:
           echo "Using signtool: $SIGNTOOL"
           FILE=$(ls -1 *.exe | head -n 1)
           echo "installer: $FILE"
+          chmod u+w "$FILE" 2>/dev/null || true
+          attrib -R "$FILE" 2>/dev/null || true
           BASE=(/f signing.pfx /d "Hikari" /du "https://github.com/codegeasse1/hikari-desktop")
           if [ -n "$CERT_PASSWORD" ]; then BASE+=(/p "$CERT_PASSWORD"); fi
           MSYS_NO_PATHCONV=1 "$SIGNTOOL" sign "${BASE[@]}" /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 "$FILE"
