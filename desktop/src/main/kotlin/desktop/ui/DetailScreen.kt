@@ -304,6 +304,19 @@ class DetailScreenView(private val item: MediaItem) {
         hero.prefHeight = HERO_H
         hero.minHeight = HERO_H
         hero.maxHeight = HERO_H
+        // Give the banner a slice of the window instead of a fixed 248px, so a
+        // short screen (a 768px laptop, with 60px of chrome on top) still
+        // leaves the source list beside it usable. The window height is
+        // independent of this value, so the listener settles in one pass.
+        root.heightProperty().addListener { _, _, h ->
+            val target = (h.toDouble() * 0.28).coerceIn(HERO_MIN, HERO_H)
+            if (hero.prefHeight != target) {
+                hero.prefHeight = target
+                hero.minHeight = target
+                hero.maxHeight = target
+                heroImage.fitHeight = target
+            }
+        }
         heroImage.fitWidthProperty().bind(hero.widthProperty())
 
         val scrim = Region().apply {
@@ -687,6 +700,10 @@ class DetailScreenView(private val item: MediaItem) {
     private companion object {
         const val PANEL_W = 396.0
         const val HERO_H = 248.0
+
+        /** The banner never shrinks below this, so the title and its buttons
+         *  always fit even on a short window. */
+        const val HERO_MIN = 180.0
 
         /** Tiles rendered per "page" before the Show-more button appears. */
         const val EPISODE_PAGE = 240
