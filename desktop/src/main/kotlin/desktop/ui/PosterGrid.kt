@@ -51,7 +51,7 @@ class PosterGrid(
 
     fun clear() {
         all = emptyList()
-        list.items.setAll(emptyList())
+        list.items.clear()
     }
 
     fun scrollToTop() {
@@ -72,7 +72,7 @@ class PosterGrid(
 
     private fun rebuild() {
         if (all.isEmpty()) {
-            list.items.setAll(emptyList())
+            list.items.clear()
             return
         }
         list.items.setAll(all.chunked(columns))

@@ -196,7 +196,7 @@ object Ui {
             KeyFrame(Duration.seconds(1.0), KeyValue(node.opacityProperty(), 0.42, Interpolator.EASE_BOTH)),
         ).apply {
             cycleCount = Timeline.INDEFINITE
-            autoReverse = true
+            setAutoReverse(true)
             play()
         }
         node.properties["hikari-pulse"] = timeline
