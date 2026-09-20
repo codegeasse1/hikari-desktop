@@ -85,12 +85,17 @@ Outside `desktop/ui/`, but part of this layer's picture: the download queue live
 - **Filter drawer** (`SearchScreen`): a full-height panel inside the screen's
   `StackPane`, `translateX` animated in/out, a dimming `Region` behind it, rows as
   `HBox`es with a check square. Multi-select; an empty selection means "all".
-- **Detail** (`DetailScreen`): the banner owns the top; below it an `HBox` of a
-  scrolling facts column (grow) and a fixed 396px `Watch` panel. The panel holds the
-  episode range selector, the episode-number grid, the now-playing callout and the
-  source list — so choosing an episode and then a source never needs a page scroll.
-  Episode tiles show the number only (the show title is stripped from the name) and
-  tile lists are paged in ranges of 60 with a "Find episode…" filter.
+- **Detail** (`DetailScreen`): the banner owns the top (its height is 28% of the
+  window, clamped to 180–248px, so a short screen still leaves room below it).
+  Under it an `HBox` of a *scrolling* facts+episodes column (grow) and a fixed
+  396px `Watch` panel. Nothing competes for the same axis: the left column owns
+  the page's vertical scroll and holds the synopsis, the facts table and the full
+  episode grid; the watch panel never leaves the screen and instead scrolls
+  *inside* itself, with the source list as its one growing child. Episode tiles
+  show the number only (the show title is stripped from the name) and every
+  episode is rendered in one wrapping grid — no pager — with a
+  "Find episode by number or name…" filter and a "Show more episodes" button
+  (240 tiles per page).
 - **Downloads** (`DownloadsScreen`): a behaviour panel (storage tiles, where exported
   copies land, the "also save a copy to my Downloads folder" switch, downloads-at-once
   segmented control) above a live queue. The queue rows are rebuilt from the

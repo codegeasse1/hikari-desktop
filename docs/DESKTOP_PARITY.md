@@ -15,6 +15,12 @@ addons, universal scrapers, mpv playback with `HlsRelay`/`LocalProxy`, the desig
 system and every main screen, `AppStore` persistence, the updater, the ad blocker,
 the WebView fallback resolver, and the download queue with its HLS/MP4 engine.
 
+A layout/input pass went over every screen afterwards: screens now fit the window
+(minimum sizes are pinned, see `UI_GUIDE.md` rules 8–11), the detail screen's
+left column scrolls while the watch panel keeps its own scrolling source list,
+the episode range pager was replaced by one grid plus a filter, and the tooltips
+that were eating clicks are gone.
+
 ## Stage 1 — Downloads (done)
 
 Ported from Android's `download/` package into
