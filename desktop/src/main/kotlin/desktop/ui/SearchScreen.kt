@@ -104,7 +104,7 @@ class SearchScreenView {
         translateX = PANEL_W
     }
 
-    private val root: StackPane = StackPane()
+    val root: StackPane = StackPane()
 
     private var searchJob: Job? = null
 
