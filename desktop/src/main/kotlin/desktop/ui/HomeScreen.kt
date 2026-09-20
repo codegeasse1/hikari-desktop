@@ -76,6 +76,13 @@ class HomeScreenView {
         prefHeight = 260.0
         isFitToWidth = true
         styleClass.add("scroll-pane")
+        // A ScrollPane reports its content's size as its own minimum, and this
+        // one holds up to 400 wrapped log lines — left alone it would grow to
+        // thousands of pixels tall and push the page apart.
+        minWidth = 0.0
+        minHeight = 0.0
+        maxWidth = Double.MAX_VALUE
+        maxHeight = Double.MAX_VALUE
     }
     private val logsBtn = Ui.button("Logs", icon = Icons.LIST, ghost = true) { toggleLogs() }
     private val refreshBtn = Ui.button("Refresh", icon = Icons.REFRESH, primary = true) { load(force = true) }
