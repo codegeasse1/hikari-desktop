@@ -72,6 +72,23 @@ class AppStore(private val dir: File) {
         const val HOME_PROVIDER = "homeProvider"
         const val TRANSLATE_PROVIDERS = "translateProviders"
         const val TRANSLATE_CACHE = "translateCache"
+        const val DL_CONCURRENCY = "downloadConcurrency"
+        const val DL_TO_FOLDER = "downloadToFolder"
+    }
+
+    fun downloadConcurrency(): Int =
+        (get(K.DL_CONCURRENCY) ?: "3").toIntOrNull()?.coerceIn(1, 10) ?: 3
+
+    fun setDownloadConcurrency(n: Int) {
+        put(K.DL_CONCURRENCY, n.coerceIn(1, 10).toString())
+    }
+
+    /** When true (the default), a finished download is ALSO written as one
+     *  playable file into the user's Downloads/Hikari folder. */
+    fun downloadToFolder(): Boolean = (get(K.DL_TO_FOLDER) ?: "true").toBoolean()
+
+    fun setDownloadToFolder(value: Boolean) {
+        put(K.DL_TO_FOLDER, value)
     }
 
     fun homeProviderFlow(): Flow<String> = flowOf { homeProvider() }

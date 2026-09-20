@@ -22,6 +22,7 @@ import javafx.scene.layout.VBox
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 sealed class Screen {
     object Home : Screen()
@@ -87,8 +88,35 @@ object AppShell {
                 Theme.refresh()
             }
         }
+        installDownloadQueue()
         show(Screen.Home, remember = false)
         return root
+    }
+
+    /**
+     * Wires the download queue into the shell: the persisted queue is read once
+     * at launch (so paused downloads survive a restart), the user's concurrency
+     * setting is applied, and a finished task raises a toast wherever the user
+     * happens to be in the app — the queue keeps running on its own scope, not
+     * tied to the Downloads screen being open.
+     */
+    private fun installDownloadQueue() {
+        com.hikari.app.download.DownloadsRepository.onTaskFinished = { task ->
+            when (task.status) {
+                com.hikari.app.download.DownloadStatus.DONE ->
+                    toast("Downloaded ${task.title}", "ok")
+                com.hikari.app.download.DownloadStatus.FAILED ->
+                    toast("Download failed: ${task.title} — ${task.error ?: "unknown error"}", "error")
+                else -> Unit
+            }
+        }
+        uiScope.launch {
+            runCatching {
+                val repo = com.hikari.app.download.DownloadsRepository
+                repo.setMaxConcurrent(app.store.downloadConcurrency())
+                repo.ensureLoaded()
+            }
+        }
     }
 
     private fun sidebar(): Region {
@@ -215,7 +243,12 @@ object AppShell {
     }
 
     fun toast(message: String, kind: String = "") {
-        if (::toasts.isInitialized) toasts.show(message, kind)
+        // Any background thread may report something worth a toast (a finished
+        // download, an extension install), so hop to the FX thread here rather
+        // than at every call site.
+        desktop.fx.Fx.run {
+            if (::toasts.isInitialized) toasts.show(message, kind)
+        }
     }
 
     fun show(screen: Screen, remember: Boolean = true) {

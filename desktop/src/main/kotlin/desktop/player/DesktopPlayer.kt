@@ -116,6 +116,60 @@ object DesktopPlayer {
         launchMpv(title, stream, refresh, attemptsLeft = 2)
     }
 
+    /**
+     * Plays a file already on this machine — a finished download. Neither the
+     * HLS relay nor the stream probe applies here: there is no network request
+     * to make, the path is ours, and routing a local playlist through the relay
+     * would hand OkHttp a `file:` URL it cannot fetch.
+     */
+    fun playFile(title: String, path: String) {
+        Fx.run {
+            val file = File(path)
+            if (!file.exists()) {
+                showBrowserFallback(title, path, "That downloaded file is no longer on disk — it may have been deleted or moved.")
+                return@run
+            }
+            val mpv = findMpv()
+            if (mpv == null) {
+                showBrowserFallback(title, path, "The video player (mpv) wasn't found next to the app — re-download the latest release.")
+                return@run
+            }
+            val args = listOf(
+                mpv.absolutePath,
+                "--force-window=yes",
+                "--no-ytdl",
+                "--no-config",
+                "--title=" + title.take(200).replace('\n', ' '),
+                file.absolutePath,
+            )
+            val p = runCatching { ProcessBuilder(args).redirectErrorStream(true).start() }.getOrNull()
+            if (p == null) {
+                showBrowserFallback(title, path, "Couldn't launch the video player.")
+                return@run
+            }
+            proc?.let { runCatching { it.destroy() } }
+            proc = p
+            dialogShown = false
+            Thread(
+                {
+                    runCatching { p.inputStream.bufferedReader().forEachLine { } }
+                    val code = runCatching { p.exitValue() }.getOrDefault(-1)
+                    if (code != 0 && !p.isAlive && proc === p) {
+                        Fx.run {
+                            if (dialogShown) return@run
+                            dialogShown = true
+                            showBrowserFallback(
+                                title, path,
+                                "The player closed with an error while opening the downloaded file.",
+                            )
+                        }
+                    }
+                },
+                "hikari-mpv-local",
+            ).apply { isDaemon = true; start() }
+        }
+    }
+
     private fun launchMpv(title: String, stream: StreamSource, refresh: (() -> StreamSource?)?, attemptsLeft: Int) {
         Fx.run {
             showLoading(title)
@@ -321,19 +375,9 @@ object DesktopPlayer {
         return merged
     }
 
-    /** `app/mpv/mpv.exe` inside the installed app (jpackage layout), with a
-     *  couple of fallbacks for running from an IDE / loose jar. */
-    private fun findMpv(): File? {
-        val runtimeHome = runCatching { File(System.getProperty("java.home")) }.getOrNull()
-        val appDir = runtimeHome?.parentFile
-        val rels = listOfNotNull(
-            appDir?.resolve("app/mpv/mpv.exe"),
-            appDir?.resolve("mpv/mpv.exe"),
-            appDir?.resolve("mpv.exe"),
-            File("mpv/mpv.exe"),
-        )
-        return rels.firstOrNull { it.isFile }
-    }
+    /** The bundled player, located by [Mpv] (shared with the download engine's
+     *  remux step, which needs the same binary). */
+    private fun findMpv(): File? = Mpv.exe()
 
     /** For the debug log: show a string with every non-ASCII character as a
      *  \\uXXXX escape, so a lookalike separator (e.g. a yen sign instead of a

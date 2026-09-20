@@ -20,6 +20,12 @@ Read this before touching anything under `desktop/src/main/kotlin/desktop/ui/`.
 | `LibraryScreen.kt`, `DownloadsScreen.kt`, `SettingsScreen.kt`, `ExtensionsScreen.kt` | The remaining screens. |
 | `WindowChrome.kt` | Resize edges, window controls, drag-to-maximise. |
 
+Outside `desktop/ui/`, but part of this layer's picture: the download queue lives in
+`com/hikari/app/download/` — `DownloadModels` (task/status + JSON), `DownloadStore`
+(`downloads.json`), `DownloadHttp` (the engine's per-host OkHttp budget),
+`DownloadEngine` (HLS/MP4 fetch) and `DownloadsRepository` (the queue, a
+`StateFlow` the Downloads screen renders).
+
 ## Rules
 
 1. **Never hardcode a colour.** Add it to layer 1 of `theme.css` and reference the
@@ -61,6 +67,12 @@ Read this before touching anything under `desktop/src/main/kotlin/desktop/ui/`.
   source list — so choosing an episode and then a source never needs a page scroll.
   Episode tiles show the number only (the show title is stripped from the name) and
   tile lists are paged in ranges of 60 with a "Find episode…" filter.
+- **Downloads** (`DownloadsScreen`): a behaviour panel (storage tiles, where exported
+  copies land, the "also save a copy to my Downloads folder" switch, downloads-at-once
+  segmented control) above a live queue. The queue rows are rebuilt from the
+  `DownloadsRepository.tasks` `StateFlow`, rendered inside `Fx.run { }`, and are
+  skipped entirely while the screen is detached (`attached`), because progress
+  emissions arrive several times a second.
 
 ## Adding a screen
 
@@ -93,9 +105,12 @@ is thousands of items and thousands of `ImageView`s will not scroll smoothly.
 
 ## Still to port from the Android app
 
-Downloads has real storage reporting but no download engine (the Android
-`DownloadEngine` is a plain OkHttp m3u8/MP4 downloader and ports directly). The
-player still launches mpv as a child process — driving it over
-`--input-ipc-server` is what unlocks a real OSD, timeline and track selection.
-SkyStream, Nuvio (QuickJS) and Aniyomi extensions are not ported yet; see
-`docs/DESKTOP_PARITY.md` for the plan and the order to do it in.
+Downloads is done: the queue, the HLS/MP4 engine (AES-128, byte-range and fMP4
+segments), pause/resume, offline playback and export to the user's own
+Downloads/Hikari folder all work — see `docs/DESKTOP_PARITY.md` for what the
+desktop changed relative to Android (mpv replaces `MediaExtractor`/`MediaMuxer`
+for the audio-merge step). The player still launches mpv as a child process —
+driving it over `--input-ipc-server` is what unlocks a real OSD, timeline and
+track selection. i18n, TMDB metadata, SkyStream, Nuvio (QuickJS) and Aniyomi
+extensions are not ported yet; see `docs/DESKTOP_PARITY.md` for the plan and the
+order to do it in.

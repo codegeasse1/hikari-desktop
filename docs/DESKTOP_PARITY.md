@@ -13,20 +13,35 @@ is missing is breadth.
 CloudStream `.cs3` on the JVM (dex2jar + `shim/android/**`), Hikari `.hiki`, Stremio
 addons, universal scrapers, mpv playback with `HlsRelay`/`LocalProxy`, the design
 system and every main screen, `AppStore` persistence, the updater, the ad blocker,
-the WebView fallback resolver.
+the WebView fallback resolver, and the download queue with its HLS/MP4 engine.
 
-## Stage 1 — Downloads (best value per hour)
+## Stage 1 — Downloads (done)
 
-Android's `DownloadEngine.kt` is a hand-rolled HLS/MP4 downloader: OkHttp plus a
-local `index.m3u8` and its segments, so playback is offline and signed links can't
-expire. No ffmpeg, no Media3 download manager — it ports almost as-is.
+Ported from Android's `download/` package into
+`desktop/src/main/kotlin/com/hikari/app/download/`:
 
-- Port `download/DownloadModels.kt`, `DownloadStore.kt`, `DownloadsRepository.kt`
-  and the engine core.
-- Replace `DownloadService` (foreground service + notifications) with an in-process
-  queue plus a tray notification.
-- `DownloadsScreen` already reports real storage; switch it to the live queue.
-- Keep the per-host concurrency budget already enforced in `net/PlayerHttp`.
+| Android | Desktop | Change |
+|---|---|---|
+| `DownloadModels.kt` | `DownloadModels.kt` | none — identical JSON, so a queue moves between the two apps |
+| `DownloadStore.kt` | `DownloadStore.kt` | DataStore → `downloads.json` (temp-file + rename, so a crash can't truncate it) |
+| `DownloadEngine.kt` | `DownloadEngine.kt` | `MediaExtractor`/`MediaMuxer` → `desktop.player.Mpv.remux` (stream copy); `MediaStore`/`Environment` → the user's `Downloads/Hikari` folder |
+| `DownloadsRepository.kt` | `DownloadsRepository.kt` | `Context` → `HikariApp.instance.filesDir`; the foreground `DownloadService` → an in-process pump on its own scope |
+| `DownloadService.kt` | (none) | a desktop window *is* the app, so the queue needs no service; `onTaskFinished` raises a toast through `AppShell` |
+| `PlayerHttp.client` | `DownloadHttp.kt` | own OkHttp client with a 16-requests-per-host budget (a download fans out over many connections) |
+| `DownloadsScreen.kt` | `DownloadsScreen.kt` | live queue: per-task progress/speed/ETA, pause/resume/remove, play offline, reveal the exported copy |
+
+Decisions worth remembering:
+
+- **mpv is the muxer.** A stream whose audio arrives as a separate HLS rendition
+  needs its video-only and audio-only parts merged. mpv's encode mode with
+  `--ovc=copy --oac=copy` does exactly that, with no re-encode, using a binary the
+  app already ships. If it fails, the export falls back to copying the whole local
+  bundle into a named folder, so nothing the user waited for is lost.
+- **An EXPORT download keeps its local bundle**, unlike Android (which deletes the
+  work dir after exporting). The bundle is what makes the download instantly
+  playable inside the app; the exported file is the copy the user can take away.
+- **`downloadToFolder` (default on)** decides whether a new download also writes a
+  single playable file into `Downloads/Hikari`. Off keeps downloads inside the app.
 
 ## Stage 2 — i18n
 

@@ -1000,3 +1000,54 @@
 .wrap-hint { -fx-font-size: 11.5px; -fx-text-fill: -h-fg-3; }
 .tiny      { -fx-font-size: 11px;   -fx-text-fill: -h-fg-3; }
 .prose     { -fx-font-size: 13.5px; -fx-text-fill: -h-fg-2; -fx-line-spacing: 4; }
+
+/* ===========================================================================
+   Downloads
+   =========================================================================== */
+
+.dl-row {
+    -fx-background-color: -h-surface-2;
+    -fx-border-color: -h-border;
+    -fx-border-width: 1;
+    -fx-border-radius: 12;
+    -fx-background-radius: 12;
+    -fx-padding: 11 13 11 13;
+}
+.dl-row:hover { -fx-border-color: -h-border-3; }
+
+.dl-thumb {
+    -fx-background-color: -h-surface-3;
+    -fx-background-radius: 10;
+    -fx-min-width: 52;  -fx-min-height: 74;
+    -fx-max-width: 52;  -fx-max-height: 74;
+}
+
+.dl-title { -fx-font-size: 13.5px; -fx-font-weight: bold; -fx-text-fill: -h-fg; }
+.dl-sub   { -fx-font-size: 11.5px; -fx-text-fill: -h-fg-3; }
+
+.dl-bar { -fx-pref-height: 6; -fx-min-height: 6; -fx-max-height: 6; }
+.dl-bar > .track {
+    -fx-background-color: -h-surface-3;
+    -fx-background-radius: 99;
+    -fx-background-insets: 0;
+}
+.dl-bar > .bar {
+    -fx-background-color: linear-gradient(to right, -h-accent, -h-accent-2);
+    -fx-background-radius: 99;
+    -fx-background-insets: 0;
+    -fx-padding: 0;
+}
+
+.check-box { -fx-text-fill: -h-fg-2; -fx-font-size: 12.5px; }
+.check-box > .box {
+    -fx-background-color: -h-surface-3;
+    -fx-border-color: -h-border-2;
+    -fx-border-width: 1;
+    -fx-border-radius: 6;
+    -fx-background-radius: 6;
+    -fx-padding: 3;
+}
+.check-box:hover > .box { -fx-border-color: -h-border-3; }
+.check-box:selected > .box { -fx-background-color: -h-accent; -fx-border-color: -h-accent; }
+.check-box:selected > .box > .mark { -fx-background-color: -h-accent-fg; }
+.check-box > .text { -fx-font-size: 12.5px; }

@@ -6,6 +6,10 @@ import com.hikari.app.data.HistoryEntry
 import com.hikari.app.data.MediaItem
 import com.hikari.app.data.MediaType
 import com.hikari.app.data.StreamSource
+import com.hikari.app.download.DownloadKind
+import com.hikari.app.download.DownloadStatus
+import com.hikari.app.download.DownloadTask
+import com.hikari.app.download.DownloadsRepository
 import desktop.fx.Fx
 import desktop.player.DesktopPlayer
 import javafx.geometry.Insets
@@ -49,6 +53,7 @@ class DetailScreenView(private val item: MediaItem) {
     private var selectedEpisode: Episode? = null
     private var streams: List<StreamSource> = emptyList()
     private var pendingPlay = false
+    private var pendingDownload = false
     private var favourite = false
 
     private val heroHeight = 300.0
@@ -63,7 +68,10 @@ class DetailScreenView(private val item: MediaItem) {
     private val heroTitle = themed("", "d-title")
     private val heroMeta = themed("", "d-meta")
     private val heroChips = HBox(8.0).apply { alignment = Pos.CENTER_LEFT }
-    private val heroActions = HBox(10.0, Ui.playButton("Play") { playFirst() }).apply { alignment = Pos.CENTER_LEFT }
+    private val heroActions = HBox(10.0,
+        Ui.playButton("Play") { playFirst() },
+        Ui.button("Download", icon = Icons.DOWNLOAD, ghost = true) { downloadFirst() },
+    ).apply { alignment = Pos.CENTER_LEFT }
     private val heroBody = VBox(10.0, heroTitle, heroMeta, heroChips, heroActions).apply { alignment = Pos.BOTTOM_LEFT }
     private val favouriteButton = Ui.button("Add to library", icon = Icons.HEART_OUTLINE, ghost = true) { toggleFavourite() }
     private val hero = StackPane()
@@ -448,6 +456,10 @@ class DetailScreenView(private val item: MediaItem) {
                     pendingPlay = false
                     playFirst()
                 }
+                if (pendingDownload) {
+                    pendingDownload = false
+                    downloadFirst()
+                }
             }
         }
     }
@@ -497,19 +509,85 @@ class DetailScreenView(private val item: MediaItem) {
 
         val browser = Ui.iconButton(Icons.EXTERNAL, "Open in browser", 15.0) {
             desktop.fx.DesktopUi.open(source.url)
+        }.noRowClick()
+        val grab = Ui.iconButton(Icons.DOWNLOAD, "Download this source", 15.0) {
+            download(source)
+        }.noRowClick().apply {
+            isDisable = !downloadable(source)
+            if (isDisable) Tooltip.install(this, Ui.tooltip("This source can only be played in a browser"))
         }
         val play = Button().apply {
             styleClass.add("src-go")
             graphic = Icons.of(Icons.PLAY, 15.0)
             isFocusTraversable = false
+            addEventFilter(javafx.scene.input.MouseEvent.MOUSE_CLICKED) { it.consume() }
             setOnAction { play(source) }
         }
-        val row = HBox(11.0, qualityBox, info, browser, play).apply {
+        val row = HBox(11.0, qualityBox, info, grab, browser, play).apply {
             styleClass.add("src-row")
             alignment = Pos.CENTER_LEFT
         }
         row.setOnMouseClicked { play(source) }
         return row
+    }
+
+    /** Keeps a button inside a clickable row from also firing the row's own
+     *  handler — otherwise pressing Download would start playback too.
+     *  MOUSE_CLICKED isn't used by JavaFX's button behaviour (it fires on
+     *  release), so consuming it here only stops the bubble up to the row. */
+    private fun Button.noRowClick(): Button = apply {
+        addEventFilter(javafx.scene.input.MouseEvent.MOUSE_CLICKED) { it.consume() }
+    }
+
+    /** True when a source is something the download engine can actually fetch:
+     *  an http(s) media URL, not a browser-only blob, a torrent, DASH or an
+     *  external page. */
+    private fun downloadable(source: StreamSource): Boolean {
+        val url = source.url.trim()
+        if (url.isBlank()) return false
+        if (source.externalUrl || source.ytId != null) return false
+        if (source.isTorrent || source.infoHash != null || source.isMpd) return false
+        if (url.startsWith("blob:") || url.startsWith("data:")) return false
+        return true
+    }
+
+    private fun download(source: StreamSource) {
+        if (!downloadable(source)) {
+            AppShell.toast("That source can only be played in a browser", "error")
+            return
+        }
+        val ep = selectedEpisode
+        // The kind decides whether the finished download also lands as a single
+        // file in the user's own Downloads folder (the default) or stays inside
+        // Hikari only.
+        val kind = if (runCatching { AppShell.app.store.downloadToFolder() }.getOrDefault(true)) {
+            DownloadKind.EXPORT
+        } else {
+            DownloadKind.OFFLINE
+        }
+        val label = ep?.name?.takeIf { it.isNotBlank() } ?: ep?.let { "Episode ${it.number}" } ?: ""
+        val task = DownloadTask(
+            id = DownloadTask.idFor(meta.providerId, meta.id, ep?.id ?: "", kind),
+            title = meta.title,
+            episodeLabel = label,
+            poster = meta.posterUrl,
+            providerId = meta.providerId,
+            mediaId = meta.id,
+            episodeId = ep?.id ?: "",
+            sourceName = source.name,
+            url = source.url,
+            headers = source.headers,
+            isM3u8 = source.isM3u8 || source.url.substringBefore('?').lowercase().contains(".m3u8"),
+            subtitles = source.subtitles,
+            kind = kind,
+            status = DownloadStatus.QUEUED,
+            createdAt = System.currentTimeMillis(),
+        )
+        DownloadsRepository.enqueue(task)
+        AppShell.toast(
+            if (label.isBlank()) "Downloading ${source.name}…" else "Downloading ${meta.title} · $label…",
+            "ok",
+        )
     }
 
     private fun qualityOf(source: StreamSource): String {
@@ -529,6 +607,22 @@ class DetailScreenView(private val item: MediaItem) {
             pendingPlay = true
             loadStreams()
         }
+    }
+
+    /** The banner's Download button: queue the best downloadable source, waiting
+     *  for the source list when it hasn't arrived yet. */
+    private fun downloadFirst() {
+        val first = streams.firstOrNull { downloadable(it) }
+        if (first != null) {
+            download(first)
+            return
+        }
+        if (streams.isEmpty() && !pendingDownload) {
+            pendingDownload = true
+            loadStreams()
+            return
+        }
+        AppShell.toast("No downloadable source found for this title", "error")
     }
 
     private fun play(source: StreamSource) {
