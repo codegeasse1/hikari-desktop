@@ -1,19 +1,33 @@
 package desktop.ui
 
 import com.hikari.app.data.CatalogRow
+import com.hikari.app.data.MediaItem
+import com.hikari.app.data.MediaType
 import desktop.fx.Fx
+import javafx.animation.FadeTransition
+import javafx.animation.KeyFrame
+import javafx.animation.Timeline
+import javafx.geometry.Insets
 import javafx.geometry.Pos
+import javafx.scene.Node
 import javafx.scene.control.ComboBox
+import javafx.scene.control.Label
 import javafx.scene.control.ScrollPane
+import javafx.scene.image.ImageView
 import javafx.scene.layout.HBox
+import javafx.scene.layout.Priority
 import javafx.scene.layout.Region
+import javafx.scene.layout.StackPane
 import javafx.scene.layout.VBox
+import javafx.scene.shape.Rectangle
+import javafx.util.Duration
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
- * Home: every enabled provider's catalogs as poster rails.
+ * Home: a featured hero banner pulled from whatever the newest catalogs
+ * returned, followed by one horizontal rail per catalog.
  *
  * Rows render the moment each catalog lands, so the page fills in progressively
  * instead of waiting on the slowest addon, and a failing catalog is skipped
@@ -21,17 +35,43 @@ import kotlinx.coroutines.launch
  */
 class HomeScreenView {
 
-    private val rowsBox = VBox(Theme.S5)
+    // ── hero ────────────────────────────────────────────────────────────────
+
+    private val heroImage = ImageView().apply {
+        isPreserveRatio = false
+        isSmooth = true
+        fitHeight = HERO_H
+    }
+    private val heroOver = themed("Featured", "hero-over")
+    private val heroTitle = themed("", "hero-title")
+    private val heroMeta = themed("", "hero-meta")
+    private val heroDesc = themed("", "hero-desc").apply {
+        isWrapText = true
+        maxWidth = 620.0
+        maxHeight = 62.0
+    }
+    private val heroActions = HBox(10.0).apply { alignment = Pos.CENTER_LEFT }
+    private val heroDots = HBox(7.0).apply { alignment = Pos.CENTER_RIGHT }
+    private val heroStack = StackPane().apply {
+        styleClass.add("hero-wrap")
+        prefHeight = HERO_H
+        minHeight = HERO_H
+        maxHeight = HERO_H
+    }
+    private var heroItems: List<MediaItem> = emptyList()
+    private var heroIndex = 0
+    private var heroTimer: Timeline? = null
+
+    // ── page ────────────────────────────────────────────────────────────────
+
+    private val rowsBox = VBox(Theme.S4)
     private val providerBox = ComboBox<String>()
-    private val statusLabel = Theme.label("", size = 12.5, dim = true)
-    private val errorLabel = Theme.label("", size = 12.5).apply {
+    private val statusLabel = themed("", "tiny")
+    private val errorLabel = themed("", "tiny").apply {
         styleClass.add("h-danger")
         isWrapText = true
     }
-    private val logsLabel = Theme.label("", size = 11.5, dim = true).apply {
-        styleClass.add("h-mono")
-        isWrapText = true
-    }
+    private val logsLabel = themed("", "h-mono").apply { isWrapText = true }
     private val logsScroll = ScrollPane(logsLabel).apply {
         prefHeight = 260.0
         isFitToWidth = true
@@ -54,21 +94,141 @@ class HomeScreenView {
         }
         logsScroll.isVisible = false
         logsScroll.isManaged = false
+        buildHero()
         content.children.addAll(
-            Ui.sectionHeader(
-                "Browse",
-                "Catalogs from every enabled source",
-                HBox(8.0, providerBox, refreshBtn, logsBtn).apply { alignment = Pos.CENTER_RIGHT },
-            ),
+            HBox(8.0, providerBox, refreshBtn, logsBtn).apply {
+                alignment = Pos.CENTER_RIGHT
+                padding = Insets(0.0, 0.0, 2.0, 0.0)
+            },
+            heroStack,
             statusLabel,
             errorLabel,
             rowsBox,
             logsScroll,
         )
+        heroStack.isVisible = false
+        heroStack.isManaged = false
     }
 
     fun onShown() {
         load()
+    }
+
+    // ── hero ────────────────────────────────────────────────────────────────
+
+    private fun buildHero() {
+        val clip = Rectangle().apply {
+            arcWidth = 36.0
+            arcHeight = 36.0
+        }
+        clip.widthProperty().bind(heroStack.widthProperty())
+        clip.heightProperty().bind(heroStack.heightProperty())
+        heroStack.clip = clip
+        heroImage.fitWidthProperty().bind(heroStack.widthProperty())
+
+        val scrimV = Region().apply {
+            styleClass.add("hero-scrim-v")
+            maxWidth = Double.MAX_VALUE
+            maxHeight = Double.MAX_VALUE
+        }
+        val scrimH = Region().apply {
+            styleClass.add("hero-scrim-h")
+            maxWidth = Double.MAX_VALUE
+            maxHeight = Double.MAX_VALUE
+        }
+
+        val body = VBox(10.0, heroOver, heroTitle, heroMeta, heroDesc, heroActions).apply {
+            alignment = Pos.BOTTOM_LEFT
+            maxWidth = 640.0
+        }
+        StackPane.setAlignment(body, Pos.BOTTOM_LEFT)
+        StackPane.setMargin(body, Insets(0.0, 24.0, 26.0, 30.0))
+
+        val prev = Ui.iconButton(Icons.CHEVRON_LEFT, "Previous", 16.0) { stepHero(-1) }.apply { styleClass.add("round-btn") }
+        val next = Ui.iconButton(Icons.CHEVRON_RIGHT, "Next", 16.0) { stepHero(1) }.apply { styleClass.add("round-btn") }
+        val nav = HBox(14.0, heroDots, prev, next).apply { alignment = Pos.CENTER_RIGHT }
+        StackPane.setAlignment(nav, Pos.BOTTOM_RIGHT)
+        StackPane.setMargin(nav, Insets(0.0, 30.0, 32.0, 0.0))
+
+        heroStack.children.addAll(heroImage, scrimV, scrimH, body, nav)
+        heroStack.setOnMouseEntered { heroTimer?.pause() }
+        heroStack.setOnMouseExited { heroTimer?.play() }
+    }
+
+    private fun setHeroItems(items: List<MediaItem>) {
+        if (items.isEmpty()) return
+        heroItems = items.take(6)
+        heroIndex = 0
+        heroStack.isVisible = true
+        heroStack.isManaged = true
+        showHero()
+        heroTimer?.stop()
+        heroTimer = Timeline(
+            KeyFrame(Duration.seconds(10.0), javafx.event.EventHandler<javafx.event.ActionEvent> { stepHero(1) }),
+        ).apply {
+            cycleCount = Timeline.INDEFINITE
+            play()
+        }
+    }
+
+    private fun stepHero(delta: Int) {
+        if (heroItems.isEmpty()) return
+        heroIndex = ((heroIndex + delta) % heroItems.size + heroItems.size) % heroItems.size
+        showHero()
+        if (delta != 0 && heroTimer?.cycleCount == Timeline.INDEFINITE) {
+            heroTimer?.stop()
+            heroTimer?.playFromStart()
+        }
+    }
+
+    private fun showHero() {
+        val item = heroItems.getOrNull(heroIndex) ?: return
+        heroTitle.text = item.title
+        heroMeta.text = listOfNotNull(
+            item.year?.toString(),
+            when (item.type) {
+                MediaType.SERIES -> "Series"
+                MediaType.MOVIE -> "Movie"
+                MediaType.UNKNOWN -> null
+            },
+            item.genres.take(3).joinToString(" · ").ifBlank { null },
+        ).joinToString("  ·  ")
+        heroDesc.text = item.overview?.replace(Regex("<[^>]*>"), "")?.replace(Regex("\\s+"), " ")?.trim().orEmpty()
+        heroImage.opacity = 0.0
+        val onImageReady: (javafx.scene.image.Image?) -> Unit = { img ->
+            if (img != null) {
+                heroImage.image = img
+                Ui.fade(heroImage, 1.0, 300.0)
+            }
+        }
+        val backdrop = item.backdropUrl
+        heroImage.isPreserveRatio = backdrop.isNullOrBlank()
+        if (!backdrop.isNullOrBlank()) {
+            desktop.img.ImageLoader.loadAsync(backdrop, onReady = onImageReady, w = 1600, h = 700)
+        } else {
+            desktop.img.ImageLoader.loadAsync(item.posterUrl, onReady = onImageReady, w = 900, h = 700)
+        }
+        heroActions.children.setAll(
+            Ui.playButton("Watch now") { AppShell.openDetail(item) },
+            Ui.button("Add to list", icon = Icons.PLUS, ghost = true) { addToLibrary(item) },
+            Ui.button("Details", icon = Icons.INFO, ghost = true) { AppShell.openDetail(item) },
+        )
+        heroDots.children.setAll(heroItems.mapIndexed { index, _ ->
+            Region().apply {
+                styleClass.add("hero-dot")
+                if (index == heroIndex) styleClass.add("hero-dot-sel")
+                setOnMouseClicked { heroIndex = index; showHero() }
+            }
+        })
+    }
+
+    private fun addToLibrary(item: MediaItem) {
+        if (runCatching { AppShell.app.store.favorites() }.getOrDefault(emptyList()).any { it.uniqueId == item.uniqueId }) {
+            AppShell.toast("Already in your library")
+        } else {
+            runCatching { AppShell.app.store.addFavorite(item) }
+            AppShell.toast("Added “${item.title}” to your library", "ok")
+        }
     }
 
     private fun toggleLogs() {
@@ -115,9 +275,7 @@ class HomeScreenView {
                 // LIVE value. JavaFX can deliver a popup's action event before
                 // the chosen item is committed to `value`, so a value captured at
                 // load() start can be stale ("All providers") and would clobber
-                // the user's pick back to "All providers". Reading it here, a
-                // beat later, is reliable — and a valid in-progress selection is
-                // never overwritten.
+                // the user's pick back to "All providers".
                 val (chosen, filterId) = Fx.runBlock {
                     val items = providerBox.items
                     val all = listOf("All providers") + providerNames
@@ -140,6 +298,15 @@ class HomeScreenView {
                                 firstRow[0] = true
                                 rowsBox.children.clear()
                             }
+                            if (!heroSeeded) {
+                                val candidates = row.items.filter {
+                                    !it.posterUrl.isNullOrBlank() || !it.backdropUrl.isNullOrBlank()
+                                }
+                                if (candidates.isNotEmpty()) {
+                                    heroSeeded = true
+                                    setHeroItems(candidates)
+                                }
+                            }
                             runCatching { rowsBox.children.add(buildRow(row)) }
                         }
                     }
@@ -156,8 +323,20 @@ class HomeScreenView {
         }
     }
 
+    /** The first catalog that lands supplies the hero. */
+    private var heroSeeded = false
+
     private fun render(rows: List<CatalogRow>, filterId: String?, chosen: String? = null) {
         statusLabel.text = ""
+        if (!heroSeeded) {
+            val candidates = rows.flatMap { it.items }
+                .filter { !it.posterUrl.isNullOrBlank() || !it.backdropUrl.isNullOrBlank() }
+                .distinctBy { it.title }
+            if (candidates.isNotEmpty()) {
+                heroSeeded = true
+                setHeroItems(candidates)
+            }
+        }
         val statuses = AppShell.app.providers.statuses.value
         val failed = statuses.filter { !it.loaded }
         val enabledCount = statuses.size
@@ -214,5 +393,14 @@ class HomeScreenView {
         subtitle = row.providerName,
         items = row.items,
         onOpen = { AppShell.openDetail(it) },
+        onSeeAll = {
+            AppShell.show(Screen.Catalog(row.title, row.providerName, row.items))
+        },
     )
+
+    private fun themed(text: String, cls: String): Label = Label(text).apply { styleClass.add(cls) }
+
+    private companion object {
+        const val HERO_H = 392.0
+    }
 }

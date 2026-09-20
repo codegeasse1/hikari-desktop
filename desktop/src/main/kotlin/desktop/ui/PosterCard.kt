@@ -233,6 +233,7 @@ object PosterRail {
         onOpen: (MediaItem) -> Unit,
         onMore: ((MediaItem) -> Unit)? = null,
         trailing: Node? = null,
+        onSeeAll: (() -> Unit)? = null,
     ): VBox {
         val row = HBox(Theme.S4).apply {
             alignment = Pos.TOP_LEFT
@@ -241,6 +242,11 @@ object PosterRail {
         items.forEach { item ->
             row.children.add(PosterCard.make(item, onOpen, onMore = onMore))
         }
-        return VBox(Theme.S3, Ui.sectionHeader(title, subtitle, trailing), Ui.rail(row))
+        val actions = HBox(8.0).apply { alignment = Pos.CENTER_RIGHT }
+        if (trailing != null) actions.children.add(trailing)
+        if (onSeeAll != null) {
+            actions.children.add(Ui.button("See all →", ghost = true) { onSeeAll() })
+        }
+        return VBox(Theme.S3, Ui.sectionHeader(title, subtitle, actions.takeIf { it.children.isNotEmpty() }), Ui.railWithArrows(Ui.rail(row)))
     }
 }

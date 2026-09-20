@@ -152,12 +152,6 @@ jobs:
           cat diagnose.log
         shell: bash
 
-      - name: Zip the app image
-        run: |
-          powershell -Command "Compress-Archive -Path Hikari -DestinationPath hikari-windows.zip -Force"
-          ls -la hikari-windows.zip
-        shell: bash
-
       - name: Install WiX (for the .exe installer)
         run: choco install wixtoolset -y --no-progress
         shell: bash
@@ -222,9 +216,8 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: hikari-windows
+          name: hikari-windows-installer
           path: |
-            hikari-windows.zip
             *.exe
           if-no-files-found: error
 
@@ -233,11 +226,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           EXE=$(ls -1 *.exe | head -n 1)
-          echo "assets: hikari-windows.zip, $EXE"
+          echo "assets: $EXE"
           published=0
           for attempt in 1 2 3 4 5; do
             if gh release view continuous --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-              if gh release upload continuous hikari-windows.zip "$EXE" --repo "$GITHUB_REPOSITORY" --clobber; then
+              if gh release upload continuous "$EXE" --repo "$GITHUB_REPOSITORY" --clobber; then
                 published=1
                 echo "published (attempt $attempt)"
                 break
@@ -246,9 +239,9 @@ jobs:
               gh release delete continuous --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag >/dev/null 2>&1 || true
               sleep 5
             fi
-            if gh release create continuous hikari-windows.zip "$EXE" --repo "$GITHUB_REPOSITORY" \
+            if gh release create continuous "$EXE" --repo "$GITHUB_REPOSITORY" \
                 --title "Continuous build" \
-                --notes "Hikari for Windows (app image zip + .exe installer), auto-built from main."; then
+                --notes "Hikari for Windows — signed .exe installer, auto-built from main."; then
               published=1
               echo "release created (attempt $attempt)"
               break
@@ -271,16 +264,16 @@ jobs:
           VERSION="${{ github.event.inputs.version }}"
           TAG="v${VERSION:-1.0.0}"
           EXE=$(ls -1 *.exe | head -n 1)
-          echo "assets: hikari-windows.zip, $EXE -> $TAG"
+          echo "assets: $EXE -> $TAG"
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             for i in 1 2 3; do
-              gh release upload "$TAG" hikari-windows.zip "$EXE" --repo "$GITHUB_REPOSITORY" --clobber && break
+              gh release upload "$TAG" "$EXE" --repo "$GITHUB_REPOSITORY" --clobber && break
               echo "release upload attempt $i failed, retrying..."
               sleep 5
             done
           else
-            gh release create "$TAG" hikari-windows.zip "$EXE" --repo "$GITHUB_REPOSITORY" \
+            gh release create "$TAG" "$EXE" --repo "$GITHUB_REPOSITORY" \
               --title "Hikari $VERSION" \
-              --notes "Signed build for Windows (app image zip + .exe installer)." || true
+              --notes "Signed Windows installer (.exe)." || true
           fi
         shell: bash

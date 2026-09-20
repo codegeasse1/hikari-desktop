@@ -9,6 +9,7 @@ import javafx.scene.Node
 import javafx.scene.Scene
 import javafx.scene.control.Button
 import javafx.scene.control.Label
+import javafx.scene.control.TextField
 import javafx.scene.input.KeyCode
 import javafx.scene.input.KeyCodeCombination
 import javafx.scene.input.KeyCombination
@@ -30,13 +31,15 @@ sealed class Screen {
     object Extensions : Screen()
     object Settings : Screen()
     data class Detail(val item: MediaItem) : Screen()
+    data class Catalog(val title: String, val provider: String, val items: List<MediaItem>) : Screen()
 }
 
 /**
  * The application shell: a desktop-style left sidebar for navigation, a top bar
- * that carries the screen title plus the window controls, and a content area that
- * swaps one screen at a time. Also owns the shared coroutine scope every screen
- * launches work on, and the toast host.
+ * that carries the screen title, a global search box and the window controls,
+ * and a content area that swaps one screen at a time. Also owns the shared
+ * coroutine scope every screen launches work on, the toast host, and a small
+ * screen history so "back" returns to where the user came from.
  */
 object AppShell {
 
@@ -49,7 +52,9 @@ object AppShell {
     private lateinit var toasts: Ui.Toasts
     private lateinit var navButtons: MutableList<Pair<Screen, Button>>
     private lateinit var themeButton: Button
+    private lateinit var globalSearch: TextField
     private var currentScreen: Screen = Screen.Home
+    private val backStack = java.util.ArrayDeque<Screen>()
 
     private val homeScreen = HomeScreenView()
     private val searchScreen = SearchScreenView()
@@ -82,7 +87,7 @@ object AppShell {
                 Theme.refresh()
             }
         }
-        show(Screen.Home)
+        show(Screen.Home, remember = false)
         return root
     }
 
@@ -97,7 +102,7 @@ object AppShell {
         val mark = Region().apply { styleClass.add("sidebar-logo-mark") }
         val brand = VBox(0.0,
             Theme.label("Hikari", size = 17.0, bold = true).apply { styleClass.add("sidebar-logo") },
-            Theme.label("universal streaming", size = 10.5, dim = true),
+            Theme.label("your media, your way", size = 10.5, dim = true),
         )
         box.children.add(HBox(10.0, mark, brand).apply {
             alignment = Pos.CENTER_LEFT
@@ -153,26 +158,46 @@ object AppShell {
         subtitleLabel = Theme.label("", size = 11.5, dim = true).apply { styleClass.add("topbar-sub") }
         val titles = VBox(0.0, titleLabel, subtitleLabel)
 
+        val searchBox = Ui.searchInput("Search movies, shows, anime…", 268.0)
+        globalSearch = searchBox.children[0] as TextField
+        globalSearch.setOnAction { runGlobalSearch() }
+        globalSearch.focusedProperty().addListener { _, _, focused ->
+            if (focused && globalSearch.text.isBlank() && currentScreen !is Screen.Search) show(Screen.Search)
+        }
+
         themeButton = Ui.iconButton(Icons.MOON, "Toggle light / dark", size = 16.0) { toggleTheme() }
-        val search = Ui.iconButton(Icons.SEARCH, "Search  (Ctrl+K)", size = 16.0) { show(Screen.Search) }
 
         val left = HBox(10.0, titles).apply { alignment = Pos.CENTER_LEFT }
         left.padding = Insets(0.0, 0.0, 0.0, 14.0)
+        left.minWidth = 150.0
         chrome.makeDraggable(left)
         val spacer = Region().apply { HBox.setHgrow(this, Priority.ALWAYS) }
-        val actions = HBox(2.0, search, themeButton).apply { alignment = Pos.CENTER_RIGHT }
+        val actions = HBox(2.0, searchBox, themeButton).apply { alignment = Pos.CENTER_RIGHT }
         return HBox(left, spacer, actions, chrome.controls()).apply {
             styleClass.add("topbar")
             alignment = Pos.CENTER_LEFT
         }
     }
 
+    private fun runGlobalSearch() {
+        val query = globalSearch.text.trim()
+        if (query.isEmpty()) return
+        show(Screen.Search)
+        searchScreen.searchWith(query)
+    }
+
     private fun installShortcuts(scene: Scene) {
-        scene.accelerators[KeyCodeCombination(KeyCode.K, KeyCombination.CONTROL_DOWN)] = Runnable { show(Screen.Search) }
+        scene.accelerators[KeyCodeCombination(KeyCode.K, KeyCombination.CONTROL_DOWN)] = Runnable { openSearch() }
         scene.accelerators[KeyCodeCombination(KeyCode.DIGIT1, KeyCombination.CONTROL_DOWN)] = Runnable { show(Screen.Home) }
         scene.accelerators[KeyCodeCombination(KeyCode.DIGIT2, KeyCombination.CONTROL_DOWN)] = Runnable { show(Screen.Search) }
         scene.accelerators[KeyCodeCombination(KeyCode.DIGIT3, KeyCombination.CONTROL_DOWN)] = Runnable { show(Screen.Library) }
         scene.accelerators[KeyCodeCombination(KeyCode.DIGIT4, KeyCombination.CONTROL_DOWN)] = Runnable { show(Screen.Downloads) }
+        scene.accelerators[KeyCodeCombination(KeyCode.ESCAPE)] = Runnable { back() }
+    }
+
+    private fun openSearch() {
+        show(Screen.Search)
+        if (::globalSearch.isInitialized) globalSearch.requestFocus()
     }
 
     private fun toggleTheme() {
@@ -193,7 +218,11 @@ object AppShell {
         if (::toasts.isInitialized) toasts.show(message, kind)
     }
 
-    fun show(screen: Screen) {
+    fun show(screen: Screen, remember: Boolean = true) {
+        if (remember && screen != currentScreen) {
+            backStack.addLast(currentScreen)
+            while (backStack.size > 24) backStack.pollFirst()
+        }
         currentScreen = screen
         Theme.refresh()
         val node = viewFor(screen)
@@ -210,8 +239,15 @@ object AppShell {
             is Screen.Extensions -> extensionsScreen.onShown()
             is Screen.Settings -> settingsScreen.onShown()
             is Screen.Detail -> Unit
+            is Screen.Catalog -> Unit
         }
         refreshNav()
+    }
+
+    /** Returns to the previously shown screen (Escape / the in-page back arrow). */
+    fun back() {
+        val previous = backStack.pollLast()
+        show(previous ?: Screen.Home, remember = false)
     }
 
     fun openDetail(item: MediaItem) {
@@ -230,6 +266,7 @@ object AppShell {
         is Screen.Extensions -> extensionsScreen.root
         is Screen.Settings -> settingsScreen.root
         is Screen.Detail -> DetailScreenView(screen.item).root
+        is Screen.Catalog -> CatalogScreenView(screen.title, screen.provider, screen.items).root
     }
 
     private fun titleFor(screen: Screen): String = when (screen) {
@@ -239,7 +276,10 @@ object AppShell {
         is Screen.Downloads -> "Downloads"
         is Screen.Extensions -> "Extensions"
         is Screen.Settings -> "Settings"
-        is Screen.Detail -> screen.item.title
+        // The detail screen's own banner carries the title, so the top bar shows
+        // where the title came from instead of repeating it.
+        is Screen.Detail -> providerName(screen.item.providerId)
+        is Screen.Catalog -> screen.title
     }
 
     private fun subtitleFor(screen: Screen): String = when (screen) {
@@ -249,8 +289,17 @@ object AppShell {
         is Screen.Downloads -> "Offline copies and exports"
         is Screen.Extensions -> "Addons, scrapers and plugin repositories"
         is Screen.Settings -> "Appearance, network and data"
-        is Screen.Detail -> "Details, episodes and sources"
+        is Screen.Detail -> when (screen.item.type.name.lowercase()) {
+            "series" -> "Series · details, episodes and sources"
+            "movie" -> "Movie · details and sources"
+            else -> "Details and sources"
+        }
+        is Screen.Catalog -> "From ${screen.provider}"
     }
+
+    private fun providerName(providerId: String): String =
+        runCatching { app.store.providers().firstOrNull { it.id == providerId }?.name }.getOrNull()
+            ?: "Details"
 
     private fun refreshNav() {
         navButtons.forEach { (screen, button) ->

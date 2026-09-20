@@ -736,3 +736,267 @@
 }
 .accent-swatch:hover { -fx-border-color: -h-border-3; }
 .accent-swatch-selected { -fx-border-color: -h-fg; -fx-border-width: 2; }
+
+/* ===========================================================================
+   Home hero
+   =========================================================================== */
+
+.hero-wrap {
+    -fx-background-color: -h-surface-2;
+    -fx-background-radius: 18;
+    -fx-effect: dropshadow(gaussian, -h-shadow-2, 26, 0, 0, 8);
+}
+.hero-scrim-v {
+    -fx-background-color: linear-gradient(to top, rgba(6,7,12,0.97) 0%, rgba(6,7,12,0.58) 38%, rgba(6,7,12,0.02) 76%);
+    -fx-background-radius: 18;
+}
+.hero-scrim-h {
+    -fx-background-color: linear-gradient(to right, rgba(6,7,12,0.88) 0%, rgba(6,7,12,0.30) 56%, rgba(6,7,12,0.0) 100%);
+    -fx-background-radius: 18;
+}
+.hero-over   { -fx-font-size: 11px;   -fx-font-weight: bold; -fx-text-fill: -h-accent; }
+.hero-title  { -fx-font-size: 38px;   -fx-font-weight: bold; -fx-text-fill: #ffffff; }
+.hero-meta   { -fx-font-size: 12.5px; -fx-text-fill: rgba(255,255,255,0.80); }
+.hero-desc   { -fx-font-size: 13.5px; -fx-text-fill: rgba(255,255,255,0.74); }
+
+.hero-dot {
+    -fx-background-color: rgba(255,255,255,0.32);
+    -fx-background-radius: 999;
+    -fx-min-width: 8;  -fx-min-height: 8;
+    -fx-max-width: 8;  -fx-max-height: 8;
+    -fx-cursor: hand;
+}
+.hero-dot-sel { -fx-background-color: -h-accent; -fx-min-width: 24; -fx-max-width: 24; }
+
+.round-btn {
+    -fx-background-color: rgba(0,0,0,0.44);
+    -fx-border-color: rgba(255,255,255,0.26);
+    -fx-border-radius: 999;
+    -fx-background-radius: 999;
+    -fx-min-width: 34; -fx-min-height: 34;
+    -fx-max-width: 34; -fx-max-height: 34;
+    -fx-padding: 0;
+    -fx-cursor: hand;
+}
+.round-btn:hover { -fx-background-color: rgba(0,0,0,0.74); -fx-border-color: rgba(255,255,255,0.46); }
+.round-btn .h-icon, .round-btn .h-icon-out { -fx-fill: #ffffff; -fx-stroke: #ffffff; }
+
+/* ===========================================================================
+   Rails (floating scroll arrows)
+   =========================================================================== */
+
+.rail-arrow {
+    -fx-background-color: rgba(19,22,30,0.94);
+    -fx-border-color: -h-border-2;
+    -fx-border-width: 1;
+    -fx-border-radius: 999;
+    -fx-background-radius: 999;
+    -fx-min-width: 38; -fx-min-height: 38;
+    -fx-max-width: 38; -fx-max-height: 38;
+    -fx-padding: 0;
+    -fx-cursor: hand;
+    -fx-effect: dropshadow(gaussian, -h-shadow-3, 16, 0, 0, 5);
+}
+.rail-arrow:hover { -fx-background-color: -h-surface-4; -fx-border-color: -h-border-3; }
+.root.light .rail-arrow { -fx-background-color: rgba(255,255,255,0.96); }
+.root.light .rail-arrow:hover { -fx-background-color: #ffffff; }
+
+/* ===========================================================================
+   Detail screen
+   =========================================================================== */
+
+.d-hero-wrap { -fx-background-color: -h-surface-2; -fx-background-radius: 16; }
+.d-scrim {
+    -fx-background-color: linear-gradient(to top, rgba(6,7,12,0.95) 0%, rgba(6,7,12,0.48) 48%, rgba(6,7,12,0.05) 100%);
+    -fx-background-radius: 16;
+}
+.d-title { -fx-font-size: 32px;   -fx-font-weight: bold; -fx-text-fill: #ffffff; }
+.d-meta  { -fx-font-size: 12.5px; -fx-text-fill: rgba(255,255,255,0.78); }
+.d-skel  { -fx-background-color: -h-surface-3; -fx-background-radius: 16; }
+
+.mchip {
+    -fx-background-color: rgba(255,255,255,0.13);
+    -fx-background-radius: 999;
+    -fx-text-fill: #ffffff;
+    -fx-font-size: 12px;
+    -fx-padding: 4 12 4 12;
+}
+.rating-pill {
+    -fx-background-color: rgba(0,0,0,0.55);
+    -fx-background-radius: 999;
+    -fx-text-fill: #ffffff;
+    -fx-font-size: 12px;
+    -fx-font-weight: bold;
+    -fx-padding: 5 11 5 11;
+}
+
+.watch {
+    -fx-background-color: -h-surface;
+    -fx-border-color: -h-border;
+    -fx-border-width: 1;
+    -fx-border-radius: 16;
+    -fx-background-radius: 16;
+}
+.watch-head { -fx-border-color: -h-border; -fx-border-width: 0 0 1 0; -fx-padding: 15 16 13 16; }
+.watch-title { -fx-font-size: 15px; -fx-font-weight: bold; -fx-text-fill: -h-fg; }
+.watch-sub   { -fx-font-size: 11.5px; -fx-text-fill: -h-fg-3; }
+.watch-body  { -fx-padding: 14 12 16 16; }
+.panel-title { -fx-font-size: 14px; -fx-font-weight: bold; -fx-text-fill: -h-fg; }
+
+.ep-grid, .ep-grid > .viewport, .ep-grid > .corner { -fx-background-color: transparent; }
+.ep-num {
+    -fx-background-color: -h-surface-3;
+    -fx-border-color: -h-border;
+    -fx-border-width: 1;
+    -fx-border-radius: 8;
+    -fx-background-radius: 8;
+    -fx-text-fill: -h-fg;
+    -fx-font-size: 12.5px;
+    -fx-padding: 0;
+    -fx-cursor: hand;
+}
+.ep-num:hover { -fx-background-color: -h-surface-4; -fx-text-fill: -h-fg; -fx-border-color: -h-border-3; }
+.ep-num-sel,
+.ep-num-sel:hover {
+    -fx-background-color: linear-gradient(to right, -h-accent, -h-accent-2);
+    -fx-text-fill: -h-accent-fg;
+    -fx-font-weight: bold;
+    -fx-border-color: transparent;
+}
+.ep-num-seen { -fx-text-fill: -h-fg-3; }
+
+.now-playing {
+    -fx-background-color: -h-accent-soft;
+    -fx-border-color: -h-accent-line;
+    -fx-border-width: 1;
+    -fx-border-radius: 11;
+    -fx-background-radius: 11;
+    -fx-padding: 11 13 11 13;
+}
+.now-playing-title { -fx-font-size: 13px;   -fx-font-weight: bold; -fx-text-fill: -h-fg; }
+.now-playing-sub   { -fx-font-size: 11.5px; -fx-text-fill: -h-fg-2; }
+
+.src-row {
+    -fx-background-color: -h-surface-3;
+    -fx-border-color: -h-border;
+    -fx-border-width: 1;
+    -fx-border-radius: 11;
+    -fx-background-radius: 11;
+    -fx-padding: 10 11 10 11;
+    -fx-cursor: hand;
+}
+.src-row:hover { -fx-border-color: -h-border-3; -fx-background-color: -h-surface-3; }
+.src-name { -fx-font-size: 13px; -fx-font-weight: bold; -fx-text-fill: -h-fg; }
+.src-meta { -fx-font-size: 11px; -fx-text-fill: -h-fg-3; }
+.src-go {
+    -fx-background-color: linear-gradient(to right, -h-accent, -h-accent-2);
+    -fx-background-radius: 999;
+    -fx-min-width: 34; -fx-min-height: 34;
+    -fx-max-width: 34; -fx-max-height: 34;
+    -fx-padding: 0;
+    -fx-cursor: hand;
+}
+.src-go .h-icon { -fx-fill: -h-accent-fg; }
+.src-go:hover { -fx-scale-x: 1.07; -fx-scale-y: 1.07; }
+
+/* ===========================================================================
+   Filter drawer (scrollable multi-select) + segmented control
+   =========================================================================== */
+
+.drawer-scrim { -fx-background-color: rgba(4,5,10,0.54); }
+.drawer {
+    -fx-background-color: -h-surface;
+    -fx-border-color: -h-border-2;
+    -fx-border-width: 0 0 0 1;
+    -fx-effect: dropshadow(gaussian, -h-shadow-2, 34, 0, -14, 0);
+}
+.drawer-head { -fx-border-color: -h-border; -fx-border-width: 0 0 1 0; -fx-padding: 16 16 13 16; }
+.drawer-foot { -fx-border-color: -h-border; -fx-border-width: 1 0 0 0; -fx-padding: 12 16 16 16; }
+
+.prow { -fx-background-radius: 10; -fx-padding: 9 10 9 10; -fx-cursor: hand; }
+.prow:hover { -fx-background-color: -h-surface-2; }
+.prow-sel, .prow-sel:hover { -fx-background-color: -h-accent-soft; }
+.prow-cb {
+    -fx-background-color: -h-surface-2;
+    -fx-border-color: -h-border-2;
+    -fx-border-width: 1;
+    -fx-border-radius: 5;
+    -fx-background-radius: 5;
+    -fx-min-width: 18; -fx-min-height: 18;
+    -fx-max-width: 18; -fx-max-height: 18;
+}
+.prow-cb-sel { -fx-background-color: -h-accent; -fx-border-color: -h-accent; }
+.prow-tick {
+    -fx-background-color: -h-accent-fg;
+    -fx-background-radius: 2;
+    -fx-min-width: 8; -fx-min-height: 8;
+    -fx-max-width: 8; -fx-max-height: 8;
+}
+.prow-name     { -fx-font-size: 13px; -fx-text-fill: -h-fg-2; }
+.prow-name-sel { -fx-text-fill: -h-accent; -fx-font-weight: bold; }
+
+.scope-btn {
+    -fx-background-color: -h-surface-2;
+    -fx-border-color: -h-border-2;
+    -fx-border-width: 1;
+    -fx-border-radius: 10;
+    -fx-background-radius: 10;
+    -fx-padding: 7 12 7 12;
+    -fx-cursor: hand;
+}
+.scope-btn:hover { -fx-border-color: -h-border-3; }
+.scope-title { -fx-font-size: 13px;   -fx-font-weight: bold; -fx-text-fill: -h-fg; }
+.scope-sub   { -fx-font-size: 11.5px; -fx-text-fill: -h-fg-3; }
+
+.selchip {
+    -fx-background-color: -h-accent-soft;
+    -fx-border-color: -h-accent-line;
+    -fx-border-width: 1;
+    -fx-border-radius: 999;
+    -fx-background-radius: 999;
+    -fx-text-fill: -h-accent;
+    -fx-font-size: 12px;
+    -fx-padding: 4 11 4 11;
+    -fx-cursor: hand;
+}
+.selchip:hover { -fx-background-color: -h-accent-line; -fx-text-fill: -h-accent-fg; }
+
+.segmented {
+    -fx-background-color: -h-surface-3;
+    -fx-border-color: -h-border;
+    -fx-border-width: 1;
+    -fx-border-radius: 11;
+    -fx-background-radius: 11;
+    -fx-padding: 4;
+}
+.seg { -fx-background-color: transparent; -fx-background-radius: 8; -fx-text-fill: -h-fg-2; -fx-font-size: 12.5px; -fx-padding: 7 14 7 14; -fx-cursor: hand; }
+.seg:hover { -fx-text-fill: -h-fg; }
+.seg-sel, .seg-sel:hover { -fx-background-color: -h-surface-4; -fx-text-fill: -h-fg; -fx-font-weight: bold; }
+
+.repo-card {
+    -fx-background-color: -h-surface-2;
+    -fx-border-color: -h-border;
+    -fx-border-width: 1;
+    -fx-border-radius: 12;
+    -fx-background-radius: 12;
+    -fx-padding: 13 15 13 15;
+}
+.repo-card:hover { -fx-border-color: -h-border-3; }
+.repo-ic {
+    -fx-background-color: -h-accent-soft;
+    -fx-background-radius: 11;
+    -fx-min-width: 40; -fx-min-height: 40;
+    -fx-max-width: 40; -fx-max-height: 40;
+}
+.repo-ic .h-icon { -fx-fill: -h-accent; }
+.repo-tile {
+    -fx-background-color: -h-surface-3;
+    -fx-background-radius: 10;
+    -fx-min-width: 38; -fx-min-height: 38;
+    -fx-max-width: 38; -fx-max-height: 38;
+}
+.repo-tile .h-icon { -fx-fill: -h-fg-2; }
+
+.wrap-hint { -fx-font-size: 11.5px; -fx-text-fill: -h-fg-3; }
+.tiny      { -fx-font-size: 11px;   -fx-text-fill: -h-fg-3; }
+.prose     { -fx-font-size: 13.5px; -fx-text-fill: -h-fg-2; -fx-line-spacing: 4; }

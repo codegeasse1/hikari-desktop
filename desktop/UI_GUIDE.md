@@ -9,10 +9,15 @@ Read this before touching anything under `desktop/src/main/kotlin/desktop/ui/`.
 | `theme.css` | The design system. Layer 1 = design tokens as JavaFX looked-up colours on `.root`; layer 2 = every control styled from those tokens. |
 | `Theme.kt` | Owns the two things that *select* a theme (light/dark, accent preset) and exposes the spacing/type scales. |
 | `Icons.kt` | The whole icon set, built from JavaFX primitives on a 24x24 grid. |
-| `Components.kt` (`Ui`) | Buttons, chips, fields, badges, section headers, empty states, skeletons, toasts. |
-| `PosterCard.kt` | The poster card + `PosterRail` (headed horizontal rail). |
-| `PosterGrid.kt` | Virtualised poster grid. |
-| `AppShell.kt` | Sidebar + top bar + content host + toasts + keyboard shortcuts. |
+| `Components.kt` (`Ui`) | Buttons, chips, fields, badges, section headers, empty states, skeletons, segmented control, rail-with-arrows, toasts. |
+| `PosterCard.kt` | The poster card + `PosterRail` (headed horizontal rail with "See all"). |
+| `PosterGrid.kt` | Virtualised poster grid (a `ListView` with one cell per row). |
+| `AppShell.kt` | Sidebar + top bar (title, global search, window controls) + content host + toasts + back stack + shortcuts. |
+| `HomeScreen.kt` | Featured hero banner + one rail per catalog. |
+| `SearchScreen.kt` | Query + scope bar + slide-in provider drawer (scrollable multi-select). |
+| `DetailScreen.kt` | Banner + facts column + fixed "Watch" panel (episode grid + sources). |
+| `CatalogScreen.kt` | The full grid behind a rail's "See all". |
+| `LibraryScreen.kt`, `DownloadsScreen.kt`, `SettingsScreen.kt`, `ExtensionsScreen.kt` | The remaining screens. |
 | `WindowChrome.kt` | Resize edges, window controls, drag-to-maximise. |
 
 ## Rules
@@ -27,12 +32,39 @@ Read this before touching anything under `desktop/src/main/kotlin/desktop/ui/`.
    (`.h-icon` filled, `.h-icon-out` stroked), so icons re-theme automatically.
    Add new ones as `shapes(name)` branches; unknown names render a placeholder
    square instead of throwing.
-5. **Text is `Theme.label(text, size, bold, dim)`** — only the size is inline, the
-   colour comes from CSS.
+5. **Text**: `Theme.label(text, size, bold, dim)` when a one-off size is needed, or
+   a plain `Label(text).apply { styleClass.add("<css class>") }` when the size is
+   part of the design system (`.hero-title`, `.d-title`, `.watch-title`, `.tiny`, …).
+6. **Never put `-fx-*` on a property you animate.** CSS (author stylesheet) wins
+   over a programmatic value the next time a node's styles are re-resolved — so
+   anything animated (`opacity` of the rail arrows, `translateX` of the drawer,
+   `opacity` of the hero image) must be set in Kotlin only, never in `theme.css`.
+7. **Re-parenting is fine, re-adding is not.** Nodes are moved between parents when
+   a screen re-renders; a `TextField` inside a rebuilt container loses focus, so
+   *filter fields rebuild only the list they filter*, never the whole screen.
+
+## Screen patterns
+
+- **Hero banner** (`HomeScreen`): a `StackPane` with a clipped rounded rectangle,
+  the image bound to the stack width, two scrim layers (vertical + horizontal
+  gradients), a bottom-left content column and a bottom-right dot/arrow navigator.
+  Auto-rotates every 10s and pauses while hovered.
+- **Rails** (`Ui.rail` + `Ui.railWithArrows`): the vertical mouse wheel is mapped
+  to horizontal movement and only consumed while the rail can still move, so the
+  page keeps scrolling normally when the rail is at its end.
+- **Filter drawer** (`SearchScreen`): a full-height panel inside the screen's
+  `StackPane`, `translateX` animated in/out, a dimming `Region` behind it, rows as
+  `HBox`es with a check square. Multi-select; an empty selection means "all".
+- **Detail** (`DetailScreen`): the banner owns the top; below it an `HBox` of a
+  scrolling facts column (grow) and a fixed 396px `Watch` panel. The panel holds the
+  episode range selector, the episode-number grid, the now-playing callout and the
+  source list — so choosing an episode and then a source never needs a page scroll.
+  Episode tiles show the number only (the show title is stripped from the name) and
+  tile lists are paged in ranges of 60 with a "Find episode…" filter.
 
 ## Adding a screen
 
-1. Create `XScreen.kt` in `desktop/ui/` with a `class XScreenView { val root: Region; fun onShown() {} }`.
+1. Create `XScreen.kt` in `desktop/ui/` with `class XScreenView { val root: Region; fun onShown() {} }`.
 2. Wrap content in `Ui.vScroll(body)`; assemble it from `Ui.sectionHeader`,
    `Ui.panel`, `Ui.emptyState`, `PosterGrid`/`PosterRail`.
 3. Add an entry to the `Screen` sealed class, to `viewFor`/`titleFor`/`subtitleFor`,
@@ -59,10 +91,11 @@ navigation so a theme change made elsewhere lands without a restart.
 rows are materialised. Do not replace it with a `FlowPane` of cards: a real library
 is thousands of items and thousands of `ImageView`s will not scroll smoothly.
 
-## What is not built yet
+## Still to port from the Android app
 
-Screens present: Home, Search, Library, Downloads, Extensions, Settings, Detail.
-Downloads has real storage reporting but no download engine; the Android
-`DownloadEngine` is a plain OkHttp m3u8/MP4 downloader and ports directly. The
+Downloads has real storage reporting but no download engine (the Android
+`DownloadEngine` is a plain OkHttp m3u8/MP4 downloader and ports directly). The
 player still launches mpv as a child process — driving it over
 `--input-ipc-server` is what unlocks a real OSD, timeline and track selection.
+SkyStream, Nuvio (QuickJS) and Aniyomi extensions are not ported yet; see
+`docs/DESKTOP_PARITY.md` for the plan and the order to do it in.

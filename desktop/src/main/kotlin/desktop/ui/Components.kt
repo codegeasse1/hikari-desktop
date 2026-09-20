@@ -82,12 +82,19 @@ object Ui {
 
     /** A search field with the magnifier drawn inside its left padding. */
     fun searchField(prompt: String = "Search…", width: Double = 260.0, onSubmit: (String) -> Unit = {}): StackPane {
+        val wrap = searchInput(prompt, width)
+        (wrap.children[0] as TextField).setOnAction { onSubmit((wrap.children[0] as TextField).text.trim()) }
+        return wrap
+    }
+
+    /** A search field wrapper whose [TextField] is the first child, so callers
+     *  can drive it (focus, clear, fire the search) themselves. */
+    fun searchInput(prompt: String = "Search…", width: Double = 260.0): StackPane {
         val input = TextField().apply {
             styleClass.addAll("field", "field-search")
             this.promptText = prompt
             prefWidth = width
             minWidth = width
-            setOnAction { onSubmit(text.trim()) }
         }
         val glass = Icons.of(Icons.SEARCH, 15.0).apply { styleClass.add("search-glass") }
         return StackPane(input, glass).apply {
@@ -232,12 +239,94 @@ object Ui {
             if (content is Region) content.padding = padding
         }
 
-    /** A horizontally scrolling rail of posters, used by the home screen rows. */
+    /** A horizontally scrolling rail of posters, used by the home screen rows.
+     *  The vertical mouse wheel is translated into horizontal movement (and only
+     *  consumed while the rail can still move that way), so scrolling over a row
+     *  behaves the way people expect on a desktop. */
     fun rail(content: Node): ScrollPane = ScrollPane(content).apply {
         isFitToHeight = true
-        hbarPolicy = ScrollPane.ScrollBarPolicy.AS_NEEDED
+        hbarPolicy = ScrollPane.ScrollBarPolicy.NEVER
         vbarPolicy = ScrollPane.ScrollBarPolicy.NEVER
         styleClass.addAll("scroll-pane", "poster-rail")
+        addEventFilter(javafx.scene.input.ScrollEvent.SCROLL) { e ->
+            if (kotlin.math.abs(e.deltaY) > kotlin.math.abs(e.deltaX)) {
+                val next = (hvalue - e.deltaY / 620.0).coerceIn(0.0, 1.0)
+                if (next != hvalue) {
+                    hvalue = next
+                    e.consume()
+                }
+            }
+        }
+    }
+
+    /**
+     * Wraps a rail in a hover-reactive overlay with circular left/right arrows.
+     * The arrows fade in only while the pointer is over the row, so the artwork
+     * stays clean but paging is always one click away.
+     */
+    fun railWithArrows(scroll: ScrollPane): StackPane {
+        fun arrow(icon: String, dir: Int, align: Pos): Button = Button().apply {
+            styleClass.add("rail-arrow")
+            graphic = Icons.of(icon, 16.0)
+            isFocusTraversable = false
+            opacity = 0.0
+            setOnAction { nudge(scroll, dir) }
+            StackPane.setAlignment(this, align)
+        }
+        val left = arrow(Icons.CHEVRON_LEFT, -1, Pos.CENTER_LEFT)
+        val right = arrow(Icons.CHEVRON_RIGHT, 1, Pos.CENTER_RIGHT)
+        StackPane.setMargin(left, Insets(0.0, 0.0, 34.0, -10.0))
+        StackPane.setMargin(right, Insets(0.0, -10.0, 34.0, 0.0))
+        return StackPane(scroll, left, right).apply {
+            alignment = Pos.CENTER_LEFT
+            setOnMouseEntered { fade(left, 1.0); fade(right, 1.0) }
+            setOnMouseExited { fade(left, 0.0); fade(right, 0.0) }
+        }
+    }
+
+    /** Slides a rail by roughly a third of a screen. */
+    fun nudge(scroll: ScrollPane, dir: Int) {
+        val target = (scroll.hvalue + dir * 0.32).coerceIn(0.0, 1.0)
+        Timeline(
+            KeyFrame(Duration.millis(260.0), KeyValue(scroll.hvalueProperty(), target, Interpolator.EASE_BOTH)),
+        ).play()
+    }
+
+    fun fade(node: Node, to: Double, millis: Double = 140.0) {
+        FadeTransition(Duration.millis(millis), node).apply {
+            toValue = to
+            play()
+        }
+    }
+
+    // ---- misc chrome --------------------------------------------------------
+
+    /** A labelled icon node matching the type scale of [Theme.label]. */
+    fun iconLabel(icon: String, text: String, size: Double = 13.0, cls: String? = null): HBox =
+        HBox(8.0, Icons.of(icon, size + 3.0), Theme.label(text, size = size)).apply {
+            alignment = Pos.CENTER_LEFT
+            if (cls != null) styleClass.addAll(cls.split(" "))
+        }
+
+    /** A pill-shaped segmented control; [onSelect] receives the chosen index. */
+    fun segmented(options: List<String>, initial: Int = 0, onSelect: (Int) -> Unit): HBox {
+        val buttons = mutableListOf<Button>()
+        val box = HBox(4.0).apply { styleClass.add("segmented") }
+        options.forEachIndexed { index, label ->
+            val button = Button(label).apply {
+                styleClass.add("seg")
+                if (index == initial) styleClass.add("seg-sel")
+                isFocusTraversable = false
+                setOnAction {
+                    buttons.forEach { it.styleClass.remove("seg-sel") }
+                    styleClass.add("seg-sel")
+                    onSelect(index)
+                }
+            }
+            buttons.add(button)
+            box.children.add(button)
+        }
+        return box
     }
 
     // ---- toasts -------------------------------------------------------------
