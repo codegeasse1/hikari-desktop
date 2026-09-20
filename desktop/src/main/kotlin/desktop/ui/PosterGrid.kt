@@ -32,6 +32,11 @@ class PosterGrid(
         styleClass.add("poster-grid")
         isFocusTraversable = false
         setCellFactory { GridRowCell() }
+        // A grid must not vote on how small the window may be.
+        minWidth = 0.0
+        minHeight = 0.0
+        maxWidth = Double.MAX_VALUE
+        maxHeight = Double.MAX_VALUE
     }
 
     private var all: List<MediaItem> = emptyList()

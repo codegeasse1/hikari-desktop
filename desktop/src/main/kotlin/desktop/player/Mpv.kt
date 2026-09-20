@@ -64,7 +64,8 @@ object Mpv {
         if (code != 0 || !out.isFile || out.length() == 0L) {
             runCatching { p.destroyForcibly() }
             return "mpv remux failed (exit $code): " +
-                text.lineSequence().filter { it.isNotBlank() }.takeLast(4).joinToString(" | ").take(400)
+                text.lineSequence().filter { it.isNotBlank() }.toList().takeLast(4)
+                    .joinToString(" | ").take(400)
         }
         return null
     }

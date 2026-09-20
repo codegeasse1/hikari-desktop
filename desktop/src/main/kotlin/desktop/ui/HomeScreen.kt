@@ -48,7 +48,7 @@ class HomeScreenView {
     private val heroDesc = themed("", "hero-desc").apply {
         isWrapText = true
         maxWidth = 620.0
-        maxHeight = 62.0
+        maxHeight = 54.0
     }
     private val heroActions = HBox(10.0).apply { alignment = Pos.CENTER_LEFT }
     private val heroDots = HBox(7.0).apply { alignment = Pos.CENTER_RIGHT }
@@ -108,6 +108,12 @@ class HomeScreenView {
         )
         heroStack.isVisible = false
         heroStack.isManaged = false
+        // The auto-rotating banner is the only long-lived animation on this
+        // screen: stop it (and restart it on return) instead of letting it tick
+        // against a detached scene graph.
+        root.sceneProperty().addListener { _, _, scene ->
+            if (scene == null) heroTimer?.stop() else heroTimer?.play()
+        }
     }
 
     fun onShown() {
@@ -130,11 +136,14 @@ class HomeScreenView {
             styleClass.add("hero-scrim-v")
             maxWidth = Double.MAX_VALUE
             maxHeight = Double.MAX_VALUE
+            // Decoration only — it must never swallow the hero's own click.
+            isMouseTransparent = true
         }
         val scrimH = Region().apply {
             styleClass.add("hero-scrim-h")
             maxWidth = Double.MAX_VALUE
             maxHeight = Double.MAX_VALUE
+            isMouseTransparent = true
         }
 
         val body = VBox(10.0, heroOver, heroTitle, heroMeta, heroDesc, heroActions).apply {
@@ -146,11 +155,18 @@ class HomeScreenView {
 
         val prev = Ui.iconButton(Icons.CHEVRON_LEFT, "Previous", 16.0) { stepHero(-1) }.apply { styleClass.add("round-btn") }
         val next = Ui.iconButton(Icons.CHEVRON_RIGHT, "Next", 16.0) { stepHero(1) }.apply { styleClass.add("round-btn") }
+        // The arrows sit inside a clickable banner, so their clicks must not
+        // also open the featured title.
+        Ui.isolateClicks(prev)
+        Ui.isolateClicks(next)
         val nav = HBox(14.0, heroDots, prev, next).apply { alignment = Pos.CENTER_RIGHT }
         StackPane.setAlignment(nav, Pos.BOTTOM_RIGHT)
         StackPane.setMargin(nav, Insets(0.0, 30.0, 32.0, 0.0))
 
         heroStack.children.addAll(heroImage, scrimV, scrimH, body, nav)
+        heroStack.cursor = javafx.scene.Cursor.HAND
+        // Clicking the banner (anywhere that isn't a button) opens the title.
+        heroStack.setOnMouseClicked { heroItems.getOrNull(heroIndex)?.let { AppShell.openDetail(it) } }
         heroStack.setOnMouseEntered { heroTimer?.pause() }
         heroStack.setOnMouseExited { heroTimer?.play() }
     }
@@ -214,11 +230,11 @@ class HomeScreenView {
             Ui.button("Details", icon = Icons.INFO, ghost = true) { AppShell.openDetail(item) },
         )
         heroDots.children.setAll(heroItems.mapIndexed { index, _ ->
-            Region().apply {
+            Ui.isolateClicks(Region().apply {
                 styleClass.add("hero-dot")
                 if (index == heroIndex) styleClass.add("hero-dot-sel")
                 setOnMouseClicked { heroIndex = index; showHero() }
-            }
+            })
         })
     }
 
@@ -401,6 +417,6 @@ class HomeScreenView {
     private fun themed(text: String, cls: String): Label = Label(text).apply { styleClass.add(cls) }
 
     private companion object {
-        const val HERO_H = 392.0
+        const val HERO_H = 320.0
     }
 }

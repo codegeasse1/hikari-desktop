@@ -67,7 +67,16 @@ object AppShell {
     fun create(stage: javafx.stage.Stage): Region {
         chrome = WindowChrome(stage)
 
-        centerStack = StackPane().apply { styleClass.add("content-host") }
+        centerStack = StackPane().apply {
+            styleClass.add("content-host")
+            // The content host is the one place that decides how small the
+            // window may get: pinned to 0/MAX, so no screen can inflate the
+            // window's minimum size (a page of rails otherwise would).
+            minWidth = 0.0
+            minHeight = 0.0
+            maxWidth = Double.MAX_VALUE
+            maxHeight = Double.MAX_VALUE
+        }
         val overlay = StackPane().apply { isMouseTransparent = true }
         toasts = Ui.Toasts(overlay)
 
@@ -189,9 +198,10 @@ object AppShell {
         val searchBox = Ui.searchInput("Search movies, shows, anime…", 268.0)
         globalSearch = searchBox.children[0] as TextField
         globalSearch.setOnAction { runGlobalSearch() }
-        globalSearch.focusedProperty().addListener { _, _, focused ->
-            if (focused && globalSearch.text.isBlank() && currentScreen !is Screen.Search) show(Screen.Search)
-        }
+        // Not focus-traversable so it can't steal focus on launch (or on Tab),
+        // and so the search screen can never be pushed in front of the screen
+        // the user just opened. Clicking it still focuses it; Ctrl+K focuses it.
+        globalSearch.isFocusTraversable = false
 
         themeButton = Ui.iconButton(Icons.MOON, "Toggle light / dark", size = 16.0) { toggleTheme() }
 
@@ -258,7 +268,15 @@ object AppShell {
         }
         currentScreen = screen
         Theme.refresh()
-        val node = viewFor(screen)
+        val node = try {
+            viewFor(screen)
+        } catch (t: Throwable) {
+            // A screen that fails to build must never leave the content area
+            // blank (or silently keep the previous screen) with the exception
+            // lost in the event dispatch — show the failure instead.
+            errorView(screen, t)
+        }
+        if (node is Region) Ui.fill(node)
         centerStack.children.clear()
         centerStack.children.add(node)
         Ui.fadeIn(node)
@@ -275,6 +293,17 @@ object AppShell {
             is Screen.Catalog -> Unit
         }
         refreshNav()
+    }
+
+    private fun errorView(screen: Screen, t: Throwable): Region {
+        AppShell.toast("Couldn't open ${titleFor(screen)}: ${t.message ?: t.javaClass.simpleName}", "error")
+        return Ui.vScroll(
+            Ui.emptyState(
+                Icons.ERROR,
+                "This screen failed to open",
+                (t.message ?: t.javaClass.simpleName) + "\n\n" + t.stackTrace.take(6).joinToString("\n") { "at $it" },
+            )
+        )
     }
 
     /** Returns to the previously shown screen (Escape / the in-page back arrow). */

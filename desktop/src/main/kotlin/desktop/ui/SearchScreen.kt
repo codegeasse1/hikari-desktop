@@ -99,17 +99,23 @@ class SearchScreenView {
         prefWidth = PANEL_W
         minWidth = PANEL_W
         maxWidth = PANEL_W
+        minHeight = 0.0
         maxHeight = Double.MAX_VALUE
         isVisible = false
         translateX = PANEL_W
     }
 
-    val root: StackPane = StackPane()
+    val root: StackPane = StackPane().apply {
+        minWidth = 0.0
+        minHeight = 0.0
+        maxWidth = Double.MAX_VALUE
+        maxHeight = Double.MAX_VALUE
+    }
 
     private var searchJob: Job? = null
 
     init {
-        val content = VBox(0.0).apply {
+        val content = Ui.fill(VBox(0.0).apply {
             padding = Insets(Theme.S5, Theme.S5, Theme.S4, Theme.S5)
             children.addAll(
                 HBox(10.0, queryInput, searchButton).apply { alignment = Pos.CENTER_LEFT },
@@ -119,7 +125,7 @@ class SearchScreenView {
                 grid.root,
             )
             VBox.setVgrow(grid.root, Priority.ALWAYS)
-        }
+        })
         buildDrawer()
         root.children.addAll(content, drawerScrim, drawer)
         StackPane.setAlignment(drawer, Pos.TOP_RIGHT)
@@ -166,6 +172,10 @@ class SearchScreenView {
             styleClass.add("scroll-pane")
             VBox.setVgrow(this, Priority.ALWAYS)
             padding = Insets(0.0, 10.0, 0.0, 10.0)
+            minWidth = 0.0
+            minHeight = 0.0
+            maxWidth = Double.MAX_VALUE
+            maxHeight = Double.MAX_VALUE
         }
         val foot = HBox(8.0,
             drawerCount,

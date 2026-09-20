@@ -1051,3 +1051,9 @@
 .check-box:selected > .box { -fx-background-color: -h-accent; -fx-border-color: -h-accent; }
 .check-box:selected > .box > .mark { -fx-background-color: -h-accent-fg; }
 .check-box > .text { -fx-font-size: 12.5px; }
+
+.ep-grid-inner { -fx-background-color: transparent; -fx-padding: 0; }
+
+/* Episode filter + pager live in the scrolling left column, so the whole
+   episode list is laid out on the page instead of inside a fixed-height box. */
+.episode-tools { -fx-padding: 0; }

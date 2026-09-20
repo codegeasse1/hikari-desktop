@@ -160,9 +160,14 @@ object PosterCard {
                 children.add(title)
                 children.add(meta)
             }
-            Tooltip.install(this, Ui.tooltip(tooltipText(item)))
+            // No tooltip here on purpose: a JavaFX tooltip is a popup window
+            // placed right under the pointer, and a click that lands on it is
+            // consumed by the popup (to dismiss it) instead of reaching the
+            // card — which is why a wall of tooltipped posters feels like it
+            // needs several clicks to register.
             setOnMouseClicked { onOpen(item) }
         }
+        moreButton?.let { Ui.isolateClicks(it) }
 
         card.setOnMouseEntered {
             ScaleTransition(Duration.millis(130.0), card).apply {
@@ -238,6 +243,9 @@ object PosterRail {
         val row = HBox(Theme.S4).apply {
             alignment = Pos.TOP_LEFT
             padding = javafx.geometry.Insets(Theme.S1, Theme.S1, Theme.S2, Theme.S1)
+            // An HBox's minimum width is the sum of its children's, so without
+            // this a long rail would declare a minimum wider than any window.
+            minWidth = 0.0
         }
         items.forEach { item ->
             row.children.add(PosterCard.make(item, onOpen, onMore = onMore))

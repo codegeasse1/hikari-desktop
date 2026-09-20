@@ -19,6 +19,10 @@ class CatalogScreenView(
 
     val root: VBox = VBox(Theme.S3).apply {
         padding = Insets(Theme.S4, Theme.S5, Theme.S4, Theme.S5)
+        minWidth = 0.0
+        minHeight = 0.0
+        maxWidth = Double.MAX_VALUE
+        maxHeight = Double.MAX_VALUE
     }
 
     init {

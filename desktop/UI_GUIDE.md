@@ -48,6 +48,30 @@ Outside `desktop/ui/`, but part of this layer's picture: the download queue live
 7. **Re-parenting is fine, re-adding is not.** Nodes are moved between parents when
    a screen re-renders; a `TextField` inside a rebuilt container loses focus, so
    *filter fields rebuild only the list they filter*, never the whole screen.
+8. **A region must not decide how small the window can be.** JavaFX lays a child out
+   at `max(min, min(available, max))` — so a big *minimum* is what pushes content off
+   the window. Two defaults conspire here: a `VBox`'s minimum height is the SUM of
+   its children's minima, and an `HBox`'s minimum width is the sum of its children's,
+   so a page of rails reports a minimum as large as its whole content and none of it
+   scrolls (the scroll pane ends up as big as its content, so there is nothing to
+   scroll). Therefore: run every screen root and every container between a screen
+   root and a scroll pane through `Ui.fill(...)`, and keep every scroll pane's
+   `minWidth`/`minHeight` at 0. `AppShell`'s `centerStack` is pinned to 0/MAX and is
+   the only thing that decides the window's minimum size.
+9. **Only one long-lived animation in the whole app.** Skeletons share a single
+   timeline through `Ui`'s shimmer property. A per-node INDEFINITE `Timeline` (the
+   old `Ui.pulse`) is never stopped when the node leaves the scene, and enough of
+   them saturate the FX pulse — which users experience as clicks that need several
+   attempts. Stop screen-owned animations (e.g. the home hero's auto-rotate) when
+   their node leaves the scene.
+10. **Tooltips only on small, deliberate targets.** A JavaFX tooltip is its own popup
+    window positioned under the pointer; a click that lands on it dismisses the popup
+    instead of reaching the control, which is why a wall of tooltipped posters feels
+    like it needs three clicks. Poster cards and episode tiles carry no tooltip (their
+    labels are visible), and `Ui.tooltip` uses a deliberately long 900ms delay.
+11. **Controls inside a clickable container need `Ui.isolateClicks`.** A poster's
+    "More" button, the hero's arrows/dots and a source row's buttons all live inside a
+    container that opens something — without it, one click does both.
 
 ## Screen patterns
 

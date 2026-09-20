@@ -67,7 +67,13 @@ object Ui {
         if (onClick != null) setOnAction { onClick() }
     }
 
-    fun tooltip(text: String): Tooltip = Tooltip(text).apply { showDelay = Duration.millis(420.0) }
+    fun tooltip(text: String): Tooltip = Tooltip(text).apply {
+        // Deliberately unhurried: a JavaFX tooltip is its own popup window, and
+        // a popup that appears while the pointer is resting on a control can
+        // take the next click (dismissing itself instead of pressing the
+        // button). Only an intentional hover should bring one up.
+        showDelay = Duration.millis(900.0)
+    }
 
     // ---- inputs -------------------------------------------------------------
 
@@ -94,7 +100,8 @@ object Ui {
             styleClass.addAll("field", "field-search")
             this.promptText = prompt
             prefWidth = width
-            minWidth = width
+            // Shrinkable: the top bar must still fit on a narrow window.
+            minWidth = 150.0
         }
         val glass = Icons.of(Icons.SEARCH, 15.0).apply { styleClass.add("search-glass") }
         return StackPane(input, glass).apply {
@@ -109,6 +116,38 @@ object Ui {
         styleClass.add("pill")
         if (selected) styleClass.add("pill-selected")
         if (onClick != null) setOnAction { onClick() }
+    }
+
+    // ---- layout guarantees --------------------------------------------------
+
+    /**
+     * Makes a region fill whatever its parent gives it, and — just as
+     * important — makes it able to shrink.
+     *
+     * JavaFX regions default `maxWidth`/`maxHeight` to their *preferred* size,
+     * so a screen dropped into a `StackPane` is laid out at its preferred size;
+     * and because a `VBox`'s minimum height is the SUM of its children's minima,
+     * a page of rails and panels reports a minimum as tall as its whole content.
+     * The pane therefore cannot shrink it, the page ends up taller than the
+     * window, and none of it scrolls. Every screen root and every intermediate
+     * container between a screen root and a scroll pane goes through this.
+     */
+    fun <T : Region> fill(region: T): T = region.apply {
+        minWidth = 0.0
+        minHeight = 0.0
+        maxWidth = Double.MAX_VALUE
+        maxHeight = Double.MAX_VALUE
+    }
+
+    /**
+     * Stops a control inside a clickable container from also firing the
+     * container's own handler. JavaFX buttons fire on mouse *release*, so
+     * consuming `MOUSE_CLICKED` here only stops the event from bubbling to the
+     * parent — a poster's "More" button, or the arrows inside the hero banner,
+     * would otherwise also open the title.
+     */
+    fun <T : Node> isolateClicks(node: T): T = node.apply {
+        addEventFilter(javafx.scene.input.MouseEvent.MOUSE_CLICKED) { it.consume() }
     }
 
     // ---- badges & headers ---------------------------------------------------
@@ -184,7 +223,33 @@ object Ui {
         maxHeight = h
         styleClass.add("skeleton")
         style = "-fx-background-radius: ${radius}px;"
-        pulse(this)
+        ensureShimmer()
+        opacityProperty().bind(shimmer)
+    }
+
+    /**
+     * One shimmer value shared by every skeleton.
+     *
+     * Each skeleton used to own an INDEFINITE `Timeline`, and nothing stopped it
+     * when the skeleton left the scene — so every catalog load leaked a dozen
+     * full-rate animations that kept running forever. After a few refreshes the
+     * FX pulse was saturated, which shows up as dropped input: clicks that need
+     * two or three attempts. A single timeline driving a shared property costs
+     * one animation no matter how many placeholders are on screen.
+     */
+    private val shimmer = javafx.beans.property.SimpleDoubleProperty(0.86)
+    private var shimmerTimeline: Timeline? = null
+
+    private fun ensureShimmer() {
+        if (shimmerTimeline != null) return
+        shimmerTimeline = Timeline(
+            KeyFrame(Duration.ZERO, KeyValue(shimmer, 0.86, Interpolator.EASE_BOTH)),
+            KeyFrame(Duration.seconds(1.1), KeyValue(shimmer, 0.40, Interpolator.EASE_BOTH)),
+        ).apply {
+            cycleCount = Timeline.INDEFINITE
+            setAutoReverse(true)
+            play()
+        }
     }
 
     fun posterSkeleton(): VBox = VBox(Theme.S2,
@@ -195,18 +260,6 @@ object Ui {
 
     fun skeletonRail(count: Int = 6): HBox = HBox(Theme.S4).apply {
         repeat(count) { children.add(posterSkeleton()) }
-    }
-
-    private fun pulse(node: Node) {
-        val timeline = Timeline(
-            KeyFrame(Duration.ZERO, KeyValue(node.opacityProperty(), 0.85, Interpolator.EASE_BOTH)),
-            KeyFrame(Duration.seconds(1.0), KeyValue(node.opacityProperty(), 0.42, Interpolator.EASE_BOTH)),
-        ).apply {
-            cycleCount = Timeline.INDEFINITE
-            setAutoReverse(true)
-            play()
-        }
-        node.properties["hikari-pulse"] = timeline
     }
 
     // ---- transitions --------------------------------------------------------
@@ -236,6 +289,13 @@ object Ui {
         ScrollPane(content).apply {
             isFitToWidth = true
             styleClass.add("scroll-pane")
+            // A scroll pane is where a too-big layout is supposed to stop: it
+            // must be free to shrink to the viewport, or it reports its
+            // content's full size as its minimum and the window grows to match.
+            minWidth = 0.0
+            minHeight = 0.0
+            maxWidth = Double.MAX_VALUE
+            maxHeight = Double.MAX_VALUE
             if (content is Region) content.padding = padding
         }
 
@@ -248,6 +308,14 @@ object Ui {
         hbarPolicy = ScrollPane.ScrollBarPolicy.NEVER
         vbarPolicy = ScrollPane.ScrollBarPolicy.NEVER
         styleClass.addAll("scroll-pane", "poster-rail")
+        // Crucial: a rail is a ScrollPane whose content is an HBox of poster
+        // cards, and an HBox's minimum width is the SUM of its children's — 20
+        // posters would otherwise declare a ~2800px minimum and drag the whole
+        // window's minimum size with them.
+        minWidth = 0.0
+        minHeight = 0.0
+        maxWidth = Double.MAX_VALUE
+        (content as? Region)?.let { it.minWidth = 0.0 }
         addEventFilter(javafx.scene.input.ScrollEvent.SCROLL) { e ->
             if (kotlin.math.abs(e.deltaY) > kotlin.math.abs(e.deltaX)) {
                 val next = (hvalue - e.deltaY / 620.0).coerceIn(0.0, 1.0)
@@ -270,6 +338,9 @@ object Ui {
             graphic = Icons.of(icon, 16.0)
             isFocusTraversable = false
             opacity = 0.0
+            // An invisible arrow must not steal clicks from the poster under it
+            // — it only becomes interactive once the hover has faded it in.
+            mouseTransparentProperty().bind(opacityProperty().lessThan(0.05))
             setOnAction { nudge(scroll, dir) }
             StackPane.setAlignment(this, align)
         }
@@ -279,6 +350,8 @@ object Ui {
         StackPane.setMargin(right, Insets(0.0, -10.0, 34.0, 0.0))
         return StackPane(scroll, left, right).apply {
             alignment = Pos.CENTER_LEFT
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
             setOnMouseEntered { fade(left, 1.0); fade(right, 1.0) }
             setOnMouseExited { fade(left, 0.0); fade(right, 0.0) }
         }

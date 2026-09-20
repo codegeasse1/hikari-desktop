@@ -16,12 +16,11 @@ import javafx.geometry.Insets
 import javafx.geometry.Pos
 import javafx.scene.Node
 import javafx.scene.control.Button
-import javafx.scene.control.ComboBox
 import javafx.scene.control.Label
 import javafx.scene.control.ScrollPane
 import javafx.scene.control.TextField
-import javafx.scene.control.Tooltip
 import javafx.scene.image.ImageView
+import javafx.scene.layout.BorderPane
 import javafx.scene.layout.HBox
 import javafx.scene.layout.Priority
 import javafx.scene.layout.Region
@@ -38,11 +37,20 @@ import kotlinx.coroutines.launch
 /**
  * The title screen.
  *
- * Layout rule: the banner owns the top, the *left* column is the reading column
- * (synopsis + facts) and scrolls on its own, and the *right* column is the
- * fixed-width "Watch" panel that never leaves the screen. Picking an episode
- * re-fetches its sources *inside that same panel*, so choosing a source is one
- * click away instead of a scroll to the bottom of the page.
+ * Layout rule — which region scrolls is decided once, and nothing else competes
+ * for the same axis:
+ *
+ *  - the banner sits at the top at a fixed height;
+ *  - the LEFT column scrolls as a whole (synopsis, facts, and the full episode
+ *    grid, which can run to hundreds of tiles);
+ *  - the RIGHT column is the fixed-width "Watch" panel: it never leaves the
+ *    screen and instead owns the vertical space *inside* itself, with the
+ *    source list as the one growing, scrolling child.
+ *
+ * Every piece here is bounded on both axes (`Ui.fill` + explicit min sizes), so
+ * the screen fits any window — the previous version let the episode grid and
+ * the source list report their full content size as a minimum, which pushed the
+ * panel off the window and made both unscrollable.
  */
 class DetailScreenView(private val item: MediaItem) {
 
@@ -56,14 +64,16 @@ class DetailScreenView(private val item: MediaItem) {
     private var pendingDownload = false
     private var favourite = false
 
-    private val heroHeight = 300.0
+    /** How many tiles the episode grid shows; a "Show more" button extends it,
+     *  so an anime season with 1000 episodes doesn't build 1000 buttons. */
+    private var episodeLimit = EPISODE_PAGE
 
     // ── hero ────────────────────────────────────────────────────────────────
 
     private val heroImage = ImageView().apply {
         isPreserveRatio = false
         isSmooth = true
-        fitHeight = heroHeight
+        fitHeight = HERO_H
     }
     private val heroTitle = themed("", "d-title")
     private val heroMeta = themed("", "d-meta")
@@ -85,41 +95,34 @@ class DetailScreenView(private val item: MediaItem) {
     }
     private val facts = VBox(9.0)
 
+    private val episodeFilter = TextField().apply {
+        styleClass.add("field")
+        promptText = "Find episode by number or name…"
+        textProperty().addListener { _, _, _ ->
+            episodeLimit = EPISODE_PAGE
+            renderEpisodeGrid()
+        }
+    }
+    private val episodeGrid = TilePane(7.0, 7.0).apply {
+        prefColumns = 8
+        prefTileWidth = 56.0
+        prefTileHeight = 34.0
+        styleClass.add("ep-grid-inner")
+        minWidth = 0.0
+    }
+    private val episodeHint = themed("", "tiny").apply { isWrapText = true }
+    private val episodeMore = Ui.button("Show more episodes", ghost = true) {
+        episodeLimit += EPISODE_PAGE
+        renderEpisodeGrid()
+    }
+    private val episodeSection = VBox(Theme.S3)
+
     // ── watch panel ─────────────────────────────────────────────────────────
 
     private val panelSub = themed("", "watch-sub")
-    private val episodeTools = HBox(8.0).apply { alignment = Pos.CENTER_LEFT }
-    private val rangeBox = ComboBox<String>().apply {
-        styleClass.add("combo-box")
-        prefWidth = 168.0
-        minWidth = 130.0
-        isFocusTraversable = false
-    }
-    private val episodeFilter = TextField().apply {
-        styleClass.add("field")
-        promptText = "Find episode…"
-        HBox.setHgrow(this, Priority.ALWAYS)
-        textProperty().addListener { _, _, _ -> renderEpisodeGrid() }
-    }
-    private val episodeTiles = TilePane(7.0, 7.0).apply {
-        prefColumns = 6
-        prefTileWidth = 54.0
-        prefTileHeight = 34.0
-        styleClass.add("ep-grid-inner")
-    }
-    private val episodeScroll = ScrollPane(episodeTiles).apply {
-        prefHeight = 214.0
-        minHeight = 120.0
-        maxHeight = 214.0
-        isFitToWidth = true
-        styleClass.addAll("scroll-pane", "ep-grid")
-        vbarPolicy = ScrollPane.ScrollBarPolicy.AS_NEEDED
-        hbarPolicy = ScrollPane.ScrollBarPolicy.NEVER
-    }
-    private val nowPlaying = VBox(2.0,
-        themed("", "now-playing-title"),
-        themed("", "now-playing-sub"),
-    ).apply {
+    private val nowPlayingTitle = themed("", "now-playing-title")
+    private val nowPlayingSub = themed("", "now-playing-sub")
+    private val nowPlaying = VBox(2.0, nowPlayingTitle, nowPlayingSub).apply {
         styleClass.add("now-playing")
         isVisible = false
         isManaged = false
@@ -132,23 +135,26 @@ class DetailScreenView(private val item: MediaItem) {
         styleClass.add("scroll-pane")
         vbarPolicy = ScrollPane.ScrollBarPolicy.AS_NEEDED
         hbarPolicy = ScrollPane.ScrollBarPolicy.NEVER
+        minWidth = 0.0
+        minHeight = 0.0
+        maxWidth = Double.MAX_VALUE
     }
     private val watchPanel = VBox().apply {
         styleClass.add("watch")
         prefWidth = PANEL_W
         minWidth = PANEL_W
         maxWidth = PANEL_W
-        val head = VBox(2.0, themed("Watch", "watch-title"), panelSub).apply {
-            styleClass.add("watch-head")
-        }
+        minHeight = 0.0
+        maxHeight = Double.MAX_VALUE
+        val head = VBox(2.0, themed("Watch", "watch-title"), panelSub).apply { styleClass.add("watch-head") }
         val body = VBox(Theme.S3).apply {
             styleClass.add("watch-body")
+            minHeight = 0.0
+            maxHeight = Double.MAX_VALUE
             children.addAll(
-                episodeTools,
-                episodeScroll,
                 nowPlaying,
                 Ui.divider(),
-                HBox(10.0, sourcesHeader, sourcesCount).apply { alignment = Pos.CENTER_LEFT },
+                HBox(10.0, sourcesHeader, Ui.spacer(), sourcesCount).apply { alignment = Pos.CENTER_LEFT },
                 sourcesScroll,
             )
         }
@@ -157,23 +163,30 @@ class DetailScreenView(private val item: MediaItem) {
         children.addAll(head, body)
     }
 
-    val root: VBox = VBox(Theme.S4).apply {
+    val root: BorderPane = BorderPane().apply {
         padding = Insets(Theme.S4, Theme.S5, Theme.S5, Theme.S5)
     }
 
     init {
         root.sceneProperty().addListener { _, _, scene -> if (scene == null) scope.cancel() }
         buildHero()
-        val side = HBox(Theme.S5, Ui.vScroll(leftColumn, Insets(0.0, 6.0, 24.0, 0.0)), watchPanel).apply {
-            VBox.setVgrow(this, Priority.ALWAYS)
+        val left = Ui.vScroll(leftColumn, Insets(0.0, 6.0, 24.0, 0.0))
+        val side = HBox(Theme.S5, left, watchPanel).apply {
+            alignment = Pos.TOP_LEFT
+            minHeight = 0.0
         }
-        HBox.setHgrow(side.children[0], Priority.ALWAYS)
+        HBox.setHgrow(left, Priority.ALWAYS)
+        Ui.fill(leftColumn)
+        val content = VBox(Theme.S4, hero, side).apply { minHeight = 0.0 }
         VBox.setVgrow(side, Priority.ALWAYS)
-        root.children.addAll(hero, side)
+        Ui.fill(left)
+        Ui.fill(side)
+        Ui.fill(content)
+        root.center = content
         hero.isVisible = false
         hero.isManaged = false
         leftColumn.children.add(Ui.loadingRow("Loading details…"))
-        panelSub.text = "Loading sources…"
+        renderPanel()
         load()
     }
 
@@ -204,6 +217,7 @@ class DetailScreenView(private val item: MediaItem) {
                     renderEpisodeGrid()
                     updateNowPlaying()
                 }
+                renderPanel()
                 loadStreams()
             }
         }
@@ -236,7 +250,7 @@ class DetailScreenView(private val item: MediaItem) {
         // letterboxed instead of stretched.
         heroImage.isPreserveRatio = m.backdropUrl.isNullOrBlank()
         if (!url.isNullOrBlank()) {
-            desktop.img.ImageLoader.loadAsync(url, onReady = { img -> if (img != null) heroImage.image = img }, w = 1600, h = 620)
+            desktop.img.ImageLoader.loadAsync(url, onReady = { img -> if (img != null) heroImage.image = img }, w = 1600, h = 560)
         }
         synopsis.text = m.overview?.let { htmlToPlain(it) }?.takeIf { it.isNotBlank() }
             ?: "No synopsis available for this title."
@@ -263,22 +277,19 @@ class DetailScreenView(private val item: MediaItem) {
         facts.children.setAll(rows.map { (k, v) ->
             val value = themed(v, "label").apply {
                 isWrapText = true
-                maxWidth = 420.0
+                maxWidth = 620.0
             }
             HBox(12.0, themed(k, "tiny").apply { prefWidth = 82.0; minWidth = 82.0 }, value).apply {
                 alignment = Pos.TOP_LEFT
+                minWidth = 0.0
             }
         })
-        leftColumn.children.setAll(
-            Ui.panel(
-                Ui.sectionHeader("Synopsis"),
-                synopsis,
-            ),
-            Ui.panel(
-                Ui.sectionHeader("Details"),
-                facts,
-            ),
+        val panels = mutableListOf<Node>(
+            Ui.panel(Ui.sectionHeader("Synopsis"), synopsis),
+            Ui.panel(Ui.sectionHeader("Details"), facts),
         )
+        if (episodes.isNotEmpty()) panels.add(episodeSection)
+        leftColumn.children.setAll(panels)
     }
 
     private fun buildHero() {
@@ -290,15 +301,16 @@ class DetailScreenView(private val item: MediaItem) {
         clip.heightProperty().bind(hero.heightProperty())
         hero.clip = clip
         hero.styleClass.add("d-hero-wrap")
-        hero.prefHeight = heroHeight
-        hero.minHeight = heroHeight
-        hero.maxHeight = heroHeight
+        hero.prefHeight = HERO_H
+        hero.minHeight = HERO_H
+        hero.maxHeight = HERO_H
         heroImage.fitWidthProperty().bind(hero.widthProperty())
 
         val scrim = Region().apply {
             styleClass.add("d-scrim")
             maxWidth = Double.MAX_VALUE
             maxHeight = Double.MAX_VALUE
+            isMouseTransparent = true
         }
 
         val back = Ui.iconButton(Icons.CHEVRON_LEFT, "Back", 18.0) { AppShell.back() }.apply {
@@ -341,75 +353,70 @@ class DetailScreenView(private val item: MediaItem) {
 
     private fun renderEpisodes() {
         if (episodes.isEmpty()) {
-            episodeTools.isVisible = false
-            episodeTools.isManaged = false
-            episodeScroll.isVisible = false
-            episodeScroll.isManaged = false
-            panelSub.text = "Find a source for this title"
+            episodeSection.isVisible = false
+            episodeSection.isManaged = false
             return
         }
-        episodeTools.isVisible = true
-        episodeTools.isManaged = true
-        val pageSize = 60
-        rangeBox.items.clear()
-        val pages = (episodes.size + pageSize - 1) / pageSize
-        if (pages <= 1) {
-            rangeBox.items.add("All ${episodes.size} episodes")
-        } else {
-            for (p in 0 until pages) {
-                val from = p * pageSize + 1
-                val to = minOf(from + pageSize - 1, episodes.size)
-                rangeBox.items.add("$from–$to")
-            }
-        }
-        // Start on the page that holds the selected episode, so the highlight is visible.
-        val selIndex = episodes.indexOfFirst { it.id == selectedEpisode?.id }
-        rangeBox.value = rangeBox.items.getOrElse(if (selIndex >= 0) selIndex / pageSize else 0) { rangeBox.items.first() }
-        rangeBox.setOnAction { renderEpisodeGrid() }
-        episodeTools.children.setAll(rangeBox, episodeFilter)
+        episodeSection.isVisible = true
+        episodeSection.isManaged = true
+        episodeSection.children.setAll(
+            Ui.sectionHeader("Episodes", "${episodes.size} available — pick one to load its sources"),
+            episodeFilter,
+            episodeGrid,
+            episodeHint,
+            episodeMore,
+        )
         renderEpisodeGrid()
-        panelSub.text = "${episodes.size} episodes"
-    }
-
-    private fun pageRange(): Pair<Int, Int> {
-        val pageSize = 60
-        val label = rangeBox.value
-        if (label == null || label.startsWith("All")) return 0 to episodes.size
-        val from = label.substringBefore("–").trim().toIntOrNull()?.minus(1) ?: 0
-        return from.coerceIn(0, maxOf(0, episodes.size - 1)) to minOf(from + pageSize, episodes.size)
     }
 
     private fun renderEpisodeGrid() {
-        if (episodes.isEmpty()) return
+        if (episodes.isEmpty()) {
+            episodeGrid.children.setAll()
+            episodeHint.text = ""
+            return
+        }
         val needle = episodeFilter.text.trim().lowercase()
-        val (from, to) = pageRange()
-        val tiles = mutableListOf<Node>()
-        for (i in from until to) {
-            val ep = episodes.getOrNull(i) ?: continue
-            val matches = needle.isEmpty() ||
+        val matches = if (needle.isEmpty()) {
+            episodes.indices.toList()
+        } else {
+            episodes.indices.filter { i ->
+                val ep = episodes[i]
                 ep.number.toString().contains(needle) ||
-                ep.name?.lowercase()?.contains(needle) == true
-            if (!matches) continue
+                    (i + 1).toString() == needle ||
+                    ep.name?.lowercase()?.contains(needle) == true
+            }
+        }
+        val shown = matches.take(episodeLimit)
+        val tiles = shown.map { i ->
+            val ep = episodes[i]
             val text = ep.name?.takeIf { it.isNotBlank() }?.let { name ->
                 // Strip the show title so a tile reads "160" instead of 60 characters.
                 val trimmed = name.replace(meta.title, "").trim().trim('-', ':', '|', '·')
                 numOf(trimmed) ?: ep.number.toString()
             } ?: ep.number.toString()
-            val button = Button(text).apply {
+            Button(text).apply {
                 styleClass.add("ep-num")
-                prefWidth = 54.0
+                prefWidth = 56.0
                 prefHeight = 34.0
                 isFocusTraversable = false
                 if (ep.id == selectedEpisode?.id) styleClass.add("ep-num-sel")
-                Tooltip.install(this, Ui.tooltip(ep.name ?: "Episode ${ep.number}"))
                 setOnAction { selectEpisode(ep) }
             }
-            tiles.add(button)
         }
-        episodeTiles.children.setAll(tiles)
         if (tiles.isEmpty()) {
-            episodeTiles.children.setAll(themed("No episode matches “$needle”.", "tiny"))
+            episodeGrid.children.setAll(themed("No episode matches “${episodeFilter.text.trim()}”.", "tiny"))
+        } else {
+            episodeGrid.children.setAll(tiles)
         }
+        episodeHint.text = when {
+            needle.isNotEmpty() -> "${matches.size} episode(s) match “${episodeFilter.text.trim()}”."
+            episodes.size > shown.size -> "Showing the first ${shown.size} of ${episodes.size} episodes."
+            else -> ""
+        }
+        episodeHint.isVisible = episodeHint.text.isNotBlank()
+        episodeHint.isManaged = episodeHint.isVisible
+        episodeMore.isVisible = shown.size < matches.size
+        episodeMore.isManaged = episodeMore.isVisible
     }
 
     private fun numOf(text: String): String? = Regex("(\\d{1,4})").find(text)?.groupValues?.get(1)
@@ -422,14 +429,24 @@ class DetailScreenView(private val item: MediaItem) {
     }
 
     private fun updateNowPlaying() {
-        val ep = selectedEpisode ?: return
-        val parent = nowPlaying.children
-        if (parent.size >= 2) {
-            (parent[0] as Label).text = ep.name?.takeIf { it.isNotBlank() } ?: "Episode ${ep.number}"
-            (parent[1] as Label).text = meta.title
+        val ep = selectedEpisode
+        if (ep == null) {
+            nowPlaying.isVisible = false
+            nowPlaying.isManaged = false
+            return
         }
+        nowPlayingTitle.text = ep.name?.takeIf { it.isNotBlank() } ?: "Episode ${ep.number}"
+        nowPlayingSub.text = meta.title
         nowPlaying.isVisible = true
         nowPlaying.isManaged = true
+    }
+
+    private fun renderPanel() {
+        panelSub.text = when {
+            episodes.isNotEmpty() -> "${episodes.size} episodes · pick one, then a source"
+            streams.isNotEmpty() -> "${streams.size} source(s)"
+            else -> "Find a source for this title"
+        }
     }
 
     // ── sources ─────────────────────────────────────────────────────────────
@@ -444,7 +461,7 @@ class DetailScreenView(private val item: MediaItem) {
                     Fx.run {
                         sourcesBox.children.setAll(
                             themed("Stream lookup failed: ${t.message ?: t.javaClass.simpleName}", "tiny")
-                                .apply { styleClass.add("h-danger") }
+                                .apply { styleClass.add("h-danger"); isWrapText = true }
                         )
                     }
                     emptyList()
@@ -452,6 +469,7 @@ class DetailScreenView(private val item: MediaItem) {
             Fx.run {
                 streams = list
                 renderStreams()
+                renderPanel()
                 if (pendingPlay) {
                     pendingPlay = false
                     playFirst()
@@ -498,45 +516,78 @@ class DetailScreenView(private val item: MediaItem) {
         val qualityBadge = Ui.badge(quality.ifBlank { "SRC" }, if (quality.isNotBlank()) "badge-accent" else "badge")
         val qualityBox = VBox(qualityBadge).apply {
             alignment = Pos.CENTER
-            prefWidth = 58.0
-            minWidth = 58.0
+            prefWidth = 54.0
+            minWidth = 54.0
+            maxWidth = 54.0
         }
         val info = VBox(1.0,
-            themed(source.name, "src-name").apply { isWrapText = true; maxWidth = 210.0 },
-            themed(badges.ifBlank { source.url.take(70) }, "src-meta"),
-        ).apply { maxWidth = 220.0 }
+            themed(source.name, "src-name").apply {
+                isWrapText = true
+                textOverrun = javafx.scene.control.OverrunStyle.ELLIPSIS
+            },
+            themed(badges.ifBlank { source.url.take(80) }, "src-meta").apply {
+                isWrapText = true
+                textOverrun = javafx.scene.control.OverrunStyle.ELLIPSIS
+            },
+        ).apply { minWidth = 0.0 }
         HBox.setHgrow(info, Priority.ALWAYS)
 
-        val browser = Ui.iconButton(Icons.EXTERNAL, "Open in browser", 15.0) {
+        val browser = Ui.isolateClicks(Ui.iconButton(Icons.EXTERNAL, "Open in browser", 15.0) {
             desktop.fx.DesktopUi.open(source.url)
-        }.noRowClick()
-        val grab = Ui.iconButton(Icons.DOWNLOAD, "Download this source", 15.0) {
+        })
+        val grab = Ui.isolateClicks(Ui.iconButton(Icons.DOWNLOAD, "Download this source", 15.0) {
             download(source)
-        }.noRowClick().apply {
+        }).apply {
             isDisable = !downloadable(source)
-            if (isDisable) Tooltip.install(this, Ui.tooltip("This source can only be played in a browser"))
         }
         val play = Button().apply {
             styleClass.add("src-go")
             graphic = Icons.of(Icons.PLAY, 15.0)
             isFocusTraversable = false
-            addEventFilter(javafx.scene.input.MouseEvent.MOUSE_CLICKED) { it.consume() }
             setOnAction { play(source) }
         }
-        val row = HBox(11.0, qualityBox, info, grab, browser, play).apply {
+        val row = HBox(9.0, qualityBox, info, grab, browser, play).apply {
             styleClass.add("src-row")
             alignment = Pos.CENTER_LEFT
+            minWidth = 0.0
         }
         row.setOnMouseClicked { play(source) }
         return row
     }
 
-    /** Keeps a button inside a clickable row from also firing the row's own
-     *  handler — otherwise pressing Download would start playback too.
-     *  MOUSE_CLICKED isn't used by JavaFX's button behaviour (it fires on
-     *  release), so consuming it here only stops the bubble up to the row. */
-    private fun Button.noRowClick(): Button = apply {
-        addEventFilter(javafx.scene.input.MouseEvent.MOUSE_CLICKED) { it.consume() }
+    private fun qualityOf(source: StreamSource): String {
+        val name = source.name.lowercase()
+        Regex("(\\d{3,4}p)").find(name)?.let { return it.groupValues[1].uppercase() }
+        if (name.contains("4k") || name.contains("2160")) return "4K"
+        if (name.contains("1080")) return "1080p"
+        if (name.contains("720")) return "720p"
+        return ""
+    }
+
+    private fun playFirst() {
+        val first = streams.firstOrNull()
+        if (first != null) {
+            play(first)
+        } else {
+            pendingPlay = true
+            loadStreams()
+        }
+    }
+
+    /** The banner's Download button: queue the best downloadable source, waiting
+     *  for the source list when it hasn't arrived yet. */
+    private fun downloadFirst() {
+        val first = streams.firstOrNull { downloadable(it) }
+        if (first != null) {
+            download(first)
+            return
+        }
+        if (streams.isEmpty() && !pendingDownload) {
+            pendingDownload = true
+            loadStreams()
+            return
+        }
+        AppShell.toast("No downloadable source found for this title", "error")
     }
 
     /** True when a source is something the download engine can actually fetch:
@@ -590,41 +641,6 @@ class DetailScreenView(private val item: MediaItem) {
         )
     }
 
-    private fun qualityOf(source: StreamSource): String {
-        val name = source.name.lowercase()
-        Regex("(\\d{3,4}p)").find(name)?.let { return it.groupValues[1].uppercase() }
-        if (name.contains("4k") || name.contains("2160")) return "4K"
-        if (name.contains("1080")) return "1080p"
-        if (name.contains("720")) return "720p"
-        return ""
-    }
-
-    private fun playFirst() {
-        val first = streams.firstOrNull()
-        if (first != null) {
-            play(first)
-        } else {
-            pendingPlay = true
-            loadStreams()
-        }
-    }
-
-    /** The banner's Download button: queue the best downloadable source, waiting
-     *  for the source list when it hasn't arrived yet. */
-    private fun downloadFirst() {
-        val first = streams.firstOrNull { downloadable(it) }
-        if (first != null) {
-            download(first)
-            return
-        }
-        if (streams.isEmpty() && !pendingDownload) {
-            pendingDownload = true
-            loadStreams()
-            return
-        }
-        AppShell.toast("No downloadable source found for this title", "error")
-    }
-
     private fun play(source: StreamSource) {
         val ep = selectedEpisode
         runCatching {
@@ -670,5 +686,9 @@ class DetailScreenView(private val item: MediaItem) {
 
     private companion object {
         const val PANEL_W = 396.0
+        const val HERO_H = 248.0
+
+        /** Tiles rendered per "page" before the Show-more button appears. */
+        const val EPISODE_PAGE = 240
     }
 }
