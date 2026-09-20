@@ -7,6 +7,7 @@ import desktop.ui.Screen
 import desktop.ui.Theme
 import javafx.application.Application
 import javafx.scene.Scene
+import javafx.scene.image.Image
 import javafx.stage.Stage
 import javafx.stage.StageStyle
 
@@ -21,14 +22,18 @@ class HikariDesktopApp : Application() {
     override fun start(stage: Stage) {
         Fx.onStart()
         stage.title = "Hikari"
-        // Frameless window: the in-app WindowChrome draws the title bar and
-        // the minimize/maximize/close buttons, so they're always visible no
-        // matter what the OS/session provides.
+        // Frameless: the window chrome lives inside the app — AppShell's top bar
+        // carries the title, search and controls, and WindowChrome contributes the
+        // resize edges plus drag-to-maximise.
         stage.initStyle(StageStyle.UNDECORATED)
+        runCatching {
+            val icon = javaClass.getResourceAsStream("/hikari.png")
+            if (icon != null) stage.icons.add(Image(icon))
+        }
         val root = AppShell.create(stage)
         stage.scene = Theme.style(Scene(root, 1280.0, 780.0))
-        stage.minWidth = 960.0
-        stage.minHeight = 620.0
+        stage.minWidth = 1024.0
+        stage.minHeight = 660.0
         stage.show()
         AppShell.show(Screen.Home)
     }

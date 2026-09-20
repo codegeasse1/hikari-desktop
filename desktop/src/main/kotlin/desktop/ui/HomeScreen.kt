@@ -1,62 +1,87 @@
 package desktop.ui
 
 import com.hikari.app.data.CatalogRow
-import com.hikari.app.data.MediaItem
 import desktop.fx.Fx
-import javafx.geometry.Insets
 import javafx.geometry.Pos
-import javafx.scene.control.Button
 import javafx.scene.control.ComboBox
-import javafx.scene.control.Label
-import javafx.scene.control.ProgressBar
 import javafx.scene.control.ScrollPane
-import javafx.scene.control.Tooltip
 import javafx.scene.layout.HBox
-import javafx.scene.layout.Priority
+import javafx.scene.layout.Region
 import javafx.scene.layout.VBox
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
+/**
+ * Home: every enabled provider's catalogs as poster rails.
+ *
+ * Rows render the moment each catalog lands, so the page fills in progressively
+ * instead of waiting on the slowest addon, and a failing catalog is skipped
+ * rather than becoming fatal.
+ */
 class HomeScreenView {
 
-    val root: VBox = VBox(12.0).apply {
-        padding = Insets(18.0, 22.0, 18.0, 22.0)
-    }
-
+    private val rowsBox = VBox(Theme.S5)
     private val providerBox = ComboBox<String>()
-    private val rowsBox = VBox(22.0)
-    private val loading = ProgressBar(-1.0)
-    private val errorLabel = Theme.label("", dim = true)
     private val statusLabel = Theme.label("", size = 12.5, dim = true)
-    private val logsLabel = Theme.label("", size = 11.0, dim = true).apply {
-        style = "-fx-font-family: 'Consolas', monospace;"
+    private val errorLabel = Theme.label("", size = 12.5).apply {
+        styleClass.add("h-danger")
         isWrapText = true
     }
-    private val logsScroll = ScrollPane(logsLabel).apply { prefHeight = 240.0; isFitToWidth = true }
-    private val logsBtn = Button("Logs").apply {
-        styleClass.add("btn"); isFocusTraversable = false
+    private val logsLabel = Theme.label("", size = 11.5, dim = true).apply {
+        styleClass.add("h-mono")
+        isWrapText = true
     }
+    private val logsScroll = ScrollPane(logsLabel).apply {
+        prefHeight = 260.0
+        isFitToWidth = true
+        styleClass.add("scroll-pane")
+    }
+    private val logsBtn = Ui.button("Logs", icon = Icons.LIST, ghost = true) { toggleLogs() }
+    private val refreshBtn = Ui.button("Refresh", icon = Icons.REFRESH, primary = true) { load(force = true) }
+    private val content = VBox(Theme.S4)
+    val root: ScrollPane = Ui.vScroll(content)
 
     private var loadJob: Job? = null
+    private var gen = 0
+    private var logsOpen = false
 
     init {
-        root.children.addAll(header(), loading, statusLabel, errorLabel, ScrollPane(rowsBox).apply {
-            VBox.setVgrow(this, Priority.ALWAYS)
-            isFitToWidth = true
-            styleClass.add("scroll-pane")
-        }, logsScroll)
-        logsScroll.isVisible = false
-        logsBtn.setOnAction {
-            logsScroll.isVisible = !logsScroll.isVisible
-            if (logsScroll.isVisible) refreshLogs()
+        providerBox.run {
+            styleClass.add("combo-box")
+            minWidth = 220.0
+            setOnAction { load(force = true) }
         }
-        refreshLogsButton()
+        logsScroll.isVisible = false
+        logsScroll.isManaged = false
+        content.children.addAll(
+            Ui.sectionHeader(
+                "Browse",
+                "Catalogs from every enabled source",
+                HBox(8.0, providerBox, refreshBtn, logsBtn).apply { alignment = Pos.CENTER_RIGHT },
+            ),
+            statusLabel,
+            errorLabel,
+            rowsBox,
+            logsScroll,
+        )
+    }
+
+    fun onShown() {
+        load()
+    }
+
+    private fun toggleLogs() {
+        logsOpen = !logsOpen
+        logsScroll.isVisible = logsOpen
+        logsScroll.isManaged = logsOpen
+        if (logsOpen) refreshLogs()
     }
 
     private fun refreshLogsButton() {
-        val newLines = com.hikari.app.util.LiveLogs.recentText()
-        logsBtn.text = "Logs (${newLines.count { it == '\n' } + 1})"
+        val text = com.hikari.app.util.LiveLogs.recentText()
+        val lines = text.count { it == '\n' } + 1
+        logsBtn.text = if (text.isBlank()) "Logs" else "Logs ($lines)"
     }
 
     private fun refreshLogs() {
@@ -66,28 +91,6 @@ class HomeScreenView {
         logsScroll.vvalue = 1.0
     }
 
-    private fun header(): HBox {
-        val title = Theme.label("Browse", size = 26.0, bold = true).apply {
-            cursor = javafx.scene.Cursor.HAND
-            Tooltip.install(this, Tooltip("Click to reload"))
-            setOnMouseClicked { load(force = true) }
-        }
-        providerBox.run {
-            minWidth = 220.0
-            setOnAction { load(force = true) }
-        }
-        val refresh = Button("Refresh").apply { styleClass.add("btn"); setOnAction { load(force = true) } }
-        return HBox(14.0, title, providerBox, refresh, logsBtn).apply {
-            alignment = Pos.CENTER_LEFT
-        }
-    }
-
-    fun onShown() {
-        load()
-    }
-
-    private var gen = 0
-
     fun load(force: Boolean = false) {
         loadJob?.cancel()
         val selected = providerBox.value ?: ""
@@ -95,10 +98,9 @@ class HomeScreenView {
         loadJob = AppShell.uiScope.launch {
             try {
                 Fx.run {
-                    loading.isVisible = true
                     errorLabel.text = ""
                     statusLabel.text = "Loading…"
-                    rowsBox.children.clear()
+                    rowsBox.children.setAll(Ui.skeletonRail(), Ui.skeletonRail())
                 }
                 // The startup provider refresh runs in the background — wait for
                 // it to finish once, so the first screen reflects real state.
@@ -130,24 +132,23 @@ class HomeScreenView {
                     val cfg = enabled.firstOrNull { it.name == c }
                     c to cfg?.id?.takeIf { c != "All providers" }
                 }
-                // Rows render the moment each catalog lands, so Home fills in
-                // progressively and "All providers" never sits on a spinner
-                // waiting for the slowest addon. One bad row is skipped, never
-                // fatal.
+                val firstRow = booleanArrayOf(false)
                 val rows = AppShell.app.repository.homeRows(filterId, force = force) { row ->
                     Fx.run {
-                        if (myGen == gen) runCatching { rowsBox.children.add(buildRow(row)) }
+                        if (myGen == gen) {
+                            if (!firstRow[0]) {
+                                firstRow[0] = true
+                                rowsBox.children.clear()
+                            }
+                            runCatching { rowsBox.children.add(buildRow(row)) }
+                        }
                     }
                 }
-                Fx.run {
-                    loading.isVisible = false
-                    render(rows, filterId, chosen)
-                }
+                Fx.run { render(rows, filterId, chosen) }
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (t: Throwable) {
                 Fx.run {
-                    loading.isVisible = false
                     statusLabel.text = ""
                     errorLabel.text = "Failed to load home rows: ${t.message}"
                 }
@@ -160,75 +161,58 @@ class HomeScreenView {
         val statuses = AppShell.app.providers.statuses.value
         val failed = statuses.filter { !it.loaded }
         val enabledCount = statuses.size
-        if (enabledCount == 0) {
-            errorLabel.text = ""
-            statusLabel.text = "No providers installed or enabled yet. Open the Extensions tab to add one — or add a Stremio addon."
-        } else if (failed.isNotEmpty()) {
-            errorLabel.text = ""
-            statusLabel.text = buildString {
-                append("${enabledCount} provider(s) enabled, ${statuses.count { it.loaded }} loaded, ${failed.size} failed to start: ")
-                append(failed.joinToString(" | ") { "${it.name}: ${it.error ?: "unknown error"}" })
+        when {
+            enabledCount == 0 -> {
+                errorLabel.text = ""
+                rowsBox.children.setAll(
+                    Ui.emptyState(
+                        Icons.EXTENSIONS,
+                        "No sources yet",
+                        "Add a Stremio addon, paste a universal scraper, or install a CloudStream repo from the Extensions screen.",
+                        Ui.button("Open Extensions", icon = Icons.EXTENSIONS, primary = true) {
+                            AppShell.show(Screen.Extensions)
+                        },
+                    )
+                )
             }
-        } else if (rows.isEmpty()) {
-            errorLabel.text = ""
-            val who = chosen?.takeIf { it != "All providers" }
-                ?: statuses.firstOrNull { it.id == filterId }?.name
-            statusLabel.text = (if (who != null) "'$who' returned no catalog rows" else "No catalog rows loaded") +
-                " — see the logs below for the real reason."
-            logsScroll.isVisible = true
-            refreshLogs()
-        } else {
-            errorLabel.text = ""
+
+            failed.isNotEmpty() -> {
+                errorLabel.text = ""
+                statusLabel.text = buildString {
+                    append("${enabledCount} provider(s) enabled, ${statuses.count { it.loaded }} loaded, ${failed.size} failed to start: ")
+                    append(failed.joinToString("  ·  ") { "${it.name}: ${it.error ?: "unknown error"}" })
+                }
+                if (rows.isEmpty()) fallback("Nothing loaded from the enabled sources.")
+            }
+
+            rows.isEmpty() -> {
+                errorLabel.text = ""
+                val who = chosen?.takeIf { it != "All providers" } ?: statuses.firstOrNull { it.id == filterId }?.name
+                statusLabel.text = (if (who != null) "'$who' returned no catalog rows" else "No catalog rows loaded") +
+                    " — open the logs for the real reason."
+                fallback("No catalog rows loaded.")
+            }
+
+            else -> {
+                errorLabel.text = ""
+                statusLabel.text = "${rows.size} row(s) from ${statuses.count { it.loaded }} loaded source(s)"
+            }
         }
         refreshLogsButton()
-        if (rows.isEmpty() && rowsBox.children.isEmpty()) {
-            rowsBox.children.add(Theme.label("Nothing loaded yet — add extensions or a Stremio addon.", dim = true))
-        }
     }
 
-    private fun buildRow(row: CatalogRow): VBox {
-        val head = HBox(10.0).apply {
-            children.addAll(
-                Theme.label(row.title, size = 17.0, bold = true),
-                Theme.label(row.providerName, size = 12.5, dim = true),
-            )
-            alignment = Pos.BASELINE_LEFT
-        }
-        val cardRow = HBox(14.0).apply { alignment = Pos.CENTER_LEFT }
-        row.items.forEach { item ->
-            cardRow.children.add(posterCard(item) {
-                AppShell.openDetail(item)
-            })
-        }
-        val scroller = ScrollPane(cardRow).apply {
-            isFitToHeight = true
-            hbarPolicy = ScrollPane.ScrollBarPolicy.AS_NEEDED
-            vbarPolicy = ScrollPane.ScrollBarPolicy.NEVER
-            styleClass.add("scroll-pane")
-        }
-        return VBox(10.0, head, scroller)
+    private fun fallback(message: String) {
+        if (rowsBox.children.isNotEmpty()) return
+        rowsBox.children.setAll(
+            Ui.emptyState(Icons.INFO, message, "Check the logs for the underlying error, then try Refresh.")
+        )
+        if (!logsOpen) toggleLogs()
     }
-}
 
-fun posterCard(media: MediaItem, onClick: () -> Unit): VBox {
-    val img = javafx.scene.image.ImageView().apply {
-        fitWidth = 180.0
-        fitHeight = 246.0
-        isPreserveRatio = true
-        styleClass.add("poster-img")
-    }
-    desktop.img.ImageLoader.loadAsync(media.posterUrl, onReady = { fx -> img.image = fx }, w = 360, h = 492)
-    val title = Label(media.title).apply {
-        styleClass.add("poster-title")
-        isWrapText = true
-        maxWidth = 180.0
-        prefWidth = 180.0
-        minHeight = 36.0
-    }
-    val box = VBox(8.0, img, title).apply {
-        cursor = javafx.scene.Cursor.HAND
-        Tooltip.install(this, Tooltip(media.title))
-        onMouseClicked = { onClick() }
-    }
-    return box
+    private fun buildRow(row: CatalogRow): Region = PosterRail.of(
+        title = row.title,
+        subtitle = row.providerName,
+        items = row.items,
+        onOpen = { AppShell.openDetail(it) },
+    )
 }

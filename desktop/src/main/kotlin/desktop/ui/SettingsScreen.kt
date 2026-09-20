@@ -2,138 +2,198 @@ package desktop.ui
 
 import com.hikari.app.HikariApp
 import com.hikari.app.net.Updater
+import com.hikari.app.ui.theme.HikariThemeMode
 import desktop.fx.Fx
-import javafx.geometry.Insets
 import javafx.geometry.Pos
-import javafx.scene.control.Button
 import javafx.scene.control.CheckBox
-import javafx.scene.control.Label
 import javafx.scene.control.ScrollPane
-import javafx.scene.control.TextField
 import javafx.scene.layout.HBox
+import javafx.scene.layout.Region
+import javafx.scene.layout.StackPane
 import javafx.scene.layout.VBox
+import javafx.scene.shape.Circle
 import kotlinx.coroutines.launch
 
+/**
+ * Settings: appearance, browser identity, updates, and data.
+ *
+ * The appearance section drives [Theme] directly, so switching mode or accent
+ * re-skins the live window with no restart.
+ */
 class SettingsScreenView {
 
-    private val content = VBox(16.0).apply {
-        padding = Insets(18.0, 22.0, 18.0, 22.0)
-    }
-    val root: ScrollPane = ScrollPane(content).apply {
-        isFitToWidth = true
-        styleClass.add("scroll-pane")
-    }
+    private val body = VBox(Theme.S5)
+    val root: ScrollPane = Ui.vScroll(body)
 
     private val app = HikariApp.instance
 
-    fun onShown() {}
+    fun onShown() {
+        val children = mutableListOf<Region>(
+            appearanceSection(),
+            browserSection(),
+            updatesSection(),
+            dataSection(),
+            aboutSection(),
+        )
+        crashSection()?.let { children.add(1, it) }
+        body.children.setAll(children)
+    }
 
-    init {
-        val title = Theme.label("Settings", size = 26.0, bold = true)
-        content.children.addAll(
-            title,
-            crashBanner(),
-            themeRow(),
-            uaRow(),
-            updateRow(),
-            historyRow(),
-            resetRow(),
-            aboutRow(),
+    private fun crashSection(): Region? {
+        val crash = HikariApp.lastCrash ?: return null
+        return Ui.panel(
+            Ui.sectionHeader("Last crash", "Recorded from the previous session"),
+            Theme.label(crash, size = 11.5).apply {
+                styleClass.add("h-mono")
+                isWrapText = true
+            },
         )
     }
 
-    private fun crashBanner(): Label? {
-        val crash = HikariApp.lastCrash ?: return null
-        val l = Theme.label("A previous crash was recorded:\n$crash", size = 12.0, dim = true)
-        l.isWrapText = true
-        l.style = l.style + "; -fx-text-fill: #ff9a9a;"
-        return l
-    }
-
-    private fun themeRow(): HBox {
-        val dark = CheckBox("Dark theme")
-        dark.isSelected = app.store.theme() != "light"
-        dark.setOnAction {
-            app.store.setTheme(if (dark.isSelected) "dark" else "light")
+    private fun appearanceSection(): Region {
+        val modeRow = HBox(Theme.S2).apply {
+            alignment = Pos.CENTER_LEFT
+            children.addAll(
+                modeButton("Dark", HikariThemeMode.DARK),
+                modeButton("Light", HikariThemeMode.LIGHT),
+            )
         }
-        return HBox(12.0, dark).apply { alignment = Pos.CENTER_LEFT; styleClass.add("list-row") }
+
+        val swatches = HBox(Theme.S2).apply { alignment = Pos.CENTER_LEFT }
+        ACCENT_SWATCHES.forEach { (key, hex) ->
+            val dot = Circle(8.0).apply { style = "-fx-fill: $hex;" }
+            val ring = StackPane(dot).apply {
+                styleClass.add("accent-swatch")
+                if (Theme.accent == key) styleClass.add("accent-swatch-selected")
+                prefWidth = 34.0
+                prefHeight = 34.0
+                minWidth = 34.0
+                minHeight = 34.0
+                maxWidth = 34.0
+                maxHeight = 34.0
+                cursor = javafx.scene.Cursor.HAND
+                setOnMouseClicked {
+                    Theme.setAccent(key)
+                    onShown()
+                }
+                javafx.scene.control.Tooltip.install(this, Ui.tooltip(key.replaceFirstChar { it.uppercase() }))
+            }
+            swatches.children.add(ring)
+        }
+
+        return Ui.panel(
+            Ui.sectionHeader("Appearance", "Applies instantly across the whole app"),
+            labelled("Theme", modeRow),
+            labelled("Accent", swatches),
+        )
     }
 
-    private fun uaRow(): VBox {
-        val useDefault = CheckBox("Use default desktop UA in the embedded browser")
-        useDefault.isSelected = app.store.webviewUseDefaultUa()
-        val custom = TextField().apply {
-            styleClass.add("field")
-            promptText = "Custom user agent (optional)"
-            prefWidth = 420.0
+    private fun modeButton(text: String, mode: HikariThemeMode): Region =
+        Ui.chip(text, Theme.mode == mode) {
+            Theme.setMode(mode)
+            onShown()
+        }
+
+    private fun labelled(text: String, control: Region): Region = HBox(Theme.S4,
+        Theme.label(text, size = 13.0).apply { minWidth = 90.0; styleClass.add("h-dim") },
+        control,
+    ).apply { alignment = Pos.CENTER_LEFT }
+
+    private fun browserSection(): Region {
+        val useDefault = CheckBox("Use the default desktop user agent in the embedded browser").apply {
+            isSelected = app.store.webviewUseDefaultUa()
+        }
+        val custom = Ui.field("Custom user agent (optional)", width = 460.0).apply {
             text = app.store.webviewCustomUa()
         }
-        useDefault.setOnAction {
+        fun save() {
             app.store.setWebViewUa(useDefault.isSelected, custom.text.trim())
+            app.webViewUseDefaultUa = useDefault.isSelected
+            app.webViewCustomUa = custom.text.trim().ifBlank { null }
+            AppShell.toast("Browser settings saved", "ok")
         }
-        custom.setOnAction {
-            app.store.setWebViewUa(useDefault.isSelected, custom.text.trim())
-        }
-        val save = Button("Save").apply {
-            styleClass.add("btn")
-            setOnAction {
-                app.store.setWebViewUa(useDefault.isSelected, custom.text.trim())
-                app.webViewUseDefaultUa = useDefault.isSelected
-                app.webViewCustomUa = custom.text.trim().ifBlank { null }
-            }
-        }
-        val box = VBox(8.0, useDefault, HBox(10.0, custom, save))
-        box.styleClass.add("list-row")
-        return box
+        useDefault.setOnAction { save() }
+        custom.setOnAction { save() }
+
+        return Ui.panel(
+            Ui.sectionHeader("Browser", "Some sources only return playable links for a desktop browser"),
+            useDefault,
+            HBox(Theme.S2, custom, Ui.button("Save", primary = true) { save() }).apply { alignment = Pos.CENTER_LEFT },
+        )
     }
 
-    private fun updateRow(): HBox {
-        val status = Theme.label("", size = 12.5, dim = true)
-        val check = Button("Check for updates").apply {
-            styleClass.add("btn")
-            setOnAction {
-                status.text = "Checking…"
-                AppShell.uiScope.launch {
-                    val info = runCatching { Updater.checkForUpdate() }.getOrNull()
-                    Fx.run {
-                        if (info == null) status.text = "Could not reach the update server."
-                        else if (!info.available) status.text = "You're on the latest build (${info.current})."
-                        else status.text = "Update available: ${info.latest} → open the GitHub release page."
+    private fun updatesSection(): Region {
+        val status = Theme.label("", size = 12.5, dim = true).apply { isWrapText = true }
+        val check = Ui.button("Check for updates", icon = Icons.REFRESH, ghost = true) {
+            status.text = "Checking…"
+            AppShell.uiScope.launch {
+                val info = runCatching { Updater.checkForUpdate() }.getOrNull()
+                Fx.run {
+                    status.text = when {
+                        info == null -> "Could not reach the update server."
+                        !info.available -> "You're on the latest build (${info.current})."
+                        else -> "Update available: ${info.latest} — grab it from the GitHub release page."
                     }
                 }
             }
         }
-        return HBox(12.0, check, status).apply { alignment = Pos.CENTER_LEFT; styleClass.add("list-row") }
+        return Ui.panel(
+            Ui.sectionHeader("Updates", "Hikari Desktop v${desktop.Build.VERSION} (${desktop.Build.DATE})"),
+            HBox(Theme.S3, check, status).apply { alignment = Pos.CENTER_LEFT },
+        )
     }
 
-    private fun historyRow(): HBox {
-        val clear = Button("Clear watch history").apply {
-            styleClass.addAll("btn", "btn-danger")
-            setOnAction {
-                app.store.clearHistory()
-            }
+    private fun dataSection(): Region {
+        val clearHistory = Ui.button("Clear watch history", icon = Icons.TRASH, ghost = true) {
+            app.store.clearHistory()
+            AppShell.toast("Watch history cleared", "ok")
         }
-        return HBox(12.0, clear).apply { alignment = Pos.CENTER_LEFT; styleClass.add("list-row") }
-    }
-
-    private fun resetRow(): HBox {
-        val status = Theme.label("", size = 12.5, dim = true)
-        val reset = Button("Reset all data (providers, repos, extensions)").apply {
-            styleClass.addAll("btn", "btn-danger")
-            setOnAction {
-                app.store.reset()
-                AppShell.uiScope.launch { app.providers.refresh() }
-                status.text = "Cleared. Default providers (YTS Hikari + YTS Stremio) are re-added on next launch."
-            }
+        val openFolder = Ui.button("Open data folder", icon = Icons.FOLDER, ghost = true) {
+            val dir = app.filesDir
+            val ok = runCatching { java.awt.Desktop.getDesktop().open(dir) }.isSuccess
+            if (!ok) AppShell.toast("Data folder: ${dir.absolutePath}", "error")
         }
-        return HBox(12.0, reset, status).apply { alignment = Pos.CENTER_LEFT; styleClass.add("list-row") }
-    }
-
-    private fun aboutRow(): Label =
-        Theme.label(
-            "Hikari Desktop · v${desktop.Build.VERSION} (${desktop.Build.DATE}) · built from the Hikari streaming stack (Stremio addons, universal scrapers, CloudStream .cs3 plugins, Hikari extensions). " +
-                "Data lives in ${app.filesDir.absolutePath}.",
-            size = 12.0,
+        val reset = Ui.button("Reset all data", icon = Icons.WARNING, danger = true) {
+            app.store.reset()
+            AppShell.uiScope.launch { app.providers.refresh() }
+            AppShell.toast("Cleared. Default providers are re-added on next launch.")
+            onShown()
+        }
+        val note = Theme.label(
+            "Resetting removes providers, repositories, installed extensions and history from this machine.",
+            size = 11.5,
             dim = true,
         ).apply { isWrapText = true }
+
+        return Ui.panel(
+            Ui.sectionHeader("Data", "Everything is stored locally in the app data folder"),
+            HBox(Theme.S2, clearHistory, openFolder, reset).apply { alignment = Pos.CENTER_LEFT },
+            note,
+        )
+    }
+
+    private fun aboutSection(): Region = Ui.panel(
+        Ui.sectionHeader("About"),
+        Theme.label(
+            "Hikari Desktop — one player for every ecosystem: Stremio addons, universal scrapers, " +
+                "CloudStream .cs3 plugins and Hikari extensions.",
+            size = 12.5,
+            dim = true,
+        ).apply { isWrapText = true },
+        Theme.label(app.filesDir.absolutePath, size = 11.0, dim = true).apply {
+            styleClass.add("h-mono")
+            isWrapText = true
+        },
+    )
+
+    private companion object {
+        val ACCENT_SWATCHES = listOf(
+            "violet" to "#a970ff",
+            "blue" to "#4d8dff",
+            "cyan" to "#2fd4e0",
+            "emerald" to "#34d399",
+            "amber" to "#f5a524",
+            "rose" to "#ff5d8f",
+        )
+    }
 }

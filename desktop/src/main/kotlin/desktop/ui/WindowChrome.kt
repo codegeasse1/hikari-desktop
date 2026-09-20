@@ -3,8 +3,6 @@ package desktop.ui
 import javafx.geometry.Pos
 import javafx.scene.Cursor
 import javafx.scene.control.Button
-import javafx.scene.control.Label
-import javafx.scene.layout.BorderPane
 import javafx.scene.layout.HBox
 import javafx.scene.layout.Region
 import javafx.scene.layout.StackPane
@@ -12,9 +10,12 @@ import javafx.stage.Screen
 import javafx.stage.Stage
 
 /**
- * Custom window chrome for the frameless (UNDECORATED) stage: a draggable title
- * bar with minimize/maximize/close buttons plus invisible resize edges, so the
- * window always has standard OS-style controls regardless of environment.
+ * Window chrome for the frameless (UNDECORATED) stage.
+ *
+ * The title bar itself lives in [AppShell]'s top bar so it can also carry the
+ * screen title, search and theme toggle; this class contributes the invisible
+ * resize edges around the window plus the standard minimise / restore / close
+ * controls ([controls]) and the drag-to-maximise behaviour.
  */
 class WindowChrome(private val stage: Stage) {
 
@@ -24,59 +25,59 @@ class WindowChrome(private val stage: Stage) {
     private var restoreY = 0.0
     private var restoreW = 0.0
     private var restoreH = 0.0
-    private var dragOffX = 0.0
-    private var dragOffY = 0.0
 
-    private val maxBtn = Button("□").apply {
-        styleClass.addAll("win-btn", "win-btn-max")
-        onAction = { toggleMaximize() }
+    private val maximizeButton = Ui.iconButton(Icons.MAXIMIZE, "Maximise", size = 13.0) { toggleMaximize() }
+
+    /** The minimise / maximise / close cluster for the window's top bar. */
+    fun controls(): HBox {
+        val minimize = Ui.iconButton(Icons.MINIMIZE, "Minimise", size = 13.0) { stage.isIconified = true }
+        val close = Ui.iconButton(Icons.CLOSE, "Close", size = 13.0) { stage.close() }
+        minimize.styleClass.add("win-btn")
+        maximizeButton.styleClass.add("win-btn")
+        close.styleClass.addAll("win-btn", "win-btn-close")
+        return HBox(minimize, maximizeButton, close).apply {
+            alignment = Pos.CENTER_RIGHT
+            spacing = 0.0
+            styleClass.add("win-controls")
+        }
     }
 
     fun build(body: Region): Region {
-        val title = Label("Hikari").apply { styleClass.add("win-title") }
-        val minBtn = Button("—").apply {
-            styleClass.addAll("win-btn", "win-btn-min")
-            onAction = { stage.isIconified = true }
-        }
-        val closeBtn = Button("✕").apply {
-            styleClass.addAll("win-btn", "win-btn-close")
-            onAction = { stage.close() }
-        }
-        val controls = HBox(minBtn, maxBtn, closeBtn).apply {
-            alignment = Pos.CENTER_RIGHT
-            spacing = 0.0
-        }
-        val titleBar = BorderPane().apply {
-            styleClass.add("win-titlebar")
-            left = title
-            right = controls
-            setOnMousePressed { e ->
-                if (!maximized) {
-                    dragOffX = e.screenX - stage.x
-                    dragOffY = e.screenY - stage.y
-                }
-            }
-            setOnMouseDragged { e ->
-                if (!maximized) {
-                    stage.x = e.screenX - dragOffX
-                    stage.y = e.screenY - dragOffY
-                }
-            }
-            setOnMouseClicked { e ->
-                if (e.clickCount == 2) toggleMaximize()
-            }
-        }
-
-        val chrome = BorderPane().apply {
-            top = titleBar
-            center = body
-        }
-        root.children.add(chrome)
+        val chrome = StackPane(body)
+        root.children.setAll(chrome)
         addResizeEdges()
         return root
     }
 
-    private fun toggleMaximize() {
+    /**
+     * Lets [node] act as the title bar: drag to move the window, double-click to
+     * maximise. Attach this to the title area only — never over buttons, which
+     * would swallow the drag.
+     */
+    fun makeDraggable(node: javafx.scene.Node) {
+        var offX = 0.0
+        var offY = 0.0
+        node.setOnMousePressed { e ->
+            if (!maximized) {
+                offX = e.screenX - stage.x
+                offY = e.screenY - stage.y
+            }
+        }
+        node.setOnMouseDragged { e ->
+            if (!maximized) {
+                stage.x = e.screenX - offX
+                stage.y = e.screenY - offY
+            }
+        }
+        node.setOnMouseClicked { e ->
+            if (e.clickCount == 2) toggleMaximize()
+        }
+    }
+
+    /** True while the window is maximised; the top bar uses this to disable dragging. */
+    fun isMaximized(): Boolean = maximized
+
+    fun toggleMaximize() {
         if (maximized) {
             stage.x = restoreX
             stage.y = restoreY
@@ -88,18 +89,19 @@ class WindowChrome(private val stage: Stage) {
             restoreY = stage.y
             restoreW = stage.width
             restoreH = stage.height
-            val vb = Screen.getPrimary().visualBounds
-            stage.x = vb.minX
-            stage.y = vb.minY
-            stage.width = vb.width
-            stage.height = vb.height
+            val bounds = Screen.getPrimary().visualBounds
+            stage.x = bounds.minX
+            stage.y = bounds.minY
+            stage.width = bounds.width
+            stage.height = bounds.height
             maximized = true
         }
-        maxBtn.text = if (maximized) "❐" else "□"
+        maximizeButton.graphic = Icons.of(if (maximized) Icons.RESTORE else Icons.MAXIMIZE, 13.0)
     }
 
     /** Edge bitmask: 1=W, 2=E, 4=N, 8=S. Corners combine two. */
     private fun resizeEdge(edge: Int): Region {
+        val thickness = 5.0
         val r = Region().apply {
             cursor = when (edge) {
                 1 -> Cursor.W_RESIZE
@@ -114,24 +116,24 @@ class WindowChrome(private val stage: Stage) {
             }
             when {
                 edge == 4 || edge == 8 -> {
-                    prefHeight = 6.0
-                    minHeight = 6.0
-                    maxHeight = 6.0
+                    prefHeight = thickness
+                    minHeight = thickness
+                    maxHeight = thickness
                     maxWidth = Double.MAX_VALUE
                 }
                 edge == 1 || edge == 2 -> {
-                    prefWidth = 6.0
-                    minWidth = 6.0
-                    maxWidth = 6.0
+                    prefWidth = thickness
+                    minWidth = thickness
+                    maxWidth = thickness
                     maxHeight = Double.MAX_VALUE
                 }
                 else -> {
-                    prefWidth = 6.0
-                    prefHeight = 6.0
-                    minWidth = 6.0
-                    minHeight = 6.0
-                    maxWidth = 6.0
-                    maxHeight = 6.0
+                    prefWidth = thickness
+                    prefHeight = thickness
+                    minWidth = thickness
+                    minHeight = thickness
+                    maxWidth = thickness
+                    maxHeight = thickness
                 }
             }
             var ox = 0.0
@@ -161,16 +163,12 @@ class WindowChrome(private val stage: Stage) {
                     nw = ww - dx
                     nx = wx + dx
                 }
-                if ((edge and 2) != 0) {
-                    nw = ww + dx
-                }
+                if ((edge and 2) != 0) nw = ww + dx
                 if ((edge and 4) != 0) {
                     nh = wh - dy
                     ny = wy + dy
                 }
-                if ((edge and 8) != 0) {
-                    nh = wh + dy
-                }
+                if ((edge and 8) != 0) nh = wh + dy
                 val minW = stage.minWidth
                 val minH = stage.minHeight
                 if (nw < minW) {
