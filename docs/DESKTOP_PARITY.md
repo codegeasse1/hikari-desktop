@@ -12,7 +12,7 @@ bundled mpv + dex2jar for `.cs3`/`.hiki`**.
 CloudStream `.cs3` on the JVM (dex2jar + `shim/android/**`), Hikari `.hiki`, Stremio
 addons, universal scrapers, **SkyStream `.sky`**, **Nuvio providers**,
 **Aniyomi `.apk` extensions**, **IPTV m3u/m3u8 playlists**, mpv playback with
-`HlsRelay`/`LocalProxy`, the **IPC-driven in-app player window**, the
+`HlsRelay`/`LocalProxy`, the **IPC-driven player transport dialog**, the
 design system and every main screen, `AppStore` persistence, the updater, the ad
 blocker, the WebView fallback resolver, and the download queue with its HLS/MP4
 engine.
@@ -132,33 +132,23 @@ elsewhere) and driven over its JSON IPC:
 - `desktop/player/MpvIpc.kt` — the client: `command`/`post`/`setProperty`/
   `getProperty`/`observe_property`, with one reader thread fanning property
   changes and events out to callbacks.
-- `desktop/player/PlayerWindow.kt` — the app's own player **layer** (mounted into
-  `AppShell.playerHost`, so it covers the app window instead of opening one),
-  laid out like the Android app's player: a loading overlay that stays up until
-  mpv reports the file loaded, header badges (elapsed time, quality, server),
-  favourite / download / always-on-top / lock actions, a scrubbable timeline with
-  real time labels, the transport (±10s, play/pause, previous/next episode,
-  volume), and the labelled feature buttons — Speed, **Source** (switch servers
-  mid-playback), Quality, Audio, Subtitles, Rotate, Skip Intro, Enhance,
-  Fullscreen — plus the file's actual tracks by name and language, what the
-  stream really is (format) and why it failed, and keyboard control (space,
-  ←/→, ↑/↓, F, L, N/P, Esc).
-- **The video renders INSIDE that layer.** mpv is handed a borderless surface
-  window the app owns as its `--wid` (`desktop/player/WinShell.kt`, the only raw
-  Win32 in the app, reached through JNA); mpv creates its video as a child of it,
-  so the plain second window mpv used to open — the "old player" — no longer
-  exists. The surface is glued to the video area on move/resize/maximise/fullscreen
-  and mpv's child window is re-sized to fill it, so maximising or dragging the app
-  keeps the video lined up. It is hidden (not closed) while the loading overlay or
-  an explanation is up, because it is a native window that would otherwise cover
-  that text. Everything degrades to mpv's own window when the handle cannot be
-  obtained (non-Windows, no JNA, no window) — a player that cannot be embedded must
-  never be worse than no player.
-- The layer is mounted *before* mpv (it owns the surface mpv renders into), so
-  clicking Play shows a spinner and what is being opened immediately, closes with
-  playback, and reports a failed IPC connection instead of sitting on
-  "Connecting…" forever.
-- Releases ship the **.exe installer only** — there is no `.zip` app image.
+- `desktop/player/PlayerWindow.kt` — the app's own player dialog, which opens as a
+  small (560x190) separate window BESIDE mpv's own video window — never over it.
+  It carries what mpv's generic on-screen controller cannot know: a scrubbable
+  timeline with real time labels, play/pause, ±10s, volume, speed, the file's
+  actual audio and subtitle tracks by name and language, what the stream really is
+  (format) and why it failed, "Next episode" (fired when mpv reports the file
+  ended), and the position handed back for resume/history.
+- **The video renders in mpv's OWN window.** mpv is launched with `--force-window`
+  and its on-screen controller left ON, so the picture is full-size and nothing
+  the app draws can ever cover it. `DesktopPlayer` shows a small "Player is
+  loading…" indicator between the Play click and mpv coming up (otherwise Play
+  looks dead for the ~1–3s mpv takes to start), which closes on its own or when an
+  explanation takes over. Closing the transport dialog stops playback, and mpv
+  exiting closes the dialog — the two windows always go together.
+- Everything degrades to plain mpv playback when the IPC channel cannot be
+  reached: the transport dialog is simply not opened (a player that cannot be
+  driven must never be worse than no player window).
 - `DetailScreen` hands the player what only it knows: `next` (advance to the next
   episode, then play its first source) and `position` (throttled history writes,
   so a title resumes where it was left).

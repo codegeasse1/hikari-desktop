@@ -21,9 +21,11 @@ import desktop.ui.Theme
  * release (`app/mpv/mpv.exe`, bundled by CI) and plays HLS/MP4/MKV natively,
  * sending the stream's Referer/Cookie/UA headers itself.
  *
- * If mpv is missing, DASH/torrent/YouTube streams are not playable, the user
- * gets a clear dialog with an "Open in browser" path — never a silent black
- * window.
+ * The video plays in mpv's OWN window, with mpv's own on-screen controller
+ * left intact; the app's contribution is the small transport dialog that opens
+ * beside it (see [PlayerWindow]). If mpv is missing, DASH/torrent/YouTube
+ * streams are not playable, the user gets a clear dialog with an "Open in
+ * browser" path — never a silent black window.
  */
 object DesktopPlayer {
 
@@ -53,39 +55,44 @@ object DesktopPlayer {
     @Volatile
     private var onPosition: ((Long, Long) -> Unit)? = null
 
-    /** Every source the caller offered for the title being played, plus the one
-     *  that was chosen — handed to the player so its Source menu can switch
-     *  servers without going back to the detail screen. */
-    @Volatile
-    private var sourceList: List<StreamSource> = emptyList()
-
-    @Volatile
-    private var sourceName: String = ""
-
-    @Volatile
-    private var onPickSource: ((StreamSource) -> Unit)? = null
-
-    /** "Previous episode" for the player's transport, when there is one. */
-    @Volatile
-    private var onPrev: (() -> Unit)? = null
-
-    /** The player's other per-title actions: download what is playing, and the
-     *  library (favourite) toggle. */
-    @Volatile
-    private var onDownloadSource: ((StreamSource) -> Unit)? = null
-
-    @Volatile
-    private var favCheck: (() -> Boolean)? = null
-
-    @Volatile
-    private var favToggle: (() -> Unit)? = null
-
-    @Volatile
-    private var openInBrowser: (() -> Unit)? = null
+    /** Non-modal "Player is loading…" indicator shown from Play-click until the
+     *  mpv window is up (or an error/fallback dialog takes over). Without it
+     *  Play appeared to do nothing for the ~1-3s mpv takes to launch. */
+    private var loadingStage: javafx.stage.Stage? = null
 
     /** True once the current launch has shown its failure dialog (mpv error or
      *  stream-probe fallback), so the two can't double-popup. Reset per launch. */
     @Volatile private var dialogShown = false
+
+    private fun closeLoading() {
+        Fx.run {
+            runCatching { loadingStage?.close() }
+            loadingStage = null
+        }
+    }
+
+    private fun showLoading(title: String) {
+        Fx.run {
+            runCatching { loadingStage?.close() }
+            val s = javafx.stage.Stage()
+            val spin = javafx.scene.control.ProgressBar(-1.0)
+            spin.prefWidth = 220.0
+            val lbl = Label("Player is loading…").apply {
+                style = "-fx-text-fill: white; -fx-font-size: 15px;"
+                isWrapText = true
+            }
+            val box = javafx.scene.layout.VBox(14.0, spin, lbl).apply {
+                alignment = Pos.CENTER
+                padding = Insets(26.0)
+            }
+            box.style = "-fx-background-color: ${Theme.BG_ELEV};"
+            s.scene = Theme.scene(box)
+            s.width = 300.0
+            s.height = 150.0
+            loadingStage = s
+            s.show()
+        }
+    }
 
     /** Signed, short-lived stream URLs (chaturbate's `mmcdn.com`/`edge-hls`
      *  LL-HLS links) — their token is single-use and expires in seconds, so:
@@ -102,24 +109,9 @@ object DesktopPlayer {
         refresh: (() -> StreamSource?)? = null,
         next: (() -> Unit)? = null,
         position: ((Long, Long) -> Unit)? = null,
-        sources: List<StreamSource> = emptyList(),
-        onPickSource: ((StreamSource) -> Unit)? = null,
-        prev: (() -> Unit)? = null,
-        onDownload: ((StreamSource) -> Unit)? = null,
-        isFavourite: (() -> Boolean)? = null,
-        onToggleFavourite: (() -> Unit)? = null,
-        onOpenInBrowser: (() -> Unit)? = null,
     ) {
         onEnded = next
-        onPrev = prev
         onPosition = position
-        sourceList = sources.ifEmpty { listOf(stream) }
-        sourceName = stream.name
-        this.onPickSource = onPickSource
-        onDownloadSource = onDownload
-        favCheck = isFavourite
-        favToggle = onToggleFavourite
-        openInBrowser = onOpenInBrowser
         // Sanitize here too so a malformed URL from ANY provider (chaturbate's
         // root-relative escaped HLS path, stray quotes, JSON escapes) can't
         // reach mpv or the browser as garbage.
@@ -167,9 +159,6 @@ object DesktopPlayer {
     fun playFile(title: String, path: String) {
         onEnded = null
         onPosition = null
-        sourceList = emptyList()
-        sourceName = ""
-        onPickSource = null
         Fx.run {
             val file = File(path)
             if (!file.exists()) {
@@ -182,27 +171,12 @@ object DesktopPlayer {
                 return@run
             }
             ipcTarget = openIpcEndpoint()
-            // The app's own player window comes up first: it is what the user
-            // sees, and its video surface is the window mpv is told to render
-            // into (--wid below). Null — not Windows, no JNA, no handle — keeps
-            // mpv's own window, which is still driven by the same controls.
-            val surface = PlayerWindow.open(
-                title = title,
-                hasNext = false,
-                hasPrev = false,
-                next = null,
-                prev = null,
-                position = null,
-                closed = { stopPlayback() },
-            )
             val args = buildList {
                 add(mpv.absolutePath)
                 add("--force-window=yes")
                 add("--no-ytdl")
-                add("--no-osc")
                 add("--no-config")
                 add("--title=" + title.take(200).replace('\n', ' '))
-                surface?.let { add("--wid=$it") }
                 ipcArg()?.let { add(it) }
                 add(file.absolutePath)
             }
@@ -219,12 +193,15 @@ object DesktopPlayer {
                 {
                     runCatching { p.inputStream.bufferedReader().forEachLine { } }
                     val code = runCatching { p.exitValue() }.getOrDefault(-1)
-                    if (code == 0 && !p.isAlive && proc === p) {
-                        // The file ended (or the user quit mpv): the app's own
-                        // player window goes with the player, rather than being
-                        // left behind as a window controlling nothing.
+                    // A newer launch (or a teardown) replaced this process while
+                    // it was draining — its exit is not this player's business.
+                    if (proc !== p) return@Thread
+                    if (code == 0 && !p.isAlive) {
+                        // The file ended (or the user quit mpv): the transport
+                        // window goes with the player rather than being left
+                        // behind controlling nothing.
                         Fx.run { if (proc === p) stopPlayback() }
-                    } else if (code != 0 && !p.isAlive && proc === p) {
+                    } else if (code != 0 && !p.isAlive) {
                         Fx.run {
                             if (dialogShown) return@run
                             dialogShown = true
@@ -240,14 +217,9 @@ object DesktopPlayer {
         }
     }
 
-    private fun launchMpv(
-        title: String,
-        stream: StreamSource,
-        refresh: (() -> StreamSource?)?,
-        attemptsLeft: Int,
-        embed: Boolean = true,
-    ) {
+    private fun launchMpv(title: String, stream: StreamSource, refresh: (() -> StreamSource?)?, attemptsLeft: Int) {
         Fx.run {
+            showLoading(title)
             ipcTarget = openIpcEndpoint()
             val mpv = findMpv()
             if (mpv == null) {
@@ -258,33 +230,6 @@ object DesktopPlayer {
             }
             val url = com.hikari.app.net.Http.sanitizeStreamUrl(stream.url)
             val signed = isSignedStreamUrl(url)
-            // The app's own player window comes up FIRST: it is the window the
-            // user sees, and the window mpv is told to render its video into
-            // (`--wid`). It replaces the old behaviour of spawning mpv's plain
-            // window next to a separate control strip. A null surface means the
-            // embed isn't possible here and mpv opens its own window as before.
-            val surface = PlayerWindow.open(
-                title = title,
-                hasNext = onEnded != null,
-                hasPrev = onPrev != null,
-                next = onEnded,
-                prev = onPrev,
-                position = onPosition,
-                closed = { stopPlayback() },
-                sources = sourceList,
-                sourceName = sourceName,
-                onPickSource = onPickSource,
-                onDownload = onDownloadSource,
-                isFavourite = favCheck,
-                onToggleFavourite = favToggle,
-                onOpenInBrowser = openInBrowser,
-                embed = embed,
-            )
-            if (surface == null && embed) {
-                PlayerWindow.note(
-                    "Embedded video isn't available on this machine, so the video plays in the player's own window.",
-                )
-            }
             // Debug: record the EXACT characters of the provider URL and the
             // playable URL, so a failed stream always leaves a real reason in
             // .hikari/hikari-player.log (e.g. a lookalike separator that the
@@ -300,8 +245,7 @@ object DesktopPlayer {
             File(logDir, "hikari-player.log").appendText(
                 "[" + java.time.Instant.now() + "] raw=" + debugEscaped(stream.url) +
                     "\n  san=" + debugEscaped(url) +
-                    "\n  ply=" + debugEscaped(playUrl) +
-                    "\n  wid=" + (surface?.toString() ?: "none") + "\n"
+                    "\n  ply=" + debugEscaped(playUrl) + "\n"
             )
             val args = buildList {
                 add(mpv.absolutePath)
@@ -310,15 +254,12 @@ object DesktopPlayer {
                 // header-less probe (no Referer/Cookie) that 403s on protected
                 // CDNs and only adds confusing [ytdl_hook] errors to the dialog.
                 add("--no-ytdl")
-                // The app draws its own transport, so mpv's on-screen controller
-                // would only fight it for the bottom of the video.
-                add("--no-osc")
+                // mpv owns its own window here, so its on-screen controller is
+                // left ON — the transport dialog beside it adds what mpv cannot
+                // know (tracks by name, next episode), it does not replace it.
                 add("--title=" + title.take(200).replace('\n', ' '))
                 val logDir2 = logDir
                 add("--log-file=${File(logDir2, "mpv.log").absolutePath}")
-                // Render INTO the app's player window (see WinShell): this is
-                // what makes the player in-app instead of a second window.
-                surface?.let { add("--wid=$it") }
                 ipcArg()?.let { add(it) }
                 // Providers may ship stream headers (Referer/Cookie/UA) their
                 // CDN validates — hand them straight to mpv. If no User-Agent is
@@ -342,39 +283,13 @@ object DesktopPlayer {
             proc?.let { runCatching { it.destroy() } }
             proc = p
             attachPlayerWindow(title)
+            // mpv is up — drop the loading indicator so it doesn't linger over
+            // the playing video.
+            Thread({ try { Thread.sleep(2500) } catch (e: InterruptedException) {}; closeLoading() }, "hikari-loading-close")
+                .apply { isDaemon = true; start() }
             // Only the FIRST explanation per launch shows: the mpv error path and
             // the stream probe both try to explain a dead player, never both.
             dialogShown = false
-            if (embed) {
-                // mpv rendering INTO the app's own window can fail on some
-                // drivers, and the symptom is exactly "the sound works but the
-                // picture never appears". If the file is loaded and still no
-                // video format has been reported, reopen once in mpv's own
-                // window — a visible picture beats a tidier window.
-                Thread(
-                    {
-                        val deadline = System.currentTimeMillis() + 20_000
-                        while (System.currentTimeMillis() < deadline) {
-                            Thread.sleep(1_000)
-                            if (proc !== p || !p.isAlive) return@Thread
-                            if (PlayerWindow.hasVideo()) return@Thread
-                            if (PlayerWindow.isLoaded()) {
-                                Fx.run {
-                                    if (proc !== p) return@run
-                                    proc = null
-                                    runCatching { p.destroy() }
-                                    PlayerWindow.note(
-                                        "Embedded video didn't start on this machine, so it has been reopened in the player's own window.",
-                                    )
-                                    launchMpv(title, stream, refresh, 0, embed = false)
-                                }
-                                return@Thread
-                            }
-                        }
-                    },
-                    "hikari-embed-watchdog",
-                ).apply { isDaemon = true; start() }
-            }
             val startedAt = System.currentTimeMillis()
             Thread(
                 {
@@ -386,7 +301,7 @@ object DesktopPlayer {
                     if (proc !== p) return@Thread
                     if (code == 0 && !p.isAlive) {
                         // The episode finished with no error and no "next": mpv
-                        // is gone, so the app's player window goes too.
+                        // is gone, so the transport window goes too.
                         Fx.run { if (proc === p) stopPlayback() }
                     }
                     if (code != 0 && !p.isAlive) {
@@ -398,7 +313,7 @@ object DesktopPlayer {
                         if (attemptsLeft > 0 && refresh != null && (signed || forbidden)) {
                             val fresh = runCatching { refresh() }.getOrNull()
                             if (fresh != null && fresh.url.isNotBlank()) {
-                                Fx.run { launchMpv(title, fresh, refresh, attemptsLeft - 1, embed) }
+                                Fx.run { launchMpv(title, fresh, refresh, attemptsLeft - 1) }
                                 return@Thread
                             }
                         }
@@ -492,6 +407,7 @@ object DesktopPlayer {
                 val resolved = runCatching { desktop.web.FxWebView.resolveStreamUrl(url, 30_000) }.getOrNull()
                 Fx.run {
                     if (dialogShown) return@run
+                    closeLoading()
                     if (resolved != null && resolved.url.isNotBlank()) {
                         val merged = mergeHeaders(stream.headers, resolved.cookie)
                         launchMpv(title, stream.copy(url = resolved.url, headers = merged), refresh, attemptsLeft)
@@ -536,14 +452,10 @@ object DesktopPlayer {
     }
 
     private fun showBrowserFallback(title: String, url: String, reason: String? = null, tryAnyway: (() -> Unit)? = null, retry: (() -> Unit)? = null) {
-        // When the app's own player window is up, the explanation belongs IN it
-        // (over the video area, which is what the user is looking at) rather
-        // than in a second dialog on top of it.
-        val text = reason?.takeIf { it.isNotBlank() } ?: "Open it in your browser instead?"
-        if (PlayerWindow.showFailure(text, url, retry = retry, tryAnyway = tryAnyway)) return
+        closeLoading()
         val stage = Stage()
         stage.title = title
-        val label = Label(text).apply {
+        val label = Label(reason?.takeIf { it.isNotBlank() } ?: "Open it in your browser instead?").apply {
             isWrapText = true
         }
         val openBtn = Button("Open in browser").apply {
@@ -596,11 +508,10 @@ object DesktopPlayer {
     }
 
     /**
-     * Connects the app's player window to a freshly launched mpv. Off the FX
-     * thread (mpv creates its pipe a moment after launch). When the endpoint
-     * never appears the window stays up and says so — the video keeps playing,
-     * only the controls are unavailable, which is a far better outcome than a
-     * window that silently shows "Connecting…" forever.
+     * Connects the transport window to a freshly launched mpv. Off the FX
+     * thread (mpv creates its pipe a moment after launch), and silently skipped
+     * when the endpoint never appears — a player window we cannot drive must
+     * leave the plain mpv playback untouched.
      */
     private fun attachPlayerWindow(title: String) {
         val target = ipcTarget ?: return
@@ -611,14 +522,6 @@ object DesktopPlayer {
                 val client = MpvIpc(target, isPipe)
                 if (!client.connect(6_000L)) {
                     runCatching { client.close() }
-                    Fx.run {
-                        if (proc === mine) {
-                            PlayerWindow.setStatus(
-                                "Couldn't reach the player's control channel — video plays, controls are unavailable.",
-                                isError = true,
-                            )
-                        }
-                    }
                     return@Thread
                 }
                 // A newer launch (or a stop) happened while we were connecting.
@@ -627,13 +530,28 @@ object DesktopPlayer {
                     return@Thread
                 }
                 ipc = client
+                client.onProperty = { name, value -> PlayerWindow.onProperty(name, value) }
+                client.onEvent = { event, data -> PlayerWindow.onEvent(event, data) }
+                val next = onEnded
+                val pos = onPosition
                 Fx.run {
                     if (proc !== mine) {
                         runCatching { client.close() }
                         ipc = null
                         return@run
                     }
-                    PlayerWindow.attachIpc(client)
+                    val ok = PlayerWindow.attach(
+                        title = title,
+                        handle = client,
+                        hasNext = next != null,
+                        next = next,
+                        position = { p, d -> pos?.invoke(p, d) },
+                        closed = { Fx.run { stopPlayback() } },
+                    )
+                    if (!ok) {
+                        runCatching { client.close() }
+                        ipc = null
+                    }
                 }
             },
             "hikari-mpv-attach",

@@ -43,14 +43,12 @@ class WindowChrome(private val stage: Stage) {
     }
 
     /**
-     * Wraps [body] in the window chrome. [overlay] — when given — is layered
-     * ABOVE the body but BELOW the resize edges, so a full-window overlay (the
-     * player) still leaves the window's resize borders usable.
+     * Wraps [body] in the window chrome: the resize edges go on top, so the
+     * window stays resizable however tall its content is.
      */
-    fun build(body: Region, overlay: Region? = null): Region {
+    fun build(body: Region): Region {
         val chrome = StackPane(body)
         root.children.setAll(chrome)
-        if (overlay != null) root.children.add(overlay)
         addResizeEdges()
         return root
     }

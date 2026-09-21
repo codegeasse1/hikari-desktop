@@ -873,39 +873,12 @@ class DetailScreenView(private val item: MediaItem) {
                     kotlinx.coroutines.runBlocking { AppShell.app.repository.streamsFor(meta, ep) }
                 }.getOrNull()?.firstOrNull()
             },
-            // The app's player window drives playback over mpv's IPC, so the
-            // screen hands it the two things it alone knows: what comes next,
-            // and where this episode got to.
+            // The transport window drives playback over mpv's IPC, so the screen
+            // hands it the two things it alone knows: what comes next, and where
+            // this episode got to.
             next = nextEpisodeAction(),
             position = { positionMs, durationMs -> savePosition(ep, positionMs, durationMs) },
-            // The player's Source menu: every source this episode offered, so a
-            // dead server can be swapped for another without leaving playback.
-            sources = streams,
-            onPickSource = { picked -> if (picked.url != source.url) play(picked) },
-            prev = prevEpisodeAction(),
-            onDownload = { s -> download(s) },
-            isFavourite = { favourite },
-            onToggleFavourite = { toggleFavourite() },
-            onOpenInBrowser = { runCatching { desktop.fx.DesktopUi.open(source.url) } },
         )
-    }
-
-    /** The player's "Previous episode": step back one and play its first source.
-     *  Null on the first episode (or a movie), so the player hides the button. */
-    private fun prevEpisodeAction(): (() -> Unit)? {
-        val current = selectedEpisode ?: return null
-        val idx = episodes.indexOfFirst { it.id == current.id }
-        if (idx <= 0) return null
-        val previous = episodes[idx - 1]
-        return {
-            Fx.run {
-                selectedEpisode = previous
-                renderEpisodeGrid()
-                updateNowPlaying()
-                pendingPlay = true
-                loadStreams()
-            }
-        }
     }
 
     /** The player's "Next episode": advance to the following episode and play
