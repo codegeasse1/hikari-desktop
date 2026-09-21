@@ -1,0 +1,56 @@
+name: CI compile check
+
+# Throwaway compile-only workflow used while a big batch is being iterated on.
+# It NEVER publishes anything (unlike build.yml, which uploads to the
+# "continuous" release on every run). Dispatch it against a temporary branch.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: "8.11.1"
+          cache-disabled: true
+
+      - name: Compile Kotlin
+        run: |
+          set +e
+          for attempt in 1 2 3 4; do
+            gradle desktop:compileKotlin --no-daemon --stacktrace > compile.log 2>&1
+            code=$?
+            if [ $code -eq 0 ]; then
+              echo "==== COMPILE OK (attempt $attempt) ===="
+              exit 0
+            fi
+            echo "==== COMPILE FAILED (attempt $attempt, exit $code) ===="
+            grep -E "Received status code 429|Could not GET" compile.log | head -n 5 || true
+            sleep 20
+          done
+          echo "==== KOTLIN ERRORS ===="
+          grep -E "^e: " compile.log | head -n 200 || true
+          echo "==== TAIL ===="
+          tail -n 120 compile.log
+          exit 1
+        shell: bash
+
+      - name: Upload compile log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compile-log
+          path: compile.log
+          if-no-files-found: ignore
