@@ -39,10 +39,21 @@ class HikariApp : Application() {
         var lastCrash: String? = null
             private set
 
-        /** Kept for plugin compatibility (the Android host exposed its
-         *  activity here). Desktop has no activity; always null. */
+        /**
+         * The host activity, exactly as the Android app exposes it.
+         *
+         * It is not decorative: CloudStream plugins receive it in
+         * `Plugin.load(context)`, cast it to an Activity — often straight to
+         * `AppCompatActivity` — and read its shared preferences / fragment
+         * manager. A null (or a bare Application) here made every plugin that
+         * touches its activity fail to load on the desktop. The desktop's
+         * stand-in is a real object of that class (it inherits the whole
+         * Activity/AppCompat/FragmentActivity chain — see
+         * [androidx.appcompat.app.DesktopActivity]); nothing it does is drawn.
+         */
         @Volatile
-        var mainActivity: Any? = null
+        var mainActivity: Any? = androidx.appcompat.app.DesktopActivity.instance()
+            private set
     }
 
     lateinit var store: AppStore
@@ -71,6 +82,7 @@ class HikariApp : Application() {
         store = AppStore(filesDir)
         providers = ProviderManager(store)
         repository = ContentRepository(providers)
+        registerAniyomiSingletons()
         Http.init()
         CoroutineScope(Dispatchers.IO).launch {
             runCatching { elementBlocks = store.elementBlocks() }
@@ -105,6 +117,15 @@ class HikariApp : Application() {
                 }
             }
             providers.refresh()
+            // Seed the bundled engine repos once, exactly like the Android app:
+            // the Yoru (nuvio), SkyStream and Aniyomi default repos are how
+            // those engines are discovered at all, and a first run can't be
+            // expected to know their URLs. Non-fatal — every call is already
+            // wrapped in its own runCatching.
+            runCatching { com.hikari.app.nuvio.NuvioPluginManager.seedDefaults(this@HikariApp, store) }
+            runCatching { com.hikari.app.skystream.SkyStreamPluginManager.seedDefaults(this@HikariApp, store) }
+            runCatching { com.hikari.app.aniyomi.AniyomiExtensionManager.seedDefaults(this@HikariApp, store) }
+            runCatching { providers.refresh() }
             runCatching { com.hikari.app.data.Translator.init(store) }
         }
     }
@@ -137,6 +158,41 @@ class HikariApp : Application() {
     fun clearCrash() {
         lastCrash = null
         runCatching { File(cacheDir, "crash.log").delete() }
+    }
+
+    /**
+     * Primes the Injekt container with the singletons an Aniyomi extension can
+     * ask for — `Application` (every `ConfigurableAnimeSource` /
+     * `AnimeHttpSource` preference accessor is
+     * `Injekt.get<Application>().getSharedPreferences(...)`, and a source that
+     * cannot get its preferences throws before it can list anything), plus the
+     * `Json`, `NetworkHelper` and `JavaScriptEngine` that the JSON helpers, the
+     * shared OkHttp stack and the JS-driven sources inject.
+     *
+     * All singletons, so every installed extension shares the app's one OkHttp
+     * stack instead of building its own. A lookup that was never registered
+     * throws at the extension's own call site, which the provider turns into a
+     * per-source error rather than a crash.
+     */
+    private fun registerAniyomiSingletons() {
+        runCatching {
+            uy.kohesive.injekt.Injekt.addSingleton<Application>(this)
+            uy.kohesive.injekt.Injekt.addSingleton<android.content.Context>(this)
+            uy.kohesive.injekt.Injekt.addSingletonFactory<kotlinx.serialization.json.Json> {
+                kotlinx.serialization.json.Json {
+                    ignoreUnknownKeys = true
+                    explicitNulls = false
+                }
+            }
+            uy.kohesive.injekt.Injekt.addSingletonFactory<eu.kanade.tachiyomi.network.NetworkHelper> {
+                eu.kanade.tachiyomi.network.NetworkHelper(this)
+            }
+            uy.kohesive.injekt.Injekt.addSingletonFactory<eu.kanade.tachiyomi.network.JavaScriptEngine> {
+                eu.kanade.tachiyomi.network.JavaScriptEngine(this)
+            }
+        }.onFailure {
+            System.err.println("Aniyomi singleton registration failed: $it")
+        }
     }
 
     /** UA string the WebViews should advertise. Desktop has no Android WebView

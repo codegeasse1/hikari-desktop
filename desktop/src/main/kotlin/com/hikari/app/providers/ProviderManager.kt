@@ -104,6 +104,10 @@ class ProviderManager(private val store: AppStore) {
         ProviderType.UNIVERSAL -> UniversalScraper(c)
         ProviderType.CS3 -> Cs3MainApiProvider(c)
         ProviderType.HIKARI -> HikariProviderAdapter(c)
+        ProviderType.SKYSTREAM -> com.hikari.app.skystream.SkyStreamProvider(c)
+        ProviderType.NUVIO -> com.hikari.app.nuvio.NuvioScraper(c)
+        ProviderType.ANIYOMI -> com.hikari.app.aniyomi.AniyomiProvider(c)
+        ProviderType.IPTV -> com.hikari.app.iptv.IptvProvider(c)
     }
 
     fun byId(id: String): ContentProvider? =

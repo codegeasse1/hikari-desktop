@@ -83,6 +83,7 @@ class ExtensionsScreenView {
         val url: String,
         val fileHash: String?,
         val jarHash: String?,
+        val iconUrl: String? = null,
     )
 
     private val repoData = HashMap<String, RepoData>()
@@ -209,7 +210,7 @@ class ExtensionsScreenView {
         fileRow.children.setAll(
             Ui.button("Pick an extension file…", icon = Icons.UPLOAD, ghost = true) { installFromDisk() },
             Ui.button("Install from a URL", ghost = true) { mode = MODE_FILE; renderAll() },
-            themed("accepts .jar, .cs3 and .hiki", "tiny"),
+            themed("accepts .jar, .cs3, .hiki, .sky, .js, .apk, .m3u/.m3u8", "tiny"),
         )
     }
 
@@ -222,6 +223,10 @@ class ExtensionsScreenView {
         when (mode) {
             MODE_HIKARI -> addRepo(Http.normalizeUrl(raw), RepoKind.HIKARI)
             MODE_CS3 -> addRepo(Http.normalizeUrl(raw), RepoKind.CS3)
+            MODE_SKYSTREAM -> addSkyStreamRepo(raw)
+            MODE_NUVIO -> addRepo(Http.normalizeUrl(raw), RepoKind.NUVIO)
+            MODE_ANIYOMI -> addAniyomiRepo(raw)
+            MODE_IPTV -> addIptv(raw)
             MODE_STREMIO -> {
                 val url = Http.normalizeUrl(raw)
                 if (url.contains("github.com") || url.contains("raw.githubusercontent.com")) {
@@ -255,6 +260,15 @@ class ExtensionsScreenView {
     }
 
     // ── repos ───────────────────────────────────────────────────────────────
+
+    /** The uppercase badge text for a repo's engine. */
+    private fun kindLabel(kind: RepoKind): String = when (kind) {
+        RepoKind.CS3 -> "CLOUDSTREAM"
+        RepoKind.HIKARI -> "HIKARI"
+        RepoKind.NUVIO -> "NUVIO"
+        RepoKind.SKYSTREAM -> "SKYSTREAM"
+        RepoKind.ANIYOMI -> "ANIYOMI"
+    }
 
     private fun repoDisplayName(repo: Cs3Repo): String {
         val cached = repoData[repo.url]
@@ -306,7 +320,7 @@ class ExtensionsScreenView {
                 data?.let { "${it.plugins.size} plugins" } ?: "…",
                 "badge-accent",
             ))
-            children.add(Ui.badge(if (repo.kind == RepoKind.CS3) "CLOUDSTREAM" else "HIKARI"))
+            children.add(Ui.badge(kindLabel(repo.kind), if (repo.kind == RepoKind.CS3) "badge" else "badge-accent"))
             if (error != null) children.add(Ui.badge("unreachable", "badge-danger"))
         }
 
@@ -467,9 +481,9 @@ class ExtensionsScreenView {
         val action: Node = if (working != null) {
             HBox(8.0, tinySpinner(), themed(working, "tiny")).apply { alignment = Pos.CENTER_RIGHT }
         } else if (installed.isEmpty()) {
-            Ui.button("Install", primary = true) { installPlugin(plugin.name, plugin.url, plugin.fileHash, plugin.jarHash) }
+            Ui.button("Install", primary = true) { installFromRepo(plugin) }
         } else {
-            Ui.button("Uninstall", danger = true) { uninstallPlugin(plugin.name, plugin.url) }
+            Ui.button("Uninstall", danger = true) { uninstallFromRepo(plugin) }
         }
         val row = HBox(12.0, info, state, action).apply {
             styleClass.add("src-row")
@@ -506,23 +520,30 @@ class ExtensionsScreenView {
             setStatus("Fetching repo…")
         }
         AppShell.uiScope.launch {
-            val result = Http.fetchRepoJson(url) { step -> Fx.run { setStatus(step, busy = true) } }
-            Fx.run {
-                busy.isVisible = false
-                repoLoading.remove(url)
-                val pair = result.getOrNull()
-                if (pair == null) {
+            val kind = repoKindOf(url)
+            val result = fetchManifest(url, kind) { step -> Fx.run { setStatus(step, busy = true) } }
+            val manifest = result.getOrNull()
+            if (manifest == null) {
+                Fx.run {
+                    busy.isVisible = false
+                    repoLoading.remove(url)
                     val message = Http.humanMessage(result.exceptionOrNull())
                     repoErrors[url] = message
                     if (!silent) setStatus("Couldn't load that repo — $message", isError = true)
                     renderAll()
-                    return@run
                 }
-                val resolved = pair.first
-                val root = runCatching { JSONObject(pair.second) }.getOrNull()
-                val name = root?.optString("name").orEmpty().ifBlank { Http.repoDisplayName(resolved) }
-                val description = root?.optString("description").orEmpty()
-                val plugins = parsePlugins(root, resolved)
+                return@launch
+            }
+            // Parsing can fetch nested list files (SkyStream repos), so it stays
+            // off the FX thread; only the finished rows are published onto it.
+            val resolved = manifest.url
+            val root = manifest.root
+            val name = root?.optString("name").orEmpty().ifBlank { Http.repoDisplayName(resolved) }
+            val description = root?.optString("description").orEmpty()
+            val plugins = parsePlugins(kind, manifest)
+            Fx.run {
+                busy.isVisible = false
+                repoLoading.remove(url)
                 repoData[url] = RepoData(resolved, name, description, plugins)
                 if (resolved != url) repoData[resolved] = repoData[url]!!
                 repoErrors.remove(url)
@@ -532,11 +553,187 @@ class ExtensionsScreenView {
         }
     }
 
+    /** A fetched repo manifest. Every repo kind publishes a JSON OBJECT except
+     *  Aniyomi, whose `index.min.json` is a bare array — that lands in [array]. */
+    private class Manifest(val url: String, val root: JSONObject?, val array: JSONArray?)
+
+    /** The kind of a stored repo, by its URL. New repos are added with an
+     *  explicit kind; this only serves re-renders/refreshes of ones already
+     *  in the store. */
+    private fun repoKindOf(url: String): RepoKind {
+        val stored = runCatching {
+            AppShell.app.store.repos().firstOrNull { it.url == url }
+        }.getOrNull()
+        if (stored != null) return stored.kind
+        val u = url.lowercase()
+        return when {
+            u.endsWith("manifest.json") -> RepoKind.NUVIO
+            u.endsWith("index.min.json") -> RepoKind.ANIYOMI
+            else -> RepoKind.CS3
+        }
+    }
+
+    private fun manifestFileName(kind: RepoKind): String = when (kind) {
+        RepoKind.NUVIO -> "manifest.json"
+        RepoKind.ANIYOMI -> "index.min.json"
+        else -> "repo.json"
+    }
+
+    /**
+     * Candidate URLs for a repo manifest: what the user pasted, the pasted
+     * folder + the kind's index file, and — for the `github.com/owner/repo`
+     * links people actually paste — the raw.githubusercontent equivalents (a
+     * github HTML page can never parse as JSON).
+     */
+    private fun manifestCandidates(rawUrl: String, fileName: String): List<String> {
+        val raw = rawUrl.trim()
+        if (raw.isBlank()) return emptyList()
+        val out = LinkedHashSet<String>()
+        out.add(raw)
+        val base = raw.trimEnd('/')
+        if (!base.lowercase().endsWith(".json")) out.add("$base/$fileName")
+        val m = Regex(
+            "^https?://github\\.com/([^/]+)/([^/]+?)(?:\\.git)?(?:/(?:tree|blob)/([^/]+)(/.*)?)?$"
+        ).find(base)
+        if (m != null) {
+            val owner = m.groupValues[1]
+            val repo = m.groupValues[2]
+            val branch = m.groupValues[3].ifBlank { "main" }
+            val rest = m.groupValues[4].trim('/')
+            val roots = linkedSetOf(
+                "https://raw.githubusercontent.com/$owner/$repo/$branch" + if (rest.isBlank()) "" else "/$rest",
+            )
+            if (branch == "main") {
+                roots.add("https://raw.githubusercontent.com/$owner/$repo/master" + if (rest.isBlank()) "" else "/$rest")
+            }
+            for (r in roots) {
+                out.add(r)
+                if (!r.lowercase().endsWith(".json")) out.add("$r/$fileName")
+            }
+        }
+        return out.toList()
+    }
+
+    /**
+     * Fetches a repo manifest of any kind. CloudStream/Hikari repos keep the
+     * existing multi-mirror [Http.fetchRepoJson] path; the other kinds fetch
+     * their own index file (Nuvio `manifest.json`, Aniyomi `index.min.json`,
+     * SkyStream `repo.json`) from [manifestCandidates].
+     */
+    private fun fetchManifest(
+        url: String,
+        kind: RepoKind,
+        onStep: ((String) -> Unit)? = null,
+    ): Result<Manifest> {
+        if (kind == RepoKind.CS3 || kind == RepoKind.HIKARI) {
+            val r = Http.fetchRepoJson(url, onStep)
+            val pair = r.getOrNull()
+                ?: return Result.failure(r.exceptionOrNull() ?: Exception("Could not fetch repo"))
+            val root = runCatching { JSONObject(pair.second) }.getOrNull()
+                ?: return Result.failure(Exception("Invalid repo.json"))
+            return Result.success(Manifest(pair.first, root, null))
+        }
+        val fileName = manifestFileName(kind)
+        val candidates = manifestCandidates(url, fileName)
+        if (candidates.isEmpty()) return Result.failure(Exception("Enter a repo URL"))
+        var last: Throwable? = null
+        for (candidate in candidates) {
+            onStep?.invoke("Fetching $fileName…")
+            val text = Http.fetchStringRobust(candidate).getOrNull()
+            if (text == null) {
+                last = Exception("Could not fetch $candidate")
+                continue
+            }
+            if (kind == RepoKind.ANIYOMI) {
+                val arr = runCatching { JSONArray(text) }.getOrNull()
+                if (arr != null && arr.length() > 0) return Result.success(Manifest(candidate, null, arr))
+                last = Exception("Invalid $fileName — expected a JSON array of extensions")
+            } else {
+                val root = runCatching { JSONObject(text) }.getOrNull()
+                if (root != null) return Result.success(Manifest(candidate, root, null))
+                last = Exception("Invalid $fileName")
+            }
+        }
+        return Result.failure(last ?: Exception("No candidate URL served $fileName"))
+    }
+
+    /** Reads a repo's plugin list for its [kind]: an Aniyomi index array, a
+     *  Nuvio manifest's `scrapers`, a SkyStream repo's `plugins`/`pluginLists`/
+     *  nested `repos`, or the plain CloudStream/Hikari `plugins` array. */
+    private fun parsePlugins(kind: RepoKind, manifest: Manifest): List<PluginRef> {
+        when (kind) {
+            RepoKind.ANIYOMI -> {
+                val arr = manifest.array ?: return emptyList()
+                val trimmed = manifest.url.trimEnd('/')
+                val baseUrl = if (trimmed.endsWith("/index.min.json", ignoreCase = true)) {
+                    trimmed.substring(0, trimmed.length - "/index.min.json".length)
+                } else {
+                    trimmed
+                }
+                val out = LinkedHashMap<String, PluginRef>()
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val p = com.hikari.app.aniyomi.AniyomiExtensionManager.repoPlugin(o, baseUrl) ?: continue
+                    out[p.url] = PluginRef(p.name, p.url, p.fileHash, null, p.iconUrl)
+                }
+                return out.values.toList()
+            }
+            RepoKind.NUVIO -> {
+                val root = manifest.root ?: return emptyList()
+                val baseUrl = manifest.url.substringBeforeLast('/')
+                val out = LinkedHashMap<String, PluginRef>()
+                val arr = root.optJSONArray("scrapers") ?: JSONArray()
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val p = com.hikari.app.nuvio.NuvioPluginManager.repoPlugin(o, baseUrl) ?: continue
+                    out[p.url] = PluginRef(p.name, p.url, p.fileHash, null, p.iconUrl)
+                }
+                return out.values.toList()
+            }
+            RepoKind.SKYSTREAM -> {
+                val root = manifest.root ?: return emptyList()
+                val out = LinkedHashMap<String, PluginRef>()
+                fun addSky(a: JSONArray?) {
+                    if (a == null) return
+                    for (i in 0 until a.length()) {
+                        val o = a.optJSONObject(i) ?: continue
+                        val p = com.hikari.app.skystream.SkyStreamPluginManager.repoPlugin(o, "") ?: continue
+                        out[p.url] = PluginRef(p.name, p.url, p.fileHash, null, p.iconUrl)
+                    }
+                }
+                fun addList(listUrl: String) {
+                    val text = Http.fetchStringRobust(listUrl).getOrNull() ?: return
+                    addSky(runCatching { JSONArray(text) }.getOrNull())
+                }
+                addSky(root.optJSONArray("plugins"))
+                root.optJSONArray("pluginLists")?.let { lists ->
+                    for (i in 0 until lists.length()) {
+                        addList(lists.optString(i))
+                    }
+                }
+                root.optJSONArray("repos")?.let { nested ->
+                    for (i in 0 until nested.length()) {
+                        val nestedUrl = nested.optString(i).trim()
+                        if (nestedUrl.isBlank()) continue
+                        val nestedText = Http.fetchStringRobust(nestedUrl).getOrNull() ?: continue
+                        val nestedRoot = runCatching { JSONObject(nestedText) }.getOrNull() ?: continue
+                        addSky(nestedRoot.optJSONArray("plugins"))
+                        nestedRoot.optJSONArray("pluginLists")?.let { lists ->
+                            for (j in 0 until lists.length()) addList(lists.optString(j))
+                        }
+                    }
+                }
+                return out.values.toList()
+            }
+            else -> return parseCloudStreamPlugins(manifest.root, manifest.url)
+        }
+    }
+
     /** Reads the repo's `plugins` array, resolving relative plugin URLs
      *  against the repo.json ([baseUrl] — the URL that actually served it),
      *  converting .hiki plugin URLs to their .jar desktop builds, and keeping
      *  the repo's sha256 signatures for post-download verification. */
-    private fun parsePlugins(root: JSONObject?, baseUrl: String = ""): List<PluginRef> {
+    private fun parseCloudStreamPlugins(root: JSONObject?, baseUrl: String = ""): List<PluginRef> {
         root ?: return emptyList()
         val plugins = when (val p = root.opt("plugins")) {
             null -> JSONArray()
@@ -556,6 +753,7 @@ class ExtensionsScreenView {
                 url = url,
                 fileHash = p.optString("fileHash").ifBlank { null },
                 jarHash = p.optString("jarHash").ifBlank { null },
+                iconUrl = p.optString("iconUrl").ifBlank { p.optString("logo") }.ifBlank { null },
             )
         }
         return out
@@ -571,22 +769,36 @@ class ExtensionsScreenView {
         busy.isVisible = true
         setStatus("Checking $url…", busy = true)
         AppShell.uiScope.launch {
-            val result = Http.fetchRepoJson(url) { step -> Fx.run { setStatus(step, busy = true) } }
-            Fx.run {
-                busy.isVisible = false
-                val pair = result.getOrNull()
-                if (pair == null) {
+            val result = fetchManifest(url, kind) { step -> Fx.run { setStatus(step, busy = true) } }
+            val manifest = result.getOrNull()
+            if (manifest == null) {
+                Fx.run {
+                    busy.isVisible = false
                     val message = Http.humanMessage(result.exceptionOrNull())
                     repoErrors[url] = message
                     setStatus("Couldn't add that repo — $message", isError = true)
                     AppShell.toast("Repo could not be added", "error")
                     renderAll()
-                    return@run
                 }
-                val resolved = pair.first
-                val name = Http.repoDisplayName(resolved)
-                val root = runCatching { JSONObject(pair.second) }.getOrNull()
-                val effKind = if (root?.has("pluginLists") == true) RepoKind.CS3 else kind
+                return@launch
+            }
+            val resolved = manifest.url
+            val root = manifest.root
+            // Only a CloudStream-family manifest can re-declare itself as v2
+            // (pluginLists); a SkyStream repo also carries pluginLists but must
+            // keep its own kind.
+            val effKind = if ((kind == RepoKind.CS3 || kind == RepoKind.HIKARI) &&
+                root?.has("pluginLists") == true
+            ) {
+                RepoKind.CS3
+            } else {
+                kind
+            }
+            val name = root?.optString("name").orEmpty().ifBlank { Http.repoDisplayName(resolved) }
+            val description = root?.optString("description").orEmpty()
+            val plugins = parsePlugins(effKind, manifest)
+            Fx.run {
+                busy.isVisible = false
                 val existing = runCatching {
                     AppShell.app.store.repos().firstOrNull {
                         it.url == resolved || (it.kind == effKind && Http.repoDisplayName(it.url) == name)
@@ -597,12 +809,7 @@ class ExtensionsScreenView {
                     repoData.remove(existing.url)
                 }
                 if (existing != null && existing.url == resolved) {
-                    repoData[existing.url] = RepoData(
-                        url = existing.url,
-                        name = root?.optString("name").orEmpty().ifBlank { name },
-                        description = root?.optString("description").orEmpty(),
-                        plugins = parsePlugins(root, existing.url),
-                    )
+                    repoData[existing.url] = RepoData(existing.url, name, description, plugins)
                     repoErrors.remove(existing.url)
                     openRepo = existing
                     composerInput.clear()
@@ -611,12 +818,7 @@ class ExtensionsScreenView {
                     return@run
                 }
                 runCatching { AppShell.app.store.addCs3Repo(Cs3Repo(url = resolved, name = name, kind = effKind)) }
-                repoData[resolved] = RepoData(
-                    url = resolved,
-                    name = root?.optString("name").orEmpty().ifBlank { name },
-                    description = root?.optString("description").orEmpty(),
-                    plugins = parsePlugins(root, resolved),
-                )
+                repoData[resolved] = RepoData(resolved, name, description, plugins)
                 repoErrors.remove(resolved)
                 openRepo = Cs3Repo(url = resolved, name = name, kind = effKind)
                 composerInput.clear()
@@ -627,32 +829,327 @@ class ExtensionsScreenView {
         }
     }
 
+    // ── engines: skystream / nuvio / aniyomi / iptv ─────────────────────────
+
+    /** SkyStream "add repo": a bare shortcode is resolved through the manager's
+     *  cutt.ly `sky-` namespace, a URL is used as-is. */
+    private fun addSkyStreamRepo(raw: String) {
+        val trimmed = raw.trim()
+        if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+            addRepo(Http.normalizeUrl(trimmed), RepoKind.SKYSTREAM)
+            return
+        }
+        busy.isVisible = true
+        setStatus("Resolving SkyStream shortcode…", busy = true)
+        AppShell.uiScope.launch {
+            val resolved = runCatching {
+                com.hikari.app.skystream.SkyStreamPluginManager.resolveRepoUrl(trimmed)
+            }.getOrNull()
+            Fx.run {
+                busy.isVisible = false
+                if (resolved.isNullOrBlank()) {
+                    setStatus("Couldn't resolve “$trimmed” — paste the repo URL instead.", isError = true)
+                    AppShell.toast("SkyStream repo not found", "error")
+                } else {
+                    addRepo(resolved, RepoKind.SKYSTREAM)
+                }
+            }
+        }
+    }
+
+    /** Aniyomi repos publish an index.min.json (a bare JSON array); a bare
+     *  folder/host is normalised to `<dir>/index.min.json` by the manager. */
+    private fun addAniyomiRepo(raw: String) {
+        val resolved = runCatching {
+            com.hikari.app.aniyomi.AniyomiExtensionManager.resolveRepoUrl(raw)
+        }.getOrNull()
+        if (resolved.isNullOrBlank()) {
+            setStatus("That doesn't look like an Aniyomi repo — paste a link to its index.min.json.", isError = true)
+            return
+        }
+        addRepo(resolved, RepoKind.ANIYOMI)
+    }
+
+    /** Adds an IPTV playlist — an m3u/m3u8 URL, or a path to a local file. The
+     *  playlist is parsed once up front, so a dead link says so here instead of
+     *  showing an empty channel list later. */
+    private fun addIptv(raw: String) {
+        val url = raw.trim()
+        if (url.isBlank()) return
+        busy.isVisible = true
+        setStatus("Reading playlist…", busy = true)
+        AppShell.uiScope.launch {
+            val preview = runCatching { com.hikari.app.iptv.IptvProvider.preview(url) }.getOrNull()
+            val count = preview?.getOrNull() ?: 0
+            val error = preview?.exceptionOrNull()
+            Fx.run {
+                busy.isVisible = false
+                if (preview == null || count <= 0) {
+                    val why = error?.message ?: "it lists no channels"
+                    setStatus("Couldn't add that playlist — $why", isError = true)
+                    AppShell.toast("Playlist could not be added", "error")
+                    return@run
+                }
+                val host = url.substringAfter("://", "").substringBefore('/').ifBlank {
+                    File(url).name.substringBeforeLast('.').ifBlank { "IPTV" }
+                }
+                val id = "iptv|" + url.hashCode()
+                if (runCatching { AppShell.app.store.providers().any { it.id == id } }.getOrDefault(false).not()) {
+                    AppShell.app.store.addProvider(
+                        ProviderConfig(id = id, name = "IPTV · $host", type = ProviderType.IPTV, url = url)
+                    )
+                }
+                AppShell.uiScope.launch { AppShell.app.providers.refresh() }
+                composerInput.clear()
+                renderAll()
+                val msg = "Added IPTV playlist ($count channel${if (count == 1) "" else "s"})"
+                setStatus(msg)
+                AppShell.toast(msg, "ok")
+            }
+        }
+    }
+
+    private fun installNuvioFromUrl(name: String, url: String) {
+        installNuvioPlugin(PluginRef(name, url, null, null))
+    }
+
+    private fun installSkyFromUrl(name: String, url: String) {
+        installSkyStreamPlugin(PluginRef(name, url, null, null))
+    }
+
+    private fun installAniyomiFromUrl(name: String, url: String) {
+        installAniyomiPlugin(PluginRef(name, url, null, null))
+    }
+
+    /** Installs one nuvio scraper: download (with its repo sha256 when listed),
+     *  then hand the bytes to [NuvioPluginManager.installScraper], which loads
+     *  the module in the JS runtime before accepting it. */
+    private fun installNuvioPlugin(plugin: PluginRef) {
+        val url = plugin.url
+        if (busyPlugins.containsKey(url)) return
+        installErrors.remove(url)
+        busyPlugins[url] = "Installing…"
+        busy.isVisible = true
+        setStatus("Installing ${plugin.name}…", busy = true)
+        fillPlugins()
+        AppShell.uiScope.launch {
+            val result = runCatching {
+                val bytes = Http.fetchBytesRobust(url)
+                    ?: throw Exception("Download failed — check the URL")
+                checkHash(bytes, plugin.fileHash)?.let { throw Exception(it) }
+                val fileName = plugin.name.substringBeforeLast('.').ifBlank { "provider" } + ".js"
+                com.hikari.app.nuvio.NuvioPluginManager.installScraper(
+                    HikariApp.instance,
+                    bytes,
+                    fileName,
+                    sourceUrl = url,
+                    iconUrl = plugin.iconUrl,
+                ).getOrThrow()
+            }
+            finishInstall(plugin.name, url, result)
+        }
+    }
+
+    /** Installs one `.sky`: [SkyStreamPluginManager.install] unpacks the zip and
+     *  validates the plugin's four exports in the JS runtime first. */
+    private fun installSkyStreamPlugin(plugin: PluginRef) {
+        val url = plugin.url
+        if (busyPlugins.containsKey(url)) return
+        installErrors.remove(url)
+        busyPlugins[url] = "Installing…"
+        busy.isVisible = true
+        setStatus("Installing ${plugin.name}…", busy = true)
+        fillPlugins()
+        AppShell.uiScope.launch {
+            val result = runCatching {
+                val bytes = Http.fetchBytesRobust(url)
+                    ?: throw Exception("Download failed — check the URL")
+                com.hikari.app.skystream.SkyStreamPluginManager.install(
+                    HikariApp.instance,
+                    bytes,
+                    sourceUrl = url,
+                    iconUrl = plugin.iconUrl,
+                ).getOrThrow()
+            }
+            finishInstall(plugin.name, url, result)
+        }
+    }
+
+    /** Installs one Aniyomi `.apk`/`.ext`: the manager validates the manifest
+     *  feature and registers one provider per bundled source. */
+    private fun installAniyomiPlugin(plugin: PluginRef) {
+        val url = plugin.url
+        if (busyPlugins.containsKey(url)) return
+        installErrors.remove(url)
+        busyPlugins[url] = "Installing…"
+        busy.isVisible = true
+        setStatus("Installing ${plugin.name}…", busy = true)
+        fillPlugins()
+        AppShell.uiScope.launch {
+            val result = runCatching {
+                val bytes = Http.fetchBytesRobust(url)
+                    ?: throw Exception("Download failed — check the URL")
+                checkHash(bytes, plugin.fileHash)?.let { throw Exception(it) }
+                com.hikari.app.aniyomi.AniyomiExtensionManager.install(
+                    HikariApp.instance,
+                    bytes,
+                    sourceUrl = url,
+                    iconUrl = plugin.iconUrl,
+                ).getOrThrow()
+            }
+            finishInstall(plugin.name, url, result)
+        }
+    }
+
+    /** A repo row's Install, routed to the manager for the open repo's kind. */
+    private fun installFromRepo(plugin: PluginRef) {
+        when (openRepo?.kind) {
+            RepoKind.NUVIO -> installNuvioPlugin(plugin)
+            RepoKind.SKYSTREAM -> installSkyStreamPlugin(plugin)
+            RepoKind.ANIYOMI -> installAniyomiPlugin(plugin)
+            else -> installPlugin(plugin.name, plugin.url, plugin.fileHash, plugin.jarHash)
+        }
+    }
+
+    /** A repo row's Uninstall, routed to the manager for the open repo's kind.
+     *  The managers remove by exact source URL, so each installed provider's own
+     *  spelling of the URL is handed over (a repo build can move the file). */
+    private fun uninstallFromRepo(plugin: PluginRef) {
+        val kind = openRepo?.kind
+        if (kind == null || kind == RepoKind.CS3 || kind == RepoKind.HIKARI) {
+            uninstallPlugin(plugin.name, plugin.url)
+            return
+        }
+        busyPlugins[plugin.url] = "Uninstalling…"
+        fillPlugins()
+        AppShell.uiScope.launch {
+            val targets = providersFor(plugin.url).mapNotNull { it.extra }.distinct()
+                .ifEmpty { listOf(plugin.url) }
+            var removed = 0
+            for (t in targets) removed += runCatching { uninstallByKind(kind, t) }.getOrDefault(0)
+            Fx.run {
+                busyPlugins.remove(plugin.url)
+                val count = if (removed > 0) removed else targets.size
+                setStatus("Uninstalled ${plugin.name} ($count provider${if (count == 1) "" else "s"}).")
+                AppShell.toast("Uninstalled ${plugin.name}", "ok")
+                renderAll()
+            }
+            reloadProvidersQuietly()
+        }
+    }
+
+    private suspend fun uninstallByKind(kind: RepoKind, source: String): Int = when (kind) {
+        RepoKind.NUVIO -> com.hikari.app.nuvio.NuvioPluginManager.uninstallScraper(HikariApp.instance, source)
+        RepoKind.SKYSTREAM -> com.hikari.app.skystream.SkyStreamPluginManager.uninstall(HikariApp.instance, source)
+        RepoKind.ANIYOMI -> com.hikari.app.aniyomi.AniyomiExtensionManager.uninstall(HikariApp.instance, source)
+        else -> 0
+    }
+
+    /** Shared tail of every non-dex install: one busy-state cleanup, one row
+     *  message, one status line, one toast. */
+    private fun finishInstall(name: String, url: String, result: Result<Int>) {
+        Fx.run {
+            busyPlugins.remove(url)
+            busy.isVisible = false
+            val count = result.getOrNull()
+            val isErr = count == null
+            val message = if (isErr) {
+                "Couldn't install $name: " +
+                    (result.exceptionOrNull()?.message ?: "unknown error").take(300)
+            } else {
+                val n = if (count!! > 0) count else 1
+                "Installed $name ($n provider${if (n == 1) "" else "s"})."
+            }
+            if (isErr) installErrors[url] = message.take(700) else installErrors.remove(url)
+            setStatus(message, isErr)
+            AppShell.toast(
+                if (isErr) "$name could not be installed" else "$name installed",
+                if (isErr) "error" else "ok",
+            )
+            renderAll()
+        }
+        reloadProvidersQuietly()
+    }
+
+    /** Verifies a repo's `sha256-<hex>` signature over [bytes]; returns a reason
+     *  when it doesn't match, null when fine (or nothing to check). */
+    private fun checkHash(bytes: ByteArray, expected: String?): String? {
+        val want = expected?.removePrefix("sha256-")?.lowercase() ?: return null
+        if (want.length != 64) return null
+        val got = runCatching {
+            java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
+                .joinToString("") { "%02x".format(it) }
+        }.getOrNull() ?: return null
+        return if (got != want) "checksum mismatch (file corrupted or tampered)" else null
+    }
+
     // ── installing / uninstalling ───────────────────────────────────────────
 
     private fun installFromUrl(raw: String) {
         val url = Http.normalizeUrl(raw)
         if (url.isBlank()) return
-        if (url.endsWith("repo.json") || url.contains("/repo.json")) {
+        val path = url.substringBefore('?').lowercase()
+        if (path.endsWith("repo.json")) {
             addRepo(url, RepoKind.CS3)
+            return
+        }
+        if (path.endsWith("manifest.json")) {
+            addRepo(url, RepoKind.NUVIO)
+            return
+        }
+        if (path.endsWith("index.min.json")) {
+            addRepo(url, RepoKind.ANIYOMI)
+            return
+        }
+        if (path.endsWith(".m3u") || path.endsWith(".m3u8")) {
+            addIptv(url)
             return
         }
         val fileName = url.substringAfterLast('/').substringBefore('?').ifBlank { "ext.jar" }
         val name = fileName
             .removeSuffix(".hiki").removeSuffix(".cs3").removeSuffix(".jar")
+            .removeSuffix(".sky").removeSuffix(".js").removeSuffix(".apk").removeSuffix(".ext")
             .replace(Regex("[-_.]+"), " ").trim().ifBlank { "Extension" }
-        installPlugin(name, url)
+        when {
+            path.endsWith(".sky") -> installSkyFromUrl(name, url)
+            path.endsWith(".js") -> installNuvioFromUrl(name, url)
+            path.endsWith(".apk") || path.endsWith(".ext") -> installAniyomiFromUrl(name, url)
+            else -> installPlugin(name, url)
+        }
     }
 
-    /** Providers installed from a given repo plugin URL (bundle providers all
-     *  share the download URL as their extra prefix). Covers both Hikari jars
-     *  and CloudStream .cs3 installs — both record the source URL in extra. */
+    /** Providers installed from a given repo plugin URL. Hikari/CloudStream
+     *  bundle providers share the download URL as their extra prefix
+     *  (`<url>|<index>`); Nuvio/SkyStream/Aniyomi record the source URL whole. */
     private fun providersFor(url: String): List<ProviderConfig> =
         runCatching {
-            AppShell.app.store.providers().filter {
-                it.type in setOf(ProviderType.HIKARI, ProviderType.CS3) &&
-                    it.extra?.startsWith("$url|") == true
+            val keys = sourceKeys(url)
+            AppShell.app.store.providers().filter { cfg ->
+                when (cfg.type) {
+                    ProviderType.HIKARI, ProviderType.CS3 -> cfg.extra?.startsWith("$url|") == true
+                    ProviderType.NUVIO, ProviderType.SKYSTREAM, ProviderType.ANIYOMI -> {
+                        val extra = cfg.extra ?: return@filter false
+                        keys.any { k -> extra == k || extra.startsWith("$k|") }
+                    }
+                    else -> false
+                }
             }
         }.getOrDefault(emptyList())
+
+    /**
+     * The spellings of a source URL an install may have recorded. A repo build
+     * can move the file (a new branch, `refs/heads/x` vs `x`, the jsDelivr
+     * mirror) between listing and uninstall, and a literal comparison used to
+     * greet an already-installed extension with an Install button again.
+     */
+    private fun sourceKeys(url: String): Set<String> {
+        val u = url.trim()
+        val out = linkedSetOf(u)
+        out.add(u.replace("/refs/heads/", "/"))
+        out.add(u.replace("https://cdn.jsdelivr.net/gh/", "https://raw.githubusercontent.com/"))
+        out.add(u.removeSuffix("/"))
+        return out
+    }
 
     /** Downloads (auto-swapping .hiki → .jar), loads, and registers every
      *  provider inside the extension. Every candidate is verified (zip header
@@ -676,7 +1173,14 @@ class ExtensionsScreenView {
             try {
                 val safeName = name.lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-').ifBlank { "ext" }
                 val dest = File(extDir, "$safeName.jar")
-                dest.delete()
+                // A reinstall or a repair of the build that is already on disk:
+                // when the repo publishes a sha256 for it (every big repo does —
+                // that is what the "signed" badge means) and the local file
+                // matches, the download would only make the user wait for bytes
+                // they already have. Re-registering the file IS the install.
+                val reused = dest.isFile && dest.length() > 0L && fileHash != null &&
+                    verifyDownload(dest, dl, fileHash, jarHash) == null
+                if (!reused) dest.delete()
                 // CloudStream repos publish the same plugin side by side as a
                 // dex .cs3 and a JVM .jar (Hikari repos: .hiki/.jar). When the
                 // preferred form 404s or is blocked on some mirror, the sibling
@@ -695,7 +1199,7 @@ class ExtensionsScreenView {
                 var loadFailure: String? = null
                 for (c in candidates) {
                     val why = StringBuilder()
-                    val ok = Http.downloadToRobust(c, dest) { tried, success, reason ->
+                    val ok = if (reused && c == dl) true else Http.downloadToRobust(c, dest) { tried, success, reason ->
                         if (!success) {
                             val host = tried.substringAfter("//").substringBefore('/')
                             if (why.isNotEmpty()) why.append(";  ")
@@ -874,14 +1378,53 @@ class ExtensionsScreenView {
 
     private fun installFromDisk() {
         val chooser = FileChooser().apply {
-            title = "Choose an extension (.jar is the desktop format)"
-            extensionFilters.add(FileChooser.ExtensionFilter("Extensions", "*.jar", "*.hiki", "*.cs3"))
+            title = "Choose an extension"
+            extensionFilters.add(
+                FileChooser.ExtensionFilter(
+                    "Extensions", "*.jar", "*.hiki", "*.cs3", "*.sky", "*.js", "*.apk", "*.ext", "*.m3u", "*.m3u8",
+                )
+            )
+            extensionFilters.add(FileChooser.ExtensionFilter("JVM extensions", "*.jar", "*.hiki"))
+            extensionFilters.add(FileChooser.ExtensionFilter("SkyStream / Nuvio", "*.sky", "*.js"))
+            extensionFilters.add(FileChooser.ExtensionFilter("Aniyomi", "*.apk", "*.ext"))
+            extensionFilters.add(FileChooser.ExtensionFilter("IPTV playlists", "*.m3u", "*.m3u8"))
             extensionFilters.add(FileChooser.ExtensionFilter("All files", "*.*"))
         }
         val file = chooser.showOpenDialog(null) ?: return
+        val kind = file.name.substringAfterLast('.', "").lowercase()
+        // Playlists and Aniyomi/SkyStream/Nuvio files are read from the path
+        // itself — no copy into the extension dir is needed (the managers own
+        // their own storage).
+        if (kind == "m3u" || kind == "m3u8") {
+            addIptv(file.absolutePath)
+            return
+        }
         busy.isVisible = true
         setStatus("Installing ${file.name}…", busy = true)
         AppShell.uiScope.launch {
+            val bytes = runCatching { file.readBytes() }.getOrNull()
+            val result: Result<Int>? = when (kind) {
+                "sky" -> bytes?.let {
+                    runCatching {
+                        com.hikari.app.skystream.SkyStreamPluginManager.install(HikariApp.instance, it).getOrThrow()
+                    }
+                }
+                "js" -> bytes?.let {
+                    runCatching {
+                        com.hikari.app.nuvio.NuvioPluginManager.installScraper(HikariApp.instance, it, file.name).getOrThrow()
+                    }
+                }
+                "apk", "ext" -> bytes?.let {
+                    runCatching {
+                        com.hikari.app.aniyomi.AniyomiExtensionManager.install(HikariApp.instance, it).getOrThrow()
+                    }
+                }
+                else -> null
+            }
+            if (result != null || bytes == null) {
+                finishInstall(file.nameWithoutExtension, file.absolutePath, result ?: Result.failure(Exception("Could not read the file")))
+                return@launch
+            }
             var statusText = "Install failed: unknown error"
             var isErr = true
             try {
@@ -1030,12 +1573,20 @@ class ExtensionsScreenView {
         const val MODE_STREMIO = 2
         const val MODE_SCRAPER = 3
         const val MODE_FILE = 4
+        const val MODE_SKYSTREAM = 5
+        const val MODE_NUVIO = 6
+        const val MODE_ANIYOMI = 7
+        const val MODE_IPTV = 8
 
         const val DEFAULT_HIKARI_REPO = "https://github.com/codegeasse1/hikari-extensions"
 
         val COMPOSER_MODES = listOf(
             "Hikari repo",
             "CloudStream repo",
+            "SkyStream repo",
+            "Nuvio repo",
+            "Aniyomi repo",
+            "IPTV playlist",
             "Stremio addon",
             "Universal scraper",
             "File / URL",
@@ -1043,15 +1594,24 @@ class ExtensionsScreenView {
         val COMPOSER_PROMPTS = listOf(
             "Hikari repo URL (repo.json)",
             "CloudStream repo.json URL",
+            "SkyStream repo URL or shortcode",
+            "Nuvio repo URL (manifest.json)",
+            "Aniyomi repo URL (index.min.json)",
+            "IPTV playlist URL (m3u / m3u8)",
             "Stremio addon manifest URL (…/manifest.json)",
             "Universal scraper JSON config URL",
-            "Direct .jar / .cs3 / .hiki URL (or repo.json)",
+            "Direct .jar / .cs3 / .hiki / .sky / .js / .apk / .m3u8 URL (or repo.json)",
         )
-        val COMPOSER_LABELS = listOf("Add repo", "Add repo", "Add addon", "Add scraper", "Install")
+        val COMPOSER_LABELS = listOf(
+            "Add repo", "Add repo", "Add repo", "Add repo", "Add repo", "Add playlist",
+            "Add addon", "Add scraper", "Install",
+        )
 
         const val HINT = "Desktop extensions are JVM .jar files — the same code the Android app ships as .hiki. " +
             "Paste a .hiki or .cs3 link anyway: the dex archive is auto-matched to its .jar build, and the repo's " +
             "sha256 signature (when published) is verified before anything is loaded. " +
-            "A bundle extension (e.g. Anime) installs each of its sub-extensions separately."
+            "A bundle extension (e.g. Anime) installs each of its sub-extensions separately. " +
+            "SkyStream (.sky), Nuvio (.js) and Aniyomi (.apk) extensions run natively here too, and an " +
+            "m3u/m3u8 playlist becomes an IPTV provider."
     }
 }

@@ -1,11 +1,77 @@
 package android.app
 
 import android.content.Context
+import android.content.Intent
+import android.view.View
+import android.view.Window
 
 open class Application : Context()
 
-/** Minimal Activity shim — desktop plugins that cast the host context to an
- *  Activity (some CloudStream plugins do `app as AppCompatActivity`) will fail
- *  that cast on desktop and fall back to their context path; that is expected
- *  and handled by plugin authors' own try/catch. */
-open class Activity : Context()
+/**
+ * Minimal Activity shim.
+ *
+ * CloudStream plugins cast the `Context` they are handed to an Activity (and
+ * often straight to `AppCompatActivity` — see
+ * [androidx.appcompat.app.DesktopActivity], which the desktop passes to
+ * `Plugin.load()`), then reach for the pieces of an Activity they need. Those
+ * pieces are here so the plugin's own code keeps running instead of dying on a
+ * NoSuchMethodError; nothing is ever displayed.
+ */
+open class Activity : Context() {
+
+    private val activityWindow = Window()
+
+    private var finished = false
+
+    @JvmField
+    var intent: Intent? = null
+
+    @JvmField
+    var title: CharSequence? = null
+
+    open fun getWindow(): Window = activityWindow
+
+    open fun getLayoutInflater(): Any? = null
+
+    open fun findViewById(id: Int): View? = null
+
+    open fun isFinishing(): Boolean = finished
+
+    open fun isDestroyed(): Boolean = finished
+
+    open fun isChangingConfigurations(): Boolean = false
+
+    open fun finish() {
+        finished = true
+    }
+
+    open fun finishAffinity() {
+        finished = true
+    }
+
+    open fun runOnUiThread(action: Runnable?) {
+        runCatching { action?.run() }
+    }
+
+    open fun getIntent(): Intent? = intent
+
+    open fun setIntent(i: Intent?) {
+        intent = i
+    }
+
+    open fun getTitle(): CharSequence? = title
+
+    open fun setTitle(t: CharSequence?) {
+        title = t
+    }
+
+    open fun setTitle(id: Int) {}
+
+    open fun setResult(resultCode: Int) {}
+
+    open fun setResult(resultCode: Int, data: Intent?) {}
+
+    open fun recreate() {}
+
+    override fun toString(): String = "DesktopActivity"
+}

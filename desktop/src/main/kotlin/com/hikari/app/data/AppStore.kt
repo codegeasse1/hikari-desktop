@@ -293,6 +293,16 @@ class AppStore(private val dir: File) {
         saveProviders(providers().map { if (it.id == id) it.copy(enabled = enabled) else it })
     }
 
+    /** Locked read-modify-write of the provider list. Rebuilding the list from
+     *  a snapshot read OUTSIDE the lock drops anything installed in between —
+     *  which is exactly how an uninstall used to silently remove an extension
+     *  the user had just added. */
+    fun updateProviders(transform: (List<ProviderConfig>) -> List<ProviderConfig>) {
+        synchronized(lock) {
+            saveProviders(transform(providers()))
+        }
+    }
+
     fun reposFlow(): Flow<List<Cs3Repo>> = flowOf { repos() }
     fun repos(): List<Cs3Repo> = parseRepos(get(K.CS3_REPOS))
     fun addCs3Repo(r: Cs3Repo) {

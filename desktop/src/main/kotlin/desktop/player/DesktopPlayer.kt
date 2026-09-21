@@ -29,6 +29,30 @@ object DesktopPlayer {
 
     private var proc: Process? = null
 
+    /** mpv's IPC endpoint for the current launch. On Windows this is a named
+     *  pipe name, elsewhere a Unix socket path — [ipcArg] turns it into the
+     *  `--input-ipc-server` value mpv expects. */
+    @Volatile
+    private var ipcTarget: String? = null
+
+    /** True when [ipcTarget] names a Windows named pipe rather than a socket. */
+    @Volatile
+    private var ipcIsPipe = false
+
+    private val ipcSeq = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /** The IPC channel to the running mpv, when one was established. */
+    @Volatile
+    private var ipc: MpvIpc? = null
+
+    /** Invoked when the file ends, so the caller can start the next episode. */
+    @Volatile
+    private var onEnded: (() -> Unit)? = null
+
+    /** Invoked with (positionMs, durationMs) as playback advances. */
+    @Volatile
+    private var onPosition: ((Long, Long) -> Unit)? = null
+
     /** Non-modal "Player is loading…" indicator shown from Play-click until the
      *  mpv window is up (or an error/fallback dialog takes over). Without it
      *  Play appeared to do nothing for the ~1-3s mpv takes to launch. */
@@ -77,7 +101,15 @@ object DesktopPlayer {
         url.contains("/v1/edge/streams/") || url.contains("mmcdn.com") ||
             url.contains("edge-hls.chaturbate.com")
 
-    fun play(title: String, stream: StreamSource, refresh: (() -> StreamSource?)? = null) {
+    fun play(
+        title: String,
+        stream: StreamSource,
+        refresh: (() -> StreamSource?)? = null,
+        next: (() -> Unit)? = null,
+        position: ((Long, Long) -> Unit)? = null,
+    ) {
+        onEnded = next
+        onPosition = position
         // Sanitize here too so a malformed URL from ANY provider (chaturbate's
         // root-relative escaped HLS path, stray quotes, JSON escapes) can't
         // reach mpv or the browser as garbage.
@@ -123,6 +155,8 @@ object DesktopPlayer {
      * would hand OkHttp a `file:` URL it cannot fetch.
      */
     fun playFile(title: String, path: String) {
+        onEnded = null
+        onPosition = null
         Fx.run {
             val file = File(path)
             if (!file.exists()) {
@@ -134,14 +168,16 @@ object DesktopPlayer {
                 showBrowserFallback(title, path, "The video player (mpv) wasn't found next to the app — re-download the latest release.")
                 return@run
             }
-            val args = listOf(
-                mpv.absolutePath,
-                "--force-window=yes",
-                "--no-ytdl",
-                "--no-config",
-                "--title=" + title.take(200).replace('\n', ' '),
-                file.absolutePath,
-            )
+            ipcTarget = openIpcEndpoint()
+            val args = buildList {
+                add(mpv.absolutePath)
+                add("--force-window=yes")
+                add("--no-ytdl")
+                add("--no-config")
+                add("--title=" + title.take(200).replace('\n', ' '))
+                ipcArg()?.let { add(it) }
+                add(file.absolutePath)
+            }
             val p = runCatching { ProcessBuilder(args).redirectErrorStream(true).start() }.getOrNull()
             if (p == null) {
                 showBrowserFallback(title, path, "Couldn't launch the video player.")
@@ -150,6 +186,7 @@ object DesktopPlayer {
             proc?.let { runCatching { it.destroy() } }
             proc = p
             dialogShown = false
+            attachPlayerWindow(title)
             Thread(
                 {
                     runCatching { p.inputStream.bufferedReader().forEachLine { } }
@@ -173,6 +210,7 @@ object DesktopPlayer {
     private fun launchMpv(title: String, stream: StreamSource, refresh: (() -> StreamSource?)?, attemptsLeft: Int) {
         Fx.run {
             showLoading(title)
+            ipcTarget = openIpcEndpoint()
             val mpv = findMpv()
             if (mpv == null) {
                 val url = com.hikari.app.net.Http.sanitizeStreamUrl(stream.url)
@@ -209,6 +247,7 @@ object DesktopPlayer {
                 add("--title=" + title.take(200).replace('\n', ' '))
                 val logDir2 = logDir
                 add("--log-file=${File(logDir2, "mpv.log").absolutePath}")
+                ipcArg()?.let { add(it) }
                 // Providers may ship stream headers (Referer/Cookie/UA) their
                 // CDN validates — hand them straight to mpv. If no User-Agent is
                 // among them, force a desktop-browser one: mpv's default
@@ -230,6 +269,7 @@ object DesktopPlayer {
             }
             proc?.let { runCatching { it.destroy() } }
             proc = p
+            attachPlayerWindow(title)
             // mpv is up — drop the loading indicator so it doesn't linger over
             // the playing video.
             Thread({ try { Thread.sleep(2500) } catch (e: InterruptedException) {}; closeLoading() }, "hikari-loading-close")
@@ -415,10 +455,102 @@ object DesktopPlayer {
         stage.show()
     }
 
-    fun closeAll() {
-        Fx.run {
-            proc?.let { runCatching { it.destroy() } }
-            proc = null
+    /** True on Windows, where mpv's IPC transport is a named pipe. */
+    private fun isWindows(): Boolean =
+        System.getProperty("os.name").orEmpty().lowercase().contains("win")
+
+    /**
+     * Reserves an endpoint for the next mpv launch. A fresh name per launch, so
+     * a stale pipe/socket left behind by a crashed player can never be mistaken
+     * for the new one's.
+     */
+    private fun openIpcEndpoint(): String {
+        val n = ipcSeq.incrementAndGet()
+        return if (isWindows()) {
+            ipcIsPipe = true
+            "hikari-mpv-" + ProcessHandle.current().pid() + "-" + n
+        } else {
+            ipcIsPipe = false
+            val dir = File(System.getProperty("java.io.tmpdir"), "hikari-player").apply { mkdirs() }
+            val sock = File(dir, "mpv-$n.sock")
+            runCatching { sock.delete() }
+            sock.absolutePath
         }
+    }
+
+    /** The `--input-ipc-server=…` argument for the current endpoint, or null
+     *  when this launch has no IPC (in which case mpv just plays normally). */
+    private fun ipcArg(): String? {
+        val target = ipcTarget ?: return null
+        return if (ipcIsPipe) "--input-ipc-server=\\\\.\\pipe\\$target"
+        else "--input-ipc-server=$target"
+    }
+
+    /**
+     * Connects the in-app player surface to a freshly launched mpv. Off the FX
+     * thread (mpv creates its pipe a moment after launch), and silently skipped
+     * when the endpoint never appears — a player window we cannot drive must
+     * leave the plain mpv playback untouched.
+     */
+    private fun attachPlayerWindow(title: String) {
+        val target = ipcTarget ?: return
+        val isPipe = ipcIsPipe
+        val mine = proc ?: return
+        Thread(
+            {
+                val client = MpvIpc(target, isPipe)
+                if (!client.connect(6_000L)) {
+                    runCatching { client.close() }
+                    return@Thread
+                }
+                // A newer launch (or a stop) happened while we were connecting.
+                if (proc !== mine) {
+                    runCatching { client.close() }
+                    return@Thread
+                }
+                ipc = client
+                client.onProperty = { name, value -> PlayerWindow.onProperty(name, value) }
+                client.onEvent = { event, data -> PlayerWindow.onEvent(event, data) }
+                val next = onEnded
+                val pos = onPosition
+                Fx.run {
+                    if (proc !== mine) {
+                        runCatching { client.close() }
+                        ipc = null
+                        return@run
+                    }
+                    val ok = PlayerWindow.attach(
+                        title = title,
+                        handle = client,
+                        hasNext = next != null,
+                        next = next,
+                        position = { p, d -> pos?.invoke(p, d) },
+                        closed = { Fx.run { stopPlayback() } },
+                    )
+                    if (!ok) {
+                        runCatching { client.close() }
+                        ipc = null
+                    }
+                }
+            },
+            "hikari-mpv-attach",
+        ).apply { isDaemon = true; start() }
+    }
+
+    /** Tears the running player down: closes the IPC channel (which closes the
+     *  app's player window) and kills mpv. Runs on the FX thread. */
+    private fun stopPlayback() {
+        Fx.run {
+            runCatching { ipc?.close() }
+            ipc = null
+            runCatching { PlayerWindow.closeAll() }
+            runCatching { proc?.destroy() }
+            proc = null
+            ipcTarget = null
+        }
+    }
+
+    fun closeAll() {
+        stopPlayback()
     }
 }

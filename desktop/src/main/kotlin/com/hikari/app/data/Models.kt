@@ -1,6 +1,21 @@
 package com.hikari.app.data
 
-enum class ProviderType { STREMIO, UNIVERSAL, CS3, HIKARI }
+enum class ProviderType {
+    STREMIO, UNIVERSAL, CS3, HIKARI, NUVIO, SKYSTREAM, ANIYOMI, IPTV;
+
+    /** Which section of the player's server chooser a source from this engine
+     *  belongs to, so the picker reads as one group per engine. */
+    val groupLabel: String
+        get() = when (this) {
+            STREMIO -> "Stremio"
+            NUVIO -> "Nuvio"
+            CS3 -> "CloudStream"
+            SKYSTREAM -> "SkyStream"
+            ANIYOMI -> "Aniyomi"
+            IPTV -> "IPTV"
+            HIKARI, UNIVERSAL -> "Hikari"
+        }
+}
 
 data class ProviderConfig(
     val id: String,
@@ -13,7 +28,7 @@ data class ProviderConfig(
 )
 
 /** A CloudStream-style plugin repository (repo.json → pluginLists → plugin list). */
-enum class RepoKind { CS3, HIKARI }
+enum class RepoKind { CS3, HIKARI, NUVIO, SKYSTREAM, ANIYOMI }
 
 /** A plugin repository, either CloudStream (.cs3) or Hikari (.hiki) style. */
 data class Cs3Repo(
@@ -33,6 +48,18 @@ data class Cs3RepoPlugin(
     val version: Int = 1,
     val tvTypes: List<String> = emptyList(),
     val fileHash: String? = null,
+    /**
+     * Where to find this entry's icon when the repo listing itself declares
+     * none. SkyStream `.sky` entries carry an `addons` array of Stremio
+     * manifest URLs, and that manifest's `logo` is the extension's real icon
+     * (the `.sky`'s own plugin.json has no icon field at all) — the first
+     * addon URL is captured here so the row can resolve a logo lazily.
+     */
+    val iconManifest: String? = null,
+    /** The extension's own site host, the last-resort icon source: the first
+     *  real entry in `domains`, else the `baseUrl`/`url` host. Null when the
+     *  listing names only a placeholder host (see the SkyStream manager). */
+    val iconHost: String? = null,
 )
 
 /** Per-repo plugin-list loading state shown in the Extensions screen. */
@@ -71,8 +98,32 @@ data class MediaItem(
      *  protocol puts this literal string in /catalog /meta /stream URLs, and
      *  many addons refuse requests sent with a different type segment. */
     val rawType: String = "",
+    /**
+     * The title a PROVIDER knows this item by, when it differs from [title].
+     *
+     * [title] is what the USER reads and, with a TMDB content language set, is
+     * TMDB's localized name; the extensions still index the ORIGINAL name, so
+     * searching them with the localized one finds nothing. TMDB hands us
+     * `original_title`/`original_name` in the same response it localizes from,
+     * so this is filled in for every TMDB-sourced item. Blank for an extension
+     * item, whose own [title] already IS the name its sites use.
+     */
+    val originalTitle: String = "",
 ) {
     val uniqueId: String get() = "$providerId|$type|$id"
+
+    /** The name to ASK PROVIDERS with: the original/English title when the item
+     *  carries one, else the display title. Nothing user-facing prints this —
+     *  it exists so a title localized for display never becomes the search
+     *  key (see [originalTitle]). */
+    val searchTitle: String get() = originalTitle.trim().ifBlank { title.trim() }
+
+    /** Every name this item is known by, display name first and the original
+     *  name last. Lookups that can afford to try more than one name walk this. */
+    val allTitles: List<String>
+        get() = listOf(title.trim(), originalTitle.trim())
+            .filter { it.isNotBlank() }
+            .distinctBy { it.lowercase() }
 }
 
 data class Episode(
@@ -80,6 +131,8 @@ data class Episode(
     val id: String,
     val name: String? = null,
     val image: String? = null,
+    /** Season this episode belongs to (1 when a provider has no season info). */
+    val season: Int = 1,
 )
 
 /** A single watch-history entry — what the user played and where they left off. */

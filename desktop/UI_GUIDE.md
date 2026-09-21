@@ -132,14 +132,19 @@ navigation so a theme change made elsewhere lands without a restart.
 rows are materialised. Do not replace it with a `FlowPane` of cards: a real library
 is thousands of items and thousands of `ImageView`s will not scroll smoothly.
 
-## Still to port from the Android app
+## Ported engines and what is still missing
 
 Downloads is done: the queue, the HLS/MP4 engine (AES-128, byte-range and fMP4
 segments), pause/resume, offline playback and export to the user's own
 Downloads/Hikari folder all work — see `docs/DESKTOP_PARITY.md` for what the
 desktop changed relative to Android (mpv replaces `MediaExtractor`/`MediaMuxer`
-for the audio-merge step). The player still launches mpv as a child process —
-driving it over `--input-ipc-server` is what unlocks a real OSD, timeline and
-track selection. i18n, TMDB metadata, SkyStream, Nuvio (QuickJS) and Aniyomi
-extensions are not ported yet; see `docs/DESKTOP_PARITY.md` for the plan and the
-order to do it in.
+for the audio-merge step).
+
+The SkyStream, Nuvio and Aniyomi engines are ported, IPTV playlists are a
+provider, and the player is now driven over mpv's JSON IPC (a real transport
+window with a timeline, tracks, speed and next-episode) — the Extensions screen
+is where all of them are added. `desktop/UI_GUIDE.md`'s rules apply to any UI
+added for them.
+
+Still missing: i18n and the TMDB metadata/ratings/collections/backup features.
+See `docs/DESKTOP_PARITY.md` for the state of each and the remaining plan.

@@ -54,6 +54,16 @@ object Cs3PluginManager {
     var lastError: String? = null
         private set
 
+    /** Non-fatal trouble from the last load: the providers came up, but
+     *  `load()` itself did not finish (see [loadFile]). */
+    @Volatile
+    var lastWarning: String? = null
+        private set
+
+    /** Set by [loadFile] when `load()` threw; the providers it had already
+     *  registered are still returned. */
+    private var loadFailure: Throwable? = null
+
     private val errorDetails = StringBuilder()
 
     private val loadExecutor =
@@ -121,6 +131,8 @@ object Cs3PluginManager {
     private fun loadFile(context: Context, file: File): List<MainAPI> {
         errorDetails.setLength(0)
         lastError = null
+        lastWarning = null
+        loadFailure = null
         val path = file.absolutePath
 
         val classLoader = try {
@@ -199,13 +211,21 @@ object Cs3PluginManager {
                 record("load() timed out after ${LOAD_TIMEOUT_S}s", RuntimeException("${manifest.pluginClassName}.load() hung"))
                 return fail()
             } catch (e: Throwable) {
+                // A plugin whose load() dies inside its own bootstrap — a
+                // donation/notice dialog, a settings screen, anything that
+                // expects the Android UI framework — has usually already
+                // registered its providers, and those providers work fine
+                // (they are network code). Throwing the whole extension away
+                // on that exception is what turned "this plugin shows a
+                // dialog" into "couldn't load <name>" and no extension at all.
+                // Keep whatever it registered and carry the reason along.
                 future.cancel(true)
                 record("load() threw", e)
-                return fail()
+                loadFailure = e
             }
         } catch (e: Throwable) {
             record("load() threw", e)
-            return fail()
+            loadFailure = e
         }
 
         val apis = try {
@@ -236,6 +256,11 @@ object Cs3PluginManager {
             } else {
                 "Plugin loaded but registered no providers"
             }
+        } else if (loadFailure != null) {
+            // Success with a caveat: the providers are registered and usable,
+            // but load() did not finish. Surface it as a warning, not a failure.
+            lastError = null
+            lastWarning = errorDetails.toString().trim().ifBlank { null }
         }
         return apis
     }

@@ -64,6 +64,11 @@ class DetailScreenView(private val item: MediaItem) {
     private var pendingDownload = false
     private var favourite = false
 
+    /** When the playback position was last written to history (mpv reports it
+     *  about once a second; history only needs the occasional checkpoint). */
+    @Volatile
+    private var lastPositionSave = 0L
+
     /** How many tiles the episode grid shows; a "Show more" button extends it,
      *  so an anime season with 1000 episodes doesn't build 1000 buttons. */
     private var episodeLimit = EPISODE_PAGE
@@ -717,6 +722,7 @@ class DetailScreenView(private val item: MediaItem) {
 
     private fun play(source: StreamSource) {
         val ep = selectedEpisode
+        lastPositionSave = 0L
         runCatching {
             HikariApp.instance.store.addHistory(
                 HistoryEntry(
@@ -741,7 +747,57 @@ class DetailScreenView(private val item: MediaItem) {
                     kotlinx.coroutines.runBlocking { AppShell.app.repository.streamsFor(meta, ep) }
                 }.getOrNull()?.firstOrNull()
             },
+            // The app's player window drives playback over mpv's IPC, so the
+            // screen hands it the two things it alone knows: what comes next,
+            // and where this episode got to.
+            next = nextEpisodeAction(),
+            position = { positionMs, durationMs -> savePosition(ep, positionMs, durationMs) },
         )
+    }
+
+    /** The player's "Next episode": advance to the following episode and play
+     *  its first source once it loads. Null on the last episode (or a movie), so
+     *  the player hides the button. */
+    private fun nextEpisodeAction(): (() -> Unit)? {
+        val current = selectedEpisode ?: return null
+        val idx = episodes.indexOfFirst { it.id == current.id }
+        if (idx < 0 || idx + 1 >= episodes.size) return null
+        val next = episodes[idx + 1]
+        return {
+            Fx.run {
+                selectedEpisode = next
+                renderEpisodeGrid()
+                updateNowPlaying()
+                pendingPlay = true
+                loadStreams()
+            }
+        }
+    }
+
+    /** Records the playback position on the title's history row, so a re-open
+     *  resumes where it left off. mpv reports the position about once a second,
+     *  so the write is throttled. */
+    private fun savePosition(ep: Episode?, positionMs: Long, durationMs: Long) {
+        if (positionMs <= 0) return
+        val now = System.currentTimeMillis()
+        if (now - lastPositionSave < POSITION_SAVE_INTERVAL_MS) return
+        lastPositionSave = now
+        runCatching {
+            HikariApp.instance.store.addHistory(
+                HistoryEntry(
+                    providerId = meta.providerId,
+                    mediaId = meta.id,
+                    type = meta.type,
+                    title = meta.title,
+                    posterUrl = meta.posterUrl,
+                    episodeId = ep?.id ?: "",
+                    episodeName = ep?.name ?: "",
+                    positionMs = positionMs,
+                    durationMs = durationMs,
+                    watchedAt = now,
+                )
+            )
+        }
     }
 
     private fun htmlToPlain(html: String): String = html
@@ -768,5 +824,8 @@ class DetailScreenView(private val item: MediaItem) {
 
         /** Tiles rendered per "page" before the Show-more button appears. */
         const val EPISODE_PAGE = 240
+
+        /** Minimum gap between two history position writes while playing. */
+        const val POSITION_SAVE_INTERVAL_MS = 10_000L
     }
 }

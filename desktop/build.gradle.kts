@@ -49,6 +49,9 @@ dependencies {
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.coroutines.swing)
     implementation(libs.okhttp)
+    // Aniyomi's NetworkHelper installs an HttpLoggingInterceptor on the shared
+    // client; the artifact is tiny and keeps that file a faithful copy.
+    implementation(libs.okhttp.logging)
     implementation(libs.jsoup)
     implementation(libs.gson)
     implementation(libs.jackson.databind)
@@ -67,6 +70,20 @@ dependencies {
     implementation(libs.conscrypt.openjdk)
     implementation(libs.orgjson)
     implementation(libs.imageio.webp)
+    // V8 for the JS engines: SkyStream `.sky` plugins and nuvio providers are
+    // plain JS written with async/await. Rhino (also a dependency, used by the
+    // CloudStream runtime) cannot parse an `async function` at all, so those
+    // engines run on V8. The native library ships inside the platform artifact
+    // and extracts itself at runtime, so jpackage only has to carry the jars.
+    implementation(libs.javet)
+    implementation(libs.javet.v8.windows)
+    // Aniyomi (.apk anime extensions) shim tree — the tachiyomi interfaces use
+    // RxJava 1, which is plain Java.
+    implementation(libs.rxjava)
+    // Aniyomi extensions that read their pages over a socket start a NanoHTTPD
+    // server themselves (`createHttpServer()`); the extension API Hikari ships
+    // is `fi.iki.elonen.NanoHTTPD`, which is exactly what this artifact holds.
+    implementation(libs.nanohttpd)
 }
 
 // The exe launcher on Windows (jpackage) needs every runtime jar in one input

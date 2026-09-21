@@ -137,6 +137,178 @@ object Http {
      *  slow network with eight parallel sockets. */
     private const val RACE_PARALLELISM = 4
 
+    /**
+     * How many candidate URLs may be in flight at once.
+     *
+     * [raceFirst] starts one worker per item up to the parallelism it is given,
+     * and a worker only frees up when its request finishes. With the old limit
+     * of four, the mirrors that actually work were queued BEHIND the blocked
+     * ones: four dead hosts held every worker for a full connect timeout (20s)
+     * before the fifth URL — the proxy frontdoor or jsDelivr that answers in a
+     * second — was even attempted. That is what made an install or a repo add
+     * sit for 30-40s while the actual download took under a second.
+     *
+     * The mirror list is bounded (8-16 URLs of a few hundred KB), so starting
+     * them all costs nothing worth saving.
+     */
+    private const val FANOUT = 12
+
+    /**
+     * What this machine's network can actually reach, learned as it goes.
+     *
+     * Two halves: hosts whose connections fail (a blocked CDN, a dead proxy) are
+     * remembered for ten minutes and moved to the BACK of every future candidate
+     * list, and the exact mirror URL that served a given file is remembered so
+     * the next request for it starts there. Both are persisted in
+     * `~/.hikari/cache/mirrors.json`, so the second launch of the app — and
+     * every install after the first — skips the dead hosts entirely instead of
+     * rediscovering them at 20 seconds a piece.
+     */
+    private object MirrorMemory {
+
+        private const val DEAD_TTL_MS = 10 * 60 * 1000L
+        private const val MAX_PREFERRED = 400
+
+        private val file: java.io.File by lazy {
+            val f = java.io.File(
+                java.io.File(System.getProperty("user.home"), ".hikari/cache"),
+                "mirrors.json",
+            )
+            runCatching { f.parentFile?.mkdirs() }
+            f
+        }
+
+        private val dead = java.util.concurrent.ConcurrentHashMap<String, Long>()
+        private val preferred = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+        @Volatile
+        private var loaded = false
+
+        @Volatile
+        private var dirty = false
+
+        private fun load() {
+            if (loaded) return
+            synchronized(this) {
+                if (loaded) return
+                loaded = true
+                runCatching {
+                    val text = file.takeIf { it.isFile }?.readText() ?: return@runCatching
+                    val root = org.json.JSONObject(text)
+                    root.optJSONObject("dead")?.let { d ->
+                        for (k in d.keys()) dead[k] = d.optLong(k)
+                    }
+                    root.optJSONObject("preferred")?.let { p ->
+                        for (k in p.keys()) preferred[k] = p.optString(k)
+                    }
+                }
+            }
+        }
+
+        private fun save() {
+            if (!dirty) return
+            dirty = false
+            runCatching {
+                val d = org.json.JSONObject()
+                val now = System.currentTimeMillis()
+                for ((k, v) in dead) if (now - v < DEAD_TTL_MS) d.put(k, v)
+                val p = org.json.JSONObject()
+                for ((k, v) in preferred.entries.take(MAX_PREFERRED)) p.put(k, v)
+                val root = org.json.JSONObject()
+                root.put("dead", d)
+                root.put("preferred", p)
+                file.writeText(root.toString())
+            }
+        }
+
+        fun hostOf(url: String): String =
+            runCatching { java.net.URI(url).host ?: url }.getOrDefault(url)
+
+        fun isDead(url: String): Boolean {
+            load()
+            val at = dead[hostOf(url)] ?: return false
+            if (System.currentTimeMillis() - at > DEAD_TTL_MS) {
+                dead.remove(hostOf(url))
+                return false
+            }
+            return true
+        }
+
+        fun markDead(url: String) {
+            load()
+            dead[hostOf(url)] = System.currentTimeMillis()
+            dirty = true
+            save()
+        }
+
+        fun markAlive(url: String) {
+            load()
+            if (dead.remove(hostOf(url)) != null) {
+                dirty = true
+                save()
+            }
+        }
+
+        /** The mirror that last served [url], if it is still a candidate. */
+        fun winnerFor(url: String): String? {
+            load()
+            return preferred[url]
+        }
+
+        fun rememberWinner(url: String, winner: String) {
+            load()
+            if (preferred[url] != winner) {
+                preferred[url] = winner
+                dirty = true
+                save()
+            }
+        }
+
+        /** Puts [winner] first and sinks hosts known to be dead, keeping the
+         *  caller's preference order within each group. */
+        fun order(url: String, variants: List<String>): List<String> {
+            load()
+            val winner = winnerFor(url)
+            val head = if (winner != null && variants.contains(winner)) listOf(winner) else emptyList()
+            val rest = variants.filter { it != winner }
+            return head + rest.sortedBy { if (isDead(it)) 1 else 0 }
+        }
+    }
+
+    /** True for failures that say something about the HOST (blocked, refused,
+     *  TLS-broken, unroutable) as opposed to the specific file — only those are
+     *  worth remembering. An HTTP 404 from a live host must not blacklist it. */
+    private fun isHostFailure(t: Throwable?): Boolean = when (t) {
+        null -> false
+        is java.net.UnknownHostException -> true
+        is java.net.ConnectException -> true
+        is java.net.SocketTimeoutException -> true
+        is java.net.NoRouteToHostException -> true
+        is javax.net.ssl.SSLException -> true
+        is java.io.InterruptedIOException -> true
+        else -> isHostFailure(t.cause)
+    }
+
+    /** A client for the FIRST pass over the mirrors: a host that is black-holed
+     *  (packets dropped, no RST — the usual shape of a censored CDN) costs the
+     *  full connect timeout, so the probe uses a short one. Whatever answers
+     *  still returns the complete body; the longer-timeout clients below only
+     *  come out when this pass found nothing at all.
+     */
+    private val mirrorProbeClient: OkHttpClient by lazy {
+        try {
+            applyConscryptTls(OkHttpClient.Builder())
+                .dns(HikariDns)
+                .followRedirects(true)
+                .followSslRedirects(true)
+                .connectTimeout(6, TimeUnit.SECONDS)
+                .readTimeout(10, TimeUnit.SECONDS)
+                .build()
+        } catch (t: Throwable) {
+            client
+        }
+    }
+
     fun get(url: String, headers: Map<String, String> = emptyMap()): Response {
         val builder = Request.Builder().url(url).header("User-Agent", UA)
         headers.forEach { (k, v) -> builder.header(k, v) }
@@ -291,35 +463,57 @@ object Http {
         val deadline = System.currentTimeMillis() + REPO_FETCH_DEADLINE_MS
         val failures = java.util.concurrent.ConcurrentLinkedQueue<Throwable>()
 
+        // The stale snapshot mirrors get their own phase, so a CDN copy of the
+        // repo can never answer before the live one.
+        val snapshot = list.filter { it == HIKARI_REPO_MIRROR || it == CLOUDSTREAM_REPO_MIRROR }
+        val live = list.filter { it !in snapshot }
+
+        // One candidate URL is not one request: each expands to its own mirror
+        // variants (jsDelivr, statically.io, the proxy frontdoors…). Flattening
+        // every candidate into a single stream of concrete URLs is what makes a
+        // repo add fast. The old code raced four CANDIDATES per wave and let each
+        // candidate walk its own mirror list serially inside the race, so a
+        // blocked raw.githubusercontent.com sitting in front of a working
+        // jsDelivr cost a full connect timeout before the good URL was even
+        // tried — several waves of that is the 30-40s wait.
+        val flattened = LinkedHashSet<String>()
+        for (c in live) flattened.addAll(urlVariants(c))
+        val snapshotUrls = LinkedHashSet<String>()
+        for (c in snapshot) snapshotUrls.addAll(urlVariants(c))
+
         fun tryOne(u: String): String? {
-            onStep?.invoke("Fetching repo… $u")
-            val r = fetchStringRobust(u)
+            val r = getStringStrict(u)
             val text = r.getOrNull()
             if (text == null) {
-                r.exceptionOrNull()?.let { failures += it }
+                val cause = r.exceptionOrNull()
+                cause?.let { failures += it }
+                if (isHostFailure(cause)) MirrorMemory.markDead(u)
                 return null
             }
             val root = runCatching { org.json.JSONObject(text) }.getOrNull() ?: return null
-            if (root.has("plugins")) return text
+            if (root.has("plugins")) {
+                MirrorMemory.markAlive(u)
+                MirrorMemory.rememberWinner(raw, u)
+                return text
+            }
             // CloudStream v2 manifests (manifestVersion + pluginLists): fetch the
             // pluginLists file and merge its plugins array in, so callers keep
             // seeing a plain "plugins" key.
-            if (root.has("pluginLists")) return resolvePluginLists(root, u)
+            if (root.has("pluginLists")) {
+                MirrorMemory.markAlive(u)
+                MirrorMemory.rememberWinner(raw, u)
+                return resolvePluginLists(root, u)
+            }
             return null
         }
 
-        // Candidates are raced in waves: the fastest host that actually serves a
-        // repo.json wins, instead of waiting out every dead mirror in front of
-        // it. The mirror snapshot stays in the LAST wave, so it can never shadow
-        // the live repo.
-        for ((index, wave) in list.chunked(RACE_PARALLELISM).withIndex()) {
-            if (System.currentTimeMillis() > deadline) {
-                return Result.failure(
-                    Exception("Timed out after ${REPO_FETCH_DEADLINE_MS / 1000}s — the repo host is unreachable from this network.")
-                )
-            }
-            onStep?.invoke("Fetching repo… (wave ${index + 1})")
-            raceFirst(wave, RACE_PARALLELISM, 30_000L) { tryOne(it) }
+        onStep?.invoke("Fetching repo… (racing ${flattened.size} mirrors)")
+        raceFirst(MirrorMemory.order(raw, flattened.toList()), FANOUT, 35_000L) { tryOne(it) }
+            ?.let { return Result.success(it.first to it.second) }
+
+        if (snapshotUrls.isNotEmpty() && System.currentTimeMillis() < deadline) {
+            onStep?.invoke("Fetching repo… (last-resort mirror)")
+            raceFirst(snapshotUrls.toList(), RACE_PARALLELISM, 25_000L) { tryOne(it) }
                 ?.let { return Result.success(it.first to it.second) }
         }
         return Result.failure(
@@ -747,60 +941,61 @@ object Http {
     }
 
     fun fetchStringRobust(url: String, headers: Map<String, String> = emptyMap()): Result<String> {
-        val variants = urlVariants(url)
+        val variants = MirrorMemory.order(url, urlVariants(url))
         val failures = java.util.concurrent.ConcurrentLinkedQueue<Throwable>()
         fun attempt(u: String): String? {
-            val r = getStringStrict(u, headers)
-            r.exceptionOrNull()?.let { failures += it }
+            val r = getStringStrictOn(mirrorProbeClient, u, headers)
+            if (r.isSuccess) {
+                MirrorMemory.markAlive(u)
+                MirrorMemory.rememberWinner(url, u)
+            } else {
+                val cause = r.exceptionOrNull()
+                cause?.let { failures += it }
+                if (isHostFailure(cause)) MirrorMemory.markDead(u)
+            }
             return r.getOrNull()
         }
-        // Wave 1: the most likely mirrors are raced, so the wall-clock cost is
-        // the fastest host rather than the sum of the dead ones (see [raceFirst]).
-        raceFirst(variants.take(RACE_PARALLELISM), RACE_PARALLELISM, 30_000L) { attempt(it) }
+        // Short-timeout pass over EVERY mirror at once: the answer is the
+        // fastest host, not the sum of the dead ones (see [raceFirst] and
+        // [FANOUT] for why four-at-a-time was not enough).
+        raceFirst(variants, FANOUT, 30_000L) { attempt(it) }
             ?.let { return Result.success(it.second) }
-        // Wave 2: everything else, with the same one-retry-per-mirror behaviour.
-        for (u in variants.drop(RACE_PARALLELISM)) {
-            for (attempt2 in 0 until 2) {
-                attempt(u)?.let { return Result.success(it) }
-                try {
-                    Thread.sleep(300L)
-                } catch (e: InterruptedException) {
-                    return Result.failure(failures.lastOrNull() ?: Exception("Failed to fetch $url"))
-                }
-            }
-        }
+        // Second pass on the full-timeout client, for hosts that are merely slow
+        // rather than dead (a throttled link can need longer than the probe).
+        raceFirst(variants, FANOUT, 40_000L) { u -> runCatching { getStringStrictOn(client, u, headers).getOrNull() }.getOrNull()?.also { MirrorMemory.markAlive(u) } }
+            ?.let { return Result.success(it.second) }
         // Rescue pass with the system proxy bypassed (see [noProxyClient]).
         if (systemProxyInUse()) {
-            for (u in variants) {
+            raceFirst(variants, RACE_PARALLELISM, 30_000L) { u ->
                 val r = getStringStrictOn(noProxyClient, u, headers)
-                if (r.isSuccess) return r
                 r.exceptionOrNull()?.let { failures += it }
-            }
+                if (r.isSuccess) MirrorMemory.markAlive(u) else if (isHostFailure(r.exceptionOrNull())) MirrorMemory.markDead(u)
+                r.getOrNull()
+            }?.let { return Result.success(it.second) }
         }
         return Result.failure(failures.lastOrNull() ?: Exception("Failed to fetch $url"))
     }
 
     fun fetchBytesRobust(url: String, headers: Map<String, String> = emptyMap()): ByteArray? {
-        for (u in urlVariants(url)) {
-            for (attempt in 0 until 2) {
-                val b = getBytes(u, headers)
-                if (b != null) return b
-                try {
-                    Thread.sleep(300L)
-                } catch (e: InterruptedException) {
-                    break
-                }
+        val variants = MirrorMemory.order(url, urlVariants(url))
+        raceFirst(variants, FANOUT, 40_000L) { u ->
+            val b = runCatching { getBytes(u, headers) }.getOrNull()
+            if (b != null) {
+                MirrorMemory.markAlive(u)
+                MirrorMemory.rememberWinner(url, u)
+            } else {
+                MirrorMemory.markDead(u)
             }
-        }
+            b
+        }?.let { return it.second }
         if (systemProxyInUse()) {
-            for (u in urlVariants(url)) {
-                try {
+            raceFirst(variants, RACE_PARALLELISM, 30_000L) { u ->
+                runCatching {
                     getOn(noProxyClient, u, headers).use { r ->
-                        if (r.isSuccessful) return r.body?.bytes()
+                        if (r.isSuccessful) r.body?.bytes() else null
                     }
-                } catch (_: Exception) {
-                }
-            }
+                }.getOrNull()
+            }?.let { return it.second }
         }
         return null
     }
@@ -828,14 +1023,15 @@ object Http {
         // (the Android app caps installs at 90s for the same reason).
         val deadline = System.currentTimeMillis() + DOWNLOAD_BUDGET_MS
         sweepParts(dest)
-        if (raceDownload(variants, dest, headers, onProgress, onAttempt, deadline, null, MAIN_RACE_MS)) return true
+        val ordered = MirrorMemory.order(url, variants)
+        if (raceDownload(ordered, dest, headers, onProgress, onAttempt, deadline, null, MAIN_RACE_MS, url)) return true
         // Rescue passes with the system proxy bypassed ([noProxyClient]) and then
         // with TLS pinned to 1.2 ([rescueClient]) — the two desktop
         // misconfigurations where every request fails while the browser works.
         if (systemProxyInUse() &&
-            raceDownload(variants, dest, headers, onProgress, onAttempt, deadline, noProxyClient, RESCUE_RACE_MS, "(no proxy)")
+            raceDownload(ordered, dest, headers, onProgress, onAttempt, deadline, noProxyClient, RESCUE_RACE_MS, url, "(no proxy)")
         ) return true
-        if (raceDownload(variants, dest, headers, onProgress, onAttempt, deadline, rescueClient, RESCUE_RACE_MS, "(TLS 1.2)")) return true
+        if (raceDownload(ordered, dest, headers, onProgress, onAttempt, deadline, rescueClient, RESCUE_RACE_MS, url, "(TLS 1.2)")) return true
         System.err.println("downloadToRobust failed for $url")
         return false
     }
@@ -877,19 +1073,33 @@ object Http {
         deadline: Long,
         via: OkHttpClient?,
         windowMs: Long,
+        rememberFor: String? = null,
         note: String = "",
     ): Boolean {
         if (System.currentTimeMillis() > deadline) return false
-        val wave = variants.take(RACE_PARALLELISM * 2)
+        // Every mirror starts at once. Taking only the first eight and racing
+        // them four at a time meant the working mirror waited behind the blocked
+        // ones for a whole connect timeout — see [FANOUT].
+        val wave = variants
         val staging = java.util.concurrent.ConcurrentHashMap<String, java.io.File>()
-        val winner = raceFirst(wave, RACE_PARALLELISM, windowMs) { u ->
+        val winner = raceFirst(wave, FANOUT, windowMs) { u ->
             if (System.currentTimeMillis() > deadline) return@raceFirst null
             val part = partOf(dest, u)
             staging[u] = part
             val reason = downloadToReason(u, part, headers, onProgress, via)
             if (reason == null) {
+                MirrorMemory.markAlive(u)
                 part
             } else {
+                // A host that refused, timed out or broke TLS is skipped for the
+                // next ten minutes (see [MirrorMemory]) — the difference between
+                // one slow install and every install being slow.
+                val r = reason.lowercase()
+                if (r.contains("timed out") || r.contains("timeout") || r.contains("refused") ||
+                    r.contains("ssl") || r.contains("unreachable") || r.contains("protocol error")
+                ) {
+                    MirrorMemory.markDead(u)
+                }
                 onAttempt?.invoke(u, false, if (note.isBlank()) reason else "$reason $note")
                 null
             }
@@ -912,6 +1122,7 @@ object Http {
             return false
         }
         onAttempt?.invoke(from, true, note.ifBlank { null })
+        if (rememberFor != null) MirrorMemory.rememberWinner(rememberFor, from)
         // Losers may still be mid-write: remove what's already on disk, and let
         // a sweep a minute later catch anything that lands after this returns.
         staging.values.forEach { p -> if (p.absolutePath != part.absolutePath) runCatching { p.delete() } }

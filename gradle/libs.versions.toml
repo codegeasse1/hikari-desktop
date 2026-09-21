@@ -18,11 +18,15 @@ serializationJson = "1.11.0"
 conscrypt = "2.5.2"
 orgjson = "20240303"
 twelvemonkeys = "3.10.1"
+javet = "4.1.2"
+rxjava = "1.3.8"
+nanohttpd = "2.3.1"
 
 [libraries]
 kotlinx-coroutines-core = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-core", version.ref = "coroutines" }
 kotlinx-coroutines-swing = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-swing", version.ref = "coroutines" }
 okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
+okhttp-logging = { group = "com.squareup.okhttp3", name = "logging-interceptor", version.ref = "okhttp" }
 jsoup = { group = "org.jsoup", name = "jsoup", version.ref = "jsoup" }
 gson = { group = "com.google.code.gson", name = "gson", version.ref = "gson" }
 jackson-databind = { group = "com.fasterxml.jackson.core", name = "jackson-databind", version.ref = "jackson" }
@@ -41,6 +45,10 @@ kotlin-reflect = { group = "org.jetbrains.kotlin", name = "kotlin-reflect", vers
 conscrypt-openjdk = { group = "org.conscrypt", name = "conscrypt-openjdk-uber", version.ref = "conscrypt" }
 orgjson = { group = "org.json", name = "json", version.ref = "orgjson" }
 imageio-webp = { group = "com.twelvemonkeys.imageio", name = "imageio-webp", version.ref = "twelvemonkeys" }
+javet = { group = "com.caoccao.javet", name = "javet", version.ref = "javet" }
+javet-v8-windows = { group = "com.caoccao.javet", name = "javet-v8-windows-x86_64", version.ref = "javet" }
+rxjava = { group = "io.reactivex", name = "rxjava", version.ref = "rxjava" }
+nanohttpd = { group = "org.nanohttpd", name = "nanohttpd", version.ref = "nanohttpd" }
 
 [plugins]
 kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
