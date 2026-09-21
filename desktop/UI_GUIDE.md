@@ -19,8 +19,8 @@ Read this before touching anything under `desktop/src/main/kotlin/desktop/ui/`.
 | `CatalogScreen.kt` | The full grid behind a rail's "See all". |
 | `LibraryScreen.kt`, `DownloadsScreen.kt`, `SettingsScreen.kt`, `ExtensionsScreen.kt` | The remaining screens. |
 | `WindowChrome.kt` | Resize edges, window controls, drag-to-maximise. |
-| `desktop/player/PlayerWindow.kt` | The player's transport dialog: opens beside mpv's own window and drives it over mpv's JSON IPC. |
-| `desktop/player/WinShell.kt` | Raw Win32 calls (JNA). Unused by the player now that the video is mpv's own window again; kept (with its CI self-test) so mpv can be embedded into an app-owned window again if it is ever wanted. |
+| `desktop/player/PlayerWindow.kt` | The in-app player layer: mpv renders into a surface the app owns (attached to the app window), with ONE slim control bar — Back, play/pause, time + seek, **Source**, audio/subtitle tracks, next episode, fullscreen — driven over mpv's JSON IPC. |
+| `desktop/player/WinShell.kt` | The raw Win32 calls (via JNA) that glue the surface mpv renders into over the player's video area. |
 | `desktop/player/DesktopPlayer.kt` | Launches/drives mpv, the HLS relay and the stream fallbacks. |
 
 Outside `desktop/ui/`, but part of this layer's picture: the download queue lives in
@@ -91,17 +91,21 @@ Outside `desktop/ui/`, but part of this layer's picture: the download queue live
   10s and pauses while hovered. The featured titles come from the *selected*
   provider (the hero is re-seeded whenever the provider selector changes) and the
   overline names that provider.
-- **Player** (`desktop/player/DesktopPlayer.kt` + `PlayerWindow.kt`): mpv's OWN
-  window plays the video, with mpv's on-screen controller left intact — the video
-  is never covered by app-drawn controls. The app adds two small dialogs, exactly
-  as it did before the in-app player experiment: a 300x150 "Player is loading…"
-  indicator that appears on Play and closes once mpv is up, and the transport
-  dialog (`PlayerWindow`) that opens beside the video — a scrubbable timeline with
-  real time labels, play/pause, ±10s, volume, speed, the file's audio/subtitle
-  tracks by name, what the stream really is (format) and why it failed, and a
-  "Next episode" button, all driven over mpv's JSON IPC. When the IPC channel
-  cannot be reached the transport dialog is simply not opened and mpv keeps
-  playing normally — a player that cannot be driven must never be worse than none.
+- **Player** (`desktop/player/PlayerWindow.kt` + `WinShell.kt`): the video plays
+  INSIDE the app window. mpv is handed a borderless surface window the app owns
+  as its `--wid`, glued exactly over the video area, so the picture is part of
+  the app rather than a second window; mpv's own controller is switched off and
+  the app draws **one** slim bar under the picture (Back, title, play/pause,
+  time + a scrubbable seek, **Source** — every server the title offered,
+  switchable mid-playback — the file's own audio and subtitle tracks, "Next
+  episode", fullscreen, and the window's minimise/maximise/close cluster). The
+  video area takes every remaining pixel: no panel of buttons, nothing drawn
+  over the picture. A status chip appears in the bar only when there is
+  something to say (a dead control channel, why a stream stopped). The surface
+  is *shrunk* to a couple of pixels while the loading overlay or an explanation
+  is up — never hidden, which used to kill mpv's video output — and
+  `DesktopPlayer` reopens the stream in mpv's own window if the embed produced
+  no picture at all on this machine.
 - **Rails** (`Ui.rail` + `Ui.railWithArrows`): the vertical mouse wheel is mapped
   to horizontal movement and only consumed while the rail can still move, so the
   page keeps scrolling normally when the rail is at its end.
@@ -167,11 +171,12 @@ desktop changed relative to Android (mpv replaces `MediaExtractor`/`MediaMuxer`
 for the audio-merge step).
 
 The SkyStream, Nuvio and Aniyomi engines are ported, IPTV playlists are a
-provider, and playback stays mpv's own window with mpv's own controls, plus the
-app's small transport dialog beside it (timeline, ±10s, volume, speed,
-audio/subtitle tracks, next-episode) driving it over mpv's JSON IPC. The
-Extensions screen is where all of them are added. `desktop/UI_GUIDE.md`'s rules
-apply to any UI added for them.
+provider, and the player is an in-app layer: mpv renders into a surface the app
+owns (`--wid`, via JNA in `WinShell`) so the video is attached to the app window,
+with ONE slim control bar of the app's own — Back, play/pause, seek, **Source**
+(switch servers mid-playback), audio/subtitle tracks, next episode, fullscreen —
+driving it over mpv's JSON IPC. The Extensions screen is where all of them are
+added. `desktop/UI_GUIDE.md`'s rules apply to any UI added for them.
 
 Still missing: i18n and the TMDB metadata/ratings/collections/backup features.
 See `docs/DESKTOP_PARITY.md` for the state of each and the remaining plan.

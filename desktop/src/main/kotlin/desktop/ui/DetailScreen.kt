@@ -873,11 +873,15 @@ class DetailScreenView(private val item: MediaItem) {
                     kotlinx.coroutines.runBlocking { AppShell.app.repository.streamsFor(meta, ep) }
                 }.getOrNull()?.firstOrNull()
             },
-            // The transport window drives playback over mpv's IPC, so the screen
-            // hands it the two things it alone knows: what comes next, and where
-            // this episode got to.
+            // The player's own bar drives playback over mpv's IPC, so the
+            // screen hands it the two things it alone knows: what comes next,
+            // and where this episode got to.
             next = nextEpisodeAction(),
             position = { positionMs, durationMs -> savePosition(ep, positionMs, durationMs) },
+            // The player's Source menu: every source this episode offered, so a
+            // dead server can be swapped for another without leaving playback.
+            sources = streams,
+            onPickSource = { picked -> if (picked.url != source.url) play(picked) },
         )
     }
 

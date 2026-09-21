@@ -132,26 +132,31 @@ elsewhere) and driven over its JSON IPC:
 - `desktop/player/MpvIpc.kt` — the client: `command`/`post`/`setProperty`/
   `getProperty`/`observe_property`, with one reader thread fanning property
   changes and events out to callbacks.
-- `desktop/player/PlayerWindow.kt` — the app's own player dialog, which opens as a
-  small (560x190) separate window BESIDE mpv's own video window — never over it.
-  It carries what mpv's generic on-screen controller cannot know: a scrubbable
-  timeline with real time labels, play/pause, ±10s, volume, speed, the file's
-  actual audio and subtitle tracks by name and language, what the stream really is
-  (format) and why it failed, "Next episode" (fired when mpv reports the file
-  ended), and the position handed back for resume/history.
-- **The video renders in mpv's OWN window.** mpv is launched with `--force-window`
-  and its on-screen controller left ON, so the picture is full-size and nothing
-  the app draws can ever cover it. `DesktopPlayer` shows a small "Player is
-  loading…" indicator between the Play click and mpv coming up (otherwise Play
-  looks dead for the ~1–3s mpv takes to start), which closes on its own or when an
-  explanation takes over. Closing the transport dialog stops playback, and mpv
-  exiting closes the dialog — the two windows always go together.
-- Everything degrades to plain mpv playback when the IPC channel cannot be
-  reached: the transport dialog is simply not opened (a player that cannot be
-  driven must never be worse than no player window).
+- `desktop/player/PlayerWindow.kt` — the app's own player **layer** (mounted into
+  `AppShell.playerHost`, so the video is part of the app window instead of a
+  second window): a single slim control bar under the picture — Back, title,
+  play/pause, time + scrubbable seek, **Source** (every server the title offered,
+  switchable mid-playback), the file's own audio and subtitle tracks by name and
+  language, "Next episode" and fullscreen, plus the window's minimise/maximise/
+  close cluster. A status chip shows only while there is something to say (a dead
+  control channel, why a stream stopped). Keyboard: space, ←/→, ↑/↓, F, N, Esc.
+- **The video renders INSIDE the app.** mpv is handed a borderless surface window
+  the app owns as its `--wid` (`desktop/player/WinShell.kt`, the only raw Win32 in
+  the app, reached through JNA); mpv creates its video as a child of it, and mpv's
+  own on-screen controller is off, so the picture is integrated with the app's bar
+  and nothing else is drawn over it. The surface is glued to the video area on
+  move/resize/maximise/fullscreen and mpv's child window is re-sized to fill it,
+  so maximising or dragging the app keeps the video lined up. It is *shrunk* (never
+  closed) while the loading overlay or an explanation is up, because it is a native
+  window that would otherwise cover that text. If the embed produces no picture at
+  all on a machine (driver-dependent), `DesktopPlayer` reopens the stream in mpv's
+  own window — a visible picture always beats a tidier window.
+- Releases ship the **.exe installer only** — there is no `.zip` app image.
 - `DetailScreen` hands the player what only it knows: `next` (advance to the next
-  episode, then play its first source) and `position` (throttled history writes,
-  so a title resumes where it was left).
+  episode, then play its first source), `position` (throttled history writes, so a
+  title resumes where it was left) and `sources`/`onPickSource` (every source the
+  episode offered, so the player's **Source** button can swap servers without
+  going back to the detail screen).
 
 ## Stage 6 — installs: real third-party plugins + latency (done)
 
@@ -234,6 +239,22 @@ and `net/DohDns` + `DnsWire` + `DnsProviders`. Note that the nuvio port already 
 
 `desktop/player/EnhancePreset`/`SubtitleStyle` (mpv `--vo=gpu-next` plus Anime4K
 shaders, `--sub-*` styling) also remain.
+
+## Repo adds (done)
+
+Adding a repository is visible on the spot and works from ANY box. The store entry
+— and therefore the repo's card — is written BEFORE any network work, so the repo
+appears immediately even when the manifest fetch afterwards races mirrors for half
+a minute or fails outright; the fetch then fills in the real name, description and
+plugin list, and an unreachable repo keeps its card with an `unreachable` badge
+instead of vanishing.
+
+The "Add a source" box also checks the pasted URL once and, when its body really
+is a repo manifest, adds it as a REPO with the right engine — Nuvio `scrapers` →
+NUVIO, CloudStream `plugins`/`pluginLists` (or a `.sky` plugin list) →
+CS3/SKYSTREAM. That mix-up is what made pasting e.g. an `All-in-One-Nuvio`
+`manifest.json` into the Scraper box report "Scraper added" while the repo
+appeared nowhere.
 
 ## Risks
 

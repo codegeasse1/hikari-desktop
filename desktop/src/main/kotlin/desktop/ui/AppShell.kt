@@ -58,6 +58,8 @@ object AppShell {
     private lateinit var activityBox: HBox
     private lateinit var activitySpinner: javafx.scene.control.ProgressIndicator
     private lateinit var activityLabel: Label
+    private lateinit var playerLayer: StackPane
+    private lateinit var windowStage: javafx.stage.Stage
     private var currentScreen: Screen = Screen.Home
     private val backStack = java.util.ArrayDeque<Screen>()
 
@@ -69,6 +71,7 @@ object AppShell {
     private val settingsScreen = SettingsScreenView()
 
     fun create(stage: javafx.stage.Stage): Region {
+        windowStage = stage
         chrome = WindowChrome(stage)
 
         centerStack = StackPane().apply {
@@ -91,7 +94,21 @@ object AppShell {
             center = StackPane(centerStack, overlay)
         }
 
-        val root = chrome.build(body)
+        // The player is an in-app layer, not a second window: it covers the
+        // whole window while it is mounted, so starting a stream reads as the
+        // app switching to a player view, with mpv rendering into a surface
+        // this app owns (see desktop/player/WinShell.kt).
+        playerLayer = StackPane().apply {
+            styleClass.add("player-layer")
+            minWidth = 0.0
+            minHeight = 0.0
+            maxWidth = Double.MAX_VALUE
+            maxHeight = Double.MAX_VALUE
+            isVisible = false
+            isManaged = false
+        }
+
+        val root = chrome.build(body, playerLayer)
         root.sceneProperty().addListener { _, _, scene ->
             if (scene != null) {
                 installShortcuts(scene)
@@ -143,7 +160,7 @@ object AppShell {
         val mark = Region().apply { styleClass.add("sidebar-logo-mark") }
         val brand = VBox(0.0,
             Theme.label("Hikari", size = 17.0, bold = true).apply { styleClass.add("sidebar-logo") },
-            Theme.label("your media, your way", size = 10.5, dim = true),
+            Theme.label("every stream, one place", size = 10.5, dim = true),
         )
         box.children.add(HBox(10.0, mark, brand).apply {
             alignment = Pos.CENTER_LEFT
@@ -442,4 +459,25 @@ object AppShell {
     }
 
     val app get() = HikariApp.instance
+
+    // ── window / player-layer hooks ─────────────────────────────────────────
+
+    /** The layer the player mounts itself into (see [desktop.player.PlayerWindow]). */
+    val playerHost: StackPane get() = playerLayer
+
+    /** The application window, for the player's fullscreen toggle and geometry. */
+    val stage: javafx.stage.Stage get() = windowStage
+
+    /** The main window's minimise/maximise/close cluster, so the player's own
+     *  bar carries the same controls as the app's top bar would. */
+    fun windowControls(): HBox = chrome.controls()
+
+    /** Lets a node drag the app window (used by the player's bar). */
+    fun makeDraggable(node: Node) {
+        chrome.makeDraggable(node)
+    }
+
+    fun toggleWindowMaximize() {
+        chrome.toggleMaximize()
+    }
 }

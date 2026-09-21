@@ -237,7 +237,7 @@ class ExtensionsScreenView {
             MODE_NUVIO -> addRepo(Http.normalizeUrl(raw), RepoKind.NUVIO)
             MODE_ANIYOMI -> addAniyomiRepo(raw)
             MODE_IPTV -> addIptv(raw)
-            MODE_STREMIO -> {
+            MODE_STREMIO -> smartAddFromUrl(raw) {
                 val url = Http.normalizeUrl(raw)
                 if (url.contains("github.com") || url.contains("raw.githubusercontent.com")) {
                     setStatus("That looks like a GitHub repo URL, not a Stremio addon manifest.", isError = true)
@@ -253,7 +253,10 @@ class ExtensionsScreenView {
                     AppShell.toast("Stremio addon added: $name", "ok")
                 }
             }
-            MODE_SCRAPER -> {
+            MODE_SCRAPER -> smartAddFromUrl(raw) {
+                // A "scraper" URL that really names a repo manifest is added as a
+                // REPO by smartAddFromUrl; only a genuine single-file scraper
+                // lands here.
                 val url = Http.normalizeUrl(raw)
                 val name = url.substringAfter("://").substringBefore("/")
                 AppShell.app.store.addProvider(
@@ -265,8 +268,59 @@ class ExtensionsScreenView {
                 setStatus("Scraper added: $name")
                 AppShell.toast("Scraper added: $name", "ok")
             }
-            else -> installFromUrl(raw)
+            else -> {
+                val url = Http.normalizeUrl(raw)
+                if (url.lowercase().substringBefore('?').endsWith(".json")) {
+                    smartAddFromUrl(raw) { installFromUrl(raw) }
+                } else {
+                    installFromUrl(raw)
+                }
+            }
         }
+    }
+
+    /**
+     * A pasted URL is not always what the selected box says it is: people paste
+     * a repo manifest into every box (that is exactly how a Nuvio repo ended up
+     * saved as a "scraper" provider that then appeared nowhere). So the URL is
+     * fetched ONCE and, when its body really is a repo manifest — Nuvio
+     * `scrapers`, CloudStream `plugins`/`pluginLists` — it is added as a REPO
+     * with the right engine, whoever's box it was pasted into. [elseDo] runs on
+     * the FX thread when it is not a repo (or the URL cannot be read).
+     */
+    private fun smartAddFromUrl(raw: String, elseDo: () -> Unit) {
+        val url = Http.normalizeUrl(raw)
+        if (url.isBlank()) return
+        busy.isVisible = true
+        setStatus("Checking $url…", busy = true)
+        AppShell.uiScope.launch {
+            val text = Http.fetchStringRobust(url).getOrNull()
+            val root = text?.let { runCatching { JSONObject(it) }.getOrNull() }
+            val kind = repoKindFromManifest(root)
+            Fx.run {
+                busy.isVisible = false
+                if (kind != null && root != null) {
+                    setStatus("That URL is a repository — adding it.")
+                    addRepo(url, kind, Manifest(url, root, null))
+                } else {
+                    elseDo()
+                }
+            }
+        }
+    }
+
+    /** Which engine a repo manifest belongs to, or null when the JSON is not a
+     *  repo manifest at all. */
+    private fun repoKindFromManifest(root: JSONObject?): RepoKind? {
+        if (root == null) return null
+        val plugins = root.optJSONArray("plugins")
+        if (plugins != null && plugins.length() > 0) {
+            val first = plugins.optJSONObject(0)?.optString("url").orEmpty().lowercase()
+            return if (first.endsWith(".sky") || root.has("skystream")) RepoKind.SKYSTREAM else RepoKind.CS3
+        }
+        if (root.has("pluginLists")) return RepoKind.CS3
+        if (root.has("scrapers")) return RepoKind.NUVIO
+        return null
     }
 
     // ── repos ───────────────────────────────────────────────────────────────
@@ -873,20 +927,44 @@ class ExtensionsScreenView {
      *  CloudStream v2 manifest (`pluginLists`) is always stored as CS3 even if
      *  pasted into the Hikari field, so the kind always reflects what the repo
      *  actually is. */
-    private fun addRepo(url: String, kind: RepoKind) {
+    /**
+     * Adds a repo. The store entry — and therefore the repo's card — is written
+     * BEFORE any network work, so adding a repo is visible on the spot even when
+     * the fetch afterwards races mirrors for tens of seconds, or fails outright.
+     * The fetch then fills in the real name, description and plugin list.
+     *
+     * [prefetched] is a manifest the caller already fetched (the "add source"
+     * box checks the URL once, so a repo pasted into the wrong box is still
+     * added — and fetched — exactly once).
+     */
+    private fun addRepo(url: String, kind: RepoKind, prefetched: Manifest? = null) {
         if (url.isBlank()) return
+        val known = runCatching { AppShell.app.store.repos().firstOrNull { it.url == url } }.getOrNull()
+        val label = Http.repoDisplayName(url).takeIf { it.isNotBlank() } ?: url
+        if (known == null) {
+            runCatching { AppShell.app.store.addCs3Repo(Cs3Repo(url = url, name = label, kind = kind)) }
+        }
+        // Whatever the user was looking at, they just added a repo: show them
+        // the repos list, with the new card on it, from the first frame.
+        openRepo = null
+        composerInput.clear()
         busy.isVisible = true
-        setStatus("Checking $url…", busy = true)
+        renderAll()
+        setStatus(if (known == null) "Added $label — loading its plugins…" else "Refreshing $label…", busy = true)
+        if (known == null) AppShell.toast("Added repo $label", "ok")
+
         AppShell.uiScope.launch {
-            val result = fetchManifest(url, kind) { step -> Fx.run { setStatus(step, busy = true) } }
+            val result = prefetched?.let { Result.success(it) }
+                ?: fetchManifest(url, kind) { step -> Fx.run { setStatus(step, busy = true) } }
             val manifest = result.getOrNull()
             if (manifest == null) {
                 Fx.run {
                     busy.isVisible = false
                     val message = Http.humanMessage(result.exceptionOrNull())
                     repoErrors[url] = message
-                    setStatus("Couldn't add that repo — $message", isError = true)
-                    AppShell.toast("Repo could not be added", "error")
+                    repoFetchedAt[url] = System.currentTimeMillis()
+                    setStatus("Couldn't load that repo — $message", isError = true)
+                    if (known == null) AppShell.toast("Added, but its contents couldn't be loaded", "error")
                     renderAll()
                 }
                 return@launch
@@ -908,38 +986,21 @@ class ExtensionsScreenView {
             val plugins = parsePlugins(effKind, manifest)
             Fx.run {
                 busy.isVisible = false
-                val existing = runCatching {
-                    AppShell.app.store.repos().firstOrNull {
-                        it.url == resolved || (it.kind == effKind && Http.repoDisplayName(it.url) == name)
-                    }
-                }.getOrNull()
-                if (existing != null && existing.url != resolved) {
-                    runCatching { AppShell.app.store.removeCs3Repo(existing.url) }
-                    repoData.remove(existing.url)
-                }
-                if (existing != null && existing.url == resolved) {
-                    repoData[existing.url] = RepoData(existing.url, name, description, plugins)
-                    repoErrors.remove(existing.url)
-                    val at = System.currentTimeMillis()
-                    repoFetchedAt[existing.url] = at
-                    repoCache.save(existing.url, RepoCache.Entry(resolved, name, description, plugins, at))
-                    openRepo = existing
-                    composerInput.clear()
-                    renderAll()
-                    setStatus("${repoDisplayName(existing)} is already added — refreshed it.")
-                    return@run
-                }
+                // The optimistic entry (and any earlier one for a URL that
+                // resolved to a different address) is replaced by the real one.
+                runCatching { AppShell.app.store.removeCs3Repo(url) }
+                runCatching { AppShell.app.store.removeCs3Repo(resolved) }
                 runCatching { AppShell.app.store.addCs3Repo(Cs3Repo(url = resolved, name = name, kind = effKind)) }
-                repoData[resolved] = RepoData(resolved, name, description, plugins)
-                repoErrors.remove(resolved)
+                repoData.remove(url)
+                repoErrors.remove(url)
                 val at = System.currentTimeMillis()
+                val data = RepoData(resolved, name, description, plugins)
+                repoData[resolved] = data
                 repoFetchedAt[resolved] = at
+                repoFetchedAt[url] = at
                 repoCache.save(resolved, RepoCache.Entry(resolved, name, description, plugins, at))
-                openRepo = Cs3Repo(url = resolved, name = name, kind = effKind)
-                composerInput.clear()
                 renderAll()
-                setStatus("Added $name")
-                AppShell.toast("Added repo $name", "ok")
+                setStatus("Added $name — ${plugins.size} plugin(s)")
             }
         }
     }
