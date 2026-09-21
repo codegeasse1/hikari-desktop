@@ -151,7 +151,7 @@ object Cs3PluginManager {
             return fail()
         }
 
-        if (manifest.pluginClassName.isBlank()) {
+        if (manifest.pluginClassName.isNullOrBlank()) {
             // A Hikari extension (manifest.json lists `mainClass`) is simply not
             // a CloudStream plugin — that is not an error for THIS loader, and
             // recording it as one used to hide the real reason from the loader

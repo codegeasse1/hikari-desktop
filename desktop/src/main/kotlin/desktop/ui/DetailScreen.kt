@@ -260,8 +260,8 @@ class DetailScreenView(private val item: MediaItem) {
                 val viewport = leftScroll.viewportBounds.height
                 val content = leftColumn.height
                 if (viewport <= 0.0 || content <= viewport) return@runLater
-                val origin = leftColumn.sceneToLocal(tile.localToScene(tile.boundsInLocal)).y
-                val target = origin + tile.boundsInLocal.height / 2.0 - viewport / 2.0
+                val inColumn = leftColumn.sceneToLocal(tile.localToScene(tile.boundsInLocal))
+                val target = inColumn.minY + inColumn.height / 2.0 - viewport / 2.0
                 leftScroll.vvalue = (target / (content - viewport)).coerceIn(0.0, 1.0)
             }
         }

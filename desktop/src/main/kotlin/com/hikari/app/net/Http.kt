@@ -119,7 +119,8 @@ object Http {
                 if (wait <= 0) break
                 val res = done.poll(wait, TimeUnit.MILLISECONDS) ?: break
                 received++
-                if (res.second != null) return res
+                val value = res.second
+                if (value != null) return res.first to value
             }
             return null
         } catch (e: InterruptedException) {

@@ -148,9 +148,9 @@ object ImageLoader {
             .filterNot { it == '\n' || it == '\r' || it == ' ' || it == '\t' }
         if (payload.isEmpty()) return null
         val decoders = listOf(
-            runCatching { java.util.Base64.getDecoder() }.getOrNull(),
-            runCatching { java.util.Base64.getUrlDecoder() }.getOrNull(),
-            runCatching { java.util.Base64.getMimeDecoder() }.getOrNull(),
+            java.util.Base64.getDecoder(),
+            java.util.Base64.getUrlDecoder(),
+            java.util.Base64.getMimeDecoder(),
         )
         for (d in decoders) {
             val bytes = runCatching { d.decode(payload) }.getOrNull() ?: continue
