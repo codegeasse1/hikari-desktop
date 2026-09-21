@@ -92,14 +92,91 @@ class DetailScreenView(private val item: MediaItem) {
     private fun paintHero() {
         Ui.coverImage(heroImage, heroArt, hero.width, hero.height)
     }
-    private val heroTitle = themed("", "d-title")
-    private val heroMeta = themed("", "d-meta")
+
+    /**
+     * The poster card on the RIGHT of the banner.
+     *
+     * The backdrop alone is a wide, short crop — it cut the artwork off at the
+     * top and bottom and had nothing to say about the title as a *poster*. A 2:3
+     * poster beside the details is what makes the header read like a store page:
+     * artwork on the right, title/meta/actions on the left. It is sized from the
+     * banner's width, so it can never push the title off the left edge.
+     */
+    private val heroPoster = ImageView().apply {
+        isPreserveRatio = false
+        isSmooth = true
+    }
+    private var heroPosterArt: javafx.scene.image.Image? = null
+
+    private fun paintPoster() {
+        Ui.coverImage(heroPoster, heroPosterArt, posterW, posterH)
+    }
+
+    private val posterClip = Rectangle().apply {
+        arcWidth = 28.0
+        arcHeight = 28.0
+    }
+    private val heroPosterFrame = StackPane(heroPoster).apply {
+        styleClass.add("d-poster")
+        clip = posterClip
+        isVisible = false
+        isManaged = false
+    }
+    private var posterW = 0.0
+    private var posterH = 0.0
+
+    /** Fits the poster to the room left beside the title; below ~720px there is
+     *  none and the banner falls back to text only. */
+    private fun sizePoster(heroWidth: Double) {
+        val w = when {
+            heroWidth >= 1040.0 -> 200.0
+            heroWidth >= 880.0 -> 176.0
+            heroWidth >= 720.0 -> 148.0
+            else -> 0.0
+        }
+        val show = w > 0.0 && heroPosterArt != null
+        if (w == posterW && show == heroPosterFrame.isVisible) return
+        posterW = w
+        posterH = w * 1.5
+        heroPosterFrame.isVisible = show
+        heroPosterFrame.isManaged = show
+        if (!show) return
+        heroPosterFrame.prefWidth = posterW
+        heroPosterFrame.minWidth = posterW
+        heroPosterFrame.maxWidth = posterW
+        heroPosterFrame.prefHeight = posterH
+        heroPosterFrame.minHeight = posterH
+        heroPosterFrame.maxHeight = posterH
+        posterClip.width = posterW
+        posterClip.height = posterH
+        paintPoster()
+    }
+
+    private val heroOver = themed("", "d-over")
+    private val heroTitle = themed("", "d-title").apply {
+        // Wrapped and width-bounded: an unwrapped 32px title declares its whole
+        // text width as a *minimum*, which is what slid this screen (and its
+        // window) sideways.
+        isWrapText = true
+        maxWidth = 560.0
+        minWidth = 0.0
+        maxHeight = 84.0
+    }
+    private val heroMeta = themed("", "d-meta").apply {
+        isWrapText = true
+        maxWidth = 560.0
+        minWidth = 0.0
+    }
     private val heroChips = HBox(8.0).apply { alignment = Pos.CENTER_LEFT }
     private val heroActions = HBox(10.0,
         Ui.playButton("Play") { playFirst() },
         Ui.button("Download", icon = Icons.DOWNLOAD, ghost = true) { downloadFirst() },
     ).apply { alignment = Pos.CENTER_LEFT }
-    private val heroBody = VBox(10.0, heroTitle, heroMeta, heroChips, heroActions).apply { alignment = Pos.BOTTOM_LEFT }
+    private val heroBody = VBox(10.0, heroOver, heroTitle, heroMeta, heroChips, heroActions).apply {
+        alignment = Pos.BOTTOM_LEFT
+        minWidth = 0.0
+        maxWidth = 580.0
+    }
     private val favouriteButton = Ui.button("Add to library", icon = Icons.HEART_OUTLINE, ghost = true) { toggleFavourite() }
     private val hero = StackPane()
 
@@ -144,7 +221,14 @@ class DetailScreenView(private val item: MediaItem) {
     // ── watch panel ─────────────────────────────────────────────────────────
 
     private val panelSub = themed("", "watch-sub")
-    private val nowPlayingTitle = themed("", "now-playing-title")
+    private val nowPlayingTitle = themed("", "now-playing-title").apply {
+        // Episode names run long ("Renegade Immortal (Xian Ni) Episode 1 English
+        // Subtitles") and the panel is a fixed 396px — wrap to two lines rather
+        // than cutting it off mid-word with an ellipsis.
+        isWrapText = true
+        maxHeight = 34.0
+        minWidth = 0.0
+    }
     private val nowPlayingSub = themed("", "now-playing-sub")
     private val nowPlaying = VBox(2.0, nowPlayingTitle, nowPlayingSub).apply {
         styleClass.add("now-playing")
@@ -289,6 +373,12 @@ class DetailScreenView(private val item: MediaItem) {
     private fun renderHero(m: MediaItem) {
         hero.isVisible = true
         hero.isManaged = true
+        val provider = runCatching {
+            AppShell.app.store.providers().firstOrNull { it.id == m.providerId }?.name
+        }.getOrNull()
+        heroOver.text = provider.orEmpty()
+        heroOver.isVisible = !provider.isNullOrBlank()
+        heroOver.isManaged = heroOver.isVisible
         heroTitle.text = m.title
         heroMeta.text = listOfNotNull(
             m.year?.toString(),
@@ -301,6 +391,22 @@ class DetailScreenView(private val item: MediaItem) {
             m.genres.take(3).joinToString(" · ").ifBlank { null },
         ).joinToString("  ·  ")
         heroChips.children.setAll(m.genres.take(6).map { themed(it, "mchip") })
+        // The poster card on the right of the banner: only a real poster goes
+        // there (a wide backdrop cover-cropped to 2:3 would be all zoom).
+        heroPosterArt = null
+        if (!m.posterUrl.isNullOrBlank()) {
+            desktop.img.ImageLoader.loadAsync(
+                m.posterUrl,
+                onReady = { img ->
+                    heroPosterArt = img
+                    sizePoster(hero.width)
+                },
+                w = 480,
+                h = 720,
+            )
+        } else {
+            sizePoster(hero.width)
+        }
         val url = desktop.img.ImageLoader.artFor(m.backdropUrl, m.posterUrl)
         if (!url.isNullOrBlank()) {
             desktop.img.ImageLoader.loadAsync(url, onReady = { img -> applyHeroArt(img) }, w = 1600, h = 900)
@@ -357,15 +463,20 @@ class DetailScreenView(private val item: MediaItem) {
         clip.heightProperty().bind(hero.heightProperty())
         hero.clip = clip
         hero.styleClass.add("d-hero-wrap")
-        hero.prefHeight = HERO_H
-        hero.minHeight = HERO_H
-        hero.maxHeight = HERO_H
-        // Give the banner a slice of the window instead of a fixed 248px, so a
-        // short screen (a 768px laptop, with 60px of chrome on top) still
-        // leaves the source list beside it usable. The window height is
-        // independent of this value, so the listener settles in one pass.
+        hero.minWidth = 0.0
+        hero.maxWidth = Double.MAX_VALUE
+        // A sane height for the very first layout pass; the listener below fits
+        // it to the window once the root has been laid out.
+        hero.prefHeight = HERO_MIN
+        hero.minHeight = HERO_MIN
+        hero.maxHeight = HERO_MIN
+        // The banner carries the poster as well as the title now, and the old
+        // 248px ceiling left the two fighting for the same strip — the reason
+        // the header looked "cut off". It takes a generous slice of the window
+        // (clamped) instead. The window height is independent of this value, so
+        // the listener settles in one pass.
         root.heightProperty().addListener { _, _, h ->
-            val target = (h.toDouble() * 0.28).coerceIn(HERO_MIN, HERO_H)
+            val target = (h.toDouble() * 0.42).coerceIn(HERO_MIN, HERO_H)
             if (hero.prefHeight != target) {
                 hero.prefHeight = target
                 hero.minHeight = target
@@ -379,11 +490,20 @@ class DetailScreenView(private val item: MediaItem) {
         heroImage.isPreserveRatio = false
         heroImage.fitWidthProperty().bind(hero.widthProperty())
         heroImage.fitHeightProperty().bind(hero.heightProperty())
-        hero.widthProperty().addListener { _, _, _ -> paintHero() }
+        hero.widthProperty().addListener { _, _, w ->
+            paintHero()
+            sizePoster(w.toDouble())
+        }
         hero.heightProperty().addListener { _, _, _ -> paintHero() }
 
         val scrim = Region().apply {
             styleClass.add("d-scrim")
+            maxWidth = Double.MAX_VALUE
+            maxHeight = Double.MAX_VALUE
+            isMouseTransparent = true
+        }
+        val scrimR = Region().apply {
+            styleClass.add("d-scrim-r")
             maxWidth = Double.MAX_VALUE
             maxHeight = Double.MAX_VALUE
             isMouseTransparent = true
@@ -399,11 +519,13 @@ class DetailScreenView(private val item: MediaItem) {
         StackPane.setAlignment(topRight, Pos.TOP_RIGHT)
         StackPane.setMargin(topRight, Insets(16.0, 16.0, 0.0, 0.0))
 
-        heroBody.maxWidth = 720.0
         StackPane.setAlignment(heroBody, Pos.BOTTOM_LEFT)
-        StackPane.setMargin(heroBody, Insets(0.0, 24.0, 22.0, 24.0))
+        StackPane.setMargin(heroBody, Insets(0.0, 24.0, 22.0, 26.0))
 
-        hero.children.addAll(heroImage, scrim, back, topRight, heroBody)
+        StackPane.setAlignment(heroPosterFrame, Pos.BOTTOM_RIGHT)
+        StackPane.setMargin(heroPosterFrame, Insets(0.0, 26.0, 24.0, 0.0))
+
+        hero.children.addAll(heroImage, scrim, scrimR, back, topRight, heroBody, heroPosterFrame)
     }
 
     private fun toggleFavourite() {
@@ -816,11 +938,14 @@ class DetailScreenView(private val item: MediaItem) {
 
     private companion object {
         const val PANEL_W = 396.0
-        const val HERO_H = 248.0
 
-        /** The banner never shrinks below this, so the title and its buttons
-         *  always fit even on a short window. */
-        const val HERO_MIN = 180.0
+        /** Ceiling for the banner's height. It carries the poster as well as the
+         *  title, so it wants a real slice of the window. */
+        const val HERO_H = 430.0
+
+        /** The banner never shrinks below this, so the title, the metadata and
+         *  the poster all fit even on a short window. */
+        const val HERO_MIN = 300.0
 
         /** Tiles rendered per "page" before the Show-more button appears. */
         const val EPISODE_PAGE = 240

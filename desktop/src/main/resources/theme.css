@@ -200,6 +200,12 @@
     -fx-padding: 4 12 4 9;
 }
 .topbar-activity { -fx-text-fill: -h-accent; }
+/* The shell's back affordance for nested screens (a title, a catalog): the
+   banner's own arrow scrolls away with the banner, this one never does. */
+.topbar-back {
+    -fx-padding: 5 11 5 9;
+    -fx-background-radius: 8;
+}
 .hero-bar {
     -fx-background-color: linear-gradient(to right, -h-surface, -h-bg-2);
     -fx-background-radius: 14;
@@ -820,6 +826,22 @@
     -fx-background-color: linear-gradient(to top, rgba(6,7,12,0.95) 0%, rgba(6,7,12,0.48) 48%, rgba(6,7,12,0.05) 100%);
     -fx-background-radius: 16;
 }
+/* A second, right-hand scrim: the poster card sits over the artwork on the
+   right, and a flat picture there is what made the header look cut off. */
+.d-scrim-r {
+    -fx-background-color: linear-gradient(to left, rgba(6,7,12,0.80) 0%, rgba(6,7,12,0.34) 38%, rgba(6,7,12,0.0) 74%);
+    -fx-background-radius: 16;
+}
+/* The poster card in the detail banner. */
+.d-poster {
+    -fx-background-color: -h-surface-3;
+    -fx-background-radius: 14;
+    -fx-border-color: rgba(255,255,255,0.16);
+    -fx-border-width: 1;
+    -fx-border-radius: 14;
+    -fx-effect: dropshadow(gaussian, -h-shadow-2, 26, 0, 0, 10);
+}
+.d-over { -fx-font-size: 11px; -fx-font-weight: bold; -fx-text-fill: -h-accent; }
 .d-title { -fx-font-size: 32px;   -fx-font-weight: bold; -fx-text-fill: #ffffff; }
 .d-meta  { -fx-font-size: 12.5px; -fx-text-fill: rgba(255,255,255,0.78); }
 .d-skel  { -fx-background-color: -h-surface-3; -fx-background-radius: 16; }
@@ -1067,3 +1089,76 @@
 /* Episode filter + pager live in the scrolling left column, so the whole
    episode list is laid out on the page instead of inside a fixed-height box. */
 .episode-tools { -fx-padding: 0; }
+
+/* ===========================================================================
+   Player
+   ===========================================================================
+
+   The player is one window: the video surface fills the middle, the transport
+   sits under it. The video itself is mpv rendering into a window this app owns
+   (see `desktop/player/WinShell.kt`), which is why the video area is only ever
+   a black panel here. */
+
+.player-root { -fx-background-color: -h-bg; }
+
+.player-head {
+    -fx-background-color: -h-bg-2;
+    -fx-border-color: -h-border;
+    -fx-border-width: 0 0 1 0;
+    -fx-padding: 7 8 7 14;
+    -fx-min-height: 44;
+}
+.player-title { -fx-font-size: 13.5px; -fx-font-weight: bold; -fx-text-fill: -h-fg; }
+.player-sub   { -fx-font-size: 11px;   -fx-text-fill: -h-fg-3; }
+
+/* The window mpv is handed: black, borderless, nothing else in it. */
+.player-video { -fx-background-color: #05060a; }
+.player-surface { -fx-background-color: #000000; }
+
+.player-msg-box { -fx-background-color: rgba(7, 8, 13, 0.86); -fx-background-radius: 16; -fx-padding: 26 30 26 30; }
+.player-msg { -fx-text-fill: #eef0f7; -fx-font-size: 13px; }
+
+.player-bar {
+    -fx-background-color: -h-bg-2;
+    -fx-border-color: -h-border;
+    -fx-border-width: 1 0 0 0;
+    -fx-padding: 10 14 12 14;
+}
+.player-time   { -fx-font-size: 11.5px; -fx-text-fill: -h-fg-2; -fx-font-family: "Consolas"; }
+.player-status { -fx-font-size: 11.5px; -fx-text-fill: -h-fg-3; }
+
+.player-btn {
+    -fx-background-color: -h-surface-3;
+    -fx-border-color: -h-border-2;
+    -fx-border-width: 1;
+    -fx-border-radius: 9;
+    -fx-background-radius: 9;
+    -fx-text-fill: -h-fg;
+    -fx-font-size: 12.5px;
+    -fx-padding: 6 12 6 12;
+    -fx-cursor: hand;
+}
+.player-btn:hover { -fx-background-color: -h-surface-4; -fx-border-color: -h-border-3; }
+.player-btn .h-icon { -fx-fill: -h-fg; }
+
+.player-menu {
+    -fx-background-color: -h-surface-3;
+    -fx-border-color: -h-border-2;
+    -fx-border-width: 1;
+    -fx-border-radius: 9;
+    -fx-background-radius: 9;
+    -fx-text-fill: -h-fg;
+    -fx-font-size: 12.5px;
+    -fx-padding: 1 4 1 4;
+    -fx-cursor: hand;
+}
+.player-menu:hover { -fx-background-color: -h-surface-4; }
+.player-menu .label { -fx-text-fill: -h-fg; }
+.player-menu .arrow { -fx-background-color: -h-fg-3; }
+
+.player-seek .track { -fx-background-color: -h-surface-4; -fx-background-radius: 999; -fx-pref-height: 6; }
+.player-seek .thumb { -fx-background-color: -h-accent; -fx-background-radius: 999; -fx-pref-width: 14; -fx-pref-height: 14; }
+.player-seek:disabled { -fx-opacity: 0.55; }
+
+.player-vol .track { -fx-background-color: -h-surface-4; -fx-background-radius: 999; -fx-pref-height: 4; }
+.player-vol .thumb { -fx-background-color: -h-fg-2; -fx-background-radius: 999; -fx-pref-width: 12; -fx-pref-height: 12; }

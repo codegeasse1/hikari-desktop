@@ -53,6 +53,7 @@ object AppShell {
     private lateinit var toasts: Ui.Toasts
     private lateinit var navButtons: MutableList<Pair<Screen, Button>>
     private lateinit var themeButton: Button
+    private lateinit var backButton: Button
     private lateinit var globalSearch: TextField
     private lateinit var activityBox: HBox
     private lateinit var activitySpinner: javafx.scene.control.ProgressIndicator
@@ -229,7 +230,16 @@ object AppShell {
             isManaged = false
         }
 
-        val left = HBox(10.0, titles).apply { alignment = Pos.CENTER_LEFT }
+        // A nested screen (a title, a catalog) needs an obvious way out that is
+        // not the sidebar: the banner's own arrow scrolls with the page, so the
+        // shell carries one that is always on screen. It steps back exactly one
+        // screen (see [back]) — never straight to Home.
+        backButton = Ui.button("Back", icon = Icons.CHEVRON_LEFT, ghost = true) { back() }.apply {
+            styleClass.add("topbar-back")
+            isVisible = false
+            isManaged = false
+        }
+        val left = HBox(10.0, backButton, titles).apply { alignment = Pos.CENTER_LEFT }
         left.padding = Insets(0.0, 0.0, 0.0, 14.0)
         left.minWidth = 150.0
         chrome.makeDraggable(left)
@@ -419,6 +429,11 @@ object AppShell {
             }
             button.styleClass.remove("nav-btn-selected")
             if (selected) button.styleClass.add("nav-btn-selected")
+        }
+        if (::backButton.isInitialized) {
+            val nested = currentScreen is Screen.Detail || currentScreen is Screen.Catalog
+            backButton.isVisible = nested
+            backButton.isManaged = nested
         }
         refreshThemeButton()
     }

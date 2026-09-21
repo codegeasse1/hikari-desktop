@@ -21,6 +21,7 @@ twelvemonkeys = "3.10.1"
 javet = "4.1.2"
 rxjava = "1.3.8"
 nanohttpd = "2.3.1"
+jna = "5.14.0"
 
 [libraries]
 kotlinx-coroutines-core = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-core", version.ref = "coroutines" }
@@ -49,6 +50,8 @@ javet = { group = "com.caoccao.javet", name = "javet", version.ref = "javet" }
 javet-v8-windows = { group = "com.caoccao.javet", name = "javet-v8-windows-x86_64", version.ref = "javet" }
 rxjava = { group = "io.reactivex", name = "rxjava", version.ref = "rxjava" }
 nanohttpd = { group = "org.nanohttpd", name = "nanohttpd", version.ref = "nanohttpd" }
+jna = { group = "net.java.dev.jna", name = "jna", version.ref = "jna" }
+jna-platform = { group = "net.java.dev.jna", name = "jna-platform", version.ref = "jna" }
 
 [plugins]
 kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }

@@ -304,7 +304,15 @@ class ExtensionsScreenView {
     private fun repoCard(repo: Cs3Repo): Node {
         val data = repoData[repo.url]
         val error = repoErrors[repo.url]
-        val title = themed(repoDisplayName(repo), "src-name").apply { isWrapText = true }
+        // The name gets a row of its own: "Hikari Extensions (desktop)" and
+        // "CloudStream Repo" were being ellipsized to "hikari e…"/"cloudstream
+        // r…" because the title shared one row with three buttons that refused
+        // to shrink.
+        val title = themed(repoDisplayName(repo), "src-name").apply {
+            isWrapText = true
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
+        }
         val subtitle = themed(
             when {
                 data != null -> data.description.ifBlank { repo.url }
@@ -312,7 +320,7 @@ class ExtensionsScreenView {
                 else -> "Loading…"
             },
             "src-meta",
-        ).apply { isWrapText = true; maxWidth = 420.0 }
+        ).apply { isWrapText = true; minWidth = 0.0; maxWidth = 620.0 }
 
         val badgeRow = HBox(6.0).apply {
             alignment = Pos.CENTER_RIGHT
@@ -324,21 +332,36 @@ class ExtensionsScreenView {
             if (error != null) children.add(Ui.badge("unreachable", "badge-danger"))
         }
 
-        val open = Ui.button("Open", primary = true) { openRepoData(repo) }
-        val reload = Ui.iconButton(Icons.REFRESH, "Reload this repo", 15.0) { refreshRepo(repo.url) }
-        val remove = Ui.iconButton(Icons.TRASH, "Remove this repo", 15.0) { removeRepo(repo) }.apply {
-            styleClass.add("h-danger")
-        }
+        // Clicking a row action must not also open the repo (the card itself is
+        // clickable): isolate each button from the card's own handler.
+        val open = Ui.isolateClicks(Ui.button("Open", primary = true) { openRepoData(repo) })
+        val reload = Ui.isolateClicks(Ui.iconButton(Icons.REFRESH, "Reload this repo", 15.0) { refreshRepo(repo.url) })
+        val remove = Ui.isolateClicks(
+            Ui.iconButton(Icons.TRASH, "Remove this repo", 15.0) { removeRepo(repo) }.apply {
+                styleClass.add("h-danger")
+            }
+        )
 
         val icon = VBox(Icons.of(Icons.GLOBE, 20.0)).apply {
             styleClass.add("repo-ic")
             alignment = Pos.CENTER
         }
-        val info = VBox(2.0, title, subtitle)
+        val info = VBox(2.0, title, subtitle).apply { minWidth = 0.0 }
         HBox.setHgrow(info, Priority.ALWAYS)
-        val card = HBox(14.0, icon, info, badgeRow, open, reload, remove).apply {
-            styleClass.add("repo-card")
+        val head = HBox(14.0, icon, info, badgeRow).apply {
             alignment = Pos.CENTER_LEFT
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
+        }
+        val actions = HBox(8.0, Ui.spacer(), open, reload, remove).apply {
+            alignment = Pos.CENTER_RIGHT
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
+        }
+        val card = VBox(Theme.S2, head, actions).apply {
+            styleClass.add("repo-card")
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
         }
         card.setOnMouseClicked { openRepoData(repo) }
         return card
@@ -396,12 +419,38 @@ class ExtensionsScreenView {
         }
         val reload = Ui.button("Reload", icon = Icons.REFRESH, ghost = true) { refreshRepo(repo.url) }
         val remove = Ui.button("Remove repo", icon = Icons.TRASH, danger = true) { removeRepo(repo) }
+        // The repo's full name on its own line, with the actions underneath: a
+        // name sharing a row with three buttons is a name that gets truncated.
+        val heading = Theme.label(
+            data?.name?.ifBlank { null } ?: repoDisplayName(repo),
+            size = 19.0,
+            bold = true,
+        ).apply {
+            styleClass.add("section-title")
+            isWrapText = true
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
+        }
+        val sub = Theme.label(
+            data?.description?.ifBlank { null } ?: repo.url,
+            size = 12.5,
+            dim = true,
+        ).apply {
+            styleClass.add("section-sub")
+            isWrapText = true
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
+        }
         content.children.add(
-            Ui.sectionHeader(
-                data?.name?.ifBlank { null } ?: repoDisplayName(repo),
-                data?.description?.ifBlank { null } ?: repo.url,
-                HBox(8.0, reload, remove, back).apply { alignment = Pos.CENTER_RIGHT },
-            )
+            VBox(Theme.S2,
+                heading,
+                sub,
+                HBox(8.0, Ui.spacer(), reload, remove, back).apply {
+                    alignment = Pos.CENTER_RIGHT
+                    minWidth = 0.0
+                    maxWidth = Double.MAX_VALUE
+                },
+            ).apply { minWidth = 0.0 }
         )
         val filterRow = HBox(10.0, pluginFilter, pluginCount).apply { alignment = Pos.CENTER_LEFT }
         filterRow.isVisible = data != null && data.plugins.isNotEmpty()
@@ -459,12 +508,16 @@ class ExtensionsScreenView {
 
     private fun pluginRow(plugin: PluginRef): Node {
         val installed = providersFor(plugin.url)
-        val name = themed(plugin.name, "src-name").apply { isWrapText = true; maxWidth = 300.0 }
+        val name = themed(plugin.name, "src-name").apply {
+            isWrapText = true
+            minWidth = 0.0
+        }
         val url = themed(plugin.url, "h-mono").apply {
-            maxWidth = 420.0
+            maxWidth = 520.0
+            minWidth = 0.0
             isWrapText = true
         }
-        val info = VBox(3.0, name, url)
+        val info = VBox(3.0, name, url).apply { minWidth = 0.0 }
         HBox.setHgrow(info, Priority.ALWAYS)
 
         val state = HBox(6.0).apply {
@@ -1494,14 +1547,18 @@ class ExtensionsScreenView {
             styleClass.add("repo-tile")
             alignment = Pos.CENTER
         }
-        val name = themed(cfg.name, "src-name").apply { isWrapText = true; maxWidth = 320.0 }
+        val name = themed(cfg.name, "src-name").apply {
+            isWrapText = true
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
+        }
         val source = themed(
             cfg.extra?.substringBefore('|')?.takeIf { it.isNotBlank() }
                 ?: cfg.url.takeIf { it.isNotBlank() }
                 ?: cfg.type.name.lowercase(),
             "h-mono",
-        ).apply { maxWidth = 380.0 }
-        val info = VBox(3.0, name, source)
+        ).apply { maxWidth = 420.0; minWidth = 0.0 }
+        val info = VBox(3.0, name, source).apply { minWidth = 0.0 }
         HBox.setHgrow(info, Priority.ALWAYS)
 
         val badges = HBox(6.0).apply {

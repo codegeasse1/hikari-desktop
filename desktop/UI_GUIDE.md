@@ -19,6 +19,9 @@ Read this before touching anything under `desktop/src/main/kotlin/desktop/ui/`.
 | `CatalogScreen.kt` | The full grid behind a rail's "See all". |
 | `LibraryScreen.kt`, `DownloadsScreen.kt`, `SettingsScreen.kt`, `ExtensionsScreen.kt` | The remaining screens. |
 | `WindowChrome.kt` | Resize edges, window controls, drag-to-maximise. |
+| `desktop/player/PlayerWindow.kt` | The in-app player window: video surface + transport, driven by mpv's JSON IPC. |
+| `desktop/player/WinShell.kt` | The raw Win32 calls (via JNA) that embed mpv's video in that window. |
+| `desktop/player/DesktopPlayer.kt` | Launches/drives mpv, the HLS relay and the stream fallbacks. |
 
 Outside `desktop/ui/`, but part of this layer's picture: the download queue lives in
 `com/hikari/app/download/` — `DownloadModels` (task/status + JSON), `DownloadStore`
@@ -57,7 +60,11 @@ Outside `desktop/ui/`, but part of this layer's picture: the download queue live
    scroll). Therefore: run every screen root and every container between a screen
    root and a scroll pane through `Ui.fill(...)`, and keep every scroll pane's
    `minWidth`/`minHeight` at 0. `AppShell`'s `centerStack` is pinned to 0/MAX and is
-   the only thing that decides the window's minimum size.
+   the only thing that decides the window's minimum size. The same applies
+   sideways: `Ui.vScroll` zeroes its content's `minWidth`, and any `Label` that can
+   hold long text (a hero title, a status line, a repo name) sets `minWidth = 0`
+   and wraps or ellipsizes — an unwrapped `Label`'s minimum IS its whole text
+   width, which is what made the home page pan left/right.
 9. **Only one long-lived animation in the whole app.** Skeletons share a single
    timeline through `Ui`'s shimmer property. A per-node INDEFINITE `Timeline` (the
    old `Ui.pulse`) is never stopped when the node leaves the scene, and enough of
@@ -78,15 +85,25 @@ Outside `desktop/ui/`, but part of this layer's picture: the download queue live
 - **Hero banner** (`HomeScreen`): a `StackPane` with a clipped rounded rectangle,
   the image bound to the stack width, two scrim layers (vertical + horizontal
   gradients), a bottom-left content column and a bottom-right dot/arrow navigator.
-  Auto-rotates every 10s and pauses while hovered.
+  Auto-rotates every 10s and pauses while hovered. The featured titles come from
+  the *selected* provider (the hero is re-seeded whenever the provider selector
+  changes) and the overline names that provider.
+- **Player** (`desktop/player/PlayerWindow.kt` + `WinShell.kt`): one window for
+  video and transport. mpv is given a borderless surface window this app owns as
+  its `--wid`, so there is no second, plain mpv window; the surface is kept glued
+  to the video area by `syncSurface` and mpv's child window is kept filling it
+  (`WinShell`, JNA). Non-Windows, or no handle, degrades to mpv's own window.
 - **Rails** (`Ui.rail` + `Ui.railWithArrows`): the vertical mouse wheel is mapped
   to horizontal movement and only consumed while the rail can still move, so the
   page keeps scrolling normally when the rail is at its end.
 - **Filter drawer** (`SearchScreen`): a full-height panel inside the screen's
   `StackPane`, `translateX` animated in/out, a dimming `Region` behind it, rows as
   `HBox`es with a check square. Multi-select; an empty selection means "all".
-- **Detail** (`DetailScreen`): the banner owns the top (its height is 28% of the
-  window, clamped to 180–248px, so a short screen still leaves room below it).
+- **Detail** (`DetailScreen`): the banner owns the top — 42% of the window,
+  clamped to 300–430px, because it now carries a 2:3 **poster card on the right**
+  (sized from the banner width, hidden below ~720px) beside the title, metadata,
+  genre chips and Play/Download actions on the left, over a cover-cropped backdrop
+  with a right-hand scrim behind the poster.
   Under it an `HBox` of a *scrolling* facts+episodes column (grow) and a fixed
   396px `Watch` panel. Nothing competes for the same axis: the left column owns
   the page's vertical scroll and holds the synopsis, the facts table and the full
@@ -141,8 +158,10 @@ desktop changed relative to Android (mpv replaces `MediaExtractor`/`MediaMuxer`
 for the audio-merge step).
 
 The SkyStream, Nuvio and Aniyomi engines are ported, IPTV playlists are a
-provider, and the player is now driven over mpv's JSON IPC (a real transport
-window with a timeline, tracks, speed and next-episode) — the Extensions screen
+provider, and the player is one in-app window: mpv renders into a surface the app
+owns (`--wid`, via JNA in `WinShell`), with the app's own transport — timeline,
+±10s, volume, speed, audio/subtitle tracks, next-episode — driving it over mpv's
+JSON IPC, plus keyboard control (space, ←/→, ↑/↓, F, Esc). The Extensions screen
 is where all of them are added. `desktop/UI_GUIDE.md`'s rules apply to any UI
 added for them.
 

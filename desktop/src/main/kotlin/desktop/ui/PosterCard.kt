@@ -46,7 +46,7 @@ object PosterCard {
         val image = ImageView().apply {
             fitWidth = width
             fitHeight = height
-            isPreserveRatio = true
+            isPreserveRatio = false
             isSmooth = true
             styleClass.add("poster-img")
             clip = Rectangle(width, height).apply {
@@ -56,7 +56,12 @@ object PosterCard {
         }
         desktop.img.ImageLoader.loadAsync(
             desktop.img.ImageLoader.artFor(item.posterUrl, item.backdropUrl),
-            onReady = { img -> if (img != null) image.image = img },
+            // Cover-crop instead of `preserveRatio`: a 2:3 frame should be
+            // filled edge to edge. With the ratio preserved, a source that is
+            // not exactly 2:3 (a wide backdrop standing in for a missing
+            // poster, a 1:1 cover) shrank into a letterboxed strip in the
+            // middle of the frame — the "poster looks wrong/cropped" report.
+            onReady = { img -> Ui.coverImage(image, img, width, height) },
             w = (width * 2).toInt(),
             h = (height * 2).toInt(),
         )
@@ -139,6 +144,7 @@ object PosterCard {
             isWrapText = true
             maxWidth = width
             prefWidth = width
+            minWidth = 0.0
             textOverrun = OverrunStyle.ELLIPSIS
             maxHeight = 34.0
         }
@@ -146,6 +152,7 @@ object PosterCard {
             styleClass.add("poster-meta")
             maxWidth = width
             prefWidth = width
+            minWidth = 0.0
             textOverrun = OverrunStyle.ELLIPSIS
         }
 

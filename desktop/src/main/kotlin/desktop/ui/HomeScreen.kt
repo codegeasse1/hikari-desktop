@@ -43,11 +43,24 @@ class HomeScreenView {
         fitHeight = HERO_H
     }
     private val heroOver = themed("Featured", "hero-over")
-    private val heroTitle = themed("", "hero-title")
-    private val heroMeta = themed("", "hero-meta")
+    private val heroTitle = themed("", "hero-title").apply {
+        // Wrapping the title (instead of letting it declare its full width as a
+        // minimum) is what keeps a long title — or a long provider name above it
+        // — from making the whole page wider than the window.
+        isWrapText = true
+        maxWidth = 620.0
+        minWidth = 0.0
+        maxHeight = 96.0
+    }
+    private val heroMeta = themed("", "hero-meta").apply {
+        isWrapText = true
+        maxWidth = 620.0
+        minWidth = 0.0
+    }
     private val heroDesc = themed("", "hero-desc").apply {
         isWrapText = true
         maxWidth = 620.0
+        minWidth = 0.0
         maxHeight = 54.0
     }
     private val heroActions = HBox(10.0).apply { alignment = Pos.CENTER_LEFT }
@@ -57,10 +70,21 @@ class HomeScreenView {
         prefHeight = HERO_H
         minHeight = HERO_H
         maxHeight = HERO_H
+        minWidth = 0.0
+        maxWidth = Double.MAX_VALUE
     }
     private var heroItems: List<MediaItem> = emptyList()
     private var heroIndex = 0
     private var heroTimer: Timeline? = null
+
+    /** The provider filter the hero's items were picked for. The hero is
+     *  re-seeded whenever this changes, so it always features the provider the
+     *  user has selected — not whichever provider happened to load first. */
+    private var heroFilter: String? = null
+
+    /** providerId → name, filled on every load so the hero can name the source
+     *  of the title it is featuring without re-reading the store. */
+    private var providerNamesById: Map<String, String> = emptyMap()
 
     /** The banner's loaded artwork, kept so the cover-crop can be recomputed
      *  whenever the banner is resized (see [paintHeroArt]). */
@@ -74,7 +98,14 @@ class HomeScreenView {
 
     private val rowsBox = VBox(Theme.S4)
     private val providerBox = ComboBox<String>()
-    private val statusLabel = themed("", "tiny")
+    private val statusLabel = themed("", "tiny").apply {
+        // A long status line (a dozen failed providers, "10 rows from 102
+        // sources") must wrap: without this it declares a minimum width wider
+        // than the window and slides the whole page sideways.
+        isWrapText = true
+        maxWidth = 900.0
+        minWidth = 0.0
+    }
     private val errorLabel = themed("", "tiny").apply {
         styleClass.add("h-danger")
         isWrapText = true
@@ -104,7 +135,11 @@ class HomeScreenView {
     init {
         providerBox.run {
             styleClass.add("combo-box")
-            minWidth = 220.0
+            prefWidth = 260.0
+            // Shrinkable: the combo + Refresh + Logs row must still fit a
+            // narrow window instead of pushing the page wider than the viewport.
+            minWidth = 150.0
+            maxWidth = 340.0
             setOnAction { load(force = true) }
         }
         logsScroll.isVisible = false
@@ -114,6 +149,8 @@ class HomeScreenView {
             HBox(8.0, providerBox, refreshBtn, logsBtn).apply {
                 alignment = Pos.CENTER_RIGHT
                 padding = Insets(0.0, 0.0, 2.0, 0.0)
+                minWidth = 0.0
+                maxWidth = Double.MAX_VALUE
             },
             heroStack,
             statusLabel,
@@ -168,6 +205,7 @@ class HomeScreenView {
         val body = VBox(10.0, heroOver, heroTitle, heroMeta, heroDesc, heroActions).apply {
             alignment = Pos.BOTTOM_LEFT
             maxWidth = 640.0
+            minWidth = 0.0
         }
         StackPane.setAlignment(body, Pos.BOTTOM_LEFT)
         StackPane.setMargin(body, Insets(0.0, 24.0, 26.0, 30.0))
@@ -218,6 +256,10 @@ class HomeScreenView {
 
     private fun showHero() {
         val item = heroItems.getOrNull(heroIndex) ?: return
+        // Name the source of the featured title, so it is obvious that the
+        // banner follows the provider selector above it.
+        val provider = providerNamesById[item.providerId]
+        heroOver.text = if (provider.isNullOrBlank()) "Featured" else "Featured · $provider"
         heroTitle.text = item.title
         heroMeta.text = listOfNotNull(
             item.year?.toString(),
@@ -302,8 +344,14 @@ class HomeScreenView {
                     delay(500)
                     attempts++
                 }
-                val enabled = AppShell.app.store.providers().filter { it.enabled }.distinctBy { it.name }
+                val enabled = AppShell.app.store.providers().filter { it.enabled }
+                    .distinctBy { it.name }
+                    // Alphabetical, not install order: this is a list of names
+                    // the user scans to find one, and the order they were added
+                    // is meaningless to them.
+                    .sortedBy { it.name.lowercase() }
                 val providerNames = enabled.map { it.name }
+                providerNamesById = enabled.associate { it.id to it.name }
                 // Resolve the ACTIVE choice on the FX thread from the ComboBox's
                 // LIVE value. JavaFX can deliver a popup's action event before
                 // the chosen item is committed to `value`, so a value captured at
@@ -320,6 +368,19 @@ class HomeScreenView {
                         else -> "All providers"
                     }
                     providerBox.value = c
+                    // Re-seed the banner whenever the source filter changes, so
+                    // the hero features the provider the user picked. Without
+                    // this it kept showing whichever provider answered first and
+                    // never changed again for the life of the screen.
+                    if (c != heroFilter) {
+                        heroFilter = c
+                        heroSeeded = false
+                        heroItems = emptyList()
+                        heroIndex = 0
+                        heroTimer?.stop()
+                        heroStack.isVisible = false
+                        heroStack.isManaged = false
+                    }
                     val cfg = enabled.firstOrNull { it.name == c }
                     c to cfg?.id?.takeIf { c != "All providers" }
                 }

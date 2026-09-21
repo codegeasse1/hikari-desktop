@@ -132,16 +132,23 @@ elsewhere) and driven over its JSON IPC:
 - `desktop/player/MpvIpc.kt` — the client: `command`/`post`/`setProperty`/
   `getProperty`/`observe_property`, with one reader thread fanning property
   changes and events out to callbacks.
-- `desktop/player/PlayerWindow.kt` — the app's own transport surface: a
+- `desktop/player/PlayerWindow.kt` — the app's own player window: a
   scrubbable timeline with real time labels, play/pause, ±10s, volume, speed,
   the file's actual audio/subtitle tracks by name and language, what the stream
-  really is (container/format) and why it failed, and **Next episode**.
-- **Video still renders in mpv's own window** (no HWND embedding). Embedding would
-  mean a native child-window protocol per platform for no functional gain: the
-  control surface is what the app could not otherwise know about.
-- The player window is opened *next to* mpv and closes with it. When IPC does not
-  connect, `DesktopPlayer` keeps the plain mpv playback it had — a player that
-  cannot be driven must never be worse than no player window.
+  really is (container/format) and why it failed, **Next episode**, and keyboard
+  control (space, ←/→, ↑/↓, F, Esc).
+- **The video renders INSIDE that window.** mpv is handed a borderless surface
+  window the app owns as its `--wid` (`desktop/player/WinShell.kt`, the only raw
+  Win32 in the app, reached through JNA); mpv creates its video as a child of it,
+  so the plain second window mpv used to open — the "old player" — no longer
+  exists. The surface is glued to the video area on move/resize/maximise/fullscreen
+  and mpv's child window is re-sized to fill it, so maximising or dragging the
+  player keeps the video lined up. Everything degrades to mpv's own window when
+  the handle cannot be obtained (non-Windows, no JNA, no window) — a player that
+  cannot be embedded must never be worse than no player window.
+- The player window is opened *before* mpv (it owns the surface mpv renders
+  into), closes with it, and reports a failed IPC connection instead of sitting on
+  "Connecting…" forever.
 - `DetailScreen` hands the player what only it knows: `next` (advance to the next
   episode, then play its first source) and `position` (throttled history writes,
   so a title resumes where it was left).

@@ -84,6 +84,13 @@ dependencies {
     // server themselves (`createHttpServer()`); the extension API Hikari ships
     // is `fi.iki.elonen.NanoHTTPD`, which is exactly what this artifact holds.
     implementation(libs.nanohttpd)
+    // The player embeds mpv's video INTO the app's own player window, which
+    // needs two raw Win32 calls (find a window by title, resize a child
+    // window). JNA is the smallest, most battle-tested way to reach them, and
+    // it carries its own native library inside the jar, so jpackage needs
+    // nothing extra. See `desktop/player/WinShell.kt`.
+    implementation(libs.jna)
+    implementation(libs.jna.platform)
 }
 
 // The exe launcher on Windows (jpackage) needs every runtime jar in one input

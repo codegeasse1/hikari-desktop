@@ -137,6 +137,12 @@ jobs:
           java -cp "jpackage-input/*" com.hikari.app.js.JsSelfTest
         shell: bash
 
+      - name: Win32 player-embed self-test (JNA)
+        run: |
+          set -e
+          java -cp "jpackage-input/*" desktop.player.WinShellSelfTestKt
+        shell: bash
+
       - name: Diagnose packaged runtime
         run: |
           set +e

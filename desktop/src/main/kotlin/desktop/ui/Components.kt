@@ -161,11 +161,24 @@ object Ui {
     }
 
     fun sectionHeader(title: String, subtitle: String? = null, trailing: Node? = null): HBox {
-        val text = VBox(1.0).apply {
-            children.add(Theme.label(title, size = 17.0, bold = true).apply { styleClass.add("section-title") })
-            if (subtitle != null) {
-                children.add(Theme.label(subtitle, size = 12.5, dim = true).apply { styleClass.add("section-sub") })
+        val text = VBox(1.0).apply { minWidth = 0.0 }
+        text.children.add(
+            Theme.label(title, size = 17.0, bold = true).apply {
+                styleClass.add("section-title")
+                // A long title must ellipsize, not declare a minimum width the
+                // whole page (and the window) has to accommodate.
+                minWidth = 0.0
+                textOverrun = javafx.scene.control.OverrunStyle.ELLIPSIS
             }
+        )
+        if (subtitle != null) {
+            text.children.add(
+                Theme.label(subtitle, size = 12.5, dim = true).apply {
+                    styleClass.add("section-sub")
+                    minWidth = 0.0
+                    textOverrun = javafx.scene.control.OverrunStyle.ELLIPSIS
+                }
+            )
         }
         val spacer = Region().apply { HBox.setHgrow(this, Priority.ALWAYS) }
         return HBox(10.0, text, spacer).apply {
@@ -335,7 +348,14 @@ object Ui {
             minHeight = 0.0
             maxWidth = Double.MAX_VALUE
             maxHeight = Double.MAX_VALUE
-            if (content is Region) content.padding = padding
+            // The content must also be free to be NARROWER than its preferred
+            // width: a content region whose minimum exceeds the viewport is what
+            // makes a page pan sideways (and drag everything on it left, so the
+            // right-hand controls sit off-screen).
+            if (content is Region) {
+                content.padding = padding
+                content.minWidth = 0.0
+            }
         }
 
     /** A horizontally scrolling rail of posters, used by the home screen rows.
