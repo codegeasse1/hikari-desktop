@@ -392,11 +392,15 @@ class DetailScreenView(private val item: MediaItem) {
         ).joinToString("  ·  ")
         heroChips.children.setAll(m.genres.take(6).map { themed(it, "mchip") })
         // The poster card on the right of the banner: only a real poster goes
-        // there (a wide backdrop cover-cropped to 2:3 would be all zoom).
+        // there — but when the provider leaves the poster empty (several anime
+        // catalogs only fill the landscape image) the backdrop is used instead,
+        // so the card shows the same artwork as the grid thumbnail rather than
+        // an empty box.
         heroPosterArt = null
-        if (!m.posterUrl.isNullOrBlank()) {
+        val posterArt = desktop.img.ImageLoader.artFor(m.posterUrl, m.backdropUrl)
+        if (!posterArt.isNullOrBlank()) {
             desktop.img.ImageLoader.loadAsync(
-                m.posterUrl,
+                posterArt,
                 onReady = { img ->
                     heroPosterArt = img
                     sizePoster(hero.width)
@@ -878,7 +882,30 @@ class DetailScreenView(private val item: MediaItem) {
             // dead server can be swapped for another without leaving playback.
             sources = streams,
             onPickSource = { picked -> if (picked.url != source.url) play(picked) },
+            prev = prevEpisodeAction(),
+            onDownload = { s -> download(s) },
+            isFavourite = { favourite },
+            onToggleFavourite = { toggleFavourite() },
+            onOpenInBrowser = { runCatching { desktop.fx.DesktopUi.open(source.url) } },
         )
+    }
+
+    /** The player's "Previous episode": step back one and play its first source.
+     *  Null on the first episode (or a movie), so the player hides the button. */
+    private fun prevEpisodeAction(): (() -> Unit)? {
+        val current = selectedEpisode ?: return null
+        val idx = episodes.indexOfFirst { it.id == current.id }
+        if (idx <= 0) return null
+        val previous = episodes[idx - 1]
+        return {
+            Fx.run {
+                selectedEpisode = previous
+                renderEpisodeGrid()
+                updateNowPlaying()
+                pendingPlay = true
+                loadStreams()
+            }
+        }
     }
 
     /** The player's "Next episode": advance to the following episode and play

@@ -82,23 +82,32 @@ Outside `desktop/ui/`, but part of this layer's picture: the download queue live
 
 ## Screen patterns
 
-- **Hero banner** (`HomeScreen`): a `StackPane` with a clipped rounded rectangle,
-  the image bound to the stack width, two scrim layers (vertical + horizontal
-  gradients), a bottom-left content column and a bottom-right dot/arrow navigator.
-  Auto-rotates every 10s and pauses while hovered. The featured titles come from
-  the *selected* provider (the hero is re-seeded whenever the provider selector
-  changes) and the overline names that provider.
+- **Hero banner** (`HomeScreen`): the same featured card the Android app uses —
+  a rounded card holding the title's **poster** (2:3, the same artwork the grid
+  thumbnail shows, so it is crisp rather than an upscaled backdrop) on the left
+  and the details on the right: provider overline, wrapped title, type/year/genre
+  line, a clipped synopsis and a primary "View Details" pill. The page dots sit
+  under the card, with the prev/next arrows on the same row. Auto-rotates every
+  10s and pauses while hovered. The featured titles come from the *selected*
+  provider (the hero is re-seeded whenever the provider selector changes) and the
+  overline names that provider.
 - **Player** (`desktop/player/PlayerWindow.kt` + `WinShell.kt`): an in-app LAYER,
   not a window — it is mounted into `AppShell.playerHost` (a full-window
   `StackPane` above the body, below the resize edges), so starting a stream reads
-  as the app switching to a player view. It carries a loading overlay that stays
-  up (with mpv's surface hidden) until mpv reports the file loaded, the transport
-  bar, and a **Source** menu for switching servers/qualities mid-playback. mpv is
-  given a borderless surface window the app owns as its `--wid`, so there is no
-  second, plain mpv window either; the surface is kept glued to the video area by
-  `syncSurface` and mpv's child window is kept filling it (`WinShell`, JNA).
-  Non-Windows, or no handle, degrades to mpv's own window (the layer then keeps
-  an explanatory note over the video area).
+  as the app switching to a player view. It mirrors the Android app's player:
+  header (round Back, title, elapsed-time/quality/server badges, round actions —
+  favourite, download, always-on-top, options, lock) over a loading overlay that
+  stays up until mpv reports the file loaded, then the control panel — transport
+  (±10s, big play/pause, previous/next episode, volume) and the labelled feature
+  buttons (Speed, Source, Quality, Audio, Subtitles, Rotate, Skip Intro, Enhance,
+  Fullscreen). mpv is given a borderless surface window the app owns as its
+  `--wid`, so there is no second, plain mpv window either; the surface is kept
+  glued to the video area by `syncSurface` and mpv's child window is kept filling
+  it (`WinShell`, JNA). While an overlay is up the surface is *shrunk* to a
+  couple of pixels — never hidden, which used to kill mpv's video output — and
+  `DesktopPlayer` reopens the stream in mpv's own window if the embed produced no
+  picture at all. Non-Windows, or no handle, degrades the same way (the layer then
+  keeps an explanatory note over the video area).
 - **Rails** (`Ui.rail` + `Ui.railWithArrows`): the vertical mouse wheel is mapped
   to horizontal movement and only consumed while the rail can still move, so the
   page keeps scrolling normally when the rail is at its end.

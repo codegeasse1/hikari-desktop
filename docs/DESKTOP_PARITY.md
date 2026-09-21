@@ -133,13 +133,16 @@ elsewhere) and driven over its JSON IPC:
   `getProperty`/`observe_property`, with one reader thread fanning property
   changes and events out to callbacks.
 - `desktop/player/PlayerWindow.kt` — the app's own player **layer** (mounted into
-  `AppShell.playerHost`, so it covers the app window instead of opening one): a
-  loading overlay that stays up until mpv reports the file loaded, a scrubbable
-  timeline with real time labels, play/pause, ±10s, volume, speed, a **Source**
-  picker for switching servers/qualities mid-playback, the file's actual
-  audio/subtitle tracks by name and language, what the stream really is
-  (container/format) and why it failed, **Next episode**, and keyboard control
-  (space, ←/→, ↑/↓, F, Esc).
+  `AppShell.playerHost`, so it covers the app window instead of opening one),
+  laid out like the Android app's player: a loading overlay that stays up until
+  mpv reports the file loaded, header badges (elapsed time, quality, server),
+  favourite / download / always-on-top / lock actions, a scrubbable timeline with
+  real time labels, the transport (±10s, play/pause, previous/next episode,
+  volume), and the labelled feature buttons — Speed, **Source** (switch servers
+  mid-playback), Quality, Audio, Subtitles, Rotate, Skip Intro, Enhance,
+  Fullscreen — plus the file's actual tracks by name and language, what the
+  stream really is (format) and why it failed, and keyboard control (space,
+  ←/→, ↑/↓, F, L, N/P, Esc).
 - **The video renders INSIDE that layer.** mpv is handed a borderless surface
   window the app owns as its `--wid` (`desktop/player/WinShell.kt`, the only raw
   Win32 in the app, reached through JNA); mpv creates its video as a child of it,

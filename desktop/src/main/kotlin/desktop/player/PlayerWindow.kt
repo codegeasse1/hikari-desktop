@@ -46,24 +46,19 @@ import kotlin.math.roundToInt
  * renders into (`--wid`, see [WinShell]): it is owned by the app window, has no
  * chrome, takes no taskbar slot, and is glued exactly over the video area.
  *
- * What the layer carries:
+ * The layout mirrors the Android app's player: a header with the title and the
+ * "what am I watching" badges (elapsed time, quality, server) plus round icon
+ * actions, and a control panel under the video with the transport and the
+ * feature buttons — Speed, Source, Quality, Audio, Subtitles, Rotate, Skip
+ * Intro, Enhance, Fullscreen.
  *
- *   - a loading overlay (spinner + what is being opened) that stays up until
- *     mpv reports the file actually loaded — so the wait for a stream is never
- *     an unexplained black rectangle,
- *   - a timeline with a scrubbable seek bar and real time labels,
- *   - play/pause, ±10s, volume and speed,
- *   - a **Source** picker, so another server/quality can be chosen without
- *     leaving the player,
- *   - the file's actual audio and subtitle tracks, by name and language,
- *   - what the stream really is (format/codec) and why it failed,
- *   - "Next episode", fired the moment mpv reports the file ended,
- *   - the position, handed back for resume/history,
- *   - keyboard control (space, ←/→, ↑/↓, F, Esc).
- *
- * When the surface cannot be created (not Windows, no JNA, no window handle)
- * [open] returns null and mpv keeps its own window; the layer then says so, and
- * the controls still drive mpv over its IPC channel, so nothing is lost.
+ * A note on the video surface: it is a real window layered ABOVE everything the
+ * app draws, so it has to get out of the way while a spinner or an explanation
+ * is on screen. It is *shrunk* rather than hidden — hiding the window mpv is
+ * rendering into made mpv's video output fail to come up at all (the "sound but
+ * no picture" bug), and a 2x2 window is invisible while keeping the output
+ * alive. It also must never be created hidden: the child window mpv makes
+ * inside it is only findable while every ancestor is visible.
  */
 object PlayerWindow {
 
@@ -72,6 +67,9 @@ object PlayerWindow {
      *  change) has to be followed — events cover the common cases, this covers
      *  the rest. */
     private const val SYNC_MS = 150.0
+
+    /** The size the surface drops to while an overlay covers the video area. */
+    private const val OVERLAY_SIZE = 2
 
     private var root: BorderPane? = null
     private var mounted = false
@@ -84,7 +82,6 @@ object PlayerWindow {
     private var childW = 0
     private var childH = 0
     private var lastChildProbe = 0L
-    private var surfaceHidden = false
 
     /** Set while the layer is being torn down, so a close request cannot
      *  re-enter (the close notification calls back into the owner, which calls
@@ -104,19 +101,32 @@ object PlayerWindow {
     }
 
     private var titleLabel: Label? = null
-    private var subLabel: Label? = null
-    private var timeLabel: Label? = null
+    private var timeChip: Label? = null
+    private var qualityChip: Label? = null
+    private var serverChip: Label? = null
     private var statusLabel: Label? = null
     private var statusSpinner: ProgressIndicator? = null
     private var seekBar: Slider? = null
     private var playButton: Button? = null
+    private var prevButton: Button? = null
+    private var nextButton: Button? = null
     private var volumeSlider: Slider? = null
-    private var audioMenu: MenuButton? = null
-    private var subMenu: MenuButton? = null
+    private var volumeIcon: Label? = null
     private var speedMenu: MenuButton? = null
     private var sourceMenu: MenuButton? = null
-    private var nextButton: Button? = null
+    private var qualityMenu: MenuButton? = null
+    private var audioMenu: MenuButton? = null
+    private var subMenu: MenuButton? = null
+    private var rotateButton: Button? = null
+    private var skipIntroButton: Button? = null
+    private var enhanceButton: Button? = null
     private var fullscreenButton: Button? = null
+    private var favButton: Button? = null
+    private var downloadButton: Button? = null
+    private var pinButton: Button? = null
+    private var lockButton: Button? = null
+    private var featureRow: HBox? = null
+    private var header: HBox? = null
     private var messageLabel: Label? = null
     private var messageActions: HBox? = null
     private var messageBox: VBox? = null
@@ -129,50 +139,75 @@ object PlayerWindow {
     private var lastPosition = 0L
     private var volume = 100.0
     private var paused = false
+    private var rotation = 0
+    private var enhanced = false
+    private var locked = false
+    private var pinned = false
+    private var muted = false
 
-    /** Set while the loading overlay is up. The video surface is a window ABOVE
-     *  the app layer, so it is kept hidden until playback actually starts —
-     *  otherwise it would cover the very spinner that explains the wait. */
-    private var loading = false
-    private var messageUp = false
+    /** Set while the loading overlay or an explanation covers the video area, so
+     *  the native surface can get out of the way. */
+    private var overlayUp = true
     private var lastStatus = ""
     private var lastStatusIsError = false
 
-    /** True when the video is rendered INTO this layer (the embed worked); false
-     *  when mpv fell back to its own window, in which case the explanation over
-     *  the video area must stay up instead of being cleared at playback start. */
+    /** True when the video is rendered INTO this layer (the embed worked). */
     private var embedded = false
 
+    /** True once mpv has reported a real video format — the signal that the
+     *  video output actually came up (a null `video-format` just means "no
+     *  video yet", which is NOT the same as "this stream is audio only"). */
+    private var sawVideo = false
+
+    /** True once mpv has the file open (its `file-loaded` event). */
+    private var loaded = false
+
     private var onNext: (() -> Unit)? = null
+    private var onPrev: (() -> Unit)? = null
     private var onPosition: ((positionMs: Long, durationMs: Long) -> Unit)? = null
     private var onClosed: (() -> Unit)? = null
     private var onPickSource: ((StreamSource) -> Unit)? = null
+    private var onDownload: ((StreamSource) -> Unit)? = null
+    private var onToggleFavourite: (() -> Unit)? = null
+    private var isFavourite: () -> Boolean = { false }
+    private var onOpenInBrowser: (() -> Unit)? = null
     private var sources: List<StreamSource> = emptyList()
+    private var currentSource: StreamSource? = null
     private var currentSourceName = ""
 
     // ── lifecycle ───────────────────────────────────────────────────────────
 
-    /**
-     * Opens the player for a new stream — instantly. The layer is mounted (first
-     * time) or re-shown with its loading overlay up, and the native handle mpv
-     * should render into is returned; null means there is no surface (mpv then
-     * opens its own window).
-     */
+    /** Opens the player for a new stream — instantly. The layer is mounted (first
+     *  time) or re-shown with its loading overlay up, and the native handle mpv
+     *  should render into is returned; null means there is no surface (mpv then
+     *  opens its own window). */
     fun open(
         title: String,
         hasNext: Boolean,
+        hasPrev: Boolean,
         next: (() -> Unit)?,
+        prev: (() -> Unit)?,
         position: ((Long, Long) -> Unit)?,
         closed: (() -> Unit)?,
         sources: List<StreamSource> = emptyList(),
         sourceName: String = "",
         onPickSource: ((StreamSource) -> Unit)? = null,
+        onDownload: ((StreamSource) -> Unit)? = null,
+        isFavourite: (() -> Boolean)? = null,
+        onToggleFavourite: (() -> Unit)? = null,
+        onOpenInBrowser: (() -> Unit)? = null,
+        embed: Boolean = true,
     ): Long? {
         onNext = next
+        onPrev = prev
         onPosition = position
         onClosed = closed
         this.sources = sources
         this.onPickSource = onPickSource
+        this.onDownload = onDownload
+        this.onToggleFavourite = onToggleFavourite
+        this.onOpenInBrowser = onOpenInBrowser
+        if (isFavourite != null) this.isFavourite = isFavourite
         return Fx.runBlock {
             val host = runCatching { AppShell.playerHost }.getOrNull() ?: return@runBlock null
             teardown = false
@@ -186,12 +221,20 @@ object PlayerWindow {
             host.isManaged = true
             installKeys()
             titleLabel?.text = title
+            prevButton?.isVisible = hasPrev
+            prevButton?.isManaged = hasPrev
             nextButton?.isVisible = hasNext
             nextButton?.isManaged = hasNext
             renderSources(sourceName)
+            refreshFavourite()
             resetForNewStream()
-            val surface = startVideoSurface()
+            // No embed: mpv keeps its own window (the fallback path), so the
+            // layer just explains that instead of covering nothing.
+            val surface = if (embed) startVideoSurface() else null
             embedded = surface != null
+            if (!embed) {
+                note("Video is playing in the player's own window — this machine's window compositor wouldn't let the app draw it inside itself. Everything below still controls it.")
+            }
             refreshOverlay()
             surface
         }
@@ -204,6 +247,8 @@ object PlayerWindow {
         lastPosition = 0L
         scrubbing = false
         paused = false
+        sawVideo = false
+        loaded = false
         // mpv starts as a new process, so the surface (and the child window we
         // were filling) is rebuilt for every stream — a stale handle from the
         // previous player can never be mistaken for the new one's.
@@ -215,18 +260,16 @@ object PlayerWindow {
         childW = 0
         childH = 0
         lastChildProbe = 0L
-        surfaceHidden = false
-        messageUp = false
         messageBox?.isVisible = false
         messageBox?.isManaged = false
         seekBar?.value = 0.0
         seekBar?.isDisable = true
-        timeLabel?.text = "00:00 / 00:00"
-        playButton?.graphic = Icons.of(Icons.PAUSE, 17.0)
+        playButton?.graphic = Icons.of(Icons.PAUSE, 18.0)
         audioMenu?.items?.setAll()
         subMenu?.items?.setAll()
         audioMenu?.isDisable = true
         subMenu?.isDisable = true
+        renderTime()
         lastStatus = "Starting the player…"
         lastStatusIsError = false
         applyStatus()
@@ -234,6 +277,13 @@ object PlayerWindow {
     }
 
     fun isOpen(): Boolean = mounted
+
+    /** True once mpv reported a real video format — used by the caller's
+     *  watchdog to detect a failed video embed. */
+    fun hasVideo(): Boolean = sawVideo
+
+    /** True once mpv reported the file as loaded. */
+    fun isLoaded(): Boolean = loaded
 
     /** Live status text on the transport bar — "Starting the player…", the
      *  reason a stream died, the codec that is playing. */
@@ -256,9 +306,9 @@ object PlayerWindow {
 
     /**
      * Shows a message over the video area, with buttons. The video surface is a
-     * window ABOVE the app layer, so it is hidden while a message is up —
-     * otherwise the message would be behind a black rectangle. Returns false
-     * when there is no player open (the caller then shows a dialog).
+     * window ABOVE the app layer, so it gets out of the way while a message is
+     * up — otherwise the message would be behind a black rectangle. Returns
+     * false when there is no player open (the caller then shows a dialog).
      */
     fun showFailure(
         reason: String,
@@ -282,11 +332,8 @@ object PlayerWindow {
         return true
     }
 
-    /**
-     * A short note over the video area (no buttons) — used when the video is
-     * playing somewhere this layer cannot show, e.g. a machine where the embed
-     * is unavailable and mpv keeps its own window.
-     */
+    /** A short note over the video area (no buttons) — used when the video is
+     *  playing somewhere this layer cannot show. */
     fun note(text: String) {
         if (!isOpen()) return
         message(text, emptyList())
@@ -298,7 +345,7 @@ object PlayerWindow {
         Fx.run { closeInternal() }
     }
 
-    // ── window ──────────────────────────────────────────────────────────────
+    // ── UI ──────────────────────────────────────────────────────────────────
 
     private fun buildUi() {
         val headTitle = Label("").apply {
@@ -306,24 +353,56 @@ object PlayerWindow {
             maxWidth = Double.MAX_VALUE
             minWidth = 0.0
         }
-        val headSub = Label("Hikari player").apply { styleClass.add("player-sub") }
-        val titleBox = VBox(1.0, headTitle, headSub).apply { minWidth = 0.0 }
+        timeChip = chip("00:00", "player-chip-time")
+        qualityChip = chip("", "player-chip-quality")
+        serverChip = chip("", "player-chip-server")
+        val badgeRow = HBox(6.0, timeChip, qualityChip, serverChip).apply {
+            alignment = Pos.CENTER_LEFT
+            minWidth = 0.0
+        }
+        val titleBox = VBox(3.0, headTitle, badgeRow).apply { minWidth = 0.0 }
         runCatching { AppShell.makeDraggable(titleBox) }
 
-        // Leaving the player is a first-class action, not a window close: it puts
-        // the app back exactly where the user left it.
-        val back = Ui.button("Back", icon = Icons.CHEVRON_LEFT, ghost = true) { requestClose() }
+        // Leaving the player is a first-class action, not a window close: it
+        // puts the app back exactly where the user left it.
+        val back = roundButton(Icons.CHEVRON_LEFT, "Back to the app") { requestClose() }
         back.styleClass.add("player-back")
 
-        val header = HBox(12.0, back, titleBox, Ui.spacer()).apply {
+        favButton = roundButton(Icons.HEART_OUTLINE, "Add to library") {
+            onToggleFavourite?.invoke()
+            refreshFavourite()
+        }
+        downloadButton = roundButton(Icons.DOWNLOAD, "Download this source") {
+            currentSource?.let { onDownload?.invoke(it) }
+        }
+        pinButton = roundButton(Icons.PIP, "Keep the window on top") { togglePin() }
+        lockButton = roundButton(Icons.LOCK, "Hide the title and the extra buttons") { toggleLock() }
+        val gear = MenuButton().apply {
+            styleClass.addAll("player-round", "player-round-menu")
+            graphic = Icons.of(Icons.SETTINGS, 16.0)
+            isFocusTraversable = false
+            javafx.scene.control.Tooltip.install(this, Ui.tooltip("Player options"))
+            items.add(MenuItem("Always on top").apply { setOnAction { togglePin() } })
+            items.add(MenuItem("Rotate video").apply { setOnAction { rotate() } })
+            items.add(MenuItem("Enhance (sharpen)").apply { setOnAction { toggleEnhance() } })
+            items.add(MenuItem("Open in browser").apply { setOnAction { onOpenInBrowser?.invoke() } })
+            items.add(MenuItem("Open the stream URL").apply {
+                setOnAction { currentSource?.url?.let { DesktopUi.open(it) } }
+            })
+            items.add(MenuItem("Close player").apply { setOnAction { requestClose() } })
+        }
+
+        val actions = HBox(
+            6.0, favButton, downloadButton, pinButton, gear, lockButton,
+        ).apply { alignment = Pos.CENTER_RIGHT }
+
+        header = HBox(12.0, back, titleBox, Ui.spacer(), actions).apply {
             styleClass.add("player-head")
             alignment = Pos.CENTER_LEFT
             minWidth = 0.0
             maxWidth = Double.MAX_VALUE
         }
-        // The window controls stay on the right, so the player window can still
-        // be minimised / maximised / closed like the app's own top bar.
-        runCatching { header.children.add(AppShell.windowControls()) }
+        runCatching { header!!.children.add(AppShell.windowControls()) }
 
         val msgLabel = Label("").apply {
             styleClass.add("player-msg")
@@ -362,21 +441,57 @@ object PlayerWindow {
         val loadBox = VBox(16.0, loadSpinner, loadTitle, loadSub).apply {
             styleClass.add("player-load")
             alignment = Pos.CENTER
+            maxWidth = Double.MAX_VALUE
+            maxHeight = Double.MAX_VALUE
         }
 
         videoArea.children.setAll(loadBox, msgBox)
 
+        // ── transport ───────────────────────────────────────────────────────
+        val play = roundButton(Icons.PAUSE, "Play / pause (space)") {
+            runCatching { ipc?.post("cycle", "pause") }
+        }.apply {
+            styleClass.add("player-play")
+            graphic = Icons.of(Icons.PAUSE, 22.0)
+        }
+        prevButton = roundButton(Icons.SKIP_PREV, "Previous episode") { onPrev?.invoke() }
+        nextButton = roundButton(Icons.SKIP_NEXT, "Next episode") { onNext?.invoke() }
+        val back10 = roundButton(null, "Back 10 seconds (←)") { runCatching { ipc?.post("seek", -10, "relative") } }
+            .apply { text = "10"; styleClass.add("player-skip") }
+        val fwd10 = roundButton(null, "Forward 10 seconds (→)") { runCatching { ipc?.post("seek", 10, "relative") } }
+            .apply { text = "10"; styleClass.add("player-skip") }
+
+        volumeSlider = Slider(0.0, 130.0, 100.0).apply {
+            styleClass.add("player-vol")
+            prefWidth = 96.0
+            minWidth = 60.0
+            maxWidth = 96.0
+            setOnMouseReleased {
+                volume = value
+                runCatching { ipc?.setProperty("volume", value) }
+            }
+        }
+        volumeIcon = Label().apply {
+            styleClass.add("player-vol-icon")
+            graphic = Icons.of(Icons.VOLUME, 16.0)
+            setOnMouseClicked {
+                muted = !muted
+                runCatching { ipc?.setProperty("mute", muted) }
+                graphic = Icons.of(if (muted) Icons.VOLUME_OFF else Icons.VOLUME, 16.0)
+            }
+        }
+
         val seek = Slider(0.0, 1.0, 0.0).apply {
             styleClass.add("player-seek")
             isDisable = true
-            // A scrub must not fight the position updates mpv is streaming in.
             setOnMousePressed { scrubbing = true }
             setOnMouseReleased {
                 scrubbing = false
                 val d = duration
-                if (d > 0) ipc?.post("seek", value * d, "absolute")
+                if (d > 0) runCatching { ipc?.post("seek", value * d, "absolute") }
             }
         }
+        seekBar = seek
 
         val time = Label("00:00 / 00:00").apply { styleClass.add("player-time") }
         val spinner = ProgressIndicator().apply {
@@ -395,104 +510,76 @@ object PlayerWindow {
             minWidth = 0.0
             maxWidth = Double.MAX_VALUE
         }
+        statusLabel = status
+        statusSpinner = spinner
+        timeLabel = time
 
-        val play = playerButton(Icons.PAUSE, "Play / pause (space)") { ipc?.post("cycle", "pause") }
-        play.styleClass.add("player-btn-play")
-        val back10 = playerButton(null, "Back 10 seconds (←)") { ipc?.post("seek", -10, "relative") }
-            .apply { text = "−10s" }
-        val fwd10 = playerButton(null, "Forward 10 seconds (→)") { ipc?.post("seek", 10, "relative") }
-            .apply { text = "+10s" }
-
-        val volume = Slider(0.0, 130.0, 100.0).apply {
-            styleClass.add("player-vol")
-            prefWidth = 100.0
-            minWidth = 60.0
-            setOnMouseReleased {
-                this@PlayerWindow.volume = value
-                ipc?.setProperty("volume", value)
-            }
+        val seekRow = HBox(10.0, seek).apply {
+            alignment = Pos.CENTER_LEFT
+            minWidth = 0.0
         }
-        val volumeIcon = Label().apply {
-            styleClass.add("player-vol-icon")
-            graphic = Icons.of(Icons.VOLUME, 15.0)
-            isFocusTraversable = false
+        val timeRow = HBox(10.0, time).apply {
+            alignment = Pos.CENTER_RIGHT
+            minWidth = 0.0
         }
-
-        val speed = MenuButton("Speed").apply {
-            styleClass.add("player-menu")
-            graphic = Icons.of(Icons.SPEED, 14.0)
-            listOf(0.5, 0.75, 1.0, 1.25, 1.5, 2.0).forEach { rate ->
-                items.add(MenuItem("${rate}x").apply { setOnAction { ipc?.setProperty("speed", rate) } })
-            }
-        }
-
-        val audio = MenuButton("Audio").apply {
-            styleClass.add("player-menu")
-            graphic = Icons.of(Icons.VOLUME, 14.0)
-            isDisable = true
-        }
-        val subs = MenuButton("Subtitles").apply {
-            styleClass.add("player-menu")
-            graphic = Icons.of(Icons.SUBTITLES, 14.0)
-            isDisable = true
-        }
-
-        // The stream picker. Hidden until there is more than one source to pick
-        // from, so a single-source episode doesn't get a dead button.
-        val source = MenuButton("Source").apply {
-            styleClass.addAll("player-menu", "player-source")
-            graphic = Icons.of(Icons.TV, 14.0)
-            isVisible = false
-            isManaged = false
-        }
-
-        val next = Button("Next episode").apply {
-            styleClass.addAll("btn", "btn-primary")
-            isVisible = false
-            isManaged = false
-            setOnAction { onNext?.invoke() }
-        }
-
-        val full = playerButton(Icons.FULLSCREEN, "Fullscreen (F)") { toggleFullscreen() }
-
-        val controlsRow = HBox(
-            8.0, play, back10, fwd10, volumeIcon, volume, time, Ui.spacer(),
-            source, speed, audio, subs, full,
+        val transportRow = HBox(
+            8.0, prevButton, back10, play, fwd10, nextButton, Ui.spacer(), volumeIcon, volumeSlider,
         ).apply {
             alignment = Pos.CENTER_LEFT
             minWidth = 0.0
         }
-        val infoRow = HBox(10.0, spinner, status, Ui.spacer(), next).apply {
+
+        // ── feature buttons (Android parity) ────────────────────────────────
+        speedMenu = pillMenu("1x", Icons.SPEED, "Playback speed").apply {
+            listOf(0.5, 0.75, 1.0, 1.25, 1.5, 2.0).forEach { rate ->
+                items.add(MenuItem("${rate}x").apply {
+                    setOnAction {
+                        runCatching { ipc?.setProperty("speed", rate) }
+                        speedMenu?.text = "${rate}x"
+                    }
+                })
+            }
+        }
+        sourceMenu = pillMenu("Source", Icons.FILM, "Pick another source / server").apply {
+            styleClass.add("player-pill-accent")
+        }
+        qualityMenu = pillMenu("Quality", Icons.TV, "Switch to a source in this quality")
+        audioMenu = pillMenu("Audio", Icons.VOLUME, "Audio track").apply { isDisable = true }
+        subMenu = pillMenu("Subtitles", Icons.SUBTITLES, "Subtitle track").apply { isDisable = true }
+        rotateButton = pillButton("Rotate", Icons.REFRESH, "Rotate the video 90°") { rotate() }
+        skipIntroButton = pillButton("Skip Intro", Icons.ZAP, "Jump forward 85 seconds") {
+            runCatching { ipc?.post("seek", 85, "relative") }
+        }.apply { styleClass.add("player-pill-accent") }
+        enhanceButton = pillButton("Enhance", Icons.SPARKLE, "Sharpen the picture") { toggleEnhance() }
+            .apply { styleClass.add("player-pill-accent") }
+        fullscreenButton = roundButton(Icons.FULLSCREEN, "Fullscreen (F)") { toggleFullscreen() }
+
+        featureRow = HBox(
+            6.0, speedMenu, sourceMenu, qualityMenu, audioMenu, subMenu,
+            rotateButton, skipIntroButton, enhanceButton, Ui.spacer(), fullscreenButton,
+        ).apply {
             alignment = Pos.CENTER_LEFT
             minWidth = 0.0
         }
-        val controls = VBox(9.0, seek, controlsRow, infoRow).apply {
+
+        val statusRow = HBox(8.0, spinner, status).apply {
+            alignment = Pos.CENTER_LEFT
+            minWidth = 0.0
+        }
+
+        val controls = VBox(7.0, seekRow, timeRow, transportRow, featureRow, statusRow).apply {
             styleClass.add("player-bar")
             minWidth = 0.0
             maxWidth = Double.MAX_VALUE
         }
 
-        val body = BorderPane().apply {
+        root = BorderPane().apply {
             styleClass.add("player-root")
             top = header
             center = videoArea
             bottom = controls
         }
 
-        titleLabel = headTitle
-        subLabel = headSub
-        timeLabel = time
-        statusLabel = status
-        statusSpinner = spinner
-        seekBar = seek
-        playButton = play
-        volumeSlider = volume
-        audioMenu = audio
-        subMenu = subs
-        speedMenu = speed
-        sourceMenu = source
-        nextButton = next
-        fullscreenButton = full
         messageLabel = msgLabel
         messageActions = msgActions
         messageBox = msgBox
@@ -502,32 +589,62 @@ object PlayerWindow {
 
         // Anything that moves or resizes the video area has to move the native
         // surface glued to it.
-        videoArea.layoutBoundsProperty().addListener { _, _, _ -> syncSurface() }
+        videoArea.layoutBoundsProperty().addListener { _, _, _ -> safeSync() }
         val stage = runCatching { AppShell.stage }.getOrNull()
         if (stage != null) {
-            stage.xProperty().addListener { _, _, _ -> syncSurface() }
-            stage.yProperty().addListener { _, _, _ -> syncSurface() }
-            stage.widthProperty().addListener { _, _, _ -> syncSurface() }
-            stage.heightProperty().addListener { _, _, _ -> syncSurface() }
-            stage.fullScreenProperty().addListener { _, _, _ -> syncSurface() }
+            stage.xProperty().addListener { _, _, _ -> safeSync() }
+            stage.yProperty().addListener { _, _, _ -> safeSync() }
+            stage.widthProperty().addListener { _, _, _ -> safeSync() }
+            stage.heightProperty().addListener { _, _, _ -> safeSync() }
+            stage.fullScreenProperty().addListener { _, _, _ -> safeSync() }
         }
         syncTimer = Timeline(
-            KeyFrame(Duration.millis(SYNC_MS), EventHandler<ActionEvent> { syncSurface() }),
+            KeyFrame(Duration.millis(SYNC_MS), EventHandler<ActionEvent> { safeSync() }),
         ).apply {
             cycleCount = Timeline.INDEFINITE
             play()
         }
-        root = body
     }
 
-    private fun playerButton(icon: String?, tooltip: String, onClick: () -> Unit): Button =
+    private fun chip(text: String, cls: String): Label = Label(text).apply {
+        styleClass.addAll("player-chip", cls)
+        isVisible = text.isNotBlank()
+        isManaged = isVisible
+    }
+
+    private fun setChip(label: Label?, text: String) {
+        label?.text = text
+        label?.isVisible = text.isNotBlank()
+        label?.isManaged = text.isNotBlank()
+    }
+
+    private fun roundButton(icon: String?, tooltip: String, onClick: () -> Unit): Button =
         Button().apply {
-            styleClass.add("player-btn")
-            if (icon != null) graphic = Icons.of(icon, 17.0)
+            styleClass.add("player-round")
+            if (icon != null) graphic = Icons.of(icon, 16.0)
             isFocusTraversable = false
             javafx.scene.control.Tooltip.install(this, Ui.tooltip(tooltip))
-            setOnAction { onClick() }
+            setOnAction { runCatching { onClick() } }
         }
+
+    private fun pillButton(text: String, icon: String, tooltip: String, onClick: () -> Unit): Button =
+        Button(text).apply {
+            styleClass.add("player-pill")
+            graphic = Icons.of(icon, 14.0)
+            isFocusTraversable = false
+            javafx.scene.control.Tooltip.install(this, Ui.tooltip(tooltip))
+            setOnAction { runCatching { onClick() } }
+        }
+
+    private fun pillMenu(text: String, icon: String, tooltip: String): MenuButton =
+        MenuButton(text).apply {
+            styleClass.addAll("player-pill", "player-pill-menu")
+            graphic = Icons.of(icon, 14.0)
+            isFocusTraversable = false
+            javafx.scene.control.Tooltip.install(this, Ui.tooltip(tooltip))
+        }
+
+    private var timeLabel: Label? = null
 
     private fun requestClose() {
         if (teardown) return
@@ -548,16 +665,14 @@ object PlayerWindow {
         mpvChild = null
         childW = 0
         childH = 0
-        surfaceHidden = false
-        loading = false
-        messageUp = false
+        overlayUp = true
+        duration = 0.0
+        scrubbing = false
+        paused = false
         runCatching {
             AppShell.playerHost.isVisible = false
             AppShell.playerHost.isManaged = false
         }
-        duration = 0.0
-        scrubbing = false
-        paused = false
     }
 
     // ── the video surface ───────────────────────────────────────────────────
@@ -578,11 +693,11 @@ object PlayerWindow {
         vs.initOwner(owner)
         runCatching { vs.initStyle(StageStyle.UNDECORATED) }
         vs.title = probe
-        // Deliberately NOT `Theme.style(scene)`: that would make the surface the
-        // theme's "current scene" and a theme toggle would re-style a window
-        // that is nothing but black. A plain black fill is all it needs.
         val surfaceRoot = Region().apply { style = "-fx-background-color: #000000;" }
-        vs.scene = javafx.scene.Scene(surfaceRoot, 32.0, 18.0).apply { fill = Color.BLACK }
+        vs.scene = javafx.scene.Scene(surfaceRoot, 640.0, 360.0).apply { fill = Color.BLACK }
+        // Shown at a sane size, NOT hidden: mpv's video output is created when
+        // it starts playing, and a hidden parent makes both the output and the
+        // child window it renders into unusable (sound-only playback).
         runCatching { vs.show() }.onFailure { return null }
         val hwnd = WinShell.windowByTitle(probe)
         if (hwnd == null) {
@@ -592,13 +707,18 @@ object PlayerWindow {
         vs.title = "Hikari Player"
         videoStage = vs
         videoHwnd = hwnd
-        refreshOverlay()
         syncSurface()
         return hwnd
     }
 
-    /** Keeps the video surface exactly over the video area, and mpv's child
-     *  window exactly filling the surface. */
+    private fun safeSync() {
+        runCatching { syncSurface() }
+    }
+
+    /**
+     * Keeps the video surface glued to the video area (or shrunk to nothing
+     * while an overlay is up), and mpv's child window filling it.
+     */
     private fun syncSurface() {
         val vs = videoStage ?: return
         if (!vs.isShowing) return
@@ -606,28 +726,27 @@ object PlayerWindow {
         if (area.scene == null || area.width < 8.0 || area.height < 8.0) return
         val rect = runCatching { area.localToScreen(area.boundsInLocal) }.getOrNull() ?: return
         if (rect.width < 8.0 || rect.height < 8.0) return
+        val w = if (overlayUp) OVERLAY_SIZE.toDouble() else rect.width
+        val h = if (overlayUp) OVERLAY_SIZE.toDouble() else rect.height
         if (abs(vs.x - rect.minX) > 0.5) vs.x = rect.minX
         if (abs(vs.y - rect.minY) > 0.5) vs.y = rect.minY
-        if (abs(vs.width - rect.width) > 0.5) vs.width = rect.width
-        if (abs(vs.height - rect.height) > 0.5) vs.height = rect.height
+        if (abs(vs.width - w) > 0.5) vs.width = w
+        if (abs(vs.height - h) > 0.5) vs.height = h
         val child = ensureChild() ?: return
         // Win32 geometry is in physical pixels; JavaFX's is in logical ones, so
-        // on a scaled display the child has to be told the real size or it
-        // covers only part of the surface.
+        // on a scaled display the child has to be told the real size.
         val scale = screenScale()
-        val w = (vs.width * scale).roundToInt()
-        val h = (vs.height * scale).roundToInt()
-        if (w > 0 && h > 0 && (w != childW || h != childH)) {
-            childW = w
-            childH = h
-            WinShell.fillWindow(child, w, h)
+        val pw = (w * scale).roundToInt()
+        val ph = (h * scale).roundToInt()
+        if (pw > 0 && ph > 0 && (pw != childW || ph != childH)) {
+            childW = pw
+            childH = ph
+            WinShell.fillWindow(child, pw, ph)
         }
     }
 
     /** mpv's child window inside the surface, probed until it exists. */
     private fun ensureChild(): Long? {
-        // A cached handle from a previous stream must be dropped once mpv has
-        // exited, or the new video would never be re-sized to the window.
         mpvChild?.let { live ->
             if (WinShell.windowExists(live)) return live
             mpvChild = null
@@ -640,7 +759,6 @@ object PlayerWindow {
         lastChildProbe = now
         val found = WinShell.firstVisibleChild(parent) ?: return null
         mpvChild = found
-        // Force a re-fill: the child appears at whatever size mpv chose.
         childW = 0
         childH = 0
         return found
@@ -655,15 +773,13 @@ object PlayerWindow {
     // ── overlays over the video ─────────────────────────────────────────────
 
     private fun showLoading(text: String) {
-        loading = true
         loadingLabel?.text = text
         loadingBox?.isVisible = true
         loadingBox?.isManaged = true
-        refreshOverlay()
+        setLoading(true)
     }
 
     private fun setLoading(value: Boolean) {
-        loading = value
         if (value) {
             loadingBox?.isVisible = true
             loadingBox?.isManaged = true
@@ -674,27 +790,11 @@ object PlayerWindow {
         refreshOverlay()
     }
 
-    /**
-     * The single place that decides whether the native video surface is shown.
-     * It is a window on top of everything the app draws, so while a loading
-     * spinner or an explanation is up it has to be hidden for that text to be
-     * readable at all.
-     */
+    /** The single place that decides whether the native video surface should be
+     *  in the way of the app's own content. */
     private fun refreshOverlay() {
-        val hide = loading || messageUp
-        val vs = videoStage ?: return
-        if (hide) {
-            if (vs.isShowing) {
-                vs.hide()
-                surfaceHidden = true
-            }
-        } else if (surfaceHidden) {
-            surfaceHidden = false
-            runCatching {
-                vs.show()
-                syncSurface()
-            }
-        }
+        overlayUp = (loadingBox?.isVisible == true) || (messageBox?.isVisible == true)
+        safeSync()
     }
 
     private fun message(text: String, actions: List<Pair<String, () -> Unit>>) {
@@ -713,49 +813,150 @@ object PlayerWindow {
             )
             box.isVisible = true
             box.isManaged = true
-            messageUp = true
             refreshOverlay()
         }
     }
 
     private fun clearMessage() {
-        messageUp = false
         messageBox?.isVisible = false
         messageBox?.isManaged = false
         refreshOverlay()
     }
 
-    // ── the source picker ───────────────────────────────────────────────────
+    // ── the source / quality pickers ────────────────────────────────────────
 
-    /** Fills the Source menu with every stream the title/episode offered. */
+    /** Fills the Source menu with every stream the title/episode offered, and
+     *  the Quality menu with the qualities those sources cover. */
     private fun renderSources(current: String) {
         currentSourceName = current
-        val menu = sourceMenu ?: return
-        val list = sources
-        if (list.size <= 1) {
-            menu.isVisible = false
-            menu.isManaged = false
-            if (list.isNotEmpty() && current.isBlank()) currentSourceName = list[0].name
-            return
+        currentSource = sources.firstOrNull { it.name == current } ?: sources.firstOrNull()
+        setChip(serverChip, current.ifBlank { sources.firstOrNull()?.name.orEmpty() })
+
+        val menu = sourceMenu
+        if (menu != null) {
+            if (sources.size <= 1) {
+                menu.isVisible = false
+                menu.isManaged = false
+            } else {
+                menu.isVisible = true
+                menu.isManaged = true
+                menu.text = "Source"
+                menu.items.setAll(
+                    *sources.map { s ->
+                        MenuItem(s.name.ifBlank { s.url.take(60) }).apply {
+                            if (s.name == currentSourceName) graphic = Icons.of(Icons.CHECK, 13.0)
+                            setOnAction { pickSource(s) }
+                        }
+                    }.toTypedArray()
+                )
+            }
         }
-        menu.isVisible = true
-        menu.isManaged = true
-        menu.text = current.ifBlank { "${list.size} sources" }.let { if (it.length > 26) it.take(25) + "…" else it }
-        javafx.scene.control.Tooltip.install(menu, Ui.tooltip(current.ifBlank { "${list.size} sources" }))
-        menu.items.setAll(
-            *list.map { s ->
-                MenuItem(s.name.ifBlank { s.url.take(60) }).apply {
-                    if (s.name == current) graphic = Icons.of(Icons.CHECK, 13.0)
-                    setOnAction { pickSource(s) }
-                }
-            }.toTypedArray()
-        )
+
+        val qualities = sources.map { qualityOf(it) }.filter { it.isNotBlank() }.distinct()
+        val qMenu = qualityMenu
+        if (qMenu != null) {
+            val show = qualities.size > 1
+            qMenu.isVisible = show
+            qMenu.isManaged = show
+            if (show && currentSource != null) setChip(qualityChip, qualityOf(currentSource!!))
+            qMenu.items.setAll(
+                *qualities.map { q ->
+                    MenuItem(q).apply {
+                        if (currentSource != null && qualityOf(currentSource!!) == q) {
+                            graphic = Icons.of(Icons.CHECK, 13.0)
+                        }
+                        setOnAction {
+                            sources.firstOrNull { qualityOf(it) == q }?.let { pickSource(it) }
+                        }
+                    }
+                }.toTypedArray()
+            )
+        } else {
+            setChip(qualityChip, currentSource?.let { qualityOf(it) } ?: "")
+        }
+        setChip(qualityChip, currentSource?.let { qualityOf(it) } ?: "")
     }
 
     private fun pickSource(source: StreamSource) {
         currentSourceName = source.name
+        currentSource = source
         renderSources(source.name)
         onPickSource?.invoke(source)
+    }
+
+    /** The quality a source advertises in its name, if any. */
+    private fun qualityOf(source: StreamSource): String {
+        val name = source.name.lowercase()
+        Regex("(\\d{3,4}p)").find(name)?.let { return it.groupValues[1].uppercase() }
+        if (name.contains("4k") || name.contains("2160")) return "4K"
+        if (name.contains("1080")) return "1080P"
+        if (name.contains("720")) return "720P"
+        if (name.contains("480")) return "480P"
+        if (name.contains("hd")) return "HD"
+        return ""
+    }
+
+    private fun refreshFavourite() {
+        runCatching {
+            val fav = isFavourite()
+            favButton?.graphic = Icons.of(if (fav) Icons.HEART else Icons.HEART_OUTLINE, 16.0)
+            favButton?.styleClass?.remove("player-round-on")
+            if (fav) favButton?.styleClass?.add("player-round-on")
+        }
+    }
+
+    // ── toggles ─────────────────────────────────────────────────────────────
+
+    private fun togglePin() {
+        val s = runCatching { AppShell.stage }.getOrNull() ?: return
+        pinned = !pinned
+        s.isAlwaysOnTop = pinned
+        pinButton?.styleClass?.remove("player-round-on")
+        if (pinned) pinButton?.styleClass?.add("player-round-on")
+    }
+
+    private fun toggleLock() {
+        locked = !locked
+        header?.isVisible = !locked
+        header?.isManaged = !locked
+        featureRow?.isVisible = !locked
+        featureRow?.isManaged = !locked
+        lastStatus = if (locked) "Controls hidden — press L to bring them back" else ""
+        lastStatusIsError = false
+        applyStatus()
+    }
+
+    private fun rotate() {
+        rotation = (rotation + 90) % 360
+        runCatching { ipc?.setProperty("video-rotate", rotation) }
+        lastStatus = if (rotation == 0) "Rotation reset" else "Rotated $rotation°"
+        lastStatusIsError = false
+        applyStatus()
+    }
+
+    private fun toggleEnhance() {
+        enhanced = !enhanced
+        runCatching { ipc?.setProperty("sharpen", if (enhanced) 1.2 else 0.0) }
+        enhanceButton?.styleClass?.remove("player-pill-on")
+        if (enhanced) enhanceButton?.styleClass?.add("player-pill-on")
+        lastStatus = if (enhanced) "Enhance on" else "Enhance off"
+        lastStatusIsError = false
+        applyStatus()
+    }
+
+    private fun setVolume(next: Double) {
+        val clamped = next.coerceIn(0.0, 130.0)
+        volume = clamped
+        volumeSlider?.value = clamped
+        runCatching { ipc?.setProperty("volume", clamped) }
+    }
+
+    private fun toggleFullscreen() {
+        val s = runCatching { AppShell.stage }.getOrNull() ?: return
+        s.isFullScreen = !s.isFullScreen
+        fullscreenButton?.graphic =
+            Icons.of(if (s.isFullScreen) Icons.FULLSCREEN_EXIT else Icons.FULLSCREEN, 16.0)
+        safeSync()
     }
 
     // ── keyboard ────────────────────────────────────────────────────────────
@@ -765,7 +966,7 @@ object PlayerWindow {
     private fun installKeys() {
         if (keyFilter != null) return
         val scene = runCatching { AppShell.playerHost.scene }.getOrNull() ?: return
-        val filter = EventHandler<KeyEvent> { e -> handleKey(e) }
+        val filter = EventHandler<KeyEvent> { e -> runCatching { handleKey(e) } }
         scene.addEventFilter(KeyEvent.KEY_PRESSED, filter)
         keyFilter = filter
     }
@@ -778,41 +979,28 @@ object PlayerWindow {
 
     private fun handleKey(e: KeyEvent) {
         when (e.code) {
-            KeyCode.SPACE -> ipc?.post("cycle", "pause")
-            KeyCode.LEFT -> ipc?.post("seek", -10, "relative")
-            KeyCode.RIGHT -> ipc?.post("seek", 10, "relative")
+            KeyCode.SPACE -> runCatching { ipc?.post("cycle", "pause") }
+            KeyCode.LEFT -> runCatching { ipc?.post("seek", -10, "relative") }
+            KeyCode.RIGHT -> runCatching { ipc?.post("seek", 10, "relative") }
             KeyCode.UP -> setVolume(volume + 5)
             KeyCode.DOWN -> setVolume(volume - 5)
             KeyCode.F, KeyCode.F11 -> toggleFullscreen()
+            KeyCode.L -> toggleLock()
+            KeyCode.N -> onNext?.invoke()
+            KeyCode.P -> onPrev?.invoke()
             KeyCode.ESCAPE -> requestClose()
             else -> Unit
         }
         e.consume()
     }
 
-    private fun setVolume(next: Double) {
-        val clamped = next.coerceIn(0.0, 130.0)
-        volume = clamped
-        volumeSlider?.value = clamped
-        ipc?.setProperty("volume", clamped)
-    }
-
-    private fun toggleFullscreen() {
-        val s = runCatching { AppShell.stage }.getOrNull() ?: return
-        s.isFullScreen = !s.isFullScreen
-        fullscreenButton?.graphic =
-            Icons.of(if (s.isFullScreen) Icons.FULLSCREEN_EXIT else Icons.FULLSCREEN, 17.0)
-        syncSurface()
-    }
-
     // ── transport, driven by mpv's JSON IPC ─────────────────────────────────
 
-    /** Hands the IPC channel over once mpv's pipe is up. From here the controls
-     *  and the timeline are live. */
+    /** Hands the IPC channel over once mpv's pipe is up. */
     fun attachIpc(handle: MpvIpc) {
         ipc = handle
-        handle.onProperty = { name, value -> onProperty(name, value) }
-        handle.onEvent = { event, data -> onEvent(event, data) }
+        handle.onProperty = { name, value -> runCatching { onProperty(name, value) } }
+        handle.onEvent = { event, data -> runCatching { onEvent(event, data) } }
         val observations = listOf(
             "time-pos" to 1L,
             "duration" to 2L,
@@ -821,7 +1009,6 @@ object PlayerWindow {
             "eof-reached" to 5L,
             "track-list" to 6L,
             "video-format" to 7L,
-            "media-title" to 8L,
         )
         // `observe` waits for a reply, so it must not run on the FX thread.
         Thread(
@@ -856,7 +1043,7 @@ object PlayerWindow {
             }
             "pause" -> {
                 paused = value == true
-                Fx.run { playButton?.graphic = Icons.of(if (paused) Icons.PLAY else Icons.PAUSE, 17.0) }
+                Fx.run { playButton?.graphic = Icons.of(if (paused) Icons.PLAY else Icons.PAUSE, 22.0) }
             }
             "volume" -> {
                 volume = (value as? Number)?.toDouble() ?: 100.0
@@ -865,16 +1052,15 @@ object PlayerWindow {
             "track-list" -> renderTracks(value)
             "video-format" -> {
                 val fmt = value?.toString().orEmpty()
-                Fx.run {
-                    playbackStarted()
-                    statusSpinner?.isVisible = false
-                    statusSpinner?.isManaged = false
+                // Only a REAL format means the video output is up: observing the
+                // property delivers its current (often null) value immediately,
+                // and treating that as "playback started" revealed a black
+                // surface and labelled a perfectly good stream "Audio only".
+                if (fmt.isNotBlank()) {
+                    sawVideo = true
+                    Fx.run { playbackStarted() }
+                    setStatus("Video: $fmt")
                 }
-                setStatus(if (fmt.isBlank()) "Audio only" else "Video: $fmt")
-            }
-            "media-title" -> {
-                val t = value?.toString().orEmpty()
-                if (t.isNotBlank()) Fx.run { subLabel?.text = t }
             }
             "eof-reached" -> {
                 if (value == true) onNext?.invoke()
@@ -891,7 +1077,9 @@ object PlayerWindow {
                 if (reason.isNotBlank() && reason != "eof" && reason != "quit" && reason != "stop") {
                     Fx.run {
                         setLoading(false)
-                        statusLabel?.text = "Playback stopped: $reason"
+                        lastStatus = "Playback stopped: $reason"
+                        lastStatusIsError = true
+                        applyStatus()
                         statusSpinner?.isVisible = false
                         statusSpinner?.isManaged = false
                     }
@@ -903,17 +1091,18 @@ object PlayerWindow {
     /** Called the moment playback is actually up: drops the loading overlay and
      *  reveals the video surface. Safe to call more than once. */
     private fun playbackStarted() {
-        if (loading) setLoading(false)
-        // With no embed the video lives in mpv's own window, so the note saying
-        // so has to survive — otherwise the video area is just blank.
+        loaded = true
+        if (loadingBox?.isVisible == true) setLoading(false)
         if (embedded) clearMessage()
         statusSpinner?.isVisible = false
         statusSpinner?.isManaged = false
     }
 
     private fun renderTime() {
-        val pos = lastPosition / 1000
-        timeLabel?.text = "${clock(pos)} / ${clock(duration.toLong())}"
+        val now = clock(lastPosition / 1000)
+        val total = clock(duration.toLong())
+        timeLabel?.text = "$now / $total"
+        setChip(timeChip, if (duration > 0.0) "$now / $total" else "")
     }
 
     /** One menu row per real track, chosen via `aid`/`sid`. */
@@ -942,12 +1131,16 @@ object PlayerWindow {
         }
         Fx.run {
             audioMenu?.items?.setAll(*audio.map { (id, name) ->
-                MenuItem(name).apply { setOnAction { ipc?.setProperty("aid", id.toInt()) } }
+                MenuItem(name).apply {
+                    setOnAction { runCatching { ipc?.setProperty("aid", id.toInt()) } }
+                }
             }.toTypedArray())
             subMenu?.items?.setAll(*buildList {
-                add(MenuItem("Off").apply { setOnAction { ipc?.setProperty("sid", false) } })
+                add(MenuItem("Off").apply { setOnAction { runCatching { ipc?.setProperty("sid", false) } } })
                 subs.forEach { (id, name) ->
-                    add(MenuItem(name).apply { setOnAction { ipc?.setProperty("sid", id.toInt()) } })
+                    add(MenuItem(name).apply {
+                        setOnAction { runCatching { ipc?.setProperty("sid", id.toInt()) } }
+                    })
                 }
             }.toTypedArray())
             audioMenu?.isDisable = audio.isEmpty()

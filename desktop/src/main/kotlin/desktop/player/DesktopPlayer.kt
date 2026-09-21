@@ -65,6 +65,24 @@ object DesktopPlayer {
     @Volatile
     private var onPickSource: ((StreamSource) -> Unit)? = null
 
+    /** "Previous episode" for the player's transport, when there is one. */
+    @Volatile
+    private var onPrev: (() -> Unit)? = null
+
+    /** The player's other per-title actions: download what is playing, and the
+     *  library (favourite) toggle. */
+    @Volatile
+    private var onDownloadSource: ((StreamSource) -> Unit)? = null
+
+    @Volatile
+    private var favCheck: (() -> Boolean)? = null
+
+    @Volatile
+    private var favToggle: (() -> Unit)? = null
+
+    @Volatile
+    private var openInBrowser: (() -> Unit)? = null
+
     /** True once the current launch has shown its failure dialog (mpv error or
      *  stream-probe fallback), so the two can't double-popup. Reset per launch. */
     @Volatile private var dialogShown = false
@@ -86,12 +104,22 @@ object DesktopPlayer {
         position: ((Long, Long) -> Unit)? = null,
         sources: List<StreamSource> = emptyList(),
         onPickSource: ((StreamSource) -> Unit)? = null,
+        prev: (() -> Unit)? = null,
+        onDownload: ((StreamSource) -> Unit)? = null,
+        isFavourite: (() -> Boolean)? = null,
+        onToggleFavourite: (() -> Unit)? = null,
+        onOpenInBrowser: (() -> Unit)? = null,
     ) {
         onEnded = next
+        onPrev = prev
         onPosition = position
         sourceList = sources.ifEmpty { listOf(stream) }
         sourceName = stream.name
         this.onPickSource = onPickSource
+        onDownloadSource = onDownload
+        favCheck = isFavourite
+        favToggle = onToggleFavourite
+        openInBrowser = onOpenInBrowser
         // Sanitize here too so a malformed URL from ANY provider (chaturbate's
         // root-relative escaped HLS path, stray quotes, JSON escapes) can't
         // reach mpv or the browser as garbage.
@@ -161,7 +189,9 @@ object DesktopPlayer {
             val surface = PlayerWindow.open(
                 title = title,
                 hasNext = false,
+                hasPrev = false,
                 next = null,
+                prev = null,
                 position = null,
                 closed = { stopPlayback() },
             )
@@ -210,7 +240,13 @@ object DesktopPlayer {
         }
     }
 
-    private fun launchMpv(title: String, stream: StreamSource, refresh: (() -> StreamSource?)?, attemptsLeft: Int) {
+    private fun launchMpv(
+        title: String,
+        stream: StreamSource,
+        refresh: (() -> StreamSource?)?,
+        attemptsLeft: Int,
+        embed: Boolean = true,
+    ) {
         Fx.run {
             ipcTarget = openIpcEndpoint()
             val mpv = findMpv()
@@ -230,14 +266,21 @@ object DesktopPlayer {
             val surface = PlayerWindow.open(
                 title = title,
                 hasNext = onEnded != null,
+                hasPrev = onPrev != null,
                 next = onEnded,
+                prev = onPrev,
                 position = onPosition,
                 closed = { stopPlayback() },
                 sources = sourceList,
                 sourceName = sourceName,
                 onPickSource = onPickSource,
+                onDownload = onDownloadSource,
+                isFavourite = favCheck,
+                onToggleFavourite = favToggle,
+                onOpenInBrowser = openInBrowser,
+                embed = embed,
             )
-            if (surface == null) {
+            if (surface == null && embed) {
                 PlayerWindow.note(
                     "Embedded video isn't available on this machine, so the video plays in the player's own window.",
                 )
@@ -302,12 +345,45 @@ object DesktopPlayer {
             // Only the FIRST explanation per launch shows: the mpv error path and
             // the stream probe both try to explain a dead player, never both.
             dialogShown = false
+            if (embed) {
+                // mpv rendering INTO the app's own window can fail on some
+                // drivers, and the symptom is exactly "the sound works but the
+                // picture never appears". If the file is loaded and still no
+                // video format has been reported, reopen once in mpv's own
+                // window — a visible picture beats a tidier window.
+                Thread(
+                    {
+                        val deadline = System.currentTimeMillis() + 20_000
+                        while (System.currentTimeMillis() < deadline) {
+                            Thread.sleep(1_000)
+                            if (proc !== p || !p.isAlive) return@Thread
+                            if (PlayerWindow.hasVideo()) return@Thread
+                            if (PlayerWindow.isLoaded()) {
+                                Fx.run {
+                                    if (proc !== p) return@run
+                                    proc = null
+                                    runCatching { p.destroy() }
+                                    PlayerWindow.note(
+                                        "Embedded video didn't start on this machine, so it has been reopened in the player's own window.",
+                                    )
+                                    launchMpv(title, stream, refresh, 0, embed = false)
+                                }
+                                return@Thread
+                            }
+                        }
+                    },
+                    "hikari-embed-watchdog",
+                ).apply { isDaemon = true; start() }
+            }
             val startedAt = System.currentTimeMillis()
             Thread(
                 {
                     val tail = StringBuilder()
                     runCatching { p.inputStream.bufferedReader().forEachLine { if (tail.length < 4000) tail.append(it).append('\n') } }
                     val code = runCatching { p.exitValue() }.getOrDefault(-1)
+                    // A newer launch (or a teardown) replaced this process while
+                    // it was draining — its exit is not this player's business.
+                    if (proc !== p) return@Thread
                     if (code == 0 && !p.isAlive) {
                         // The episode finished with no error and no "next": mpv
                         // is gone, so the app's player window goes too.
@@ -322,7 +398,7 @@ object DesktopPlayer {
                         if (attemptsLeft > 0 && refresh != null && (signed || forbidden)) {
                             val fresh = runCatching { refresh() }.getOrNull()
                             if (fresh != null && fresh.url.isNotBlank()) {
-                                Fx.run { launchMpv(title, fresh, refresh, attemptsLeft - 1) }
+                                Fx.run { launchMpv(title, fresh, refresh, attemptsLeft - 1, embed) }
                                 return@Thread
                             }
                         }

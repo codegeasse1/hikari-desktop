@@ -12,9 +12,36 @@ import javafx.stage.Stage
 import javafx.stage.StageStyle
 
 fun main() {
+    installCrashLogger()
     val app = HikariApp()
     app.init()
     Application.launch(HikariDesktopApp::class.java)
+}
+
+/**
+ * Records any uncaught exception to `~/.hikari/crash.log` (and the in-app log),
+ * so "the player just froze and closed" always leaves something to read instead
+ * of a window that vanished.
+ */
+private fun installCrashLogger() {
+    val previous = Thread.getDefaultUncaughtExceptionHandler()
+    Thread.setDefaultUncaughtExceptionHandler { thread, error ->
+        runCatching {
+            val dir = java.io.File(System.getProperty("user.home"), ".hikari").apply { mkdirs() }
+            java.io.File(dir, "crash.log").appendText(
+                "\n[" + java.time.Instant.now() + "] thread=" + thread.name + "\n" +
+                    error.stackTraceToString() + "\n",
+            )
+        }
+        runCatching {
+            com.hikari.app.util.LiveLogs.error(
+                "crash",
+                (error.message ?: error.javaClass.name) + " (see .hikari/crash.log)",
+                error,
+            )
+        }
+        previous?.uncaughtException(thread, error)
+    }
 }
 
 class HikariDesktopApp : Application() {

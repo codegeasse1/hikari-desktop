@@ -37,39 +37,66 @@ class HomeScreenView {
 
     // ── hero ────────────────────────────────────────────────────────────────
 
-    private val heroImage = ImageView().apply {
+    /**
+     * The featured card: the title's POSTER on the left (the same artwork the
+     * grid thumbnail uses — a poster is high-resolution and crisp at this size,
+     * where an upscaled backdrop was the blurry banner), and the details on the
+     * right, with the page dots under the card.
+     */
+    private val heroPoster = ImageView().apply {
         isPreserveRatio = false
         isSmooth = true
-        fitHeight = HERO_H
     }
+    private var heroPosterArt: javafx.scene.image.Image? = null
+    private val heroPosterClip = Rectangle().apply { arcWidth = 16.0; arcHeight = 16.0 }
+    private val heroPosterFrame = StackPane(heroPoster).apply {
+        styleClass.add("hero-poster")
+        clip = heroPosterClip
+    }
+
+    private fun paintHeroPoster() {
+        Ui.coverImage(heroPoster, heroPosterArt, POSTER_W, POSTER_H)
+    }
+
     private val heroOver = themed("Featured", "hero-over")
     private val heroTitle = themed("", "hero-title").apply {
         // Wrapping the title (instead of letting it declare its full width as a
         // minimum) is what keeps a long title — or a long provider name above it
         // — from making the whole page wider than the window.
         isWrapText = true
-        maxWidth = 620.0
+        maxWidth = 560.0
         minWidth = 0.0
-        maxHeight = 96.0
+        maxHeight = 74.0
     }
     private val heroMeta = themed("", "hero-meta").apply {
         isWrapText = true
-        maxWidth = 620.0
+        maxWidth = 560.0
         minWidth = 0.0
     }
     private val heroDesc = themed("", "hero-desc").apply {
         isWrapText = true
-        maxWidth = 620.0
+        maxWidth = 560.0
         minWidth = 0.0
-        maxHeight = 54.0
+        maxHeight = 68.0
+        textOverrun = javafx.scene.control.OverrunStyle.ELLIPSIS
     }
     private val heroActions = HBox(10.0).apply { alignment = Pos.CENTER_LEFT }
-    private val heroDots = HBox(7.0).apply { alignment = Pos.CENTER_RIGHT }
+    private val heroDots = HBox(7.0).apply { alignment = Pos.CENTER }
     private val heroStack = StackPane().apply {
         styleClass.add("hero-wrap")
         prefHeight = HERO_H
         minHeight = HERO_H
         maxHeight = HERO_H
+        minWidth = 0.0
+        maxWidth = Double.MAX_VALUE
+    }
+    private val heroDotsRow = StackPane(heroDots).apply {
+        alignment = Pos.CENTER
+        minWidth = 0.0
+        maxWidth = Double.MAX_VALUE
+    }
+    /** The hero as it is laid out on the page: the card, then the dots. */
+    private val heroBox = VBox(8.0, heroStack, heroDotsRow).apply {
         minWidth = 0.0
         maxWidth = Double.MAX_VALUE
     }
@@ -85,14 +112,6 @@ class HomeScreenView {
     /** providerId → name, filled on every load so the hero can name the source
      *  of the title it is featuring without re-reading the store. */
     private var providerNamesById: Map<String, String> = emptyMap()
-
-    /** The banner's loaded artwork, kept so the cover-crop can be recomputed
-     *  whenever the banner is resized (see [paintHeroArt]). */
-    private var heroArt: javafx.scene.image.Image? = null
-
-    private fun paintHeroArt() {
-        Ui.coverImage(heroImage, heroArt, heroStack.width, heroStack.height)
-    }
 
     // ── page ────────────────────────────────────────────────────────────────
 
@@ -152,14 +171,14 @@ class HomeScreenView {
                 minWidth = 0.0
                 maxWidth = Double.MAX_VALUE
             },
-            heroStack,
+            heroBox,
             statusLabel,
             errorLabel,
             rowsBox,
             logsScroll,
         )
-        heroStack.isVisible = false
-        heroStack.isManaged = false
+        heroBox.isVisible = false
+        heroBox.isManaged = false
         // The auto-rotating banner is the only long-lived animation on this
         // screen: stop it (and restart it on return) instead of letting it tick
         // against a detached scene graph.
@@ -176,39 +195,38 @@ class HomeScreenView {
 
     private fun buildHero() {
         val clip = Rectangle().apply {
-            arcWidth = 36.0
-            arcHeight = 36.0
+            arcWidth = 30.0
+            arcHeight = 30.0
         }
         clip.widthProperty().bind(heroStack.widthProperty())
         clip.heightProperty().bind(heroStack.heightProperty())
         heroStack.clip = clip
-        heroImage.isPreserveRatio = false
-        heroImage.fitWidthProperty().bind(heroStack.widthProperty())
-        heroImage.fitHeightProperty().bind(heroStack.heightProperty())
-        heroStack.widthProperty().addListener { _, _, _ -> paintHeroArt() }
-        heroStack.heightProperty().addListener { _, _, _ -> paintHeroArt() }
+        // The poster is a fixed 2:3 card inside the featured card, so its art
+        // never has to be re-cropped on resize.
+        heroPoster.fitWidth = POSTER_W
+        heroPoster.fitHeight = POSTER_H
+        heroPosterClip.width = POSTER_W
+        heroPosterClip.height = POSTER_H
+        listOf(heroPosterFrame.prefWidthProperty(), heroPosterFrame.minWidthProperty(),
+            heroPosterFrame.maxWidthProperty()).forEach { it.set(POSTER_W) }
+        listOf(heroPosterFrame.prefHeightProperty(), heroPosterFrame.minHeightProperty(),
+            heroPosterFrame.maxHeightProperty()).forEach { it.set(POSTER_H) }
 
-        val scrimV = Region().apply {
-            styleClass.add("hero-scrim-v")
+        val body = VBox(8.0, heroOver, heroTitle, heroMeta, heroDesc, heroActions).apply {
+            alignment = Pos.CENTER_LEFT
             maxWidth = Double.MAX_VALUE
-            maxHeight = Double.MAX_VALUE
-            // Decoration only — it must never swallow the hero's own click.
-            isMouseTransparent = true
-        }
-        val scrimH = Region().apply {
-            styleClass.add("hero-scrim-h")
-            maxWidth = Double.MAX_VALUE
-            maxHeight = Double.MAX_VALUE
-            isMouseTransparent = true
-        }
-
-        val body = VBox(10.0, heroOver, heroTitle, heroMeta, heroDesc, heroActions).apply {
-            alignment = Pos.BOTTOM_LEFT
-            maxWidth = 640.0
             minWidth = 0.0
         }
-        StackPane.setAlignment(body, Pos.BOTTOM_LEFT)
-        StackPane.setMargin(body, Insets(0.0, 24.0, 26.0, 30.0))
+        HBox.setHgrow(body, Priority.ALWAYS)
+
+        val layout = HBox(24.0, heroPosterFrame, body).apply {
+            alignment = Pos.CENTER_LEFT
+            padding = Insets(CARD_PAD, 26.0, CARD_PAD, CARD_PAD)
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
+        }
+        heroStack.children.add(layout)
+        heroStack.cursor = javafx.scene.Cursor.HAND
 
         val prev = Ui.iconButton(Icons.CHEVRON_LEFT, "Previous", 16.0) { stepHero(-1) }.apply { styleClass.add("round-btn") }
         val next = Ui.iconButton(Icons.CHEVRON_RIGHT, "Next", 16.0) { stepHero(1) }.apply { styleClass.add("round-btn") }
@@ -216,12 +234,11 @@ class HomeScreenView {
         // also open the featured title.
         Ui.isolateClicks(prev)
         Ui.isolateClicks(next)
-        val nav = HBox(14.0, heroDots, prev, next).apply { alignment = Pos.CENTER_RIGHT }
-        StackPane.setAlignment(nav, Pos.BOTTOM_RIGHT)
-        StackPane.setMargin(nav, Insets(0.0, 30.0, 32.0, 0.0))
+        val nav = HBox(8.0, prev, next).apply { alignment = Pos.CENTER_RIGHT }
+        StackPane.setAlignment(nav, Pos.CENTER_RIGHT)
+        StackPane.setMargin(nav, Insets(0.0, 4.0, 0.0, 0.0))
+        heroDotsRow.children.add(nav)
 
-        heroStack.children.addAll(heroImage, scrimV, scrimH, body, nav)
-        heroStack.cursor = javafx.scene.Cursor.HAND
         // Clicking the banner (anywhere that isn't a button) opens the title.
         heroStack.setOnMouseClicked { heroItems.getOrNull(heroIndex)?.let { AppShell.openDetail(it) } }
         heroStack.setOnMouseEntered { heroTimer?.pause() }
@@ -232,8 +249,8 @@ class HomeScreenView {
         if (items.isEmpty()) return
         heroItems = items.take(6)
         heroIndex = 0
-        heroStack.isVisible = true
-        heroStack.isManaged = true
+        heroBox.isVisible = true
+        heroBox.isManaged = true
         showHero()
         heroTimer?.stop()
         heroTimer = Timeline(
@@ -271,22 +288,27 @@ class HomeScreenView {
             item.genres.take(3).joinToString(" · ").ifBlank { null },
         ).joinToString("  ·  ")
         heroDesc.text = item.overview?.replace(Regex("<[^>]*>"), "")?.replace(Regex("\\s+"), " ")?.trim().orEmpty()
-        heroImage.opacity = 0.0
-        val onImageReady: (javafx.scene.image.Image?) -> Unit = { img ->
-            heroArt = img
-            paintHeroArt()
-            if (img != null) {
-                Ui.fade(heroImage, 1.0, 300.0)
-            }
-        }
-        val art = desktop.img.ImageLoader.artFor(item.backdropUrl, item.posterUrl)
+        heroPoster.opacity = 0.0
+        heroPosterArt = null
+        paintHeroPoster()
+        val art = desktop.img.ImageLoader.artFor(item.posterUrl, item.backdropUrl)
         if (!art.isNullOrBlank()) {
-            desktop.img.ImageLoader.loadAsync(art, onReady = onImageReady, w = 1600, h = 700)
+            desktop.img.ImageLoader.loadAsync(
+                art,
+                onReady = { img ->
+                    heroPosterArt = img
+                    paintHeroPoster()
+                    if (img != null) Ui.fade(heroPoster, 1.0, 300.0)
+                },
+                w = 480,
+                h = 720,
+            )
+        } else {
+            heroPoster.opacity = 1.0
         }
         heroActions.children.setAll(
-            Ui.playButton("Watch now") { AppShell.openDetail(item) },
-            Ui.button("Add to list", icon = Icons.PLUS, ghost = true) { addToLibrary(item) },
-            Ui.button("Details", icon = Icons.INFO, ghost = true) { AppShell.openDetail(item) },
+            Ui.button("View Details", icon = Icons.PLAY, primary = true) { AppShell.openDetail(item) },
+            Ui.isolateClicks(Ui.button("Add to list", icon = Icons.PLUS, ghost = true) { addToLibrary(item) }),
         )
         heroDots.children.setAll(heroItems.mapIndexed { index, _ ->
             Ui.isolateClicks(Region().apply {
@@ -378,8 +400,8 @@ class HomeScreenView {
                         heroItems = emptyList()
                         heroIndex = 0
                         heroTimer?.stop()
-                        heroStack.isVisible = false
-                        heroStack.isManaged = false
+                        heroBox.isVisible = false
+                        heroBox.isManaged = false
                     }
                     val cfg = enabled.firstOrNull { it.name == c }
                     c to cfg?.id?.takeIf { c != "All providers" }
@@ -495,6 +517,11 @@ class HomeScreenView {
     private fun themed(text: String, cls: String): Label = Label(text).apply { styleClass.add(cls) }
 
     private companion object {
-        const val HERO_H = 320.0
+        /** The featured card's height; the 2:3 poster inside it fills it minus
+         *  the card's padding. */
+        const val HERO_H = 300.0
+        const val CARD_PAD = 20.0
+        const val POSTER_H = HERO_H - 2 * CARD_PAD
+        const val POSTER_W = POSTER_H / 1.5
     }
 }

@@ -758,9 +758,22 @@
    =========================================================================== */
 
 .hero-wrap {
-    -fx-background-color: -h-surface-2;
-    -fx-background-radius: 18;
+    -fx-background-color: linear-gradient(to right, -h-surface-3 0%, -h-surface-2 46%, -h-bg-2 100%);
+    -fx-background-radius: 20;
+    -fx-border-color: -h-border;
+    -fx-border-width: 1;
+    -fx-border-radius: 20;
     -fx-effect: dropshadow(gaussian, -h-shadow-2, 26, 0, 0, 8);
+}
+/* The featured title's poster — the same artwork the grid thumbnail shows,
+   crisp at this size where an upscaled backdrop was blurry. */
+.hero-poster {
+    -fx-background-color: -h-surface-3;
+    -fx-background-radius: 14;
+    -fx-border-color: rgba(255,255,255,0.14);
+    -fx-border-width: 1;
+    -fx-border-radius: 14;
+    -fx-effect: dropshadow(gaussian, -h-shadow-2, 20, 0, 0, 8);
 }
 .hero-scrim-v {
     -fx-background-color: linear-gradient(to top, rgba(6,7,12,0.97) 0%, rgba(6,7,12,0.58) 38%, rgba(6,7,12,0.02) 76%);
@@ -771,18 +784,18 @@
     -fx-background-radius: 18;
 }
 .hero-over   { -fx-font-size: 11px;   -fx-font-weight: bold; -fx-text-fill: -h-accent; }
-.hero-title  { -fx-font-size: 38px;   -fx-font-weight: bold; -fx-text-fill: #ffffff; }
-.hero-meta   { -fx-font-size: 12.5px; -fx-text-fill: rgba(255,255,255,0.80); }
-.hero-desc   { -fx-font-size: 13.5px; -fx-text-fill: rgba(255,255,255,0.74); }
+.hero-title  { -fx-font-size: 30px;   -fx-font-weight: bold; -fx-text-fill: -h-fg; }
+.hero-meta   { -fx-font-size: 12.5px; -fx-text-fill: -h-fg-3; }
+.hero-desc   { -fx-font-size: 13px;   -fx-text-fill: -h-fg-2; }
 
 .hero-dot {
-    -fx-background-color: rgba(255,255,255,0.32);
+    -fx-background-color: -h-border-3;
     -fx-background-radius: 999;
     -fx-min-width: 8;  -fx-min-height: 8;
     -fx-max-width: 8;  -fx-max-height: 8;
     -fx-cursor: hand;
 }
-.hero-dot-sel { -fx-background-color: -h-accent; -fx-min-width: 24; -fx-max-width: 24; }
+.hero-dot-sel { -fx-background-color: -h-fg; -fx-min-width: 22; -fx-max-width: 22; }
 
 .round-btn {
     -fx-background-color: rgba(0,0,0,0.44);
@@ -1111,11 +1124,22 @@
     -fx-background-color: -h-bg-2;
     -fx-border-color: -h-border;
     -fx-border-width: 0 0 1 0;
-    -fx-padding: 7 8 7 14;
-    -fx-min-height: 44;
+    -fx-padding: 8 8 8 12;
+    -fx-min-height: 54;
 }
-.player-title { -fx-font-size: 13.5px; -fx-font-weight: bold; -fx-text-fill: -h-fg; }
-.player-sub   { -fx-font-size: 11px;   -fx-text-fill: -h-fg-3; }
+.player-title { -fx-font-size: 15px; -fx-font-weight: bold; -fx-text-fill: -h-fg; }
+
+/* The "what am I watching" badges: elapsed time, quality, server. */
+.player-chip {
+    -fx-background-color: -h-surface-3;
+    -fx-background-radius: 6;
+    -fx-padding: 2 8 2 8;
+    -fx-font-size: 11px;
+    -fx-text-fill: -h-fg-2;
+}
+.player-chip-time    { -fx-font-family: "Consolas"; }
+.player-chip-quality { -fx-background-color: -h-accent; -fx-text-fill: -h-accent-fg; -fx-font-weight: bold; }
+.player-chip-server  { -fx-text-fill: -h-fg; }
 
 /* The window mpv is handed: black, borderless, nothing else in it. */
 .player-video { -fx-background-color: #05060a; }
@@ -1140,54 +1164,79 @@
 .player-time   { -fx-font-size: 11.5px; -fx-text-fill: -h-fg-2; -fx-font-family: "Consolas"; }
 .player-status { -fx-font-size: 11.5px; -fx-text-fill: -h-fg-3; }
 
-.player-btn {
+/* Round icon buttons — the header actions and the transport. */
+.player-round {
     -fx-background-color: -h-surface-3;
     -fx-border-color: -h-border-2;
     -fx-border-width: 1;
-    -fx-border-radius: 9;
-    -fx-background-radius: 9;
+    -fx-border-radius: 999;
+    -fx-background-radius: 999;
     -fx-text-fill: -h-fg;
-    -fx-font-size: 12.5px;
-    -fx-padding: 6 12 6 12;
+    -fx-font-size: 12px;
+    -fx-padding: 0;
+    -fx-min-width: 34;  -fx-min-height: 34;
+    -fx-max-width: 34;  -fx-max-height: 34;
     -fx-cursor: hand;
 }
-.player-btn:hover { -fx-background-color: -h-surface-4; -fx-border-color: -h-border-3; }
-.player-btn .h-icon { -fx-fill: -h-fg; }
-.player-btn-play {
+.player-round:hover { -fx-background-color: -h-surface-4; -fx-border-color: -h-border-3; }
+.player-round .h-icon { -fx-fill: -h-fg; }
+.player-round-menu { -fx-padding: 0; }
+.player-round-menu .arrow { -fx-background-color: -h-fg-3; -fx-padding: 2; }
+.player-round-on { -fx-background-color: -h-accent-soft; -fx-border-color: -h-accent-line; }
+.player-round-on .h-icon { -fx-fill: -h-accent; }
+.player-back {
+    -fx-min-width: 38;  -fx-min-height: 38;
+    -fx-max-width: 38;  -fx-max-height: 38;
+}
+
+/* The big accent play/pause in the middle of the transport. */
+.player-play {
     -fx-background-color: -h-accent;
     -fx-border-color: transparent;
-    -fx-padding: 8 16 8 16;
+    -fx-min-width: 52;  -fx-min-height: 52;
+    -fx-max-width: 52;  -fx-max-height: 52;
 }
-.player-btn-play:hover { -fx-background-color: -h-accent-2; }
-.player-btn-play .h-icon { -fx-fill: -h-accent-fg; }
+.player-play:hover { -fx-background-color: -h-accent-2; -fx-border-color: transparent; }
+.player-play .h-icon { -fx-fill: -h-accent-fg; }
+
+/* ±10s: a round button carrying the number. */
+.player-skip {
+    -fx-font-size: 12px;
+    -fx-font-weight: bold;
+    -fx-min-width: 40;  -fx-min-height: 40;
+    -fx-max-width: 40;  -fx-max-height: 40;
+}
+.player-vol-icon { -fx-padding: 0 0 0 2; -fx-cursor: hand; }
 .player-vol-icon .h-icon { -fx-fill: -h-fg-3; }
 
-.player-menu {
+/* Labelled feature buttons: Speed, Source, Quality, Audio, Subtitles, Rotate,
+   Skip Intro, Enhance. */
+.player-pill {
     -fx-background-color: -h-surface-3;
     -fx-border-color: -h-border-2;
     -fx-border-width: 1;
     -fx-border-radius: 9;
     -fx-background-radius: 9;
     -fx-text-fill: -h-fg;
-    -fx-font-size: 12.5px;
-    -fx-padding: 1 4 1 4;
+    -fx-font-size: 12px;
+    -fx-padding: 5 11 5 9;
     -fx-cursor: hand;
 }
-.player-menu:hover { -fx-background-color: -h-surface-4; }
-.player-menu .label { -fx-text-fill: -h-fg; }
-.player-menu .arrow { -fx-background-color: -h-fg-3; }
-.player-menu .h-icon { -fx-fill: -h-fg-2; }
-
-/* The stream picker is the one control that changes WHAT is playing, so it is
-   the one control that reads as primary. */
-.player-source {
-    -fx-background-color: -h-surface-4;
-    -fx-border-color: -h-accent;
-    -fx-border-width: 1;
-    -fx-padding: 3 8 3 8;
+.player-pill:hover { -fx-background-color: -h-surface-4; -fx-border-color: -h-border-3; }
+.player-pill .label { -fx-text-fill: -h-fg; }
+.player-pill .arrow { -fx-background-color: -h-fg-3; }
+.player-pill .h-icon { -fx-fill: -h-fg-2; }
+.player-pill-menu { -fx-padding: 2 4 2 4; }
+.player-pill-accent {
+    -fx-background-color: -h-accent-soft;
+    -fx-border-color: -h-accent-line;
 }
-.player-source:hover { -fx-background-color: -h-surface-4; -fx-border-color: -h-accent-2; }
-.player-source .h-icon { -fx-fill: -h-accent; }
+.player-pill-accent .label { -fx-text-fill: -h-accent; }
+.player-pill-accent .h-icon { -fx-fill: -h-accent; }
+.player-pill-accent:hover { -fx-background-color: -h-accent-glow; -fx-border-color: -h-accent; }
+.player-pill-on { -fx-background-color: -h-accent; -fx-border-color: -h-accent; }
+.player-pill-on .label { -fx-text-fill: -h-accent-fg; }
+.player-pill-on .h-icon { -fx-fill: -h-accent-fg; }
 
 .player-seek .track { -fx-background-color: -h-surface-4; -fx-background-radius: 999; -fx-pref-height: 6; }
 .player-seek .thumb { -fx-background-color: -h-accent; -fx-background-radius: 999; -fx-pref-width: 14; -fx-pref-height: 14; }

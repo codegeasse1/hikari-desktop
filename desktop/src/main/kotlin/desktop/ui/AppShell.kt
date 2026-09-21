@@ -214,7 +214,7 @@ object AppShell {
     private fun topbar(): Region {
         titleLabel = Theme.label("", size = 13.5, bold = true).apply { styleClass.add("topbar-title") }
         subtitleLabel = Theme.label("", size = 11.5, dim = true).apply { styleClass.add("topbar-sub") }
-        val titles = VBox(0.0, titleLabel, subtitleLabel)
+        val titles = VBox(0.0, titleLabel, subtitleLabel).apply { isPickOnBounds = true }
 
         val searchBox = Ui.searchInput("Search movies, shows, anime…", 268.0)
         globalSearch = searchBox.children[0] as TextField
@@ -256,10 +256,13 @@ object AppShell {
             isVisible = false
             isManaged = false
         }
-        val left = HBox(10.0, backButton, titles).apply { alignment = Pos.CENTER_LEFT }
+        val left = HBox(10.0, Ui.isolateClicks(backButton), titles).apply { alignment = Pos.CENTER_LEFT }
         left.padding = Insets(0.0, 0.0, 0.0, 14.0)
         left.minWidth = 150.0
-        chrome.makeDraggable(left)
+        // Only the titles drag the window. The drag handler used to cover the
+        // whole left cluster, including the Back button — a 1px mouse movement
+        // on press turned a click into a window drag, so Back looked dead.
+        chrome.makeDraggable(titles)
         val spacer = Region().apply { HBox.setHgrow(this, Priority.ALWAYS) }
         val actions = HBox(2.0, activityBox, searchBox, themeButton).apply { alignment = Pos.CENTER_RIGHT }
         return HBox(left, spacer, actions, chrome.controls()).apply {
