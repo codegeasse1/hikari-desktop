@@ -90,6 +90,16 @@ class ExtensionsScreenView {
     private val repoErrors = HashMap<String, String>()
     private val repoLoading = HashSet<String>()
 
+    /** On-disk copy of every fetched repo manifest + its parsed plugin list, so
+     *  the screen paints instantly at launch instead of re-fetching every repo
+     *  over the network (with the top-bar "Fetching repo…" chip up) before it
+     *  can show anything. */
+    private val repoCache = RepoCache()
+
+    /** When each repo's manifest was last fetched (or last attempted): decides
+     *  which entries are stale enough to refresh in the background. */
+    private val repoFetchedAt = HashMap<String, Long>()
+
     private var openRepo: Cs3Repo? = null
 
     /** Per-repo-plugin install outcome, shown right under its row so a failed
@@ -292,13 +302,36 @@ class ExtensionsScreenView {
                 )
             )
         } else {
+            // Everything already fetched is painted straight from disk, so the
+            // cards (names, plugin counts) are there on the first frame.
+            primeRepoCache()
+            val now = System.currentTimeMillis()
             repos.forEach { repo ->
                 reposBox.children.add(repoCard(repo))
                 val known = repoData.containsKey(repo.url) || repoErrors.containsKey(repo.url)
-                if (!known && repoLoading.add(repo.url)) loadRepoData(repo.url, silent = true)
+                val stale = !known || now - (repoFetchedAt[repo.url] ?: 0L) > REPO_CACHE_TTL_MS
+                // A stale repo is refreshed quietly, in the background: cached
+                // contents stay on screen and nothing claims the UI while it
+                // happens.
+                if (stale && repoLoading.add(repo.url)) loadRepoData(repo.url, silent = true)
             }
         }
         content.children.add(reposBox)
+    }
+
+    /** Loads every stored repo's cached manifest into [repoData] (disk only —
+     *  never the network), so they render before anything is fetched. */
+    private fun primeRepoCache() {
+        val repos = runCatching { AppShell.app.store.repos() }.getOrDefault(emptyList())
+        for (repo in repos) {
+            if (repoData.containsKey(repo.url)) continue
+            val entry = repoCache.load(repo.url) ?: continue
+            val name = entry.name.ifBlank { Http.repoDisplayName(entry.resolved) }
+            val data = RepoData(entry.resolved, name, entry.description, entry.plugins)
+            repoData[repo.url] = data
+            if (entry.resolved != repo.url) repoData[entry.resolved] = data
+            repoFetchedAt[repo.url] = entry.fetchedAt
+        }
     }
 
     private fun repoCard(repo: Cs3Repo): Node {
@@ -378,6 +411,8 @@ class ExtensionsScreenView {
         runCatching { AppShell.app.store.removeCs3Repo(repo.url) }
         repoData.remove(repo.url)
         repoErrors.remove(repo.url)
+        repoFetchedAt.remove(repo.url)
+        repoCache.remove(repo.url)
         if (openRepo?.url == repo.url) openRepo = null
         renderAll()
         setStatus("Removed repo ${repoDisplayName(repo)}")
@@ -395,6 +430,10 @@ class ExtensionsScreenView {
         busy.isVisible = true
         repoData.clear()
         repoErrors.clear()
+        repoFetchedAt.clear()
+        // Explicit reload means the user wants fresh network answers — drop the
+        // on-disk copies too, or the next render would just re-paint them.
+        repoCache.clear()
         renderAll()
         AppShell.uiScope.launch {
             runCatching { AppShell.app.providers.refresh() }
@@ -574,15 +613,26 @@ class ExtensionsScreenView {
         }
         AppShell.uiScope.launch {
             val kind = repoKindOf(url)
-            val result = fetchManifest(url, kind) { step -> Fx.run { setStatus(step, busy = true) } }
+            // A silent load is a background refresh of something the user can
+            // already see — it must not hijack the status line or the shell's
+            // activity chip with "Fetching repo… (racing 8 mirrors)".
+            val onStep: ((String) -> Unit)? =
+                if (silent) null else ({ step -> Fx.run { setStatus(step, busy = true) } })
+            val result = fetchManifest(url, kind, onStep)
             val manifest = result.getOrNull()
             if (manifest == null) {
                 Fx.run {
-                    busy.isVisible = false
                     repoLoading.remove(url)
+                    repoFetchedAt[url] = System.currentTimeMillis()
                     val message = Http.humanMessage(result.exceptionOrNull())
-                    repoErrors[url] = message
-                    if (!silent) setStatus("Couldn't load that repo — $message", isError = true)
+                    // Cached contents beat an error message for a repo the user
+                    // has already added: the failure is only worth showing when
+                    // there is nothing to show in its place.
+                    if (repoData[url] == null) repoErrors[url] = message
+                    if (!silent) {
+                        busy.isVisible = false
+                        setStatus("Couldn't load that repo — $message", isError = true)
+                    }
                     renderAll()
                 }
                 return@launch
@@ -595,12 +645,18 @@ class ExtensionsScreenView {
             val description = root?.optString("description").orEmpty()
             val plugins = parsePlugins(kind, manifest)
             Fx.run {
-                busy.isVisible = false
                 repoLoading.remove(url)
-                repoData[url] = RepoData(resolved, name, description, plugins)
-                if (resolved != url) repoData[resolved] = repoData[url]!!
                 repoErrors.remove(url)
-                if (!silent) setStatus("Loaded ${plugins.size} plugin(s) from $name")
+                val data = RepoData(resolved, name, description, plugins)
+                repoData[url] = data
+                if (resolved != url) repoData[resolved] = data
+                val at = System.currentTimeMillis()
+                repoFetchedAt[url] = at
+                repoCache.save(url, RepoCache.Entry(resolved, name, description, plugins, at))
+                if (!silent) {
+                    busy.isVisible = false
+                    setStatus("Loaded ${plugins.size} plugin(s) from $name")
+                }
                 renderAll()
             }
         }
@@ -864,6 +920,9 @@ class ExtensionsScreenView {
                 if (existing != null && existing.url == resolved) {
                     repoData[existing.url] = RepoData(existing.url, name, description, plugins)
                     repoErrors.remove(existing.url)
+                    val at = System.currentTimeMillis()
+                    repoFetchedAt[existing.url] = at
+                    repoCache.save(existing.url, RepoCache.Entry(resolved, name, description, plugins, at))
                     openRepo = existing
                     composerInput.clear()
                     renderAll()
@@ -873,6 +932,9 @@ class ExtensionsScreenView {
                 runCatching { AppShell.app.store.addCs3Repo(Cs3Repo(url = resolved, name = name, kind = effKind)) }
                 repoData[resolved] = RepoData(resolved, name, description, plugins)
                 repoErrors.remove(resolved)
+                val at = System.currentTimeMillis()
+                repoFetchedAt[resolved] = at
+                repoCache.save(resolved, RepoCache.Entry(resolved, name, description, plugins, at))
                 openRepo = Cs3Repo(url = resolved, name = name, kind = effKind)
                 composerInput.clear()
                 renderAll()
@@ -1624,7 +1686,112 @@ class ExtensionsScreenView {
 
     private fun themed(text: String, cls: String): Label = Label(text).apply { styleClass.add(cls) }
 
+    /**
+     * A repo's fetched manifest and parsed plugin list, cached on disk.
+     *
+     * A repo's contents change rarely, but the Extensions screen exists from the
+     * moment the app starts (and used to fetch every repo then). Reading the
+     * last-known manifest from here instead makes the screen instant: the cards,
+     * names and plugin counts are on the first frame, and the network is only
+     * touched for entries that are stale — quietly, in the background.
+     */
+    private class RepoCache {
+
+        data class Entry(
+            val resolved: String,
+            val name: String,
+            val description: String,
+            val plugins: List<PluginRef>,
+            val fetchedAt: Long,
+        )
+
+        private val dir: File = File(HikariApp.instance.filesDir, "cache/repos").apply { mkdirs() }
+
+        private fun fileFor(url: String): File {
+            // Stored by digest, so no repo URL ever has to be a legal file name.
+            val hex = java.security.MessageDigest.getInstance("SHA-256")
+                .digest(url.toByteArray())
+                .take(12)
+                .joinToString("") { "%02x".format(it) }
+            return File(dir, "$hex.json")
+        }
+
+        fun load(url: String): Entry? = runCatching {
+            val f = fileFor(url)
+            if (!f.isFile) return null
+            val o = JSONObject(f.readText())
+            val plugins = ArrayList<PluginRef>()
+            val arr = o.optJSONArray("plugins") ?: JSONArray()
+            for (i in 0 until arr.length()) {
+                val p = arr.optJSONObject(i) ?: continue
+                val u = p.optString("url")
+                if (u.isBlank()) continue
+                plugins.add(
+                    PluginRef(
+                        name = p.optString("name").ifBlank { u.substringAfterLast('/') },
+                        url = u,
+                        fileHash = jsonOpt(p, "fileHash"),
+                        jarHash = jsonOpt(p, "jarHash"),
+                        iconUrl = jsonOpt(p, "iconUrl"),
+                    )
+                )
+            }
+            Entry(
+                resolved = o.optString("resolved").ifBlank { url },
+                name = o.optString("name"),
+                description = o.optString("description"),
+                plugins = plugins,
+                fetchedAt = o.optLong("fetchedAt"),
+            )
+        }.getOrNull()
+
+        fun save(url: String, entry: Entry) {
+            runCatching {
+                val arr = JSONArray()
+                for (p in entry.plugins) {
+                    arr.put(JSONObject().apply {
+                        put("name", p.name)
+                        put("url", p.url)
+                        p.fileHash?.let { put("fileHash", it) }
+                        p.jarHash?.let { put("jarHash", it) }
+                        p.iconUrl?.let { put("iconUrl", it) }
+                    })
+                }
+                val o = JSONObject().apply {
+                    put("resolved", entry.resolved)
+                    put("name", entry.name)
+                    put("description", entry.description)
+                    put("fetchedAt", entry.fetchedAt)
+                    put("plugins", arr)
+                }
+                val f = fileFor(url)
+                val tmp = File(dir, f.name + ".tmp")
+                tmp.writeText(o.toString())
+                if (!tmp.renameTo(f)) {
+                    f.writeText(o.toString())
+                    tmp.delete()
+                }
+            }
+        }
+
+        fun remove(url: String) {
+            runCatching { fileFor(url).delete() }
+        }
+
+        fun clear() {
+            runCatching { dir.listFiles()?.forEach { it.delete() } }
+        }
+
+        private fun jsonOpt(o: JSONObject, key: String): String? =
+            o.optString(key).takeIf { it.isNotBlank() && it != "null" }
+    }
+
     private companion object {
+        /** How long a cached repo is trusted before it is refreshed in the
+         *  background. Long on purpose: the point is that opening the app (or
+         *  the Extensions screen) never waits on the network. */
+        const val REPO_CACHE_TTL_MS = 6 * 60 * 60 * 1000L
+
         const val MODE_HIKARI = 0
         const val MODE_CS3 = 1
         const val MODE_STREMIO = 2

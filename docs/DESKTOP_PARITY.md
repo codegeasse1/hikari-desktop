@@ -132,23 +132,30 @@ elsewhere) and driven over its JSON IPC:
 - `desktop/player/MpvIpc.kt` — the client: `command`/`post`/`setProperty`/
   `getProperty`/`observe_property`, with one reader thread fanning property
   changes and events out to callbacks.
-- `desktop/player/PlayerWindow.kt` — the app's own player window: a
-  scrubbable timeline with real time labels, play/pause, ±10s, volume, speed,
-  the file's actual audio/subtitle tracks by name and language, what the stream
-  really is (container/format) and why it failed, **Next episode**, and keyboard
-  control (space, ←/→, ↑/↓, F, Esc).
-- **The video renders INSIDE that window.** mpv is handed a borderless surface
+- `desktop/player/PlayerWindow.kt` — the app's own player **layer** (mounted into
+  `AppShell.playerHost`, so it covers the app window instead of opening one): a
+  loading overlay that stays up until mpv reports the file loaded, a scrubbable
+  timeline with real time labels, play/pause, ±10s, volume, speed, a **Source**
+  picker for switching servers/qualities mid-playback, the file's actual
+  audio/subtitle tracks by name and language, what the stream really is
+  (container/format) and why it failed, **Next episode**, and keyboard control
+  (space, ←/→, ↑/↓, F, Esc).
+- **The video renders INSIDE that layer.** mpv is handed a borderless surface
   window the app owns as its `--wid` (`desktop/player/WinShell.kt`, the only raw
   Win32 in the app, reached through JNA); mpv creates its video as a child of it,
   so the plain second window mpv used to open — the "old player" — no longer
   exists. The surface is glued to the video area on move/resize/maximise/fullscreen
-  and mpv's child window is re-sized to fill it, so maximising or dragging the
-  player keeps the video lined up. Everything degrades to mpv's own window when
-  the handle cannot be obtained (non-Windows, no JNA, no window) — a player that
-  cannot be embedded must never be worse than no player window.
-- The player window is opened *before* mpv (it owns the surface mpv renders
-  into), closes with it, and reports a failed IPC connection instead of sitting on
+  and mpv's child window is re-sized to fill it, so maximising or dragging the app
+  keeps the video lined up. It is hidden (not closed) while the loading overlay or
+  an explanation is up, because it is a native window that would otherwise cover
+  that text. Everything degrades to mpv's own window when the handle cannot be
+  obtained (non-Windows, no JNA, no window) — a player that cannot be embedded must
+  never be worse than no player.
+- The layer is mounted *before* mpv (it owns the surface mpv renders into), so
+  clicking Play shows a spinner and what is being opened immediately, closes with
+  playback, and reports a failed IPC connection instead of sitting on
   "Connecting…" forever.
+- Releases ship the **.exe installer only** — there is no `.zip` app image.
 - `DetailScreen` hands the player what only it knows: `next` (advance to the next
   episode, then play its first source) and `position` (throttled history writes,
   so a title resumes where it was left).

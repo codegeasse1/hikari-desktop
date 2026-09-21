@@ -1094,10 +1094,16 @@
    Player
    ===========================================================================
 
-   The player is one window: the video surface fills the middle, the transport
-   sits under it. The video itself is mpv rendering into a window this app owns
-   (see `desktop/player/WinShell.kt`), which is why the video area is only ever
-   a black panel here. */
+   The player is an in-app layer (`.player-layer`) that covers the whole
+   window — sidebar, top bar and all — so starting a stream reads as the app
+   switching to a player view rather than a dialog appearing next to it. The
+   video itself is mpv rendering into a borderless window this app owns (see
+   `desktop/player/WinShell.kt`), glued exactly over `.player-video`, which is
+   why that area is only ever a black panel here. */
+
+.player-layer { -fx-background-color: -h-bg; }
+
+.player-back { -fx-font-size: 12.5px; }
 
 .player-root { -fx-background-color: -h-bg; }
 
@@ -1114,6 +1120,13 @@
 /* The window mpv is handed: black, borderless, nothing else in it. */
 .player-video { -fx-background-color: #05060a; }
 .player-surface { -fx-background-color: #000000; }
+
+/* Up from "Play" until mpv reports the file loaded: the wait always has an
+   answer on screen instead of an unexplained black rectangle. */
+.player-load { -fx-background-color: #05060a; }
+.player-load-spinner { -fx-progress-color: -h-accent; }
+.player-load-title { -fx-text-fill: #eef0f7; -fx-font-size: 15px; -fx-font-weight: bold; }
+.player-load-sub   { -fx-text-fill: -h-fg-3; -fx-font-size: 12px; }
 
 .player-msg-box { -fx-background-color: rgba(7, 8, 13, 0.86); -fx-background-radius: 16; -fx-padding: 26 30 26 30; }
 .player-msg { -fx-text-fill: #eef0f7; -fx-font-size: 13px; }
@@ -1140,6 +1153,14 @@
 }
 .player-btn:hover { -fx-background-color: -h-surface-4; -fx-border-color: -h-border-3; }
 .player-btn .h-icon { -fx-fill: -h-fg; }
+.player-btn-play {
+    -fx-background-color: -h-accent;
+    -fx-border-color: transparent;
+    -fx-padding: 8 16 8 16;
+}
+.player-btn-play:hover { -fx-background-color: -h-accent-2; }
+.player-btn-play .h-icon { -fx-fill: -h-accent-fg; }
+.player-vol-icon .h-icon { -fx-fill: -h-fg-3; }
 
 .player-menu {
     -fx-background-color: -h-surface-3;
@@ -1155,6 +1176,18 @@
 .player-menu:hover { -fx-background-color: -h-surface-4; }
 .player-menu .label { -fx-text-fill: -h-fg; }
 .player-menu .arrow { -fx-background-color: -h-fg-3; }
+.player-menu .h-icon { -fx-fill: -h-fg-2; }
+
+/* The stream picker is the one control that changes WHAT is playing, so it is
+   the one control that reads as primary. */
+.player-source {
+    -fx-background-color: -h-surface-4;
+    -fx-border-color: -h-accent;
+    -fx-border-width: 1;
+    -fx-padding: 3 8 3 8;
+}
+.player-source:hover { -fx-background-color: -h-surface-4; -fx-border-color: -h-accent-2; }
+.player-source .h-icon { -fx-fill: -h-accent; }
 
 .player-seek .track { -fx-background-color: -h-surface-4; -fx-background-radius: 999; -fx-pref-height: 6; }
 .player-seek .thumb { -fx-background-color: -h-accent; -fx-background-radius: 999; -fx-pref-width: 14; -fx-pref-height: 14; }

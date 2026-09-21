@@ -53,6 +53,18 @@ object DesktopPlayer {
     @Volatile
     private var onPosition: ((Long, Long) -> Unit)? = null
 
+    /** Every source the caller offered for the title being played, plus the one
+     *  that was chosen — handed to the player so its Source menu can switch
+     *  servers without going back to the detail screen. */
+    @Volatile
+    private var sourceList: List<StreamSource> = emptyList()
+
+    @Volatile
+    private var sourceName: String = ""
+
+    @Volatile
+    private var onPickSource: ((StreamSource) -> Unit)? = null
+
     /** True once the current launch has shown its failure dialog (mpv error or
      *  stream-probe fallback), so the two can't double-popup. Reset per launch. */
     @Volatile private var dialogShown = false
@@ -72,9 +84,14 @@ object DesktopPlayer {
         refresh: (() -> StreamSource?)? = null,
         next: (() -> Unit)? = null,
         position: ((Long, Long) -> Unit)? = null,
+        sources: List<StreamSource> = emptyList(),
+        onPickSource: ((StreamSource) -> Unit)? = null,
     ) {
         onEnded = next
         onPosition = position
+        sourceList = sources.ifEmpty { listOf(stream) }
+        sourceName = stream.name
+        this.onPickSource = onPickSource
         // Sanitize here too so a malformed URL from ANY provider (chaturbate's
         // root-relative escaped HLS path, stray quotes, JSON escapes) can't
         // reach mpv or the browser as garbage.
@@ -122,6 +139,9 @@ object DesktopPlayer {
     fun playFile(title: String, path: String) {
         onEnded = null
         onPosition = null
+        sourceList = emptyList()
+        sourceName = ""
+        onPickSource = null
         Fx.run {
             val file = File(path)
             if (!file.exists()) {
@@ -145,7 +165,6 @@ object DesktopPlayer {
                 position = null,
                 closed = { stopPlayback() },
             )
-            PlayerWindow.setStatus("Starting the player…", busy = true)
             val args = buildList {
                 add(mpv.absolutePath)
                 add("--force-window=yes")
@@ -214,8 +233,10 @@ object DesktopPlayer {
                 next = onEnded,
                 position = onPosition,
                 closed = { stopPlayback() },
+                sources = sourceList,
+                sourceName = sourceName,
+                onPickSource = onPickSource,
             )
-            PlayerWindow.setStatus("Starting the player…", busy = true)
             if (surface == null) {
                 PlayerWindow.note(
                     "Embedded video isn't available on this machine, so the video plays in the player's own window.",

@@ -58,6 +58,8 @@ object AppShell {
     private lateinit var activityBox: HBox
     private lateinit var activitySpinner: javafx.scene.control.ProgressIndicator
     private lateinit var activityLabel: Label
+    private lateinit var playerLayer: StackPane
+    private lateinit var windowStage: javafx.stage.Stage
     private var currentScreen: Screen = Screen.Home
     private val backStack = java.util.ArrayDeque<Screen>()
 
@@ -69,6 +71,7 @@ object AppShell {
     private val settingsScreen = SettingsScreenView()
 
     fun create(stage: javafx.stage.Stage): Region {
+        windowStage = stage
         chrome = WindowChrome(stage)
 
         centerStack = StackPane().apply {
@@ -91,7 +94,21 @@ object AppShell {
             center = StackPane(centerStack, overlay)
         }
 
-        val root = chrome.build(body)
+        // The player is an in-app layer, not a second window: it covers the whole
+        // window (sidebar, top bar and all) while it is mounted, so playback
+        // reads as the app switching to a player view rather than a dialog
+        // appearing next to it.
+        playerLayer = StackPane().apply {
+            styleClass.add("player-layer")
+            minWidth = 0.0
+            minHeight = 0.0
+            maxWidth = Double.MAX_VALUE
+            maxHeight = Double.MAX_VALUE
+            isVisible = false
+            isManaged = false
+        }
+
+        val root = chrome.build(body, playerLayer)
         root.sceneProperty().addListener { _, _, scene ->
             if (scene != null) {
                 installShortcuts(scene)
@@ -439,4 +456,25 @@ object AppShell {
     }
 
     val app get() = HikariApp.instance
+
+    // ── window / player-layer hooks ─────────────────────────────────────────
+
+    /** The layer the player mounts itself into (see [desktop.player.PlayerWindow]). */
+    val playerHost: StackPane get() = playerLayer
+
+    /** The application window, for the player's fullscreen toggle and geometry. */
+    val stage: javafx.stage.Stage get() = windowStage
+
+    /** The main window's minimse/maximise/close cluster, so the player's header
+     *  carries the same controls as the app's own top bar. */
+    fun windowControls(): HBox = chrome.controls()
+
+    /** Lets the player's header drag the window it is covering. */
+    fun makeDraggable(node: Node) {
+        chrome.makeDraggable(node)
+    }
+
+    fun toggleWindowMaximize() {
+        chrome.toggleMaximize()
+    }
 }

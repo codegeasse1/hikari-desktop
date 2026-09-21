@@ -874,6 +874,10 @@ class DetailScreenView(private val item: MediaItem) {
             // and where this episode got to.
             next = nextEpisodeAction(),
             position = { positionMs, durationMs -> savePosition(ep, positionMs, durationMs) },
+            // The player's Source menu: every source this episode offered, so a
+            // dead server can be swapped for another without leaving playback.
+            sources = streams,
+            onPickSource = { picked -> if (picked.url != source.url) play(picked) },
         )
     }
 

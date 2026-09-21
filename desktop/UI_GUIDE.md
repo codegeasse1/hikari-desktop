@@ -19,7 +19,7 @@ Read this before touching anything under `desktop/src/main/kotlin/desktop/ui/`.
 | `CatalogScreen.kt` | The full grid behind a rail's "See all". |
 | `LibraryScreen.kt`, `DownloadsScreen.kt`, `SettingsScreen.kt`, `ExtensionsScreen.kt` | The remaining screens. |
 | `WindowChrome.kt` | Resize edges, window controls, drag-to-maximise. |
-| `desktop/player/PlayerWindow.kt` | The in-app player window: video surface + transport, driven by mpv's JSON IPC. |
+| `desktop/player/PlayerWindow.kt` | The in-app player layer: loading overlay, video surface, transport and Source picker, driven by mpv's JSON IPC. |
 | `desktop/player/WinShell.kt` | The raw Win32 calls (via JNA) that embed mpv's video in that window. |
 | `desktop/player/DesktopPlayer.kt` | Launches/drives mpv, the HLS relay and the stream fallbacks. |
 
@@ -88,11 +88,17 @@ Outside `desktop/ui/`, but part of this layer's picture: the download queue live
   Auto-rotates every 10s and pauses while hovered. The featured titles come from
   the *selected* provider (the hero is re-seeded whenever the provider selector
   changes) and the overline names that provider.
-- **Player** (`desktop/player/PlayerWindow.kt` + `WinShell.kt`): one window for
-  video and transport. mpv is given a borderless surface window this app owns as
-  its `--wid`, so there is no second, plain mpv window; the surface is kept glued
-  to the video area by `syncSurface` and mpv's child window is kept filling it
-  (`WinShell`, JNA). Non-Windows, or no handle, degrades to mpv's own window.
+- **Player** (`desktop/player/PlayerWindow.kt` + `WinShell.kt`): an in-app LAYER,
+  not a window — it is mounted into `AppShell.playerHost` (a full-window
+  `StackPane` above the body, below the resize edges), so starting a stream reads
+  as the app switching to a player view. It carries a loading overlay that stays
+  up (with mpv's surface hidden) until mpv reports the file loaded, the transport
+  bar, and a **Source** menu for switching servers/qualities mid-playback. mpv is
+  given a borderless surface window the app owns as its `--wid`, so there is no
+  second, plain mpv window either; the surface is kept glued to the video area by
+  `syncSurface` and mpv's child window is kept filling it (`WinShell`, JNA).
+  Non-Windows, or no handle, degrades to mpv's own window (the layer then keeps
+  an explanatory note over the video area).
 - **Rails** (`Ui.rail` + `Ui.railWithArrows`): the vertical mouse wheel is mapped
   to horizontal movement and only consumed while the rail can still move, so the
   page keeps scrolling normally when the rail is at its end.
@@ -158,9 +164,10 @@ desktop changed relative to Android (mpv replaces `MediaExtractor`/`MediaMuxer`
 for the audio-merge step).
 
 The SkyStream, Nuvio and Aniyomi engines are ported, IPTV playlists are a
-provider, and the player is one in-app window: mpv renders into a surface the app
-owns (`--wid`, via JNA in `WinShell`), with the app's own transport — timeline,
-±10s, volume, speed, audio/subtitle tracks, next-episode — driving it over mpv's
+provider, and the player is an in-app layer rather than a window: mpv renders into
+a surface the app owns (`--wid`, via JNA in `WinShell`), with the app's own
+transport — timeline, ±10s, volume, speed, audio/subtitle tracks, next-episode,
+and a Source picker — driving it over mpv's
 JSON IPC, plus keyboard control (space, ←/→, ↑/↓, F, Esc). The Extensions screen
 is where all of them are added. `desktop/UI_GUIDE.md`'s rules apply to any UI
 added for them.
