@@ -78,6 +78,64 @@ object Http {
     private fun execute(client: OkHttpClient, request: Request): Response =
         client.newCall(request).execute()
 
+    /**
+     * Runs [task] for every item on a small thread pool and returns the first
+     * result that isn't null, with the item that produced it.
+     *
+     * Every "try one host after another" path in this object (repo lookups,
+     * extension downloads) used to walk its candidates *serially*, so a single
+     * blocked or throttled host cost a full connect timeout (20s) before the
+     * next one was even attempted — which is why adding a repo or installing an
+     * extension could sit there for a minute. Racing the candidates makes the
+     * wall-clock cost the FASTEST host instead of the sum of the dead ones.
+     *
+     * Losers are left to finish (or be interrupted by the pool shutdown) in the
+     * background; nothing outside [task] is mutated by them.
+     */
+    private fun <T : Any> raceFirst(
+        items: List<String>,
+        parallelism: Int = 4,
+        windowMs: Long = 45_000L,
+        task: (String) -> T?,
+    ): Pair<String, T>? {
+        if (items.isEmpty()) return null
+        val threads = minOf(parallelism, items.size)
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(threads) { r ->
+            Thread(r, "hikari-fetch").apply { isDaemon = true }
+        }
+        try {
+            val done = java.util.concurrent.LinkedBlockingQueue<Pair<String, T?>>()
+            items.forEach { item ->
+                pool.execute {
+                    val value = runCatching { task(item) }.getOrNull()
+                    done.put(item to value)
+                }
+            }
+            val rounds = (items.size + threads - 1) / threads
+            val deadline = System.currentTimeMillis() + windowMs * rounds
+            var received = 0
+            while (received < items.size) {
+                val wait = deadline - System.currentTimeMillis()
+                if (wait <= 0) break
+                val res = done.poll(wait, TimeUnit.MILLISECONDS) ?: break
+                received++
+                if (res.second != null) return res
+            }
+            return null
+        } catch (e: InterruptedException) {
+            return null
+        } finally {
+            // Interrupts whatever is still running: for a fetch that's free, and
+            // the download path uses per-attempt temp files so nothing is lost.
+            pool.shutdownNow()
+        }
+    }
+
+    /** How many mirror candidates are raced at once. Four covers the realistic
+     *  "one CDN + one proxy frontdoor + the origin" spread without hammering a
+     *  slow network with eight parallel sockets. */
+    private const val RACE_PARALLELISM = 4
+
     fun get(url: String, headers: Map<String, String> = emptyMap()): Response {
         val builder = Request.Builder().url(url).header("User-Agent", UA)
         headers.forEach { (k, v) -> builder.header(k, v) }
@@ -230,38 +288,42 @@ object Http {
             ordered
         }
         val deadline = System.currentTimeMillis() + REPO_FETCH_DEADLINE_MS
-        var last: Throwable = Exception("No candidate URL served a valid repo.json")
-        var tried = 0
-        for (u in list) {
+        val failures = java.util.concurrent.ConcurrentLinkedQueue<Throwable>()
+
+        fun tryOne(u: String): String? {
+            onStep?.invoke("Fetching repo… $u")
+            val r = fetchStringRobust(u)
+            val text = r.getOrNull()
+            if (text == null) {
+                r.exceptionOrNull()?.let { failures += it }
+                return null
+            }
+            val root = runCatching { org.json.JSONObject(text) }.getOrNull() ?: return null
+            if (root.has("plugins")) return text
+            // CloudStream v2 manifests (manifestVersion + pluginLists): fetch the
+            // pluginLists file and merge its plugins array in, so callers keep
+            // seeing a plain "plugins" key.
+            if (root.has("pluginLists")) return resolvePluginLists(root, u)
+            return null
+        }
+
+        // Candidates are raced in waves: the fastest host that actually serves a
+        // repo.json wins, instead of waiting out every dead mirror in front of
+        // it. The mirror snapshot stays in the LAST wave, so it can never shadow
+        // the live repo.
+        for ((index, wave) in list.chunked(RACE_PARALLELISM).withIndex()) {
             if (System.currentTimeMillis() > deadline) {
                 return Result.failure(
                     Exception("Timed out after ${REPO_FETCH_DEADLINE_MS / 1000}s — the repo host is unreachable from this network.")
                 )
             }
-            tried++
-            onStep?.invoke("Fetching repo… ($tried/${list.size}) $u")
-            val r = fetchStringRobust(u)
-            if (r.isSuccess) {
-                val text = r.getOrThrow()
-                val root = runCatching { org.json.JSONObject(text) }.getOrNull()
-                if (root != null) {
-                    if (root.has("plugins")) return Result.success(u to text)
-                    // CloudStream v2 manifests (manifestVersion + pluginLists):
-                    // fetch the pluginLists file and merge its plugins array in,
-                    // so callers keep seeing a plain "plugins" key.
-                    if (root.has("pluginLists")) {
-                        val merged = resolvePluginLists(root, u)
-                        if (merged != null) return Result.success(u to merged)
-                        last = Exception("repo.json listed no readable plugins list ($u)")
-                        continue
-                    }
-                }
-                last = Exception("not a repo.json ($u)")
-                continue
-            }
-            r.exceptionOrNull()?.let { last = it }
+            onStep?.invoke("Fetching repo… (wave ${index + 1})")
+            raceFirst(wave, RACE_PARALLELISM, 30_000L) { tryOne(it) }
+                ?.let { return Result.success(it.first to it.second) }
         }
-        return Result.failure(last)
+        return Result.failure(
+            failures.lastOrNull() ?: Exception("No candidate URL served a valid repo.json")
+        )
     }
 
     /** Resolves [url] against [baseUrl] when it is relative. The CloudStream
@@ -684,17 +746,25 @@ object Http {
     }
 
     fun fetchStringRobust(url: String, headers: Map<String, String> = emptyMap()): Result<String> {
-        var last: Throwable = Exception("Failed to fetch $url")
         val variants = urlVariants(url)
-        for (u in variants) {
-            for (attempt in 0 until 2) {
-                val r = getStringStrict(u, headers)
-                if (r.isSuccess) return r
-                r.exceptionOrNull()?.let { last = it }
+        val failures = java.util.concurrent.ConcurrentLinkedQueue<Throwable>()
+        fun attempt(u: String): String? {
+            val r = getStringStrict(u, headers)
+            r.exceptionOrNull()?.let { failures += it }
+            return r.getOrNull()
+        }
+        // Wave 1: the most likely mirrors are raced, so the wall-clock cost is
+        // the fastest host rather than the sum of the dead ones (see [raceFirst]).
+        raceFirst(variants.take(RACE_PARALLELISM), RACE_PARALLELISM, 30_000L) { attempt(it) }
+            ?.let { return Result.success(it.second) }
+        // Wave 2: everything else, with the same one-retry-per-mirror behaviour.
+        for (u in variants.drop(RACE_PARALLELISM)) {
+            for (attempt2 in 0 until 2) {
+                attempt(u)?.let { return Result.success(it) }
                 try {
                     Thread.sleep(300L)
                 } catch (e: InterruptedException) {
-                    break
+                    return Result.failure(failures.lastOrNull() ?: Exception("Failed to fetch $url"))
                 }
             }
         }
@@ -703,10 +773,10 @@ object Http {
             for (u in variants) {
                 val r = getStringStrictOn(noProxyClient, u, headers)
                 if (r.isSuccess) return r
-                r.exceptionOrNull()?.let { last = it }
+                r.exceptionOrNull()?.let { failures += it }
             }
         }
-        return Result.failure(last)
+        return Result.failure(failures.lastOrNull() ?: Exception("Failed to fetch $url"))
     }
 
     fun fetchBytesRobust(url: String, headers: Map<String, String> = emptyMap()): ByteArray? {
@@ -754,62 +824,104 @@ object Http {
         val variants = urlVariants(url)
         // Overall budget: on a black-hole network every mirror costs a full
         // connect timeout; bound the walk so the UI doesn't sit for minutes
-        // (the Android app caps installs at 90s for the same reason). An
-        // in-flight download is never interrupted — only new attempts are.
+        // (the Android app caps installs at 90s for the same reason).
         val deadline = System.currentTimeMillis() + DOWNLOAD_BUDGET_MS
-        for (u in variants) {
-            if (System.currentTimeMillis() > deadline) {
-                onAttempt?.invoke(u, false, "gave up after ${DOWNLOAD_BUDGET_MS / 1000}s total")
-                break
-            }
-            var reason: String? = null
-            for (attempt in 0 until 2) {
-                reason = downloadToReason(u, dest, headers, onProgress)
-                if (reason == null) {
-                    onAttempt?.invoke(u, true, null)
-                    return true
-                }
-                try {
-                    Thread.sleep(400L)
-                } catch (e: InterruptedException) {
-                    return false
-                }
-            }
-            onAttempt?.invoke(u, false, reason)
-        }
-        if (systemProxyInUse()) {
-            for (u in variants) {
-                if (System.currentTimeMillis() > deadline) break
-                val reason = try {
-                    downloadToReason(u, dest, headers, onProgress, noProxyClient)
-                } catch (t: Throwable) {
-                    humanMessage(t)
-                }
-                if (reason == null) {
-                    onAttempt?.invoke(u, true, "(bypassed system proxy)")
-                    return true
-                }
-                onAttempt?.invoke(u, false, "$reason (no proxy)")
-            }
-        }
-        // Final rescue: TLS 1.2 pinned + no proxy, ALWAYS tried — not gated
-        // on a proxy being configured, because the failure it fixes (TLS 1.3
-        // "SSL protocol error" inside Conscrypt) happens with no proxy at all.
-        for (u in variants) {
-            if (System.currentTimeMillis() > deadline) break
-            val reason = try {
-                downloadToReason(u, dest, headers, onProgress, rescueClient)
-            } catch (t: Throwable) {
-                humanMessage(t)
-            }
-            if (reason == null) {
-                onAttempt?.invoke(u, true, "(TLS 1.2)")
-                return true
-            }
-            onAttempt?.invoke(u, false, "$reason (TLS 1.2)")
-        }
+        sweepParts(dest)
+        if (raceDownload(variants, dest, headers, onProgress, onAttempt, deadline, null, MAIN_RACE_MS)) return true
+        // Rescue passes with the system proxy bypassed ([noProxyClient]) and then
+        // with TLS pinned to 1.2 ([rescueClient]) — the two desktop
+        // misconfigurations where every request fails while the browser works.
+        if (systemProxyInUse() &&
+            raceDownload(variants, dest, headers, onProgress, onAttempt, deadline, noProxyClient, RESCUE_RACE_MS, "(no proxy)")
+        ) return true
+        if (raceDownload(variants, dest, headers, onProgress, onAttempt, deadline, rescueClient, RESCUE_RACE_MS, "(TLS 1.2)")) return true
         System.err.println("downloadToRobust failed for $url")
         return false
+    }
+
+    /** How long one wave of raced mirrors may take before the next wave starts. */
+    private const val MAIN_RACE_MS = 45_000L
+    private const val RESCUE_RACE_MS = 20_000L
+
+    /** Part-file name for one raced attempt at [dest]. */
+    private fun partOf(dest: java.io.File, key: String): java.io.File =
+        java.io.File(dest.parentFile, dest.name + ".part-" + Integer.toHexString(key.hashCode()))
+
+    /** Removes leftovers of an interrupted download (a part file from a killed
+     *  attempt would otherwise sit in the extensions folder forever). */
+    private fun sweepParts(dest: java.io.File) {
+        runCatching {
+            dest.parentFile?.listFiles()?.forEach { f ->
+                if (f.name.startsWith(dest.name + ".part-")) f.delete()
+            }
+        }
+    }
+
+    /**
+     * Downloads [dest] from whichever mirror answers first.
+     *
+     * Every mirror of the same file is raced instead of being tried one after
+     * another, so the cost of a blocked or throttled host is paid in parallel
+     * rather than in series — the single biggest reason an extension install
+     * could take a minute for a 100KB file. Each attempt streams into its OWN
+     * part file (two threads must never share an output stream); the first one
+     * to finish is moved into place and the rest are cleaned up.
+     */
+    private fun raceDownload(
+        variants: List<String>,
+        dest: java.io.File,
+        headers: Map<String, String>,
+        onProgress: ((Long, Long) -> Unit)?,
+        onAttempt: ((String, Boolean, String?) -> Unit)?,
+        deadline: Long,
+        via: OkHttpClient?,
+        windowMs: Long,
+        note: String = "",
+    ): Boolean {
+        if (System.currentTimeMillis() > deadline) return false
+        val wave = variants.take(RACE_PARALLELISM * 2)
+        val staging = java.util.concurrent.ConcurrentHashMap<String, java.io.File>()
+        val winner = raceFirst(wave, RACE_PARALLELISM, windowMs) { u ->
+            if (System.currentTimeMillis() > deadline) return@raceFirst null
+            val part = partOf(dest, u)
+            staging[u] = part
+            val reason = downloadToReason(u, part, headers, onProgress, via)
+            if (reason == null) {
+                part
+            } else {
+                onAttempt?.invoke(u, false, if (note.isBlank()) reason else "$reason $note")
+                null
+            }
+        }
+        if (winner == null) {
+            staging.values.forEach { runCatching { it.delete() } }
+            return false
+        }
+        val (from, part) = winner
+        val ok = runCatching {
+            dest.delete()
+            if (!part.renameTo(dest)) {
+                part.copyTo(dest, overwrite = true)
+                part.delete()
+            }
+            dest.isFile && dest.length() > 0
+        }.getOrDefault(false)
+        if (!ok) {
+            onAttempt?.invoke(from, false, "couldn't write ${dest.name}")
+            return false
+        }
+        onAttempt?.invoke(from, true, note.ifBlank { null })
+        // Losers may still be mid-write: remove what's already on disk, and let
+        // a sweep a minute later catch anything that lands after this returns.
+        staging.values.forEach { p -> if (p.absolutePath != part.absolutePath) runCatching { p.delete() } }
+        val sweeper = Thread {
+            runCatching { Thread.sleep(90_000L) }
+            sweepParts(dest)
+        }
+        sweeper.isDaemon = true
+        sweeper.name = "hikari-part-sweep"
+        sweeper.start()
+        return true
     }
 
     /**

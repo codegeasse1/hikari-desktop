@@ -55,7 +55,7 @@ object PosterCard {
             }
         }
         desktop.img.ImageLoader.loadAsync(
-            item.posterUrl,
+            desktop.img.ImageLoader.artFor(item.posterUrl, item.backdropUrl),
             onReady = { img -> if (img != null) image.image = img },
             w = (width * 2).toInt(),
             h = (height * 2).toInt(),

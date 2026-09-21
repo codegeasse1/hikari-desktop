@@ -50,13 +50,17 @@ object ImageLoader {
 
     fun loadAsync(url: String?, onReady: (Image?) -> Unit, w: Int = 0, h: Int = 0) {
         Fx.requireFx()
-        if (url.isNullOrBlank()) {
+        // Repaired here rather than at every call site: a scheme-less or
+        // protocol-relative poster URL can't be fetched at all, and that is the
+        // difference between an extension's grid rendering and a wall of blanks.
+        val fixed = normalize(url)
+        if (fixed.isNullOrBlank()) {
             onReady(null)
             return
         }
         // Requested-size-aware cache key: the same URL may be shown as a small
         // poster and a wide banner.
-        val key = if (w > 0 && h > 0) "$url|${w}x$h" else url
+        val key = if (w > 0 && h > 0) "$fixed|${w}x$h" else fixed
         mem[key]?.let {
             onReady(it)
             return
@@ -68,7 +72,7 @@ object ImageLoader {
             val img = runCatching {
                 gate.acquire()
                 try {
-                    load(url, key, w, h)
+                    load(fixed, key, w, h)
                 } finally {
                     gate.release()
                 }
@@ -96,16 +100,77 @@ object ImageLoader {
             }.getOrNull()
         }
 
-    private suspend fun fetchBytes(url: String): ByteArray? {
-        if (url.startsWith("data:image/")) {
-            val comma = url.indexOf(',')
-            if (comma <= 0) return null
-            val raw = url.substring(comma + 1)
-            val b = runCatching { android.util.Base64.decode(raw, android.util.Base64.DEFAULT) }.getOrNull()
-                ?: return null
-            // JavaFX can't decode every format an extension can embed (webp).
-            return makeDecodable(b, url)
+    /**
+     * The artwork a card should show: the poster, or the landscape backdrop when
+     * the provider left the poster empty. Several catalogs only fill the
+     * landscape image, and an empty model is a blank cell (the Android app has
+     * the same fallback).
+     */
+    fun artFor(poster: String?, backdrop: String?): String? =
+        normalize(poster)?.takeIf { it.isNotBlank() } ?: normalize(backdrop)
+
+    /** Host-looking path with no scheme — extensions emit these now and then
+     *  ('pic.example.com/x.jpg'), and OkHttp has no URL for a scheme-less
+     *  string, so the poster came out blank. */
+    private val HOST_LIKE = Regex("^[A-Za-z0-9][A-Za-z0-9.-]*\\.[A-Za-z]{2,}(/.*)?$")
+
+    /**
+     * Repairs a poster URL the way the Android app does: trims it and gives a
+     * missing scheme an https one. Protocol-relative ('//host/x.jpg') and bare
+     * host paths are the two shapes that made a whole extension's posters blank
+     * on desktop while the same data rendered fine on Android.
+     */
+    fun normalize(url: String?): String? {
+        val u = url?.trim() ?: return null
+        if (u.isEmpty()) return null
+        if (u.startsWith("http://") || u.startsWith("https://")) return u
+        if (u.startsWith("data:") || u.startsWith("blob:") || u.startsWith("file:")) return u
+        if (u.startsWith("//")) return "https:$u"
+        if (HOST_LIKE.matches(u)) return "https://$u"
+        return u
+    }
+
+    /**
+     * Decodes the base64 payload of a `data:` URI, stubbornly.
+     *
+     * A silently-wrong decode is worse than a failure: the standard decoder
+     * stops at the first character outside its alphabet, so a URL-safe payload
+     * (`-`/`_`) decodes to truncated garbage that no image decoder accepts — a
+     * whole provider's rows of blank posters, with no error anywhere. So each
+     * alphabet is tried and only a result whose magic bytes really are an image
+     * is accepted. (This is exactly what the Android app's PosterLoader does,
+     * and why the same extension's encrypted posters work there.)
+     */
+    private fun decodeImageDataUri(url: String): ByteArray? {
+        val comma = url.indexOf(',')
+        if (comma <= 0) return null
+        val payload = url.substring(comma + 1)
+            .filterNot { it == '\n' || it == '\r' || it == ' ' || it == '\t' }
+        if (payload.isEmpty()) return null
+        val decoders = listOf(
+            runCatching { java.util.Base64.getDecoder() }.getOrNull(),
+            runCatching { java.util.Base64.getUrlDecoder() }.getOrNull(),
+            runCatching { java.util.Base64.getMimeDecoder() }.getOrNull(),
+        )
+        for (d in decoders) {
+            val bytes = runCatching { d.decode(payload) }.getOrNull() ?: continue
+            if (isImageBytes(bytes)) return bytes
         }
+        return null
+    }
+
+    /** Poster bytes for a `data:` URL — base64 first, then the one case the
+     *  embedded browser handles and JavaFX cannot: an inline SVG. */
+    private fun loadDataUri(url: String): ByteArray? {
+        val bytes = decodeImageDataUri(url)
+        if (bytes != null) return makeDecodable(bytes, url)
+        val mime = url.substringAfter("data:", "").substringBefore(';').lowercase()
+        if (mime.contains("svg")) return desktop.web.FxWebView.imageBytes(url)
+        return null
+    }
+
+    private suspend fun fetchBytes(url: String): ByteArray? {
+        if (url.startsWith("data:")) return loadDataUri(url)
         val disk = diskFile(url)
         disk.takeIf { it.exists() && it.length() > 0 }?.let {
             val cached = runCatching { it.readBytes() }.getOrNull()

@@ -8,6 +8,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /** One line of truth about a configured provider: did it start, and why not? */
@@ -32,31 +34,69 @@ class ProviderManager(private val store: AppStore) {
     private val _initialized = MutableStateFlow(false)
     val initialized: StateFlow<Boolean> = _initialized.asStateFlow()
 
-    suspend fun refresh() = withContext(Dispatchers.IO) {
-        val configs = store.providers()
-        val statuses = mutableListOf<ProviderStatus>()
-        val loaded = configs.mapNotNull { c ->
-            try {
-                val p = instantiate(c)
-                if (p == null) {
-                    statuses += ProviderStatus(c.id, c.name, c.type, loaded = false, error = "no provider instance")
-                    null
-                } else {
+    /**
+     * Already-instantiated providers, keyed by everything that can change what
+     * an instance *is* (id, source url, and — for a local extension file — its
+     * size+mtime, so reinstalling an updated build re-loads it).
+     *
+     * Instantiating a CS3 provider runs its plugin's dex→JVM conversion and
+     * calls `load()`, which can take a second or more each. Re-creating all of
+     * them on every refresh made an extension install feel like a stall long
+     * after the download had finished (and uninstall just as bad), because the
+     * refresh that follows it re-loaded every OTHER extension too.
+     */
+    private val instances = java.util.concurrent.ConcurrentHashMap<String, ContentProvider>()
+
+    private val refreshLock = Mutex()
+
+    suspend fun refresh() = refreshLock.withLock {
+        withContext(Dispatchers.IO) {
+            val configs = store.providers()
+            val keys = configs.associateWith { cacheKey(it) }
+            // Drop the instances of providers that are gone or have changed.
+            instances.keys.retainAll(keys.values.toHashSet())
+            val statuses = mutableListOf<ProviderStatus>()
+            val loaded = configs.mapNotNull { c ->
+                val key = keys.getValue(c)
+                instances[key]?.let { cached ->
                     statuses += ProviderStatus(c.id, c.name, c.type, loaded = true, error = null)
-                    p
+                    return@mapNotNull cached
                 }
-            } catch (t: Throwable) {
-                // One broken addon must never blank the whole list — skip it,
-                // but record WHY so the UI can show it instead of a blank Home.
-                val msg = t.message?.take(400) ?: t.javaClass.simpleName
-                statuses += ProviderStatus(c.id, c.name, c.type, loaded = false, error = msg)
-                System.err.println("Provider init failed for ${c.name} (${c.type}): $t")
-                null
+                try {
+                    val p = instantiate(c)
+                    if (p == null) {
+                        statuses += ProviderStatus(c.id, c.name, c.type, loaded = false, error = "no provider instance")
+                        null
+                    } else {
+                        instances[key] = p
+                        statuses += ProviderStatus(c.id, c.name, c.type, loaded = true, error = null)
+                        p
+                    }
+                } catch (t: Throwable) {
+                    // One broken addon must never blank the whole list — skip it,
+                    // but record WHY so the UI can show it instead of a blank Home.
+                    val msg = t.message?.take(400) ?: t.javaClass.simpleName
+                    statuses += ProviderStatus(c.id, c.name, c.type, loaded = false, error = msg)
+                    System.err.println("Provider init failed for ${c.name} (${c.type}): $t")
+                    null
+                }
             }
+            _providers.value = loaded
+            _statuses.value = statuses
+            _initialized.value = true
         }
-        _providers.value = loaded
-        _statuses.value = statuses
-        _initialized.value = true
+    }
+
+    /** Everything that identifies the *instance* a config needs. */
+    private fun cacheKey(c: ProviderConfig): String {
+        val f = c.url.takeIf { it.isNotBlank() }?.let { runCatching { java.io.File(it) }.getOrNull() }
+        val stamp = if (f != null && f.isFile) "${f.length()}:${f.lastModified()}" else ""
+        return "${c.id}|${c.url}|$stamp"
+    }
+
+    /** Forgets one provider's cached instance (used after a reinstall). */
+    fun invalidate(id: String) {
+        instances.keys.removeAll { it.substringBefore('|') == id }
     }
 
     fun instantiate(c: ProviderConfig): ContentProvider? = when (c.type) {

@@ -52,6 +52,13 @@ object DexJar {
         return converted.toURI().toURL()
     }
 
+    /** [toJvmJarUrl] that reports failure instead of silently falling back to
+     *  the dex archive (which a URLClassLoader can open but whose classes can
+     *  never load — the confusing ClassNotFoundException that used to be shown
+     *  as the install error). */
+    fun toJvmJarUrlOrNull(file: File): URL? =
+        if (isDexArchive(file)) ensureJvmJar(file)?.toURI()?.toURL() else file.toURI().toURL()
+
     /** Converts and caches [file]; returns the original file when it's already
      *  a JVM jar. Null on conversion failure (see [lastError]). */
     fun ensureJvmJar(file: File): File? {
@@ -59,14 +66,30 @@ object DexJar {
         if (!isDexArchive(file)) return file
         val stamp = "${file.length()}-${file.lastModified()}"
         val key = file.absolutePath
-        cache[key]?.let { if (it.stamp == stamp) return it.jar }
+        cache[key]?.let { if (it.stamp == stamp && it.jar.isFile && it.jar.length() > 0L) return it.jar }
         return runCatching {
             val out = File(cacheDir, "dex-${Integer.toHexString(key.hashCode())}-${file.lastModified()}.jar")
-            if (out.isFile) {
+            if (out.isFile && out.length() > 0L) {
                 cache[key] = Entry(out, stamp)
                 return@runCatching out
             }
-            convert(file, out)
+            // Convert to a temp name and rename: a jar that is only half written
+            // (the app was closed mid-conversion, the process was killed) must
+            // never be cached as the real thing, or that plugin stays broken
+            // forever with a "manifest missing" that makes no sense.
+            val tmp = File(cacheDir, out.name + ".part-${System.nanoTime()}")
+            try {
+                convert(file, tmp)
+                if (!tmp.isFile || tmp.length() == 0L) {
+                    throw IllegalStateException("conversion produced an empty jar")
+                }
+                out.delete()
+                if (!tmp.renameTo(out)) {
+                    tmp.copyTo(out, overwrite = true)
+                }
+            } finally {
+                runCatching { tmp.delete() }
+            }
             cache[key] = Entry(out, stamp)
             out
         }.getOrElse { e ->

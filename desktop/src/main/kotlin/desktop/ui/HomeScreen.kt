@@ -62,6 +62,14 @@ class HomeScreenView {
     private var heroIndex = 0
     private var heroTimer: Timeline? = null
 
+    /** The banner's loaded artwork, kept so the cover-crop can be recomputed
+     *  whenever the banner is resized (see [paintHeroArt]). */
+    private var heroArt: javafx.scene.image.Image? = null
+
+    private fun paintHeroArt() {
+        Ui.coverImage(heroImage, heroArt, heroStack.width, heroStack.height)
+    }
+
     // ── page ────────────────────────────────────────────────────────────────
 
     private val rowsBox = VBox(Theme.S4)
@@ -137,7 +145,11 @@ class HomeScreenView {
         clip.widthProperty().bind(heroStack.widthProperty())
         clip.heightProperty().bind(heroStack.heightProperty())
         heroStack.clip = clip
+        heroImage.isPreserveRatio = false
         heroImage.fitWidthProperty().bind(heroStack.widthProperty())
+        heroImage.fitHeightProperty().bind(heroStack.heightProperty())
+        heroStack.widthProperty().addListener { _, _, _ -> paintHeroArt() }
+        heroStack.heightProperty().addListener { _, _, _ -> paintHeroArt() }
 
         val scrimV = Region().apply {
             styleClass.add("hero-scrim-v")
@@ -219,17 +231,15 @@ class HomeScreenView {
         heroDesc.text = item.overview?.replace(Regex("<[^>]*>"), "")?.replace(Regex("\\s+"), " ")?.trim().orEmpty()
         heroImage.opacity = 0.0
         val onImageReady: (javafx.scene.image.Image?) -> Unit = { img ->
+            heroArt = img
+            paintHeroArt()
             if (img != null) {
-                heroImage.image = img
                 Ui.fade(heroImage, 1.0, 300.0)
             }
         }
-        val backdrop = item.backdropUrl
-        heroImage.isPreserveRatio = backdrop.isNullOrBlank()
-        if (!backdrop.isNullOrBlank()) {
-            desktop.img.ImageLoader.loadAsync(backdrop, onReady = onImageReady, w = 1600, h = 700)
-        } else {
-            desktop.img.ImageLoader.loadAsync(item.posterUrl, onReady = onImageReady, w = 900, h = 700)
+        val art = desktop.img.ImageLoader.artFor(item.backdropUrl, item.posterUrl)
+        if (!art.isNullOrBlank()) {
+            desktop.img.ImageLoader.loadAsync(art, onReady = onImageReady, w = 1600, h = 700)
         }
         heroActions.children.setAll(
             Ui.playButton("Watch now") { AppShell.openDetail(item) },

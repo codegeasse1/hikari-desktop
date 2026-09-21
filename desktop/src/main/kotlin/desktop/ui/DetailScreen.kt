@@ -73,7 +73,19 @@ class DetailScreenView(private val item: MediaItem) {
     private val heroImage = ImageView().apply {
         isPreserveRatio = false
         isSmooth = true
-        fitHeight = HERO_H
+    }
+
+    /** The banner's loaded artwork, kept so the cover-crop can be recomputed
+     *  whenever the banner is resized (see [paintHero]). */
+    private var heroArt: javafx.scene.image.Image? = null
+
+    private fun applyHeroArt(img: javafx.scene.image.Image?) {
+        heroArt = img
+        paintHero()
+    }
+
+    private fun paintHero() {
+        Ui.coverImage(heroImage, heroArt, hero.width, hero.height)
     }
     private val heroTitle = themed("", "d-title")
     private val heroMeta = themed("", "d-meta")
@@ -116,6 +128,13 @@ class DetailScreenView(private val item: MediaItem) {
         renderEpisodeGrid()
     }
     private val episodeSection = VBox(Theme.S3)
+
+    /** The scrolling column that holds the episodes, so the selected episode can
+     *  be brought into view (see [revealSelected]). */
+    private lateinit var leftScroll: ScrollPane
+
+    /** Episode id → its tile, so the selected one can be scrolled to. */
+    private val episodeTiles = HashMap<String, Button>()
 
     // ── watch panel ─────────────────────────────────────────────────────────
 
@@ -170,16 +189,16 @@ class DetailScreenView(private val item: MediaItem) {
     init {
         root.sceneProperty().addListener { _, _, scene -> if (scene == null) scope.cancel() }
         buildHero()
-        val left = Ui.vScroll(leftColumn, Insets(0.0, 6.0, 24.0, 0.0))
-        val side = HBox(Theme.S5, left, watchPanel).apply {
+        leftScroll = Ui.vScroll(leftColumn, Insets(0.0, 6.0, 24.0, 0.0))
+        val side = HBox(Theme.S5, leftScroll, watchPanel).apply {
             alignment = Pos.TOP_LEFT
             minHeight = 0.0
         }
-        HBox.setHgrow(left, Priority.ALWAYS)
+        HBox.setHgrow(leftScroll, Priority.ALWAYS)
         Ui.fill(leftColumn)
         val content = VBox(Theme.S4, hero, side).apply { minHeight = 0.0 }
         VBox.setVgrow(side, Priority.ALWAYS)
-        Ui.fill(left)
+        Ui.fill(leftScroll)
         Ui.fill(side)
         Ui.fill(content)
         root.center = content
@@ -219,6 +238,31 @@ class DetailScreenView(private val item: MediaItem) {
                 }
                 renderPanel()
                 loadStreams()
+                revealSelected()
+            }
+        }
+    }
+
+    /**
+     * Brings the selected episode's tile into view.
+     *
+     * Opening a series used to leave the episode list below the fold (under a
+     * long synopsis) and, when resuming, the highlighted episode somewhere
+     * inside a grid of hundreds — so the user could not tell where they were in
+     * the series. The episodes panel is now the first thing in the scrolling
+     * column, and this makes sure the *selected* tile is actually on screen.
+     */
+    private fun revealSelected() {
+        val ep = selectedEpisode ?: return
+        val tile = episodeTiles[ep.id] ?: return
+        javafx.application.Platform.runLater {
+            javafx.application.Platform.runLater {
+                val viewport = leftScroll.viewportBounds.height
+                val content = leftColumn.height
+                if (viewport <= 0.0 || content <= viewport) return@runLater
+                val origin = leftColumn.sceneToLocal(tile.localToScene(tile.boundsInLocal)).y
+                val target = origin + tile.boundsInLocal.height / 2.0 - viewport / 2.0
+                leftScroll.vvalue = (target / (content - viewport)).coerceIn(0.0, 1.0)
             }
         }
     }
@@ -227,7 +271,14 @@ class DetailScreenView(private val item: MediaItem) {
     private fun dedupe(eps: List<Episode>): List<Episode> {
         val unique = LinkedHashMap<String, Episode>()
         eps.forEach { unique[it.id.ifBlank { it.name ?: "${it.number}" }] = it }
-        return unique.values.toList()
+        val list = unique.values.toList()
+        // Providers hand episodes over newest-first at least as often as not, so
+        // a 160-episode series opened on "Episode 160" — which the user reads as
+        // "the episodes are the wrong way round". Sort by the episode number
+        // whenever the numbering is meaningful (all numbered, and out of order).
+        val ordered = list.all { it.number > 0 } && list.size > 1 &&
+            list.zipWithNext().any { (a, b) -> a.number > b.number }
+        return if (ordered) list.sortedBy { it.number } else list
     }
 
     private fun renderHero(m: MediaItem) {
@@ -245,12 +296,9 @@ class DetailScreenView(private val item: MediaItem) {
             m.genres.take(3).joinToString(" · ").ifBlank { null },
         ).joinToString("  ·  ")
         heroChips.children.setAll(m.genres.take(6).map { themed(it, "mchip") })
-        val url = m.backdropUrl ?: m.posterUrl
-        // A real (wide) backdrop fills the banner; a portrait poster is
-        // letterboxed instead of stretched.
-        heroImage.isPreserveRatio = m.backdropUrl.isNullOrBlank()
+        val url = desktop.img.ImageLoader.artFor(m.backdropUrl, m.posterUrl)
         if (!url.isNullOrBlank()) {
-            desktop.img.ImageLoader.loadAsync(url, onReady = { img -> if (img != null) heroImage.image = img }, w = 1600, h = 560)
+            desktop.img.ImageLoader.loadAsync(url, onReady = { img -> applyHeroArt(img) }, w = 1600, h = 900)
         }
         synopsis.text = m.overview?.let { htmlToPlain(it) }?.takeIf { it.isNotBlank() }
             ?: "No synopsis available for this title."
@@ -284,11 +332,14 @@ class DetailScreenView(private val item: MediaItem) {
                 minWidth = 0.0
             }
         })
-        val panels = mutableListOf<Node>(
-            Ui.panel(Ui.sectionHeader("Synopsis"), synopsis),
-            Ui.panel(Ui.sectionHeader("Details"), facts),
-        )
+        // Episodes come first: they are what the user opened the title for. A
+        // long synopsis above them pushed the whole episode grid below the fold,
+        // which is why opening a series gave no clue where the episodes (or the
+        // one you left off on) were.
+        val panels = mutableListOf<Node>()
         if (episodes.isNotEmpty()) panels.add(episodeSection)
+        panels.add(Ui.panel(Ui.sectionHeader("Synopsis"), synopsis))
+        panels.add(Ui.panel(Ui.sectionHeader("Details"), facts))
         leftColumn.children.setAll(panels)
     }
 
@@ -314,10 +365,17 @@ class DetailScreenView(private val item: MediaItem) {
                 hero.prefHeight = target
                 hero.minHeight = target
                 hero.maxHeight = target
-                heroImage.fitHeight = target
             }
         }
+        // The artwork always *covers* the banner: a portrait poster used to be
+        // letterboxed into a narrow strip in the middle of a wide banner, which
+        // is what "the header image is collapsing" looked like. Re-cropped on
+        // every resize instead of stretched.
+        heroImage.isPreserveRatio = false
         heroImage.fitWidthProperty().bind(hero.widthProperty())
+        heroImage.fitHeightProperty().bind(hero.heightProperty())
+        hero.widthProperty().addListener { _, _, _ -> paintHero() }
+        hero.heightProperty().addListener { _, _, _ -> paintHero() }
 
         val scrim = Region().apply {
             styleClass.add("d-scrim")
@@ -400,6 +458,7 @@ class DetailScreenView(private val item: MediaItem) {
             }
         }
         val shown = matches.take(episodeLimit)
+        episodeTiles.clear()
         val tiles = shown.map { i ->
             val ep = episodes[i]
             val text = ep.name?.takeIf { it.isNotBlank() }?.let { name ->
@@ -407,7 +466,7 @@ class DetailScreenView(private val item: MediaItem) {
                 val trimmed = name.replace(meta.title, "").trim().trim('-', ':', '|', '·')
                 numOf(trimmed) ?: ep.number.toString()
             } ?: ep.number.toString()
-            Button(text).apply {
+            val tile = Button(text).apply {
                 styleClass.add("ep-num")
                 prefWidth = 56.0
                 prefHeight = 34.0
@@ -415,6 +474,8 @@ class DetailScreenView(private val item: MediaItem) {
                 if (ep.id == selectedEpisode?.id) styleClass.add("ep-num-sel")
                 setOnAction { selectEpisode(ep) }
             }
+            episodeTiles[ep.id] = tile
+            tile
         }
         if (tiles.isEmpty()) {
             episodeGrid.children.setAll(themed("No episode matches “${episodeFilter.text.trim()}”.", "tiny"))

@@ -54,6 +54,9 @@ object AppShell {
     private lateinit var navButtons: MutableList<Pair<Screen, Button>>
     private lateinit var themeButton: Button
     private lateinit var globalSearch: TextField
+    private lateinit var activityBox: HBox
+    private lateinit var activitySpinner: javafx.scene.control.ProgressIndicator
+    private lateinit var activityLabel: Label
     private var currentScreen: Screen = Screen.Home
     private val backStack = java.util.ArrayDeque<Screen>()
 
@@ -205,12 +208,33 @@ object AppShell {
 
         themeButton = Ui.iconButton(Icons.MOON, "Toggle light / dark", size = 16.0) { toggleTheme() }
 
+        // A single always-visible place for "something is happening": an
+        // extension install finishes at the bottom of a long scrolling page,
+        // which is exactly where the user is not looking. Anything long-running
+        // calls AppShell.activity("Installing Foo…").
+        activitySpinner = javafx.scene.control.ProgressIndicator().apply {
+            styleClass.add("spinner")
+            prefWidth = 15.0
+            prefHeight = 15.0
+            minWidth = 15.0
+            minHeight = 15.0
+            maxWidth = 15.0
+            maxHeight = 15.0
+        }
+        activityLabel = Theme.label("", size = 11.5, dim = true).apply { styleClass.add("topbar-activity") }
+        activityBox = HBox(7.0, activitySpinner, activityLabel).apply {
+            alignment = Pos.CENTER_LEFT
+            styleClass.add("activity-chip")
+            isVisible = false
+            isManaged = false
+        }
+
         val left = HBox(10.0, titles).apply { alignment = Pos.CENTER_LEFT }
         left.padding = Insets(0.0, 0.0, 0.0, 14.0)
         left.minWidth = 150.0
         chrome.makeDraggable(left)
         val spacer = Region().apply { HBox.setHgrow(this, Priority.ALWAYS) }
-        val actions = HBox(2.0, searchBox, themeButton).apply { alignment = Pos.CENTER_RIGHT }
+        val actions = HBox(2.0, activityBox, searchBox, themeButton).apply { alignment = Pos.CENTER_RIGHT }
         return HBox(left, spacer, actions, chrome.controls()).apply {
             styleClass.add("topbar")
             alignment = Pos.CENTER_LEFT
@@ -258,6 +282,25 @@ object AppShell {
         // than at every call site.
         desktop.fx.Fx.run {
             if (::toasts.isInitialized) toasts.show(message, kind)
+        }
+    }
+
+    /**
+     * Shows — or, with null, hides — the busy chip in the top bar.
+     *
+     * Long-running work (installing an extension, adding a repo, reloading all
+     * providers) reports itself here so the user always has a visible answer to
+     * "is anything happening?", wherever they have scrolled to. Safe to call
+     * from any thread.
+     */
+    fun activity(text: String?) {
+        val label = text?.takeIf { it.isNotBlank() }
+        desktop.fx.Fx.run {
+            if (::activityBox.isInitialized) {
+                if (label != null) activityLabel.text = label
+                activityBox.isVisible = label != null
+                activityBox.isManaged = label != null
+            }
         }
     }
 

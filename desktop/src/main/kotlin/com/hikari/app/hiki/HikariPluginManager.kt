@@ -88,7 +88,15 @@ object HikariPluginManager {
             val text = stream.use { InputStreamReader(it).readText() }
             val root = JSONObject(text)
             when (val mc = root.opt("mainClass")) {
-                null -> throw RuntimeException("manifest.json has no mainClass")
+                null -> {
+                    // A CloudStream plugin (manifest.json with `pluginClassName`)
+                    // is not a Hikari extension. That is not a failure of this
+                    // loader, and reporting it as one is what showed the user
+                    // "manifest.json has no mainClass" for a .cs3 file whose real
+                    // problem was somewhere else entirely.
+                    if (root.has("pluginClassName")) return emptyList()
+                    throw RuntimeException("manifest.json has no mainClass")
+                }
                 is JSONArray -> (0 until mc.length()).mapNotNull { mc.optString(it).ifBlank { null } }
                 else -> listOf(mc.toString())
             }

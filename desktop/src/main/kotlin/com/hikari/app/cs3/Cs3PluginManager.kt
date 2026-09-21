@@ -124,23 +124,43 @@ object Cs3PluginManager {
         val path = file.absolutePath
 
         val classLoader = try {
-            URLClassLoader(arrayOf(DexJar.toJvmJarUrl(file)), context.classLoader)
+            val url = DexJar.toJvmJarUrlOrNull(file)
+                ?: throw IllegalStateException(DexJar.lastError ?: "this extension's dex payload couldn't be converted to JVM bytecode")
+            URLClassLoader(arrayOf(url), context.classLoader)
         } catch (e: Throwable) {
             record("URLClassLoader failed", e)
             return fail()
         }
 
-        val manifest = try {
+        val manifestText = try {
             val stream = classLoader.getResourceAsStream("manifest.json")
             if (stream == null) {
                 record("manifest missing", RuntimeException("no manifest.json in ${file.name}"))
                 return fail()
             }
-            stream.use {
-                AppUtils.parseJson(InputStreamReader(it).readText(), BasePlugin.Manifest::class)
-            }
+            stream.use { InputStreamReader(it).readText() }
         } catch (e: Throwable) {
             record("manifest read failed", e)
+            return fail()
+        }
+
+        val manifest = try {
+            AppUtils.parseJson(manifestText, BasePlugin.Manifest::class)
+        } catch (e: Throwable) {
+            record("manifest read failed", e)
+            return fail()
+        }
+
+        if (manifest.pluginClassName.isBlank()) {
+            // A Hikari extension (manifest.json lists `mainClass`) is simply not
+            // a CloudStream plugin — that is not an error for THIS loader, and
+            // recording it as one used to hide the real reason from the loader
+            // that was supposed to handle the file.
+            if (manifestText.contains("\"mainClass\"")) return emptyList()
+            record(
+                "manifest has no pluginClassName",
+                RuntimeException("manifest.json in ${file.name} has no pluginClassName — this is not a CloudStream plugin"),
+            )
             return fail()
         }
 

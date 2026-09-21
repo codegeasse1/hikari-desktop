@@ -8,6 +8,7 @@ import javafx.animation.ScaleTransition
 import javafx.animation.Timeline
 import javafx.geometry.Insets
 import javafx.geometry.Pos
+import javafx.geometry.Rectangle2D
 import javafx.scene.Node
 import javafx.scene.control.Button
 import javafx.scene.control.Label
@@ -15,6 +16,8 @@ import javafx.scene.control.ProgressIndicator
 import javafx.scene.control.ScrollPane
 import javafx.scene.control.TextField
 import javafx.scene.control.Tooltip
+import javafx.scene.image.Image
+import javafx.scene.image.ImageView
 import javafx.scene.layout.HBox
 import javafx.scene.layout.Priority
 import javafx.scene.layout.Region
@@ -283,6 +286,42 @@ object Ui {
         }
     }
 
+    /**
+     * Draws [img] so that it *covers* a [w]x[h] viewport.
+     *
+     * `ImageView` has no object-fit: with `preserveRatio` on, a portrait poster
+     * inside a wide banner shrinks to a narrow strip in the middle (exactly the
+     * "the header image collapsed" look); with it off, the artwork is stretched
+     * out of shape. Cropping the source to the viewport's own aspect ratio with
+     * a viewport rectangle fills the banner edge to edge with no distortion.
+     * Tall artwork keeps its TOP — for a poster, that is where the key art and
+     * the faces are; a wide backdrop is cropped evenly at the sides.
+     */
+    fun coverImage(view: ImageView, img: Image?, w: Double, h: Double) {
+        view.image = img
+        view.isPreserveRatio = false
+        if (img == null) {
+            view.viewport = null
+            return
+        }
+        val iw = img.width
+        val ih = img.height
+        if (iw <= 0.0 || ih <= 0.0 || w <= 0.0 || h <= 0.0) {
+            view.viewport = null
+            return
+        }
+        val target = w / h
+        val source = iw / ih
+        view.viewport = if (source > target) {
+            val cw = ih * target
+            Rectangle2D((iw - cw) / 2.0, 0.0, cw, ih)
+        } else {
+            val ch = iw / target
+            val y = if (source < 0.95) 0.0 else (ih - ch) / 2.0
+            Rectangle2D(0.0, y, iw, ch)
+        }
+    }
+
     // ---- scroll helpers -----------------------------------------------------
 
     fun vScroll(content: Node, padding: Insets = Insets(Theme.S5, Theme.S5, Theme.S6, Theme.S5)): ScrollPane =
@@ -317,13 +356,18 @@ object Ui {
         maxWidth = Double.MAX_VALUE
         (content as? Region)?.let { it.minWidth = 0.0 }
         addEventFilter(javafx.scene.input.ScrollEvent.SCROLL) { e ->
-            if (kotlin.math.abs(e.deltaY) > kotlin.math.abs(e.deltaX)) {
-                val next = (hvalue - e.deltaY / 620.0).coerceIn(0.0, 1.0)
-                if (next != hvalue) {
-                    hvalue = next
-                    e.consume()
-                }
-            }
+            // PC/touchpad rule: a vertical scroll gesture over a rail scrolls the
+            // PAGE. The old version translated vertical wheel/two-finger motion
+            // into horizontal movement AND consumed the event, so scrolling a
+            // catalog with a touchpad slid rows sideways and the page itself
+            // appeared frozen. Only an explicitly horizontal gesture — a
+            // sideways two-finger swipe, or Shift+wheel — pages the rail.
+            val sideways = kotlin.math.abs(e.deltaX) > kotlin.math.abs(e.deltaY)
+            val shiftWheel = e.isShiftDown && e.deltaY != 0.0
+            if (!sideways && !shiftWheel) return@addEventFilter
+            val delta = if (e.deltaX != 0.0) e.deltaX else e.deltaY
+            hvalue = (hvalue + delta / 620.0).coerceIn(0.0, 1.0)
+            e.consume()
         }
     }
 

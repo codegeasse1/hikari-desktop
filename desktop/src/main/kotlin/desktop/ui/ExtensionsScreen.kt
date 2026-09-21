@@ -95,6 +95,16 @@ class ExtensionsScreenView {
      *  install says why where the user is looking. Keyed by plugin URL. */
     private val installErrors = HashMap<String, String>()
 
+    /**
+     * Plugin URL → what is happening to it right now ("Installing…").
+     *
+     * The row's Install button is replaced by a spinner + that text, so the
+     * click has an immediate answer *where the user clicked*; the same text is
+     * mirrored into the shell's top-bar chip, so it is still visible when the
+     * row has scrolled out of view.
+     */
+    private val busyPlugins = HashMap<String, String>()
+
     // ── composer state (kept across re-renders) ─────────────────────────────
 
     private var mode = 0
@@ -132,6 +142,13 @@ class ExtensionsScreenView {
     private fun renderAll() {
         content.children.clear()
         content.children.add(header())
+        // The live status line sits directly under the header: an install that
+        // finishes while the user is looking at the top of the page must not
+        // report itself at the bottom of a long list (that is where the old
+        // layout put it, and why installs looked like they did nothing).
+        content.children.add(
+            HBox(10.0, busy, statusLabel).apply { alignment = Pos.CENTER_LEFT },
+        )
         val repo = openRepo
         if (repo != null) {
             renderRepoDetail(repo)
@@ -140,9 +157,6 @@ class ExtensionsScreenView {
             renderRepos()
             renderInstalled()
         }
-        content.children.add(
-            HBox(10.0, busy, statusLabel).apply { alignment = Pos.CENTER_LEFT },
-        )
     }
 
     private fun header(): Node {
@@ -340,11 +354,19 @@ class ExtensionsScreenView {
     }
 
     private fun reloadAll() {
-        AppShell.uiScope.launch { AppShell.app.providers.refresh() }
+        setStatus("Reloading every provider and repo…", busy = true)
+        busy.isVisible = true
         repoData.clear()
         repoErrors.clear()
         renderAll()
-        setStatus("Reloading every provider and repo…")
+        AppShell.uiScope.launch {
+            runCatching { AppShell.app.providers.refresh() }
+            Fx.run {
+                busy.isVisible = false
+                setStatus("Reloaded every provider.")
+                renderAll()
+            }
+        }
     }
 
     private fun openExtFolder() {
@@ -440,7 +462,11 @@ class ExtensionsScreenView {
                 children.add(Ui.badge("signed", "badge"))
             }
         }
-        val action = if (installed.isEmpty()) {
+        // While the click is being acted on, the button becomes the answer.
+        val working = busyPlugins[plugin.url]
+        val action: Node = if (working != null) {
+            HBox(8.0, tinySpinner(), themed(working, "tiny")).apply { alignment = Pos.CENTER_RIGHT }
+        } else if (installed.isEmpty()) {
             Ui.button("Install", primary = true) { installPlugin(plugin.name, plugin.url, plugin.fileHash, plugin.jarHash) }
         } else {
             Ui.button("Uninstall", danger = true) { uninstallPlugin(plugin.name, plugin.url) }
@@ -461,6 +487,17 @@ class ExtensionsScreenView {
         }
     }
 
+    /** The 14px spinner used inline in a row's action slot. */
+    private fun tinySpinner(): ProgressIndicator = ProgressIndicator().apply {
+        styleClass.add("spinner")
+        prefWidth = 14.0
+        prefHeight = 14.0
+        minWidth = 14.0
+        minHeight = 14.0
+        maxWidth = 14.0
+        maxHeight = 14.0
+    }
+
     // ── network ─────────────────────────────────────────────────────────────
 
     private fun loadRepoData(url: String, silent: Boolean = false) {
@@ -469,7 +506,7 @@ class ExtensionsScreenView {
             setStatus("Fetching repo…")
         }
         AppShell.uiScope.launch {
-            val result = Http.fetchRepoJson(url) { step -> Fx.run { setStatus(step) } }
+            val result = Http.fetchRepoJson(url) { step -> Fx.run { setStatus(step, busy = true) } }
             Fx.run {
                 busy.isVisible = false
                 repoLoading.remove(url)
@@ -532,9 +569,9 @@ class ExtensionsScreenView {
     private fun addRepo(url: String, kind: RepoKind) {
         if (url.isBlank()) return
         busy.isVisible = true
-        setStatus("Checking $url…")
+        setStatus("Checking $url…", busy = true)
         AppShell.uiScope.launch {
-            val result = Http.fetchRepoJson(url) { step -> Fx.run { setStatus(step) } }
+            val result = Http.fetchRepoJson(url) { step -> Fx.run { setStatus(step, busy = true) } }
             Fx.run {
                 busy.isVisible = false
                 val pair = result.getOrNull()
@@ -623,11 +660,16 @@ class ExtensionsScreenView {
      *  bad candidate falls through to the next one. Every path ends with a
      *  visible status — nothing ever fails silently. */
     private fun installPlugin(name: String, url: String, fileHash: String? = null, jarHash: String? = null) {
+        // A second click while the first is still running would download the
+        // same file twice and register the provider twice.
+        if (busyPlugins.containsKey(url)) return
         var dl = url
         if (dl.endsWith(".hiki")) dl = dl.removeSuffix(".hiki") + ".jar"
         installErrors.remove(url)
+        busyPlugins[url] = "Installing…"
         busy.isVisible = true
-        setStatus("Installing $name…")
+        setStatus("Installing $name…", busy = true)
+        fillPlugins()
         AppShell.uiScope.launch {
             var statusText = "Install failed: unknown error"
             var isErr = true
@@ -680,8 +722,16 @@ class ExtensionsScreenView {
                         registered = result
                         break
                     }
-                    loadFailure = HikariPluginManager.lastError ?: Cs3PluginManager.lastError ?: "not an extension"
-                    attempts.append("${c.substringAfterLast('/')} — not loadable (${loadFailure?.take(90)})\n")
+                    // Report the reason from the loader that was actually
+                    // supposed to handle this file: a dex archive's real error
+                    // lives on Cs3PluginManager, and showing the Hikari loader's
+                    // "manifest.json has no mainClass" for a .cs3 hid it.
+                    val isDex = c.endsWith(".cs3") || c.endsWith(".hiki")
+                    val primary = if (isDex) Cs3PluginManager.lastError else HikariPluginManager.lastError
+                    val secondary = if (isDex) HikariPluginManager.lastError else Cs3PluginManager.lastError
+                    loadFailure = listOfNotNull(primary, secondary).joinToString("  |  ")
+                        .ifBlank { "not an extension" }
+                    attempts.append("${c.substringAfterLast('/')} — not loadable (${loadFailure?.take(200)})\n")
                 }
                 if (registered != null) {
                     statusText = registered!!
@@ -696,8 +746,8 @@ class ExtensionsScreenView {
             } catch (t: Throwable) {
                 statusText = "Install failed: ${t.message?.take(300) ?: t.javaClass.simpleName}"
             }
-            AppShell.app.providers.refresh()
             Fx.run {
+                busyPlugins.remove(url)
                 busy.isVisible = false
                 if (isErr) installErrors[url] = statusText.take(700) else installErrors.remove(url)
                 setStatus(statusText, isErr)
@@ -705,8 +755,25 @@ class ExtensionsScreenView {
                     if (isErr) "$name could not be installed" else "$name installed",
                     if (isErr) "error" else "ok",
                 )
+                // The extension is registered and usable NOW — render it as
+                // installed immediately. Reloading every OTHER provider is
+                // background work: waiting for it here is what made an install
+                // that had already finished look like it was still going.
                 renderAll()
             }
+            reloadProvidersQuietly()
+        }
+    }
+
+    /**
+     * Refreshes the provider list off the critical path. Reuses already-loaded
+     * provider instances (see ProviderManager), so this is a cheap incremental
+     * pass rather than a full re-init of every installed extension.
+     */
+    private fun reloadProvidersQuietly() {
+        AppShell.uiScope.launch {
+            runCatching { AppShell.app.providers.refresh() }
+            Fx.run { renderAll() }
         }
     }
 
@@ -791,13 +858,18 @@ class ExtensionsScreenView {
     private fun uninstallPlugin(name: String, url: String) {
         val matches = providersFor(url)
         if (matches.isEmpty()) return
+        busyPlugins[url] = "Uninstalling…"
+        fillPlugins()
+        // Removing an extension is entirely local work — the row must never wait
+        // on the network or on any other extension to update.
         matches.forEach { AppShell.app.store.removeProvider(it.id) }
         val file = matches.first().url.takeIf { it.isNotBlank() }?.let { File(it) }
-        if (file != null && file.exists()) file.delete()
-        AppShell.uiScope.launch { AppShell.app.providers.refresh() }
+        if (file != null && file.exists()) runCatching { file.delete() }
+        busyPlugins.remove(url)
         setStatus("Uninstalled $name (${matches.size} extension${if (matches.size > 1) "s" else ""}).")
         AppShell.toast("Uninstalled $name", "ok")
         renderAll()
+        reloadProvidersQuietly()
     }
 
     private fun installFromDisk() {
@@ -808,7 +880,7 @@ class ExtensionsScreenView {
         }
         val file = chooser.showOpenDialog(null) ?: return
         busy.isVisible = true
-        setStatus("Installing ${file.name}…")
+        setStatus("Installing ${file.name}…", busy = true)
         AppShell.uiScope.launch {
             var statusText = "Install failed: unknown error"
             var isErr = true
@@ -826,13 +898,13 @@ class ExtensionsScreenView {
             } catch (t: Throwable) {
                 statusText = "Install failed: ${t.message?.take(300) ?: t.javaClass.simpleName}"
             }
-            AppShell.app.providers.refresh()
             Fx.run {
                 busy.isVisible = false
                 setStatus(statusText, isErr)
                 AppShell.toast(if (isErr) "${file.name} could not be installed" else "${file.name} installed", if (isErr) "error" else "ok")
                 renderAll()
             }
+            reloadProvidersQuietly()
         }
     }
 
@@ -939,12 +1011,15 @@ class ExtensionsScreenView {
 
     // ── misc ────────────────────────────────────────────────────────────────
 
-    private fun setStatus(text: String, isError: Boolean = false) {
+    private fun setStatus(text: String, isError: Boolean = false, busy: Boolean = false) {
         statusLabel.text = text
         statusLabel.styleClass.remove("h-danger")
         if (isError) statusLabel.styleClass.add("h-danger")
         statusLabel.isWrapText = true
         statusLabel.maxWidth = 900.0
+        // The status line is part of a long, scrolling page, so the shell's
+        // top-bar chip carries the same text where it is always on screen.
+        AppShell.activity(if (busy && !isError) text else null)
     }
 
     private fun themed(text: String, cls: String): Label = Label(text).apply { styleClass.add(cls) }
