@@ -81,10 +81,10 @@ object DesktopPlayer {
      *  LL-HLS links) — their token is single-use and expires in seconds, so:
      *  1) the pre-flight probe must NOT request them (it would burn the token
      *     and the follow-up mpv request would 403), and
-     *  2) a 403 means the link expired → relaunch with a freshly-fetched URL. */
-    private fun isSignedStreamUrl(url: String): Boolean =
-        url.contains("/v1/edge/streams/") || url.contains("mmcdn.com") ||
-            url.contains("edge-hls.chaturbate.com")
+     *  2) a 403 means the link expired → relaunch with a freshly-fetched URL.
+     *  The rule itself lives on [Http] so the "play straight away" speed race
+     *  respects it too. */
+    private fun isSignedStreamUrl(url: String): Boolean = com.hikari.app.net.Http.isSignedStreamUrl(url)
 
     fun play(
         title: String,
@@ -196,7 +196,13 @@ object DesktopPlayer {
                 showBrowserFallback(title, path, "Couldn't launch the video player.")
                 return@run
             }
-            proc?.let { runCatching { it.destroy() } }
+            proc?.let { old ->
+                // Replace any previous player outright: two mpv windows would
+                // both try to own the video area, and the old process's window
+                // dies with it.
+                runCatching { old.descendants().forEach { c -> runCatching { c.destroyForcibly() } } }
+                runCatching { old.destroyForcibly() }
+            }
             proc = p
             dialogShown = false
             if (glued) PlayerWindow.attachProcess(p.pid())
@@ -322,7 +328,13 @@ object DesktopPlayer {
                 showBrowserFallback(title, url, "Couldn't launch the video player. Open it in your browser instead?")
                 return@run
             }
-            proc?.let { runCatching { it.destroy() } }
+            proc?.let { old ->
+                // Replace any previous player outright: two mpv windows would
+                // both try to own the video area, and the old process's window
+                // dies with it.
+                runCatching { old.descendants().forEach { c -> runCatching { c.destroyForcibly() } } }
+                runCatching { old.destroyForcibly() }
+            }
             proc = p
             // Adopt mpv's window and glue it over the video area (see
             // PlayerWindow/WinShell). Off the FX thread: mpv creates its window
@@ -656,14 +668,61 @@ object DesktopPlayer {
         Fx.run {
             runCatching { ipc?.close() }
             ipc = null
+            // Takes the video window out of the picture (see parkSurface) and
+            // hides the layer, before the process below is killed.
             runCatching { PlayerWindow.closeAll() }
-            runCatching { proc?.destroy() }
-            proc = null
-            ipcTarget = null
         }
+        killMpv()
     }
 
     fun closeAll() {
         stopPlayback()
+    }
+
+    /**
+     * Kills the running mpv and forgets it — from ANY thread, at any point of
+     * shutdown.
+     *
+     * Why this is not just [stopPlayback]: the player is a SEPARATE process
+     * whose window the app adopts, and adopting a window does not make it die
+     * with the app. Closing the app therefore used to leave mpv running with
+     * its last frame frozen on screen — the reported "when closing player the
+     * app closes but the player stays stuck". This is called from the window's
+     * close request, from `Application.stop()` and from a JVM shutdown hook;
+     * by the time the last two run the JavaFX toolkit is already gone, so
+     * nothing here may go through [Fx] (a `Platform.runLater` at that point
+     * throws, and the player would survive).
+     */
+    fun shutdown() {
+        runCatching { PlayerWindow.parkSurface() }
+        runCatching { ipc?.close() }
+        ipc = null
+        runCatching { PlayerWindow.closeAll() }
+        killMpv()
+    }
+
+    /** Destroys mpv (its own window dies with it) and waits, briefly, for the
+     *  process to actually go. `destroy()` on Windows terminates the process
+     *  outright; the wait is what turns "I asked it to stop" into "it is gone",
+     *  and the forcible fallback covers a wedged one. */
+    private fun killMpv() {
+        val p = proc
+        proc = null
+        ipcTarget = null
+        if (p == null) return
+        val started = System.currentTimeMillis()
+        runCatching {
+            p.descendants().forEach { child -> runCatching { child.destroy() } }
+            p.destroy()
+            if (!p.waitFor(1_500L, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                p.descendants().forEach { child -> runCatching { child.destroyForcibly() } }
+                p.destroyForcibly()
+                p.waitFor(1_000L, java.util.concurrent.TimeUnit.MILLISECONDS)
+            }
+            System.err.println(
+                "player: mpv pid=" + p.pid() + " alive=" + p.isAlive +
+                    " (stopped in " + (System.currentTimeMillis() - started) + "ms)",
+            )
+        }.onFailure { System.err.println("player: killing mpv failed: " + it) }
     }
 }

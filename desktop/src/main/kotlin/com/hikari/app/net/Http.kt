@@ -59,7 +59,17 @@ object Http {
                 java.security.Security.insertProviderAt(org.conscrypt.Conscrypt.newProvider(), 1)
             }
             val tmf = javax.net.ssl.TrustManagerFactory.getInstance("X509")
-            tmf.init(null as java.security.KeyStore?)
+            // The anchors are handed over EXPLICITLY. Left to itself Conscrypt
+            // takes them from the JDK's `lib/security/cacerts` snapshot (see
+            // Conscrypt's Platform.getDefaultCertKeyStore()), and that snapshot
+            // is what made every GitHub-family host unreachable on Windows — the
+            // "extensions won't load / no server answered" bug. See [trustStore].
+            val anchors = runCatching { trustStore() }.getOrNull()
+            if (anchors != null) {
+                tmf.init(anchors as java.security.KeyStore)
+            } else {
+                tmf.init(null as java.security.KeyStore?)
+            }
             val ctx = javax.net.ssl.SSLContext.getInstance("TLS")
             ctx.init(null, tmf.trustManagers, null)
             return builder.sslSocketFactory(
@@ -71,6 +81,233 @@ object Http {
             return builder
         }
     }
+
+    // ── trust anchors ───────────────────────────────────────────────────────
+
+    /**
+     * The certificate authorities this app verifies HTTPS against.
+     *
+     * Why this exists at all: Conscrypt (which every client in this object is
+     * pinned to) derives its trust anchors from the JDK's
+     * `lib/security/cacerts` snapshot — see Conscrypt's
+     * `Platform.getDefaultCertKeyStore()`, which asks the JDK's PKIX
+     * TrustManagerFactory for its accepted issuers. That snapshot no longer
+     * contains the legacy Comodo/Sectigo **AAA Certificate Services** root
+     * (Temurin 17.0.20 and 21.0.12 both ship USERTrust RSA and the Sectigo R46
+     * root, neither ships AAA), while GitHub's CDN still serves chains that end
+     * at a Sectigo root cross-signed by AAA. So on a user's Windows machine the
+     * browser loaded the repo and the app answered
+     *
+     *     Unacceptable certificate: CN=AAA Certificate Services, O=Comodo CA Limited …
+     *
+     * for every repo, extension download and mirror — which looked exactly like
+     * "this network is blocking GitHub".
+     *
+     * The anchors are therefore assembled explicitly, from three sources, once
+     * per process:
+     *
+     *  1. the JDK's own store (what we would have had anyway),
+     *  2. the **Windows certificate store** — precisely what Chrome/Edge trust
+     *     on this machine, which is the literal meaning of "but my browser can
+     *     open it", and which also picks up corporate/AV roots the JDK never
+     *     sees,
+     *  3. `cacerts-extra.pem` from this app's resources: public roots that modern
+     *     JDKs stopped shipping but that real servers still require (currently
+     *     AAA Certificate Services — see the header of that file).
+     *
+     * Nothing is trusted blindly: every anchor comes from a public CA program
+     * (Mozilla/Microsoft/JDK), and certificate *validation* is unchanged.
+     */
+    private val trustStoreLock = Any()
+
+    @Volatile
+    private var trustStoreCache: java.security.KeyStore? = null
+
+    @Volatile
+    private var trustStoreSummary = "not built yet"
+
+    /** Anchor counts from the last [trustStore] build, for the log and the tests. */
+    fun trustStoreReport(): String = trustStoreSummary
+
+    /** The merged trust store (see [trustStoreReport] for what it holds). */
+    fun trustStore(): java.security.KeyStore {
+        trustStoreCache?.let { return it }
+        synchronized(trustStoreLock) {
+            trustStoreCache?.let { return it }
+            val ks = java.security.KeyStore.getInstance("JKS")
+            ks.load(null, null)
+            var added = 0
+            val jdk = addCertificates(ks, jdkCacerts(ks), added)
+            added += jdk
+            val windows = addCertificates(ks, windowsRootStore(ks), added)
+            added += windows
+            val extra = addPemCertificates(ks, "cacerts-extra.pem", added)
+            added += extra
+            trustStoreSummary =
+                "anchors=" + ks.size() + " (jdk=" + jdk + " windows=" + windows + " extra=" + extra + ")"
+            System.err.println("tls-trust: " + trustStoreSummary)
+            if (ks.size() == 0) {
+                // Nothing loaded at all (no JDK store on disk, no resources):
+                // returning an EMPTY store would fail every request, so fall
+                // back to letting the platform decide (the old behaviour).
+                System.err.println("tls-trust: no anchors loaded — using the platform default store")
+                trustStoreSummary = "anchors=none (platform default)"
+                throw IllegalStateException("no trust anchors could be loaded")
+            }
+            trustStoreCache = ks
+            return ks
+        }
+    }
+
+    /** SHA-256 of every anchor in [trustStore] (how the tests recognise one). */
+    fun trustStoreFingerprints(): Set<String> = runCatching {
+        val ks = trustStore()
+        val out = HashSet<String>()
+        val aliases = ks.aliases()
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        while (aliases.hasMoreElements()) {
+            val alias = aliases.nextElement()
+            val cert = runCatching { ks.getCertificate(alias) }.getOrNull() ?: continue
+            out.add(md.digest(cert.encoded).joinToString("") { "%02x".format(it) })
+        }
+        out
+    }.getOrDefault(emptySet())
+
+    private fun addCertificates(dest: java.security.KeyStore, src: java.security.KeyStore?, already: Int): Int {
+        if (src == null) return 0
+        var n = 0
+        val aliases = runCatching { src.aliases() }.getOrNull() ?: return 0
+        while (aliases.hasMoreElements()) {
+            val alias = aliases.nextElement()
+            val cert = runCatching {
+                if (src.isCertificateEntry(alias)) src.getCertificate(alias) else null
+            }.getOrNull() ?: continue
+            if (cert !is java.security.cert.X509Certificate) continue
+            runCatching { dest.setCertificateEntry("a" + (already + n), cert) }.onSuccess { n++ }
+        }
+        return n
+    }
+
+    /** The JDK's own `lib/security/cacerts`, read from disk (never through
+     *  `sun.security.ssl`, which can be a landmine once Conscrypt is the
+     *  default provider — see [applyConscryptTls]). */
+    private fun jdkCacerts(dest: java.security.KeyStore): java.security.KeyStore? {
+        val home = System.getProperty("java.home") ?: return null
+        val file = java.io.File(java.io.File(home, "lib/security"), "cacerts")
+        if (!file.isFile || !file.canRead()) return null
+        return loadKeyStore(file, "changeit")
+    }
+
+    private fun loadKeyStore(file: java.io.File, password: String): java.security.KeyStore? {
+        // JKS/JCEKS files carry the 0xFEEDFEED magic; everything else modern is
+        // a PKCS#12 (the JDK's own cacerts has been PKCS#12 since JDK 9).
+        val magic = runCatching { file.inputStream().use { it.readNBytes(4) } }.getOrNull()
+        val looksJks = magic != null && magic.size == 4 && (magic[0].toInt() and 0xFF) == 0xFE &&
+            (magic[1].toInt() and 0xFF) == 0xED
+        val types = if (looksJks) listOf("JKS", "PKCS12") else listOf("PKCS12", "JKS")
+        for (t in types) {
+            val ks = runCatching {
+                val k = java.security.KeyStore.getInstance(t)
+                file.inputStream().use { k.load(it, password.toCharArray()) }
+                k
+            }.getOrNull()
+            if (ks != null) return ks
+        }
+        return null
+    }
+
+    /** The OS certificate store. On Windows this is what Chrome/Edge use, so a
+     *  site the user's browser trusts is trusted here too — including the roots
+     *  of a corporate/AV TLS inspection proxy, which no JDK update will ever
+     *  contain. Absent (or unreadable) on other platforms: that is fine, the
+     *  other two sources still apply. */
+    private fun windowsRootStore(dest: java.security.KeyStore): java.security.KeyStore? =
+        runCatching {
+            val ks = java.security.KeyStore.getInstance("Windows-ROOT")
+            ks.load(null, null)
+            ks
+        }.getOrElse {
+            System.err.println("tls-trust: no OS root store (" + (it.message ?: it.javaClass.simpleName) + ")")
+            null
+        }
+
+    /** Anchors shipped with the app (see the header of `cacerts-extra.pem`). */
+    private fun addPemCertificates(dest: java.security.KeyStore, resource: String, already: Int): Int {
+        var n = 0
+        for (cert in extraAnchors(resource)) {
+            runCatching { dest.setCertificateEntry("x" + (already + n), cert) }.onSuccess { n++ }
+        }
+        if (n == 0) System.err.println("tls-trust: no anchors parsed from " + resource)
+        return n
+    }
+
+    /** The certificates in a PEM resource of this jar, parsed once. */
+    private fun extraAnchors(resource: String): List<java.security.cert.X509Certificate> =
+        certCache.computeIfAbsent(resource) { parsePemResource(it) }
+
+    private val certCache =
+        java.util.concurrent.ConcurrentHashMap<String, List<java.security.cert.X509Certificate>>()
+
+    /**
+     * Reads every `-----BEGIN CERTIFICATE-----` block out of a PEM resource.
+     *
+     * Not `CertificateFactory.generateCertificates(stream)`: that call yields
+     * NOTHING at all — silently — for a stream holding text it does not
+     * understand, and this file deliberately carries a comment header (why it
+     * exists, where each root came from, how to regenerate it). The first
+     * version of this shipped exactly that way: the store logged `extra=0`,
+     * the build passed because the Windows store happened to hold the same
+     * root, and the shipped anchor was not actually being loaded at all.
+     */
+    private fun parsePemResource(resource: String): List<java.security.cert.X509Certificate> {
+        val text = runCatching {
+            val stream = javaClass.getResourceAsStream("/" + resource)
+                ?: javaClass.classLoader?.getResourceAsStream(resource)
+                ?: return emptyList()
+            stream.use { it.readBytes().toString(Charsets.UTF_8) }
+        }.getOrNull() ?: return emptyList()
+        val factory = runCatching {
+            java.security.cert.CertificateFactory.getInstance("X.509")
+        }.getOrNull() ?: return emptyList()
+        val out = ArrayList<java.security.cert.X509Certificate>()
+        val block = Regex("-----BEGIN CERTIFICATE-----[\\s\\S]*?-----END CERTIFICATE-----")
+        for (match in block.findAll(text)) {
+            val body = match.value.replace(Regex("-----[^-]+-----"), "").trim()
+            val der = runCatching { java.util.Base64.getMimeDecoder().decode(body) }.getOrNull() ?: continue
+            val cert = runCatching { factory.generateCertificate(der.inputStream()) }.getOrNull() ?: continue
+            if (cert is java.security.cert.X509Certificate) out.add(cert)
+        }
+        if (out.isEmpty()) System.err.println("tls-trust: nothing parsed from " + resource)
+        return out
+    }
+
+    /** How many anchors the shipped `cacerts-extra.pem` holds (0 = missing or
+     *  unparsable — the state the trust self-test refuses to accept). */
+    fun extraAnchorCount(): Int = extraAnchors("cacerts-extra.pem").size
+
+    /** SHA-256 of every anchor in the shipped file (how the tests recognise
+     *  that a root came from the file and not from the OS store). */
+    fun extraAnchorFingerprints(): Set<String> {
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        return extraAnchors("cacerts-extra.pem")
+            .map { md.digest(it.encoded).joinToString("") { b -> "%02x".format(b) } }
+            .toSet()
+    }
+
+    /**
+     * The subject names of the certificate chain a host actually serves, read
+     * from a real handshake with this machine's stack. Purely diagnostic: it is
+     * what turns "the TLS handshake is being blocked" into a name the user (and
+     * the log) can act on, and the trust self-test prints it.
+     */
+    fun serverChainSubjects(url: String): List<String> = runCatching {
+        val request = Request.Builder().url(url).header("User-Agent", UA).build()
+        client.newCall(request).execute().use { resp ->
+            resp.handshake?.peerCertificates?.mapNotNull { c ->
+                (c as? java.security.cert.X509Certificate)?.subjectX500Principal?.name
+            }.orEmpty()
+        }
+    }.getOrDefault(emptyList())
 
     // ── the compatibility ladder ────────────────────────────────────────────
 
@@ -235,16 +472,67 @@ object Http {
     }
 
     /**
+     * True when the connection died because the certificate chain could not be
+     * verified — "Unacceptable certificate: …", "unable to find valid
+     * certification path", "PKIX path building failed".
+     *
+     * This is a property of THIS MACHINE's trust store and does not depend on
+     * the TLS version, the proxy or the mirror, so the ladder treats it as
+     * final (see [fetchStringRobust]): re-trying the same host on the TLS-1.2
+     * and no-proxy passes is what turned one rejected certificate into a
+     * minute-long "loading" spinner, and "the TLS handshake is being blocked by
+     * this network" was exactly the wrong thing to tell the user about it.
+     */
+    fun isCertTrustFailure(t: Throwable?): Boolean {
+        val text = ((t?.message ?: "") + " | " + (t?.cause?.message ?: "")).lowercase()
+        if (text.isBlank()) return false
+        return text.contains("unacceptable certificate") ||
+            text.contains("unable to find valid certification path") ||
+            text.contains("pkix path building failed") ||
+            text.contains("no trusted certificate") ||
+            text.contains("certpath") ||
+            text.contains("certificate verify failed") ||
+            text.contains("self signed certificate") ||
+            text.contains("certificateexception")
+    }
+
+    /** True when a fetch failed because WE cancelled it (a racing mirror lost
+     *  the race and its pool was shut down), not because the host did anything.
+     *  Reported as a cause these entries only ever buried the real reason —
+     *  "(3) InterruptedException" next to "(2) Unacceptable certificate" — so
+     *  they are left out of the summary. */
+    private fun isCancellation(t: Throwable?): Boolean = when (t) {
+        null -> false
+        is InterruptedException -> true
+        // SocketTimeoutException extends InterruptedIOException but IS a real
+        // answer about the host; only the plain interrupt is ours.
+        is java.io.InterruptedIOException -> t !is java.net.SocketTimeoutException
+        else -> {
+            val m = (t.message ?: "").lowercase()
+            m.contains("interrupted") || m.contains("canceled") || m.contains("cancelled") ||
+                isCancellation(t.cause)
+        }
+    }
+
+    /** What a certificate-trust failure deserves: it is neither the user's
+     *  network nor the site, and it cannot be retried away, so the message says
+     *  whose store is missing what. */
+    private const val CERT_TRUST_MESSAGE =
+        "this machine's certificate store doesn't trust the site's CA chain"
+
+    /**
      * A short, honest reason for a failed fetch across many mirrors: the most
      * common distinct causes with how many hosts reported them, so the user
      * reads "TLS handshake blocked by this network (8)" instead of whichever
      * attempt happened to fail last.
      */
     fun summariseFailures(failures: Collection<Throwable>): String {
-        if (failures.isEmpty()) return "no server answered"
+        val real = failures.filterNot { isCancellation(it) }
+        if (real.isEmpty()) return if (failures.isEmpty()) "no server answered" else "the fetch was cancelled"
         val groups = LinkedHashMap<String, Int>()
-        for (t in failures) {
+        for (t in real) {
             val label = when {
+                isCertTrustFailure(t) -> CERT_TRUST_MESSAGE
                 isTlsStackFailure(t) -> "the TLS handshake is being blocked by this network"
                 t is UnknownHostException -> "DNS lookup failed"
                 t is java.net.ConnectException -> "connection refused"
@@ -333,10 +621,10 @@ object Http {
      *  mirrors are allowed to answer. A blocked origin usually fails in
      *  milliseconds (connection reset / TLS refusal), so this window is only
      *  ever fully spent on a black-holed host. */
-    private const val ORIGIN_WINDOW_MS = 12_000L
+    private const val ORIGIN_WINDOW_MS = 9_000L
 
     /** How long the mirror wave gets per network pass. */
-    private const val MIRROR_WINDOW_MS = 25_000L
+    private const val MIRROR_WINDOW_MS = 15_000L
 
     /** How many mirror candidates are raced at once. Four covers the realistic
      *  "one CDN + one proxy frontdoor + the origin" spread without hammering a
@@ -619,10 +907,10 @@ object Http {
 
     /** Hard cap for a repo fetch so a slow/blocked network fails with a clear
      *  error instead of leaving the UI stuck on "Checking…" for minutes. */
-    private const val REPO_FETCH_DEADLINE_MS = 75_000L
+    private const val REPO_FETCH_DEADLINE_MS = 30_000L
 
     /** Overall budget for one extension download (all mirrors + retries). */
-    private const val DOWNLOAD_BUDGET_MS = 90_000L
+    private const val DOWNLOAD_BUDGET_MS = 60_000L
 
     /** Fetches a repo.json, trying every candidate URL. Only accepts a response
      *  that is actually a JSON object with a "plugins" key — or a CloudStream v2
@@ -650,7 +938,7 @@ object Http {
             ordered
         }
         val deadline = System.currentTimeMillis() + REPO_FETCH_DEADLINE_MS
-        val failures = java.util.concurrent.ConcurrentLinkedQueue<Throwable>()
+        val walk = Walk()
 
         // The stale snapshot mirrors get their own phase, so a CDN copy of the
         // repo can never answer before the live one.
@@ -680,12 +968,12 @@ object Http {
         val snapshotUrls = LinkedHashSet<String>()
         for (c in snapshot) snapshotUrls.addAll(urlVariants(c))
 
-        fun tryOne(c: OkHttpClient, u: String): String? {
+        fun tryOne(c: OkHttpClient, u: String, throughProxy: Boolean): String? {
             val r = getStringStrictOn(c, u)
             val text = r.getOrNull()
             if (text == null) {
                 val cause = r.exceptionOrNull()
-                cause?.let { failures += it }
+                walk.record(u, cause, throughProxy)
                 if (isHostFailure(cause)) MirrorMemory.markDead(u)
                 return null
             }
@@ -723,17 +1011,28 @@ object Http {
             // the whole deadline is how a repo reported "unreachable" while the
             // very next stack would have loaded it.
             val share = left / (ladder.size - index)
-            val window = minOf(if (index == 0) 30_000L else 18_000L, maxOf(8_000L, share))
-            for ((wave, ms) in listOf(MirrorMemory.order(raw, liveOrigins.toList()) to ORIGIN_WINDOW_MS, MirrorMemory.order(raw, liveMirrors.toList()) to window)) {
+            val window = minOf(if (index == 0) 15_000L else 12_000L, maxOf(6_000L, share))
+            walk.startPass(pass.noProxy)
+            for ((wave, ms) in listOf(
+                walk.live(MirrorMemory.order(raw, liveOrigins.toList()), pass.noProxy) to ORIGIN_WINDOW_MS,
+                walk.live(MirrorMemory.order(raw, liveMirrors.toList()), pass.noProxy) to window,
+            )) {
                 if (wave.isEmpty()) continue
                 if (System.currentTimeMillis() >= deadline) break
-                val got = raceFirst(wave, FANOUT, ms) { tryOne(passClient(pass), it) }
+                val got = raceFirst(wave, FANOUT, ms) { tryOne(passClient(pass), it, pass.noProxy) }
                 if (got != null) {
-                    System.err.println("net-ladder(repo): served by pass '" + pass.key + "' (" + got.first + ")")
+                    System.err.println(
+                        "net-ladder(repo): served by pass '" + pass.key + "' (" + got.first + ") in " +
+                            (System.currentTimeMillis() - (deadline - REPO_FETCH_DEADLINE_MS)) + "ms",
+                    )
                     lastWinPassKey = pass.key
                     NetMemory.remember(pass)
                     return Result.success(got.first to got.second)
                 }
+            }
+            if (walk.hopeless()) {
+                System.err.println("net-ladder(repo): every candidate failed certificate verification — no other pass can change a trust decision")
+                break
             }
             System.err.println("net-ladder(repo): pass '" + pass.key + "' exhausted every candidate")
         }
@@ -742,15 +1041,15 @@ object Http {
             onStep?.invoke("Fetching repo… (last-resort mirror)")
             for (pass in ladder) {
                 if (System.currentTimeMillis() >= deadline) break
-                raceFirst(snapshotUrls.toList(), RACE_PARALLELISM, 20_000L) {
-                    tryOne(passClient(pass), it)
+                raceFirst(walk.live(snapshotUrls.toList(), pass.noProxy), FANOUT, 15_000L) {
+                    tryOne(passClient(pass), it, pass.noProxy)
                 }?.let {
                     NetMemory.remember(pass)
                     return Result.success(it.first to it.second)
                 }
             }
         }
-        return Result.failure(Exception(summariseFailures(failures)))
+        return Result.failure(Exception(summariseFailures(walk.failures)))
     }
 
     /** Resolves [url] against [baseUrl] when it is relative. The CloudStream
@@ -813,8 +1112,9 @@ object Http {
     /** Short human-readable reason for a failed network call: collapses the
      *  multi-line Conscrypt/BoringSSL TLS noise into a single line. */
     fun humanMessage(t: Throwable?): String {
-        // The single most common desktop failure deserves a sentence a user can
-        // act on, not an OpenSSL routine dump.
+        // The two desktop failures that deserve a sentence a user can act on,
+        // not an OpenSSL/BoringSSL routine dump.
+        if (isCertTrustFailure(t)) return CERT_TRUST_MESSAGE
         if (isTlsStackFailure(t)) return "the TLS handshake is being blocked by this network"
         val raw = t?.message?.trim().orEmpty().ifBlank { t?.javaClass?.simpleName ?: "unknown network error" }
         val firstLine = raw.lineSequence().firstOrNull { it.isNotBlank() } ?: raw
@@ -886,6 +1186,17 @@ object Http {
      *  — so probe the first bytes and classify. */
     enum class StreamProbe { HLS, VIDEO, DASH, HTML, JSON, UNKNOWN }
 
+    /**
+     * Signed, single-use stream links (chaturbate's `mmcdn.com` / `edge-hls`
+     * hosts): their token is valid for one request and expires in seconds, so
+     * NOTHING may touch the URL before the player does — a probe would burn the
+     * token and the player's own request would 403. Used by the speed race
+     * ([streamLatencyMs]) and by the player's launch path.
+     */
+    fun isSignedStreamUrl(url: String): Boolean =
+        url.contains("/v1/edge/streams/") || url.contains("mmcdn.com") ||
+            url.contains("edge-hls.chaturbate.com")
+
     /** Fast classifier client: short timeouts, system resolver (no DoH) so a
      *  filtered network fails fast as UNKNOWN and the player's own DoH proxy
      *  path takes over instead of stalling playback. */
@@ -901,6 +1212,57 @@ object Http {
         } catch (t: Throwable) {
             null
         }
+    }
+
+    /**
+     * The player's "play straight away" server race: how many milliseconds the
+     * server needed to ANSWER (headers in, first bytes back), or null when it
+     * did not answer inside [budgetMs].
+     *
+     * This is the only honest way to pick "the fastest server": the provider's
+     * ordering is about quality and the source list, not about which host is
+     * actually reachable from this machine right now — and a host that takes 9
+     * seconds to say hello is the reason a video "takes ages to start".
+     *
+     * The probe is a 2-byte ranged GET with the provider's own headers, so it is
+     * as cheap as a player's own first request and cannot download anything.
+     * Signed, single-use links must never be probed (the request would burn the
+     * token and the player's own request would 403) — callers skip those.
+     */
+    fun streamLatencyMs(
+        url: String,
+        headers: Map<String, String> = emptyMap(),
+        budgetMs: Long = 2_500L,
+    ): Long? {
+        val clean = sanitizeStreamUrl(url)
+        if (!clean.startsWith("http://") && !clean.startsWith("https://")) return null
+        val started = System.currentTimeMillis()
+        return try {
+            val b = Request.Builder().url(clean)
+                .header("User-Agent", UA)
+                .header("Range", "bytes=0-1")
+            headers.forEach { (k, v) -> if (k.isNotBlank() && v.isNotBlank()) b.header(k, v) }
+            val call = latencyClient.newCall(b.build())
+            runCatching { call.timeout().timeout(budgetMs.coerceIn(500L, 10_000L), TimeUnit.MILLISECONDS) }
+            call.execute().use { resp ->
+                if (!resp.isSuccessful) return null
+                System.currentTimeMillis() - started
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** The client [streamLatencyMs] uses: one, with the probe budget baked in. */
+    private val latencyClient: OkHttpClient by lazy {
+        applyConscryptTls(OkHttpClient.Builder())
+            .proxySelector(java.net.ProxySelector.getDefault())
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .connectTimeout(3, TimeUnit.SECONDS)
+            .readTimeout(3, TimeUnit.SECONDS)
+            .callTimeout(4, TimeUnit.SECONDS)
+            .build()
     }
 
     /** Fetches the first bytes of a stream URL (with the provider's Referer /
@@ -1227,17 +1589,18 @@ object Http {
     }
 
     fun fetchStringRobust(url: String, headers: Map<String, String> = emptyMap()): Result<String> {
+        val started = System.currentTimeMillis()
         val origins = MirrorMemory.order(url, originVariants(url))
         val mirrors = MirrorMemory.order(url, mirrorVariants(url))
-        val failures = java.util.concurrent.ConcurrentLinkedQueue<Throwable>()
-        fun attempt(c: OkHttpClient, u: String): String? {
+        val walk = Walk()
+        fun attempt(c: OkHttpClient, u: String, throughProxy: Boolean): String? {
             val r = getStringStrictOn(c, u, headers)
             if (r.isSuccess) {
                 MirrorMemory.markAlive(u)
                 MirrorMemory.rememberWinner(url, u)
             } else {
                 val cause = r.exceptionOrNull()
-                cause?.let { failures += it }
+                walk.record(u, cause, throughProxy)
                 if (isHostFailure(cause)) MirrorMemory.markDead(u)
             }
             return r.getOrNull()
@@ -1251,36 +1614,130 @@ object Http {
         // and the CDN/proxy mirrors only if those all fail: racing them together
         // lets a stale CDN copy of a branch file answer first, which is how a
         // repo add shows an old extension list and an install fetches an old jar.
+        //
+        // [Walk] is what keeps a hopeless network from costing a minute: a host
+        // whose certificate was rejected is not asked again on the next pass,
+        // and a pass where every failure was a certificate rejection ends the
+        // ladder outright (see [Walk.hopeless]).
         for (pass in passes()) {
-            for ((wave, kind) in listOf(origins to "origin", mirrors to "mirror")) {
+            walk.startPass(pass.noProxy)
+            for ((wave, kind) in listOf(
+                walk.live(origins, pass.noProxy) to "origin",
+                walk.live(mirrors, pass.noProxy) to "mirror",
+            )) {
                 if (wave.isEmpty()) continue
                 val window = if (kind == "origin") ORIGIN_WINDOW_MS else MIRROR_WINDOW_MS
-                val got = raceFirst(wave, FANOUT, window) { attempt(passClient(pass), it) }
+                val got = raceFirst(wave, FANOUT, window) { attempt(passClient(pass), it, pass.noProxy) }
                 if (got != null) {
-                    System.err.println("net-ladder: served by pass '" + pass.key + "' (" + kind + " " + got.first + ")")
+                    System.err.println(
+                        "net-ladder: served by pass '" + pass.key + "' (" + kind + " " + got.first + ") in " +
+                            (System.currentTimeMillis() - started) + "ms",
+                    )
                     lastWinPassKey = pass.key
                     NetMemory.remember(pass)
                     return Result.success(got.second)
                 }
             }
+            if (walk.hopeless()) {
+                System.err.println("net-ladder: every candidate failed certificate verification — no other pass can change a trust decision")
+                break
+            }
             System.err.println("net-ladder: pass '" + pass.key + "' exhausted every candidate")
         }
         // The full-timeout client, for hosts that are merely slow rather than
         // dead (a throttled link can need longer than the probe) — on the
-        // compatibility stack, since every normal attempt has now failed.
-        raceFirst(origins + mirrors, FANOUT, 40_000L) { u -> runCatching { getStringStrictOn(client, u, headers).getOrNull() }.getOrNull()?.also { MirrorMemory.markAlive(u) } }
-            ?.let { return Result.success(it.second) }
-        return Result.failure(Exception(summariseFailures(failures)))
+        // compatibility stack, since every normal attempt has now failed. Hosts
+        // that already failed for a stack-independent reason are skipped.
+        val left = walk.live(origins + mirrors, false)
+        if (left.isNotEmpty()) {
+            raceFirst(left, FANOUT, 15_000L) { u ->
+                runCatching { getStringStrictOn(client, u, headers).getOrNull() }
+                    .getOrNull()?.also { MirrorMemory.markAlive(u) }
+            }?.let { return Result.success(it.second) }
+        }
+        System.err.println("net-fetch: gave up on $url after " + (System.currentTimeMillis() - started) + "ms")
+        return Result.failure(Exception(summariseFailures(walk.failures)))
+    }
+
+    /**
+     * One "try every candidate URL until one answers" walk.
+     *
+     * Two rules turn a blocked network from a minute-long spinner into a few
+     * seconds of honest failure:
+     *
+     *  - a host that failed for a reason **no other TLS stack can change** — a
+     *    rejected certificate, a refused connection, a dead DNS name, an HTTP
+     *    error — is never tried again in a later pass *on the same route*;
+     *  - a pass in which EVERY failure was a certificate rejection ends the walk
+     *    outright: the TLS-1.2 pass presents the same chain to the same trust
+     *    store, so it cannot make that trust store trust it.
+     *
+     * The route matters and is therefore part of the key: going through the
+     * system proxy and going direct are genuinely different paths (a leftover
+     * OS proxy is exactly the desktop misconfiguration the no-proxy pass
+     * rescues, and a proxy can present its own chain), so a host failed through
+     * the proxy is still asked again directly.
+     */
+    private class Walk {
+
+        val failures = java.util.concurrent.ConcurrentLinkedQueue<Throwable>()
+
+        /** Route-keyed: "url|p" through the system proxy, "url|d" direct. */
+        private val spent = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+
+        private var passFailures = java.util.concurrent.ConcurrentHashMap<String, Throwable>()
+
+        private var viaProxy = false
+
+        fun startPass(throughProxy: Boolean) {
+            passFailures = java.util.concurrent.ConcurrentHashMap()
+            viaProxy = throughProxy
+        }
+
+        /** The candidates still worth asking on this pass. */
+        fun live(urls: List<String>, throughProxy: Boolean): List<String> =
+            urls.filter { !spent.containsKey(route(it, throughProxy)) }
+
+        fun record(url: String, cause: Throwable?, throughProxy: Boolean) {
+            if (cause == null) return
+            failures += cause
+            val key = route(url, throughProxy)
+            passFailures[key] = cause
+            if (!Http.isTlsStackFailure(cause)) spent[key] = true
+        }
+
+        /** True when this pass proved that no other stack can get through: every
+         *  candidate failed CERTIFICATE verification.
+         *
+         *  A trust decision does not depend on the TLS version and cannot be
+         *  retried away, so the remaining passes would ask the same hosts the
+         *  same question and get the same answer — that re-asking is what made
+         *  one rejected certificate into a minute of "Fetching repo…".
+         *
+         *  The route matters: through a proxy the chain may be the proxy's own,
+         *  so a DIRECT pass is still worth its (bounded) time — but when the OS
+         *  has no proxy configured the "proxy" passes ARE direct, and waiting
+         *  for one of them would only delay the error by a whole pass. */
+        fun hopeless(): Boolean {
+            if (passFailures.isEmpty()) return false
+            if (!passFailures.values.all { Http.isCertTrustFailure(it) }) return false
+            return !viaProxy || !Http.systemProxyInUse()
+        }
+
+        private fun route(url: String, throughProxy: Boolean): String =
+            url + (if (throughProxy) "|p" else "|d")
     }
 
     fun fetchBytesRobust(url: String, headers: Map<String, String> = emptyMap()): ByteArray? {
+        val started = System.currentTimeMillis()
         val origins = MirrorMemory.order(url, originVariants(url))
         val mirrors = MirrorMemory.order(url, mirrorVariants(url))
-        fun attempt(c: OkHttpClient, u: String): ByteArray? {
-            val b = runCatching {
-                getOn(c, u, headers).use { r -> if (r.isSuccessful) r.body?.bytes() else null }
-            }.getOrNull()
+        val walk = Walk()
+        fun attempt(c: OkHttpClient, u: String, throughProxy: Boolean): ByteArray? {
+            val r = runCatching { getOn(c, u, headers) }
+            val b = r.getOrNull()?.use { if (it.isSuccessful) it.body?.bytes() else null }
             if (b == null) {
+                walk.record(u, r.exceptionOrNull() ?: Exception("HTTP error for " + u), throughProxy)
                 MirrorMemory.markDead(u)
                 return null
             }
@@ -1290,6 +1747,7 @@ object Http {
                 // 122-byte stub beats an 88 KB extension every time. See
                 // [mirrorVariants].
                 System.err.println("net: ignoring a web page served for $u")
+                walk.record(u, Exception("an HTML error page, not the file"), throughProxy)
                 MirrorMemory.markDead(u)
                 return null
             }
@@ -1298,14 +1756,24 @@ object Http {
             return b
         }
         // Authoritative URLs first, mirrors after — a CS3/JAR downloaded from a
-        // stale CDN copy installs an extension that cannot load.
+        // stale CDN copy installs an extension that cannot load. Hosts that
+        // already failed for a stack-independent reason are not re-asked on the
+        // next pass (see [Walk]).
         for (pass in passes()) {
-            raceFirst(origins, FANOUT, ORIGIN_WINDOW_MS) { attempt(passClient(pass), it) }?.let { return it.second }
-            raceFirst(mirrors, FANOUT, MIRROR_WINDOW_MS) { attempt(passClient(pass), it) }?.let { return it.second }
+            walk.startPass(pass.noProxy)
+            raceFirst(walk.live(origins, pass.noProxy), FANOUT, ORIGIN_WINDOW_MS) { attempt(passClient(pass), it, pass.noProxy) }
+                ?.let { return it.second }
+            raceFirst(walk.live(mirrors, pass.noProxy), FANOUT, MIRROR_WINDOW_MS) { attempt(passClient(pass), it, pass.noProxy) }
+                ?.let { return it.second }
+            if (walk.hopeless()) {
+                System.err.println("net-ladder(bytes): every candidate failed certificate verification — stopping")
+                break
+            }
         }
         if (systemProxyInUse()) {
-            raceFirst(origins + mirrors, RACE_PARALLELISM, 30_000L) { attempt(noProxyClient, it) }?.let { return it.second }
+            raceFirst(walk.live(origins + mirrors, true), FANOUT, 20_000L) { attempt(noProxyClient, it, true) }?.let { return it.second }
         }
+        System.err.println("net-bytes: gave up on $url after " + (System.currentTimeMillis() - started) + "ms")
         return null
     }
 
@@ -1336,15 +1804,40 @@ object Http {
         // (the Android app caps installs at 90s for the same reason).
         val deadline = System.currentTimeMillis() + DOWNLOAD_BUDGET_MS
         sweepParts(dest)
-        if (raceDownload(origins, dest, headers, onProgress, onAttempt, deadline, null, MAIN_RACE_MS, url)) return true
-        if (raceDownload(ordered, dest, headers, onProgress, onAttempt, deadline, null, MAIN_RACE_MS, url)) return true
+        // A certificate rejection is not worth walking the rest of the ladder
+        // for: the TLS-1.2 pass, the direct route and the mirrors all present
+        // the same chain to the same trust store. Counting it here is what kept
+        // "install" from sitting on a spinner for a minute on a machine whose
+        // store cannot verify the host (see [trustStore] and
+        // [TlsTrustSelfTest]).
+        val attempts = java.util.concurrent.atomic.AtomicInteger()
+        val certRejections = java.util.concurrent.atomic.AtomicInteger()
+        var certRejected = false
+        val counting: (String, Boolean, String?) -> Unit = { u, ok, why ->
+            if (!ok) {
+                attempts.incrementAndGet()
+                if (why != null && why.contains(CERT_TRUST_MESSAGE)) certRejections.incrementAndGet()
+                if (attempts.get() > 2 && certRejections.get() == attempts.get()) certRejected = true
+            }
+            onAttempt?.invoke(u, ok, why)
+        }
+        if (raceDownload(origins, dest, headers, onProgress, counting, deadline, null, MAIN_RACE_MS, url)) return true
+        if (certRejected) {
+            System.err.println("downloadToRobust: every candidate was rejected by the certificate store — stopping")
+            return false
+        }
+        if (raceDownload(ordered, dest, headers, onProgress, counting, deadline, null, MAIN_RACE_MS, url)) return true
+        if (certRejected) {
+            System.err.println("downloadToRobust: every candidate was rejected by the certificate store — stopping")
+            return false
+        }
         // Rescue passes with the system proxy bypassed ([noProxyClient]) and then
         // with TLS pinned to 1.2 ([rescueClient]) — the two desktop
         // misconfigurations where every request fails while the browser works.
         if (systemProxyInUse() &&
-            raceDownload(ordered, dest, headers, onProgress, onAttempt, deadline, noProxyClient, RESCUE_RACE_MS, url, "(no proxy)")
+            raceDownload(ordered, dest, headers, onProgress, counting, deadline, noProxyClient, RESCUE_RACE_MS, url, "(no proxy)")
         ) return true
-        if (raceDownload(ordered, dest, headers, onProgress, onAttempt, deadline, rescueClient, RESCUE_RACE_MS, url, "(TLS 1.2)")) return true
+        if (raceDownload(ordered, dest, headers, onProgress, counting, deadline, rescueClient, RESCUE_RACE_MS, url, "(TLS 1.2)")) return true
         System.err.println("downloadToRobust failed for $url")
         return false
     }
@@ -1405,8 +1898,12 @@ object Http {
         // them four at a time meant the working mirror waited behind the blocked
         // ones for a whole connect timeout — see [FANOUT].
         val wave = variants
+        // Never let one wave run past the overall budget: the second and third
+        // waves used to be allowed their FULL window even with seconds left on
+        // the clock, which is how a failed install could still take two minutes.
+        val window = minOf(windowMs, maxOf(2_000L, deadline - System.currentTimeMillis()))
         val staging = java.util.concurrent.ConcurrentHashMap<String, java.io.File>()
-        val winner = raceFirst(wave, FANOUT, windowMs) { u ->
+        val winner = raceFirst(wave, FANOUT, window) { u ->
             if (System.currentTimeMillis() > deadline) return@raceFirst null
             val part = partOf(dest, u)
             staging[u] = part

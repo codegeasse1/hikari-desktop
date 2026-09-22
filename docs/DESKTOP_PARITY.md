@@ -322,6 +322,100 @@ compatibility ladder now gets an EQUAL share of the fetch deadline instead of th
 first one helping itself to half of it — a first pass that ate the whole budget is
 how a repo reported "unreachable" while the next stack would have loaded it.
 
+## Stage 8 — the certificate trust store (the real reason NO repo loaded), instant reinstalls, player teardown, "play straight away" (done)
+
+Four complaints from a released build.
+
+**1. "Adding any repo shows this" — and the app blamed the network.** The error card
+read `No server answered from this network — the TLS handshake is being blocked by
+this network … Unacceptable certificate: CN=AAA Certificate Services, O=Comodo CA
+Limited …` for every repo, every extension download and every mirror, on a machine
+whose browser opened the same URLs fine. It was none of the things it said.
+
+Every HTTP client here is pinned to Conscrypt, and Conscrypt takes its trust anchors
+from the JDK's `lib/security/cacerts` snapshot (its `Platform.getDefaultCertKeyStore()`
+asks the JDK's PKIX trust manager for its accepted issuers). That snapshot no longer
+contains the legacy Comodo/Sectigo **AAA Certificate Services** root — verified against
+Temurin 17.0.20 and 21.0.12: both ship USERTrust RSA and the Sectigo R46 root, neither
+ships AAA — while GitHub's CDN still serves chains that end at a Sectigo root
+cross-signed by AAA. So the app rejected every GitHub-family host with a certificate
+error, and the retry ladder turned that one verdict into a minute of "Fetching repo…".
+
+The fix is `Http.trustStore()`: the anchors are assembled explicitly, once per
+process, from three sources — the JDK's own store, the **Windows certificate store**
+(`Windows-ROOT`: literally what Chrome/Edge trust on that machine, and the reason a
+corporate/AV inspection root now works too), and `desktop/src/main/resources/cacerts-extra.pem`,
+which ships AAA (provenance and the `curl`/`openssl` recipe are in the file's header).
+Nothing is trusted blindly — every anchor comes from a public CA program and
+certificate *validation* is unchanged.
+
+Conscrypt's own behaviour is why the file is parsed by hand: `CertificateFactory.generateCertificates`
+yields **nothing at all, silently**, for a stream holding text it does not understand,
+and that file carries a comment header. The first build of this shipped with
+`extra=0` — the extra anchor was never loaded — and CI passed anyway because the
+Windows store happened to hold the same root. `TlsTrustSelfTest` now asserts against
+the FILE as well as the merged store (`extraAnchorCount()`, `extraAnchorFingerprints()`),
+so that failure cannot pass unnoticed again; `Http.trustStoreReport()` prints
+`anchors=N (jdk=… windows=… extra=…)` on every run.
+
+Certificate rejections are also now *classified* (`isCertTrustFailure`) and separated
+from our own race-cancellation noise, so the failure summary says
+`this machine's certificate store doesn't trust the site's CA chain` — a sentence the
+user can act on — instead of `(3) Unacceptable certificate … (2) InterruptedException`,
+and `humanMessage` puts that reason first.
+
+**2. Repo fetches stop after one honest verdict (and are fast).** The ladder's
+`Walk` is now route-keyed (`url|p` through the system proxy, `url|d` direct): a host
+that failed for a stack-INDEPENDENT reason is not asked again on the next pass, and
+`Walk.hopeless()` ends the ladder outright when every candidate on a direct pass was
+rejected by the certificate store — a trust decision does not depend on the TLS
+version and cannot be retried away. The windows came down with it
+(`REPO_FETCH_DEADLINE_MS` 75s → 30s, origin 12s → 9s, mirror 25s → 15s, later passes
+15s/12s, tail rescue 40s → 15s, `DOWNLOAD_BUDGET_MS` 90s → 60s) and `raceDownload`
+clamps its window to whatever is left of the budget. Timing is logged
+(`net-ladder(repo): served by pass … in Xms`, `net-fetch: gave up on … after Xms`), so
+"it took a minute" is now a number in the log rather than an impression. Measured on
+CI: a repo manifest in 22–30 ms once a stack is known, and a 404 answered in 4 s
+instead of a minute.
+
+**3. Installs and uninstalls are instant when the bytes are already here.** The
+published sha256 IS the identity of a build, so `ExtCache` (a capped, LRU-trimmed
+folder under `filesDir/cache/extensions`, keyed by that sha256) keeps the verified
+bytes of every extension this machine has ever installed. `installPlugin` therefore
+downloads nothing when (a) the destination already matches the repo's published hash,
+or (b) the cache holds those exact bytes — which covers a reinstall, a repair, a
+re-add from another repo, and an add-after-uninstall (uninstall deliberately leaves
+the cached copy, since the same build is routinely re-added). `install:` /
+`uninstall: <name> in Xms` is logged with the elapsed time, and the downloaded bytes
+are cached only *after* `verifyDownload` has passed (zip header + published hash).
+
+**4. "Play" starts the fastest server it can actually reach.** New setting
+**Settings → Playback → "Play straight away — pick the fastest working server for me"**
+(on by default; `AppStore.playFastest`). With it on, `DetailScreen.playBest` probes up
+to `MAX_PROBE_SOURCES` (6) usable sources CONCURRENTLY with `Http.streamLatencyMs`
+— a 2-byte ranged GET on a 3-second-timeout client — under a `PROBE_BUDGET_MS` (2.5 s)
+budget, and starts the one that answered fastest; every probe is in flight at once, so
+the cost is one round-trip, not a sum. Torrents, YouTube ids, browser-only links and
+signed single-use URLs are never probed (a probe would burn the token the player
+needs) — those keep the provider's order, as does everything when the setting is off.
+The player is still handed every source found, so its Source menu can switch servers
+mid-playback; the race only decides where playback begins. The outcome is logged
+(`play: server race -> a=312ms, b=no answer … winner=…`).
+
+**5. Closing the app no longer leaves the player frozen on screen.** The video is
+mpv's own Win32 window, adopted by the app — so it does not die with the app, and
+abandoning it left mpv's last frame sitting over the desktop. `WinShell.parkAndHide`
+(`ShowWindow(SW_HIDE)` + `SetWindowPos` to `PARKED_X/Y`) is called FIRST in
+`PlayerWindow.closeInternal()` and from `PlayerWindow.parkSurface()` (any thread), and
+`DesktopPlayer.shutdown()` — park, close IPC, close the window layer, then kill mpv —
+runs from `Main`'s `setOnCloseRequest`, from `Application.stop()` and from a JVM
+shutdown hook. Nothing on that path touches `Fx` any more (a `Platform.runLater` after
+the toolkit is gone throws, and the player would survive). The kill itself is explicit
+and waited on: descendants → `destroy()` → 1.5 s → `destroyForcibly()` → 1 s
+(`player: mpv pid=… alive=false (stopped in Xms)`). `EmbedSelfTest` now asserts both
+halves: `parkAndHide` takes mpv's window off the screen, and the window is GONE once
+the process is killed.
+
 ## Still to do
 
 ### i18n

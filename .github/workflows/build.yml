@@ -188,6 +188,15 @@ jobs:
           java -cp "jpackage-input/*" com.hikari.app.net.NetworkSelfTestKt
         shell: bash
 
+      - name: TLS trust self-test (GitHub raw + repo manifest through Conscrypt)
+        if: always()
+        timeout-minutes: 8
+        run: |
+          set -e
+          java -cp "jpackage-input/*" com.hikari.app.net.TlsTrustSelfTestKt
+        shell: bash
+
+
       - name: Diagnose packaged runtime
         run: |
           set +e

@@ -419,6 +419,21 @@ object PlayerWindow {
         embedded = false
     }
 
+    /**
+     * Moves the adopted video window far off-screen and hides it, from ANY
+     * thread. Used while the player — or the whole app — is being torn down:
+     * the video is another process's window, so if the app simply stops
+     * touching it, whatever it last painted (a frozen frame) sits over the
+     * desktop until that process dies. Hiding it makes the teardown instant and
+     * visible, whatever the kill costs.
+     */
+    fun parkSurface() {
+        val h = surfaceHwnd ?: return
+        runCatching { WinShell.parkAndHide(h) }
+        surfaceHwnd = null
+        embedded = false
+    }
+
     private fun safeSync() {
         runCatching { syncSurface() }
     }
@@ -809,7 +824,10 @@ object PlayerWindow {
         uninstallKeys()
         runCatching { ipc?.close() }
         ipc = null
-        releaseSurface()
+        // FIRST: take the video window out of the picture. It belongs to mpv,
+        // not to JavaFX, so a half-finished teardown (or a slow kill) would
+        // otherwise leave its last frame frozen over the app.
+        parkSurface()
         // Leaving the app fullscreen with no player in it would strand the user
         // on a screen with no controls.
         runCatching {

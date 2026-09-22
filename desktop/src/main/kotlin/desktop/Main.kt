@@ -13,6 +13,17 @@ import javafx.stage.StageStyle
 
 fun main() {
     installCrashLogger()
+    // The player is a SEPARATE process (mpv) whose window the app adopts, so
+    // nothing about the app going away kills it by itself. Every exit path gets
+    // this hook: the window's close button, Alt+F4, a taskkill, a crash in the
+    // FX thread — any of which used to leave mpv running with its last frame
+    // frozen on the desktop. Shutdown hooks run in parallel with the exit, so
+    // the kill inside is bounded (see DesktopPlayer.killMpv).
+    runCatching {
+        Runtime.getRuntime().addShutdownHook(
+            Thread({ runCatching { desktop.player.DesktopPlayer.shutdown() } }, "hikari-player-shutdown"),
+        )
+    }
     val app = HikariApp()
     app.init()
     Application.launch(HikariDesktopApp::class.java)
@@ -69,7 +80,19 @@ class HikariDesktopApp : Application() {
         stage.minHeight = minOf(560.0, h)
         stage.x = bounds.minX + (bounds.width - w) / 2
         stage.y = bounds.minY + (bounds.height - h) / 2
+        // Closing the window (the app's own close button calls stage.close(),
+        // and Alt+F4 goes through the same request) must take the video player
+        // with it — see the shutdown hook in main().
+        stage.setOnCloseRequest { runCatching { desktop.player.DesktopPlayer.shutdown() } }
         stage.show()
         AppShell.show(Screen.Home)
+    }
+
+    /** Called by the toolkit once the last window is gone (and by [Platform.exit]).
+     *  The shutdown hook covers anything that skips this, but stopping playback
+     *  here makes the normal path deterministic: the app is not "gone" until mpv
+     *  is. */
+    override fun stop() {
+        runCatching { desktop.player.DesktopPlayer.shutdown() }
     }
 }

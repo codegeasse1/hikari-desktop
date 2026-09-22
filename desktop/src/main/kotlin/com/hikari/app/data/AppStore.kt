@@ -74,6 +74,22 @@ class AppStore(private val dir: File) {
         const val TRANSLATE_CACHE = "translateCache"
         const val DL_CONCURRENCY = "downloadConcurrency"
         const val DL_TO_FOLDER = "downloadToFolder"
+        const val PLAY_FASTEST = "playFastest"
+    }
+
+    /**
+     * "Play straight away" (default on): clicking Play picks the FASTEST server
+     * that answers for the title and starts it, instead of the first entry the
+     * provider happened to list, and without waiting for the user to choose one.
+     * The player's Source menu still lists every server, so a bad pick is one
+     * click from being changed — see [desktop.ui.DetailScreenView].
+     */
+    fun playFastestFlow(): Flow<Boolean> = flowOf { playFastest() }
+
+    fun playFastest(): Boolean = (get(K.PLAY_FASTEST) ?: "true").toBoolean()
+
+    fun setPlayFastest(value: Boolean) {
+        put(K.PLAY_FASTEST, value)
     }
 
     fun downloadConcurrency(): Int =

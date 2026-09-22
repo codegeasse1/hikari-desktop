@@ -6,6 +6,7 @@ import com.hikari.app.data.HistoryEntry
 import com.hikari.app.data.MediaItem
 import com.hikari.app.data.MediaType
 import com.hikari.app.data.StreamSource
+import com.hikari.app.net.Http
 import com.hikari.app.download.DownloadKind
 import com.hikari.app.download.DownloadStatus
 import com.hikari.app.download.DownloadTask
@@ -31,8 +32,11 @@ import javafx.scene.shape.Rectangle
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * The title screen.
@@ -677,7 +681,9 @@ class DetailScreenView(private val item: MediaItem) {
                 renderPanel()
                 if (pendingPlay) {
                     pendingPlay = false
-                    playFirst()
+                    // Play straight away: the race starts as soon as the
+                    // sources land, instead of waiting for a click.
+                    playBest(list)
                 }
                 if (pendingDownload) {
                     pendingDownload = false
@@ -770,13 +776,75 @@ class DetailScreenView(private val item: MediaItem) {
     }
 
     private fun playFirst() {
-        val first = streams.firstOrNull()
-        if (first != null) {
-            play(first)
+        val list = streams
+        if (list.isNotEmpty()) {
+            playBest(list)
         } else {
+            // Nothing looked up yet: fetch, and start the fastest one the moment
+            // the list lands (see [loadStreams]).
             pendingPlay = true
             loadStreams()
         }
+    }
+
+    /**
+     * What the Play button does.
+     *
+     * With "Play straight away" on (Settings → Playback, the default), the
+     * server race in [pickFastest] decides: whichever source answers first is
+     * started, without making the user choose one. With it off, the provider's
+     * own order wins.
+     *
+     * Either way the PLAYER is handed every source that was found, so its
+     * Source menu can switch servers mid-playback — the race only decides where
+     * playback starts.
+     */
+    private fun playBest(list: List<StreamSource>) {
+        if (list.isEmpty()) return
+        if (!AppShell.app.store.playFastest()) {
+            play(list.first())
+            return
+        }
+        scope.launch {
+            val best = runCatching { pickFastest(list) }.getOrNull() ?: list.first()
+            Fx.run { play(best) }
+        }
+    }
+
+    /**
+     * "The fastest server it finds" — measured, not guessed.
+     *
+     * The provider's ordering says nothing about which server is reachable from
+     * THIS machine right now: a host that is blocked, throttled or simply slow
+     * is the reason a video "takes ages to start" while three better servers sit
+     * below it in the list. So the first few usable sources are asked
+     * concurrently for their first bytes ([Http.streamLatencyMs]) and the
+     * quickest answer wins; every probe is in flight at the same time, so the
+     * cost is one round-trip, not a sum.
+     *
+     * Sources that must not be probed are left alone and keep the provider's
+     * order: torrents and YouTube/external links (not media URLs), and signed
+     * single-use links, whose first request would burn the token the player
+     * needs.
+     */
+    private suspend fun pickFastest(list: List<StreamSource>): StreamSource? = withContext(Dispatchers.IO) {
+        val probeable = list.filter {
+            it.url.startsWith("http") && !it.externalUrl && it.ytId == null && !it.isTorrent &&
+                !Http.isSignedStreamUrl(it.url)
+        }.take(MAX_PROBE_SOURCES)
+        if (probeable.size < 2) return@withContext probeable.firstOrNull()
+        val measured = probeable.map { s ->
+            async {
+                s to runCatching { Http.streamLatencyMs(s.url, s.headers, PROBE_BUDGET_MS) }.getOrNull()
+            }
+        }.awaitAll()
+        val winner = measured.filter { it.second != null }.minByOrNull { it.second ?: Long.MAX_VALUE }?.first
+        println(
+            "play: server race -> " + measured.joinToString(", ") { (s, ms) ->
+                s.name.take(24) + "=" + (ms?.toString() ?: "no answer")
+            } + "  winner=" + (winner?.name ?: "(provider order)"),
+        )
+        winner ?: probeable.first()
     }
 
     /** The banner's Download button: queue the best downloadable source, waiting
@@ -960,5 +1028,16 @@ class DetailScreenView(private val item: MediaItem) {
 
         /** Minimum gap between two history position writes while playing. */
         const val POSITION_SAVE_INTERVAL_MS = 10_000L
+
+        /** How many of a title's sources the "fastest server" race probes.
+         *  Enough to find a good one among the usual spread (three or four
+         *  mirrors per provider), few enough that the race is one round-trip. */
+        const val MAX_PROBE_SOURCES = 6
+
+        /** How long one probe may take before that server is out of the race.
+         *  The probes run in parallel, so this is also the race's worst case —
+         *  and a server that needs longer than this to say hello is not the
+         *  fastest one anyway. */
+        const val PROBE_BUDGET_MS = 2_500L
     }
 }

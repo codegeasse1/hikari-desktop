@@ -1402,18 +1402,35 @@ class ExtensionsScreenView {
         setStatus("Installing $name…", busy = true)
         fillPlugins()
         AppShell.uiScope.launch {
+            val startedAt = System.currentTimeMillis()
             var statusText = "Install failed: unknown error"
             var isErr = true
             try {
                 val safeName = name.lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-').ifBlank { "ext" }
                 val dest = File(extDir, "$safeName.jar")
-                // A reinstall or a repair of the build that is already on disk:
-                // when the repo publishes a sha256 for it (every big repo does —
-                // that is what the "signed" badge means) and the local file
-                // matches, the download would only make the user wait for bytes
-                // they already have. Re-registering the file IS the install.
-                val reused = dest.isFile && dest.length() > 0L && fileHash != null &&
+                // Downloads are the only slow part of an install, so nothing is
+                // downloaded when this machine already has the exact bytes:
+                //  1. the extension itself is on disk and matches the repo's
+                //     published sha256 — a reinstall or a repair, where
+                //     re-registering the file IS the install (every big repo
+                //     publishes a sha256: that is what the "signed" badge means);
+                //  2. the shared extension cache holds those bytes already.
+                //     Uninstall keeps the cached copy on purpose: the same build
+                //     is routinely re-added from another repo (or after removing
+                //     a repo by mistake), and its bytes were verified once.
+                var reused = dest.isFile && dest.length() > 0L && fileHash != null &&
                     verifyDownload(dest, dl, fileHash, jarHash) == null
+                if (!reused) {
+                    val cached = ExtCache.file(expectedShaFor(dl, fileHash, jarHash))
+                    if (cached != null) {
+                        val fromCache = runCatching { cached.copyTo(dest, overwrite = true) }.isSuccess &&
+                            verifyDownload(dest, dl, fileHash, jarHash) == null
+                        if (fromCache) {
+                            reused = true
+                            System.err.println("install: $name from the extension cache (no download)")
+                        }
+                    }
+                }
                 if (!reused) dest.delete()
                 // CloudStream repos publish the same plugin side by side as a
                 // dex .cs3 and a JVM .jar (Hikari repos: .hiki/.jar). When the
@@ -1455,6 +1472,11 @@ class ExtensionsScreenView {
                         dest.delete()
                         continue
                     }
+                    // These bytes are verified (zip header + the repo's sha256),
+                    // so keep them: the next install of this build — after an
+                    // uninstall, or from another repo that lists it — is then
+                    // instant, because nothing has to be downloaded at all.
+                    ExtCache.put(expectedShaFor(c, fileHash, jarHash), dest)
                     val result = registerExtension(name, safeName, dest, dl)
                     if (result != null) {
                         registered = result
@@ -1498,6 +1520,10 @@ class ExtensionsScreenView {
                 // background work: waiting for it here is what made an install
                 // that had already finished look like it was still going.
                 renderAll()
+                System.err.println(
+                    "install: " + name + (if (isErr) " FAILED" else "") + " in " +
+                        (System.currentTimeMillis() - startedAt) + "ms",
+                )
             }
             reloadProvidersQuietly()
         }
@@ -1513,6 +1539,18 @@ class ExtensionsScreenView {
             runCatching { AppShell.app.providers.refresh() }
             Fx.run { renderAll() }
         }
+    }
+
+    /** The sha256 a repo publishes for this file, or null when it publishes
+     *  none (used to look the exact bytes up in the extension cache). */
+    private fun expectedShaFor(url: String, fileHash: String?, jarHash: String?): String? {
+        val raw = when {
+            url.endsWith(".cs3") || url.endsWith(".hiki") -> fileHash
+            url.endsWith(".jar") -> jarHash ?: fileHash
+            else -> null
+        } ?: return null
+        val want = raw.removePrefix("sha256-").lowercase()
+        return want.takeIf { it.length == 64 }
     }
 
     /** Null = the downloaded file is a plausible, untampered extension; a
@@ -1594,6 +1632,7 @@ class ExtensionsScreenView {
     }
 
     private fun uninstallPlugin(name: String, url: String) {
+        val started = System.currentTimeMillis()
         val matches = providersFor(url)
         if (matches.isEmpty()) return
         busyPlugins[url] = "Uninstalling…"
@@ -1607,6 +1646,12 @@ class ExtensionsScreenView {
         setStatus("Uninstalled $name (${matches.size} extension${if (matches.size > 1) "s" else ""}).")
         AppShell.toast("Uninstalled $name", "ok")
         renderAll()
+        // Removing an extension is local work only (store row + file), so this
+        // is the whole wait the user has: the provider list refresh below runs
+        // in the background and never blocks the row.
+        System.err.println(
+            "uninstall: " + name + " in " + (System.currentTimeMillis() - started) + "ms (local)",
+        )
         reloadProvidersQuietly()
     }
 
@@ -1959,5 +2004,62 @@ class ExtensionsScreenView {
             "A bundle extension (e.g. Anime) installs each of its sub-extensions separately. " +
             "SkyStream (.sky), Nuvio (.js) and Aniyomi (.apk) extensions run natively here too, and an " +
             "m3u/m3u8 playlist becomes an IPTV provider."
+    }
+}
+
+/**
+ * The verified extension bytes this machine has already downloaded, keyed by
+ * the sha256 the repo published for them.
+ *
+ * An install is normally slow only because of the download, and the *verified*
+ * bytes behind a published sha256 never change — so keeping them makes a
+ * re-install (or an install of the same build listed by another repo) instant
+ * and offline. Uninstall deliberately leaves the copy here, because the same
+ * build is routinely re-added. The cache is capped and trims its oldest entries.
+ */
+private object ExtCache {
+    private const val MAX_BYTES = 512L * 1024 * 1024
+
+    private val dir: File by lazy {
+        File(HikariApp.instance.filesDir, "cache/extensions").apply { mkdirs() }
+    }
+
+    /** The cached file for a published sha256, if it is still here. */
+    fun file(sha: String?): File? {
+        val key = key(sha) ?: return null
+        val f = File(dir, "$key.bin")
+        if (!f.isFile || f.length() <= 0L) return null
+        runCatching { f.setLastModified(System.currentTimeMillis()) }
+        return f
+    }
+
+    /** Store a verified download under the sha256 the repo published for it. */
+    fun put(sha: String?, src: File) {
+        val key = key(sha) ?: return
+        if (!src.isFile || src.length() <= 0L) return
+        runCatching { src.copyTo(File(dir, "$key.bin"), overwrite = true) }
+        trim()
+    }
+
+    fun totalBytes(): Long =
+        runCatching { dir.listFiles()?.sumOf { it.length() } ?: 0L }.getOrDefault(0L)
+
+    private fun key(sha: String?): String? {
+        val k = sha?.removePrefix("sha256-")?.lowercase() ?: return null
+        return k.takeIf { it.length == 64 }
+    }
+
+    /** Keep the cache under the cap by dropping its least recently used entries. */
+    private fun trim() {
+        runCatching {
+            val files = dir.listFiles()?.filter { it.isFile } ?: return
+            var total = files.sumOf { it.length() }
+            if (total <= MAX_BYTES) return
+            for (f in files.sortedBy { it.lastModified() }) {
+                if (total <= MAX_BYTES) break
+                val len = f.length()
+                if (f.delete()) total -= len
+            }
+        }
     }
 }

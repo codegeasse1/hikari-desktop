@@ -115,6 +115,9 @@ object WinShell {
     private const val SWP_NOACTIVATE = 0x0010
     private const val SWP_FRAMECHANGED = 0x0020
 
+    /** `ShowWindow` command: hide the window (see [parkAndHide]). */
+    private const val SW_HIDE = 0
+
     /** Virtual-key code for the left mouse button (see [leftButtonDown]). */
     private const val VK_LBUTTON = 0x01
 
@@ -248,6 +251,26 @@ object WinShell {
     /** Kept for the CI smoke test: resizes a child window to fill its parent. */
     fun fillWindow(hwnd: Long, w: Int, h: Int): Boolean = call(false) {
         User32.INSTANCE.MoveWindow(toHwnd(hwnd), 0, 0, w, h, true)
+    }
+
+    /**
+     * Moves a window off-screen and hides it (SW_HIDE).
+     *
+     * Used for exactly one thing: while a player is being torn down. The video
+     * window belongs to mpv, so the app cannot destroy it — and if it is simply
+     * abandoned, its last painted frame stays on screen until mpv's process
+     * dies, which is the "the player stays stuck/frozen after closing" users
+     * saw. Hiding it is immediate and costs mpv nothing it needs (it is about
+     * to be killed).
+     */
+    fun parkAndHide(hwnd: Long): Boolean = call(false) {
+        if (!windowExists(hwnd)) return@call false
+        User32.INSTANCE.ShowWindow(toHwnd(hwnd), SW_HIDE)
+        User32.INSTANCE.SetWindowPos(
+            toHwnd(hwnd), WinDef.HWND(Pointer.createConstant(0)), PARKED_X, PARKED_Y, 320, 180,
+            SWP_NOACTIVATE,
+        )
+        true
     }
 
     // ── the pointer ─────────────────────────────────────────────────────────

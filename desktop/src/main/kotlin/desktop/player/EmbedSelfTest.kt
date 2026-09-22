@@ -190,6 +190,23 @@ fun main() {
     runCatching { mpvLog.readLines().takeLast(80).forEach { println("  " + it) } }
     println("  ---- /mpv log (" + (if (mpvLog.isFile) mpvLog.length().toString() + " bytes" else "missing") + ") ----")
     runCatching { ipc.close() }
+
+    // ── 4. teardown: the video window must not outlive the player ───────────
+    // This is the "closing the app left the player stuck/frozen on screen"
+    // bug: the adopted window belongs to mpv, and abandoning it leaves its last
+    // frame over the desktop. The app now parks and hides it and then kills
+    // mpv — both are checked here.
+    if (window != null) {
+        check("parkAndHide(mpv's window) takes it off the screen", WinShell.parkAndHide(window))
+        println("  after parkAndHide: rect=" + WinShell.windowRect(window)?.joinToString(","))
+        runCatching { proc.descendants().forEach { c -> runCatching { c.destroyForcibly() } } }
+        runCatching { proc.destroyForcibly() }
+        runCatching { proc.waitFor(6, java.util.concurrent.TimeUnit.SECONDS) }
+        val goneBy = System.currentTimeMillis() + 6_000
+        while (WinShell.windowExists(window) && System.currentTimeMillis() < goneBy) Thread.sleep(100)
+        check("the video window is GONE once the player's process is killed", !WinShell.windowExists(window))
+    }
+
     cleanup(frame, proc, picture)
 
     if (failures.isNotEmpty()) {

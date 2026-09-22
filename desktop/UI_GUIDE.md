@@ -117,6 +117,16 @@ Outside `desktop/ui/`, but part of this layer's picture: the download queue live
     Subs buttons. Use half the track's height (3px for a 6px track). `UiShotTest`
     measures the track against its slider and fails the build if it is wider.
 
+16. **A setting that changes behaviour says what it does, in the user's words, right
+    under the control.** No "Advanced", no unexplained toggle: Settings → Playback →
+    *"Play straight away — pick the fastest working server for me"* is followed by a
+    two-line note saying that the first few sources are tested in parallel and the
+    fastest answer starts, that blocked/slow servers lose the race rather than the
+    user's patience, and that everything found is still listed under Sources. The
+    checkbox's label states the OUTCOME, the note states the MECHANISM, and the
+    default is the one that needs no explanation (this one: on).
+
+
 ## Screen patterns
 
 - **Hero banner** (`HomeScreen`): the same featured card the Android app uses —

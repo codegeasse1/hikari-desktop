@@ -29,6 +29,7 @@ class SettingsScreenView {
 
     fun onShown() {
         val children = mutableListOf<Region>(
+            playbackSection(),
             appearanceSection(),
             browserSection(),
             updatesSection(),
@@ -37,6 +38,40 @@ class SettingsScreenView {
         )
         crashSection()?.let { children.add(1, it) }
         body.children.setAll(children)
+    }
+
+    /**
+     * Playback behaviour. The one setting here is the answer to "why do I have
+     * to choose a server before anything plays?": with it on (the default),
+     * Play picks the fastest server that answers and starts it immediately —
+     * every server the title offered is still in the player's Source menu, so
+     * switching to another one is a single click from inside playback.
+     */
+    private fun playbackSection(): Region {
+        val fastest = CheckBox("Play straight away — pick the fastest working server for me").apply {
+            isSelected = app.store.playFastest()
+        }
+        fastest.setOnAction {
+            app.store.setPlayFastest(fastest.isSelected)
+            AppShell.toast(
+                if (fastest.isSelected) "Play now races the servers and starts the fastest"
+                else "Play uses the provider's own order",
+                "ok",
+            )
+        }
+        val note = Theme.label(
+            "With this on, Play tests the first few sources in parallel and starts whichever answers " +
+                "fastest — no picking a server first. Servers that are blocked or slow for your network " +
+                "lose the race, not your patience. Everything found is still listed under Sources (and in " +
+                "the player's Source menu) if you want to change it.",
+            size = 11.5,
+            dim = true,
+        ).apply { isWrapText = true }
+        return Ui.panel(
+            Ui.sectionHeader("Playback", "What the Play button does"),
+            fastest,
+            note,
+        )
     }
 
     private fun crashSection(): Region? {
