@@ -1,9 +1,11 @@
 package desktop.uitest
 
 import com.hikari.app.HikariApp
+import com.hikari.app.data.Cs3Repo
 import com.hikari.app.data.Episode
 import com.hikari.app.data.MediaItem
 import com.hikari.app.data.MediaType
+import com.hikari.app.data.RepoKind
 import com.hikari.app.data.StreamSource
 import desktop.fx.Fx
 import desktop.player.PlayerWindow
@@ -295,6 +297,70 @@ class UiShotApp : Application() {
             }
         }
         shot("l-detail-episodes-search", "searching episode 187 of 379")
+
+        // ── a repo that will not load: the card the user acts on ─────────────
+        // This is the screen the bug reports are about, so it is worth looking
+        // at: the failure message, and the action row under it ("Try again",
+        // "Diagnose network", and "Trust this network's certificate…" when the
+        // message is a certificate one).
+        //
+        // Reaching it deterministically: the repo list is emptied and ONE
+        // unloadable repo is added, so there is exactly one card and "Open" is
+        // unambiguous; then that card is opened and the screen is polled for the
+        // action row. A repo that cannot load is the state being fixed here.
+        val badRepoUrl = "https://raw.githubusercontent.com/codegeasse1/hikari-desktop/main/no-such-repo.json"
+        var errorCardShot = false
+        steps += 300L to { AppShell.show(Screen.Extensions) }
+        steps += 1200L to {
+            val store = AppShell.app.store
+            store.repos().forEach { r -> runCatching { store.removeCs3Repo(r.url) } }
+            store.addCs3Repo(Cs3Repo(url = badRepoUrl, name = "Broken repo (test)", kind = RepoKind.HIKARI))
+            AppShell.show(Screen.Home)
+            AppShell.show(Screen.Extensions)
+        }
+        steps += 1500L to {
+            scene.root.lookupAll(".button")
+                .filterIsInstance<javafx.scene.control.Button>()
+                .firstOrNull { it.text == "Open" }
+                ?.fire()
+        }
+        repeat(16) {
+            steps += 6000L to poll@{
+                if (errorCardShot) return@poll
+                val labels = scene.root.lookupAll(".button")
+                    .filterIsInstance<javafx.scene.control.Button>()
+                    .mapNotNull { it.text }
+                    .toList()
+                if (labels.none { it.contains("Diagnose network") }) return@poll
+                errorCardShot = true
+                println("UiShotTest: repo-error card buttons = " + labels.joinToString(" | "))
+                println(
+                    "UiShotTest: OK   the repo error card offers Diagnose network (" +
+                        labels.count { it.contains("certificate") } + " certificate trust button(s))",
+                )
+                save(
+                    scene.snapshot(WritableImage(scene.width.toInt(), scene.height.toInt())),
+                    File(out, "m-extensions-repo-error.png"),
+                )
+            }
+        }
+        steps += 300L to {
+            if (!errorCardShot) {
+                println(
+                    "UiShotTest: WARN the repo error card had not appeared after 96s; buttons = " +
+                        scene.root.lookupAll(".button")
+                            .filterIsInstance<javafx.scene.control.Button>()
+                            .mapNotNull { it.text }
+                            .joinToString(" | "),
+                )
+                save(
+                    scene.snapshot(WritableImage(scene.width.toInt(), scene.height.toInt())),
+                    File(out, "m-extensions-repo-error.png"),
+                )
+            }
+            runCatching { AppShell.app.store.removeCs3Repo(badRepoUrl) }
+            AppShell.show(Screen.Home)
+        }
 
         // ── run it ──────────────────────────────────────────────────────────
         var index = 0

@@ -416,6 +416,87 @@ and waited on: descendants → `destroy()` → 1.5 s → `destroyForcibly()` →
 halves: `parkAndHide` takes mpv's window off the screen, and the window is GONE once
 the process is killed.
 
+## Stage 9 — the certificate wall, the player that stayed black, the episode pager
+
+### Why extension repos would not load (the real cause, after several wrong ones)
+
+Every HTTP client here runs on **Conscrypt**, and Conscrypt's verifier
+(`TrustManagerImpl`) builds its paths with `ChainStrengthAnalyzer`, which refuses
+**any certificate in the peer's chain whose own signature is md2/md4/md5/SHA-1**.
+GitHub's CDN still serves chains that include the legacy Comodo/Sectigo
+**AAA Certificate Services** root (itself SHA-1-signed) on some networks, so every
+GitHub-family host — every repo, every extension download, every mirror — died with
+
+    Unacceptable certificate: CN=AAA Certificate Services, O=Comodo CA Limited …
+
+Adding AAA to the trust store could never fix that: the refusal happens while the
+path is being *built*, before any anchor is consulted. That is why two earlier
+attempts (shipping the root, then merging the Windows store) changed nothing.
+
+The fix is to take Conscrypt's verifier out of the path entirely:
+`Http.HikariTrustManager` is a plain `X509TrustManager` backed by the JDK's own
+PKIX validator (`CertPathValidator` first, then a `CertPathBuilder` repair pass over
+the peer's own certificates), and Conscrypt delegates to a supplied manager
+(`Platform.checkServerTrusted`), so its SHA-1 rule is not consulted at all. The
+anchors are merged from the JDK store, the **Windows** store and the shipped
+`cacerts-extra.pem`; a chain that genuinely cannot be verified now says which
+certificate and why instead of one friendly sentence for every case.
+
+`TlsTrustSelfTest` section 5 generates a SHA-1-signed certificate with keytool in CI
+and asserts the whole story: our verifier is the one in use, an unanchored SHA-1
+chain is rejected and classified as a trust failure, `Http.trustCertificates` writes
+it into `~/.hikari/extra-trusted.pem`, and the same chain then verifies.
+
+- A certificate failure no longer blacklists the host for the rest of the run, and
+  the failure summary names the hosts that were asked.
+- Extensions screen, on a repo that will not load: **Try again**, **Diagnose
+  network** (a real report — OS/clock, anchor counts, proxy, every compatibility
+  pass with its full exception chain, the served chain with signature algorithms
+  and SHA-1 flags, whether the anchors hold that issuer — with Copy and Save to
+  file) and, for a certificate failure only, **Trust this network's certificate…**
+  (per machine, reversible, shows subject/issuer/validity/sha256 first).
+- Settings → Updates shows the build identity — version, build time, commit — with
+  **Copy build info**, and the sidebar shows it too. CI stamps `desktop/Build.kt`
+  on every build (`0.1.<run number>`, UTC time, short sha). Before this, every
+  published exe claimed to be "0.1.0", so there was no way to tell which build a
+  user was running.
+
+### The player that went black (and the second window)
+
+- `--keep-open=yes` on every mpv launch: a stream that ends keeps its last frame and
+  the app keeps its controls, instead of mpv exiting at EOF and `MpvIpc.send`
+  failing with "the player stopped reading its command pipe".
+- The previous mpv is parked off-screen and **waited for** before the next one starts
+  (`DesktopPlayer.killPrevious`), so two video windows cannot be on screen at once.
+- If the player process dies under a live layer, `PlayerWindow.onPlayerDied` hands it
+  to `DesktopPlayer.recoverFromPlayerDeath`: retry once on a freshly resolved URL,
+  otherwise show the reason with Retry — never an unexplained black rectangle.
+- If mpv's window cannot be adopted, mpv's own controls are re-enabled and the layer
+  says why, rather than leaving a black area under a dead overlay.
+
+### The episode pager (as asked)
+
+- **30 episodes per page**, a range picker listing the whole season in 30s
+  ("1 - 30", "31 - 60", …), **Prev 30** / **Next 30**, and a search box that searches
+  the whole season — so episode 187 of 379 is one keystroke away, whatever page is
+  showing.
+- The picker listens to its **value**, not `onAction`: JavaFX only fires onAction for
+  a range the *user* picked, so a range selected by code (the page an episode lives
+  on) would silently not load the episodes it names. Selecting an episode jumps to
+  its page.
+- `UiShotTest` asserts the whole thing on a synthetic 379-episode season (tiles
+  1..30, then 121..150 after picking a range, then 151..180 after Next 30, then 187
+  after searching) and writes the three PNGs, so the pager cannot regress silently.
+  It drives the real `renderEpisodes`/`renderEpisodeGrid` path through
+  `DetailScreenTestSeam`, and the repo-error card through a repo that cannot load.
+
+### CI
+
+- New steps: **Stamp the build** (rewrites `desktop/Build.kt`) and **Make a
+  SHA-1-signed test certificate** (keytool) for the TLS self-test.
+- **The release is pruned after every publish**: the newest three installers are kept
+  and the rest deleted. 37 assets / 6.2 GB had piled up on `continuous`.
+
 ## Still to do
 
 ### i18n
