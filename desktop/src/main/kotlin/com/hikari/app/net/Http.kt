@@ -254,8 +254,15 @@ object Http {
             }
             groups[label] = (groups[label] ?: 0) + 1
         }
-        return groups.entries.sortedByDescending { it.value }.take(3)
+        val detail = groups.entries.sortedByDescending { it.value }.take(3)
             .joinToString("; ") { it.key + " (" + it.value + ")" }
+        // Say what it means, not just what the network stack said: this string
+        // ends up on screen under "Couldn't load this repo", and it is the one
+        // place the user can judge whether to retry, change network, or stop
+        // caring — the extensions they already have keep working either way.
+        return "No server answered from this network — $detail.\n" +
+            "Extensions you already installed keep working. Try again in a minute, or switch " +
+            "network/VPN if this keeps happening."
     }
 
     /** Runs the call. No JDK-TLS retry: the Conscrypt stack above is the one and
@@ -612,7 +619,7 @@ object Http {
 
     /** Hard cap for a repo fetch so a slow/blocked network fails with a clear
      *  error instead of leaving the UI stuck on "Checking…" for minutes. */
-    private const val REPO_FETCH_DEADLINE_MS = 60_000L
+    private const val REPO_FETCH_DEADLINE_MS = 75_000L
 
     /** Overall budget for one extension download (all mirrors + retries). */
     private const val DOWNLOAD_BUDGET_MS = 90_000L
@@ -707,8 +714,16 @@ object Http {
         // still loads its repos, just on the second pass. Within a pass the
         // authoritative URLs go first, the CDN copies only after they fail.
         for ((index, pass) in ladder.withIndex()) {
-            if (System.currentTimeMillis() >= deadline) break
-            val window = if (index == 0) 30_000L else 18_000L
+            val left = deadline - System.currentTimeMillis()
+            if (left <= 1_000L) break
+            // Every stack that is still to come gets an EQUAL share of the time
+            // that is left, rather than the first one helping itself to half of
+            // the budget. A network whose TLS 1.3 handshake to the GitHub family
+            // dies needs the LATER passes to actually run — a first pass that ate
+            // the whole deadline is how a repo reported "unreachable" while the
+            // very next stack would have loaded it.
+            val share = left / (ladder.size - index)
+            val window = minOf(if (index == 0) 30_000L else 18_000L, maxOf(8_000L, share))
             for ((wave, ms) in listOf(MirrorMemory.order(raw, liveOrigins.toList()) to ORIGIN_WINDOW_MS, MirrorMemory.order(raw, liveMirrors.toList()) to window)) {
                 if (wave.isEmpty()) continue
                 if (System.currentTimeMillis() >= deadline) break
@@ -1109,13 +1124,16 @@ object Http {
         val p = gh.path.substringBefore('?')
         val raw = "https://raw.githubusercontent.com/${gh.user}/${gh.repo}/${gh.ref}/$p"
         val out = linkedSetOf<String>()
-        // jsDelivr's three independent edges: the same files on three different
-        // hostnames, which is exactly what is needed when ONE of them is
-        // SNI-blocked by the local network.
+        // jsDelivr's edges: the same files on several different hostnames, which
+        // is exactly what is needed when ONE of them is SNI-blocked by the local
+        // network. (cdn.statically.io, raw.gitmirror.com and github.moeyy.xyz
+        // were removed: all three stopped answering, and a host that only ever
+        // fails makes the race shorter for the ones that work.)
         out.add("https://cdn.jsdelivr.net/gh/${gh.user}/${gh.repo}@${gh.ref}/$p")
         out.add("https://fastly.jsdelivr.net/gh/${gh.user}/${gh.repo}@${gh.ref}/$p")
         out.add("https://gcore.jsdelivr.net/gh/${gh.user}/${gh.repo}@${gh.ref}/$p")
-        out.add("https://cdn.statically.io/gh/${gh.user}/${gh.repo}/${gh.ref}/$p")
+        out.add("https://testingcf.jsdelivr.net/gh/${gh.user}/${gh.repo}@${gh.ref}/$p")
+        out.add("https://jsdelivr.b-cdn.net/gh/${gh.user}/${gh.repo}@${gh.ref}/$p")
         out.add("https://raw.githack.com/${gh.user}/${gh.repo}/${gh.ref}/$p")
         // Frontdoors for networks where TLS to every GitHub-family host dies
         // (the classic "SSL protocol error" on raw + jsDelivr while normal
@@ -1128,8 +1146,6 @@ object Http {
         out.add("https://gh-proxy.com/$raw")
         out.add("https://ghproxy.cc/$raw")
         out.add("https://gh.llkk.cc/$raw")
-        out.add("https://github.moeyy.xyz/$raw")
-        out.add("https://raw.gitmirror.com/${gh.user}/${gh.repo}/${gh.ref}/$p")
         return out.toList()
     }
 

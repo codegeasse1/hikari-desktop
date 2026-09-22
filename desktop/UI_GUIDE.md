@@ -93,9 +93,29 @@ Outside `desktop/ui/`, but part of this layer's picture: the download queue live
     to a screen size.
 13. **Never let a layout change ship unseen.** `desktop/uitest/UiShotTest.kt`
     renders the real screens and the player's states (wide, phone-width, loading,
-    failed) to PNGs; CI runs it and uploads the `ui-shots` artifact. When you
-    touch a screen, look at the picture before believing the layout is right — the
-    narrow-window breakage above survived a compile, a boot test and code review.
+    failed, playing with the bars shown and with them hidden) to PNGs; CI runs it
+    and uploads the `ui-shots` artifact. When you touch a screen, look at the
+    picture before believing the layout is right — the narrow-window breakage above
+    survived a compile, a boot test and code review.
+14. **Chrome that covers the content must be able to get out of the way.**
+    The player's bars are shown on activity and hidden after
+    `PlayerWindow.CHROME_IDLE_MS` (2s) — a control bar that is always there is a
+    control bar that is always covering the picture. Two consequences to respect
+    when touching the player: (a) hiding the bars gives their height to the video
+    area, and the video surface is re-glued from `applyChrome`'s `safeSync` — never
+    show/hide a bar without going through `applyChrome`; (b) the picture is mpv's
+    own window, so JavaFX sees no mouse events over it — activity over the picture
+    is noticed by polling `WinShell.cursorPos()`/`leftButtonDown()` from the layer's
+    existing timer, not by a mouse handler.
+15. **Never give a `Slider`'s `.track` a pill radius (999).** JavaFX's
+    `SliderSkin` widens the track node by the CSS `-fx-background-radius` on BOTH
+    sides (`track.resizeRelocate(trackStart - trackRadius, …, trackLength +
+    trackRadius + trackRadius, …)`) so a rounded track's ends stay flush with the
+    control. With a 999 radius that paints ~1000px of stray track on each side of
+    every slider in the app — which on the player looked exactly like a timeline
+    running from the window's left edge to its right edge, under the Source/Audio/
+    Subs buttons. Use half the track's height (3px for a 6px track). `UiShotTest`
+    measures the track against its slider and fails the build if it is wider.
 
 ## Screen patterns
 

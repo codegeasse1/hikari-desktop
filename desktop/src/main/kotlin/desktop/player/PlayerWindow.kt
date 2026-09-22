@@ -7,6 +7,7 @@ import desktop.ui.AppShell
 import desktop.ui.Icons
 import desktop.ui.Ui
 import javafx.animation.KeyFrame
+import javafx.animation.PauseTransition
 import javafx.animation.Timeline
 import javafx.event.ActionEvent
 import javafx.event.EventHandler
@@ -20,6 +21,7 @@ import javafx.scene.control.ProgressIndicator
 import javafx.scene.control.Slider
 import javafx.scene.input.KeyCode
 import javafx.scene.input.KeyEvent
+import javafx.scene.input.MouseEvent
 import javafx.scene.layout.BorderPane
 import javafx.scene.layout.HBox
 import javafx.scene.layout.Priority
@@ -65,6 +67,12 @@ object PlayerWindow {
      *  change) has to be followed — events cover the common cases, this covers
      *  the rest. */
     private const val SYNC_MS = 120.0
+
+    /** How long the bars stay up after the last pointer/key activity. Two
+     *  seconds is what players on every platform do, and it is the difference
+     *  between "the picture, with controls when you reach for them" and "a
+     *  control bar with a picture behind it". */
+    private const val CHROME_IDLE_MS = 2000.0
 
     private var root: BorderPane? = null
     private var mounted = false
@@ -122,6 +130,24 @@ object PlayerWindow {
     /** Set while the loading overlay or an explanation covers the video area, so
      *  the video surface can get out of the way. */
     private var overlayUp = true
+
+    /** True while the two bars (top strip + control bar) are on screen. They are
+     *  not permanent furniture: a mouse move brings them back and they leave
+     *  again two seconds later, because a bar that is always up is a bar that is
+     *  always covering the picture. */
+    private var chromeVisible = true
+
+    /** The countdown that takes the bars away; restarted by [pokeChrome]. */
+    private var hideChrome: PauseTransition? = null
+
+    /** The pointer's last seen screen position (physical pixels), so [pollPointer]
+     *  can tell a move from a rest. */
+    private var lastCursorX = Int.MIN_VALUE
+    private var lastCursorY = Int.MIN_VALUE
+
+    /** Whether the left mouse button was down at the last poll — a click on the
+     *  picture brings the bars back. */
+    private var leftWasDown = false
 
     /** True while the status chip is showing a failure (so starting playback
      *  does not wipe an error the caller just reported). */
@@ -197,7 +223,7 @@ object PlayerWindow {
             nextButton?.isManaged = hasNext
             renderSources(sourceName)
             releaseSurface()
-            applyFullscreenUi()
+            refreshFullscreenButton()
             resetForNewStream()
             refreshOverlay()
             // Embedding needs Win32 (to adopt mpv's window) and the app's own
@@ -213,6 +239,10 @@ object PlayerWindow {
         lastPosition = 0L
         scrubbing = false
         paused = false
+        // A new stream starts with its chrome up: the loading overlay is the only
+        // thing on screen and the bars are what say so.
+        chromeVisible = true
+        runCatching { hideChrome?.stop() }
         sawVideo = false
         loaded = false
         ipcAnswered = false
@@ -258,6 +288,9 @@ object PlayerWindow {
      *  a chip in the top strip that is absent while there is nothing to say, so
      *  the strip never carries an empty label. */
     fun setStatus(text: String, isError: Boolean = false, busy: Boolean = false) {
+        // Whatever the layer has to say ("Volume 40%", "Playback stopped: …") is
+        // said in the top strip, so saying it is a reason to have the strip up.
+        if (text.isNotBlank()) pokeChrome()
         Fx.run {
             statusIsError = isError && text.isNotBlank()
             statusLabel?.text = text
@@ -552,11 +585,18 @@ object PlayerWindow {
             styleClass.add("player-seek")
             isDisable = true
             cursor = Cursor.HAND
-            setOnMousePressed { scrubbing = true }
+            // Clicking anywhere on the bar scrubs there, and the readout follows
+            // the pointer while it is dragged; the seek itself is posted once the
+            // button is released, so a drag costs ONE seek instead of one per
+            // pixel.
+            setOnMousePressed {
+                scrubbing = true
+                previewScrub()
+            }
+            setOnMouseDragged { previewScrub() }
             setOnMouseReleased {
                 scrubbing = false
-                val d = duration
-                if (d > 0) runCatching { ipc?.post("seek", value * d, "absolute") }
+                seekTo(value)
             }
         }
         seekBar = seek
@@ -602,6 +642,16 @@ object PlayerWindow {
         val sepA = separator()
         val sepB = separator()
         barSeparators = listOf(sepA, sepB)
+        // Transport on the left, pickers on the right, and the flexible gap
+        // BETWEEN them. The seek bar used to be the growing child of this row,
+        // so it stretched from the time label all the way to the Source button —
+        // at every window size the two were in each other's lap, and on a
+        // maximised window the bar ran the width of the screen. Its length is
+        // now chosen in [applyResponsive] and the gap takes whatever is left.
+        val barGap = Region().apply {
+            HBox.setHgrow(this, Priority.ALWAYS)
+            minWidth = 12.0
+        }
         val bar = HBox(10.0).apply {
             styleClass.add("player-bar")
             alignment = Pos.CENTER_LEFT
@@ -609,13 +659,13 @@ object PlayerWindow {
             maxWidth = Double.MAX_VALUE
             children.addAll(
                 play, time, seek, total,
+                barGap,
                 sepA,
                 source, audio, subs,
                 sepB,
                 next, full,
             )
         }
-        HBox.setHgrow(seek, Priority.ALWAYS)
         bottomBar = bar
 
         root = BorderPane().apply {
@@ -623,6 +673,17 @@ object PlayerWindow {
             top = strip
             center = videoArea
             bottom = bar
+        }
+
+        // ── the bars are shown, not always there ────────────────────────────
+        // A move anywhere inside the layer counts as activity, and it is an
+        // event FILTER, so it fires for one over a slider, a menu or a button
+        // too. Moves over the picture itself never arrive here — the picture is
+        // a separate Win32 window — and that half is what [pollPointer] is for.
+        root?.addEventFilter(MouseEvent.MOUSE_MOVED) { pokeChrome() }
+        root?.addEventFilter(MouseEvent.MOUSE_PRESSED) { pokeChrome() }
+        hideChrome = PauseTransition(Duration.millis(CHROME_IDLE_MS)).apply {
+            setOnFinished { setChromeVisible(false) }
         }
 
         messageLabel = msgLabel
@@ -645,10 +706,13 @@ object PlayerWindow {
             stage.yProperty().addListener { _, _, _ -> safeSync() }
             stage.widthProperty().addListener { _, _, _ -> safeSync() }
             stage.heightProperty().addListener { _, _, _ -> safeSync() }
-            stage.fullScreenProperty().addListener { _, _, _ -> applyFullscreenUi(); safeSync() }
+            stage.fullScreenProperty().addListener { _, _, _ -> refreshFullscreenButton(); pokeChrome() }
         }
         syncTimer = Timeline(
-            KeyFrame(Duration.millis(SYNC_MS), EventHandler<ActionEvent> { safeSync() }),
+            KeyFrame(Duration.millis(SYNC_MS), EventHandler<ActionEvent> {
+                safeSync()
+                pollPointer()
+            }),
         ).apply {
             cycleCount = Timeline.INDEFINITE
             play()
@@ -689,6 +753,24 @@ object PlayerWindow {
         // window it gives them up instead of drawing under them.
         titleLabel?.let { it.maxWidth = if (narrow) 200.0 else 380.0 }
         statusLabel?.let { it.maxWidth = if (narrow) 170.0 else 320.0 }
+        // The seek bar's length is what is LEFT of the row after the controls
+        // that must always be there (transport buttons, three pickers, the window
+        // buttons and their gaps ≈ 480px), capped so it never grows into a
+        // corner-to-corner line: on a maximised window the two dozen other things
+        // on the row leave plenty of room, and on a narrow one the length is the
+        // first thing to go. Its floor (90px) is what keeps it scrubbable when
+        // the window is at its smallest.
+        seekBar?.let { it1 ->
+            val length = (width - 480.0).coerceIn(90.0, 620.0)
+            it1.minWidth = 90.0
+            it1.prefWidth = length
+            it1.maxWidth = length
+        }
+        // Below 620px the row is carryable without the total-time label: the
+        // elapsed time and the seek bar still say where playback is, and dropping
+        // the label is what stops the remaining controls being squeezed into each
+        // other (the seek bar keeps its own length either way).
+        totalLabel?.let { it.isVisible = width >= 620.0; it.isManaged = width >= 620.0 }
     }
 
     private fun roundButton(icon: String, tooltip: String, iconSize: Double, diameter: Double, onClick: () -> Unit): Button =
@@ -723,6 +805,7 @@ object PlayerWindow {
         teardown = true
         runCatching { syncTimer?.stop() }
         syncTimer = null
+        runCatching { hideChrome?.stop() }
         uninstallKeys()
         runCatching { ipc?.close() }
         ipc = null
@@ -742,13 +825,131 @@ object PlayerWindow {
         }
     }
 
-    /** Fullscreen is the picture and nothing else: the bars go, so the video
-     *  area covers the whole screen. */
-    private fun applyFullscreenUi() {
+    /** Only the fullscreen button's icon depends on the stage's own fullscreen
+     *  state now. The bars are governed by [applyChrome] in every mode, so
+     *  fullscreen is no longer a place with no controls at all: moving the
+     *  pointer there brings them back, exactly as it does in a window. */
+    private fun refreshFullscreenButton() {
         val fs = runCatching { AppShell.stage.isFullScreen }.getOrDefault(false)
-        topStrip?.let { it.isVisible = !fs; it.isManaged = !fs }
-        bottomBar?.let { it.isVisible = !fs; it.isManaged = !fs }
         fullscreenButton?.graphic = Icons.of(if (fs) Icons.FULLSCREEN_EXIT else Icons.FULLSCREEN, 16.0)
+    }
+
+    // ── showing and hiding the bars ─────────────────────────────────────────
+
+    /**
+     * Brings the bars back and restarts their countdown.
+     *
+     * Called for a mouse move, a click and a key press. While the picture is a
+     * separate Win32 window glued over the video area, the moves that matter
+     * most — the ones over the picture — never reach JavaFX at all, which is
+     * why [pollPointer] calls this too.
+     */
+    fun pokeChrome() {
+        Fx.run {
+            setChromeVisible(true)
+            scheduleChromeHide()
+        }
+    }
+
+    /** Starts (or restarts) the countdown — unless the bars are the only way to
+     *  drive playback right now (paused, still loading, or explaining a
+     *  failure), in which case they stay. */
+    private fun scheduleChromeHide() {
+        if (!mounted || paused || overlayUp) return
+        hideChrome?.playFromStart()
+    }
+
+    private fun setChromeVisible(visible: Boolean) {
+        val wanted = visible || paused || overlayUp
+        if (wanted == chromeVisible) {
+            applyChrome()
+            return
+        }
+        chromeVisible = wanted
+        applyChrome()
+    }
+
+    /**
+     * The one place that puts the bars on screen or takes them away. Hiding them
+     * gives their height back to the video area, which is the entire point: the
+     * picture grows into the space instead of being permanently wrapped in
+     * controls. [safeSync] then moves the video surface to the new rectangle.
+     */
+    private fun applyChrome() {
+        val show = chromeVisible || paused || overlayUp
+        if (!show) runCatching { hideChrome?.stop() }
+        topStrip?.let { it.isVisible = show; it.isManaged = show }
+        bottomBar?.let { it.isVisible = show; it.isManaged = show }
+        // The pointer is the only thing left on the picture when the bars are
+        // away, and a player that keeps an arrow parked in the middle of the
+        // frame is not a player. (mpv hides its own cursor over the video; this
+        // covers the strip/bar areas, which the app draws.)
+        root?.cursor = if (show) Cursor.DEFAULT else Cursor.NONE
+        safeSync()
+    }
+
+    /**
+     * Counts pointer movement — and a click — inside the app's window as
+     * activity, and brings the bars back for it.
+     *
+     * Polling is the only option: the picture is another process's window, so it
+     * consumes the mouse messages for its whole rectangle and the layer never
+     * sees them. `GetCursorPos` is a cheap call that needs no hook, and the
+     * layer already has a 120 ms timer running for the video surface.
+     */
+    private fun pollPointer() {
+        if (!mounted) return
+        val p = WinShell.cursorPos()
+        if (p != null) {
+            val moved = p[0] != lastCursorX || p[1] != lastCursorY
+            lastCursorX = p[0]
+            lastCursorY = p[1]
+            if (moved && pointerInWindow()) pokeChrome()
+        }
+        // A click on the picture is swallowed by mpv's window, so it is noticed
+        // here: while the bars are away, the first click brings them back rather
+        // than doing nothing at all.
+        val down = WinShell.leftButtonDown() ?: return
+        val pressed = down && !leftWasDown
+        leftWasDown = down
+        if (pressed && !chromeVisible && pointerInWindow()) pokeChrome()
+    }
+
+    /** True while the pointer is inside the app's own window. */
+    private fun pointerInWindow(): Boolean {
+        val owner = ownerHwnd ?: return false
+        val r = WinShell.windowRect(owner) ?: return false
+        val p = WinShell.cursorPos() ?: return false
+        return p[0] >= r[0] && p[1] >= r[1] && p[0] < r[0] + r[2] && p[1] < r[1] + r[3]
+    }
+
+    /**
+     * Harness hook (see UiShotTest): makes the layer believe the picture is up,
+     * so the playing chrome can be captured without launching mpv.
+     */
+    fun previewPlaying() {
+        loaded = true
+        ipcAnswered = true
+        sawVideo = true
+        Fx.run {
+            setLoading(false)
+            clearMessage()
+            playButton?.isDisable = false
+            seekBar?.isDisable = false
+            seekBar?.value = 0.34
+            lastPosition = 125_000L
+            // Seconds, like every other duration the layer holds: 6:07.
+            duration = 367.0
+            renderTime()
+            refreshFullscreenButton()
+            pokeChrome()
+        }
+    }
+
+    /** Harness hook (see UiShotTest): drive the bars directly, because a build
+     *  agent's pointer never moves and the real trigger cannot fire there. */
+    fun previewChrome(visible: Boolean) {
+        Fx.run { setChromeVisible(visible) }
     }
 
     // ── overlays over the video ─────────────────────────────────────────────
@@ -770,7 +971,10 @@ object PlayerWindow {
      *  way of the app's own content. */
     private fun refreshOverlay() {
         overlayUp = (loadingBox?.isVisible == true) || (messageBox?.isVisible == true)
-        safeSync()
+        // Loading or explaining something puts the bars back, and holds them
+        // there ([applyChrome] keeps them up while an overlay is); the picture
+        // gets its full size back the moment the overlay goes.
+        applyChrome()
     }
 
     private fun message(text: String, actions: List<Pair<String, () -> Unit>>) {
@@ -850,8 +1054,29 @@ object PlayerWindow {
     private fun toggleFullscreen() {
         val stage = runCatching { AppShell.stage }.getOrNull() ?: return
         stage.isFullScreen = !stage.isFullScreen
-        applyFullscreenUi()
-        safeSync()
+        refreshFullscreenButton()
+        pokeChrome()
+    }
+
+    // ── seeking ─────────────────────────────────────────────────────────────
+
+    /** Moves the readout to where the pointer is dragging, without telling mpv
+     *  yet — the picture jumps once, on release. */
+    private fun previewScrub() {
+        val d = duration
+        if (d <= 0) return
+        lastPosition = ((seekBar?.value ?: 0.0) * d * 1000).toLong()
+        renderTime()
+    }
+
+    /** Seeks to a 0..1 position and moves the readout there immediately. */
+    private fun seekTo(fraction: Double) {
+        val d = duration
+        if (d <= 0) return
+        val pos = fraction.coerceIn(0.0, 1.0)
+        lastPosition = (pos * d * 1000).toLong()
+        renderTime()
+        runCatching { ipc?.post("seek", pos * d, "absolute") }
     }
 
     // ── keyboard ────────────────────────────────────────────────────────────
@@ -873,6 +1098,10 @@ object PlayerWindow {
     }
 
     private fun handleKey(e: KeyEvent) {
+        // A key press is activity: a space bar aimed at a picture whose controls
+        // are hidden must not be aimed at nothing, so any handled key brings the
+        // bars back.
+        pokeChrome()
         when (e.code) {
             KeyCode.SPACE -> runCatching { ipc?.post("cycle", "pause") }
             KeyCode.LEFT -> runCatching { ipc?.post("seek", -10, "relative") }
@@ -941,7 +1170,13 @@ object PlayerWindow {
             }
             "pause" -> {
                 paused = value == true
-                Fx.run { playButton?.graphic = Icons.of(if (paused) Icons.PLAY else Icons.PAUSE, 18.0) }
+                Fx.run {
+                    playButton?.graphic = Icons.of(if (paused) Icons.PLAY else Icons.PAUSE, 18.0)
+                    // Paused means the bars stay (they are how playback gets
+                    // started again); playing means they get out of the way.
+                    if (paused) runCatching { hideChrome?.stop() } else scheduleChromeHide()
+                    applyChrome()
+                }
             }
             "volume" -> volume = (value as? Number)?.toDouble() ?: 100.0
             "track-list" -> renderTracks(value)
@@ -1003,6 +1238,9 @@ object PlayerWindow {
         titleLabel?.tooltip = javafx.scene.control.Tooltip(
             titleLabel?.text.orEmpty() + if (videoFormat.isBlank()) "" else "\nVideo: $videoFormat"
         )
+        // The picture is up: the bars have said what they had to say, and the
+        // countdown to getting out of the way starts now.
+        pokeChrome()
     }
 
     private fun renderTime() {

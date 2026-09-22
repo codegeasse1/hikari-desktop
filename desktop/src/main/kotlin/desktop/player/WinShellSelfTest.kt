@@ -35,6 +35,14 @@ fun main() {
         check("windowExists(0) is false", !WinShell.windowExists(0L))
         // Filling a window that does not exist must fail quietly.
         check("fillWindow(0) is false", !WinShell.fillWindow(0L, 16, 16))
+        // The pointer poll the player runs to bring its bars back. It binds two
+        // extra user32 entries (GetCursorPos, GetAsyncKeyState); a bad signature
+        // there would silently return null on a user's machine and the bars
+        // would never come back over the picture, so it is proven here.
+        val cursor = WinShell.cursorPos()
+        check("cursorPos() answers", cursor != null && cursor.size == 2, cursor?.joinToString(",") ?: "null")
+        println("  pointer at " + (cursor?.joinToString(",") ?: "?"))
+        check("leftButtonDown() answers", WinShell.leftButtonDown() != null)
     }
 
     if (failures > 0) {

@@ -145,6 +145,10 @@ class ExtensionsScreenView {
     }
 
     fun onShown() {
+        // Coming back to the screen must not re-show the last visit's "Fetching
+        // repo…" line: a stale status is what made a screen whose contents were
+        // already loaded look like it was fetching everything again.
+        if (!busy.isVisible) setStatus("")
         renderAll()
     }
 
@@ -362,12 +366,17 @@ class ExtensionsScreenView {
             val now = System.currentTimeMillis()
             repos.forEach { repo ->
                 reposBox.children.add(repoCard(repo))
+                // A repo that already has contents is NOT fetched again just
+                // because the screen was opened. It used to be (on a six-hour
+                // TTL), which is why a repo added days ago — every one of its
+                // extensions already installed — could still put "Fetching repo…
+                // (racing 16 mirrors)" across the screen for no reason the user
+                // could see. Contents are refreshed when the user asks for it:
+                // "Reload this repo", "Reload all", or "Try again" on a failure.
+                // The background pass is left to repos that have NEVER loaded.
                 val known = repoData.containsKey(repo.url) || repoErrors.containsKey(repo.url)
-                val stale = !known || now - (repoFetchedAt[repo.url] ?: 0L) > REPO_CACHE_TTL_MS
-                // A stale repo is refreshed quietly, in the background: cached
-                // contents stay on screen and nothing claims the UI while it
-                // happens.
-                if (stale && repoLoading.add(repo.url)) loadRepoData(repo.url, silent = true)
+                val waited = now - (repoFetchedAt[repo.url] ?: 0L) >= FAILED_RETRY_MS
+                if (!known && waited && repoLoading.add(repo.url)) loadRepoData(repo.url, silent = true)
             }
         }
         content.children.add(reposBox)
@@ -457,7 +466,17 @@ class ExtensionsScreenView {
     private fun openRepoData(repo: Cs3Repo) {
         openRepo = repo
         pluginFilter.clear()
-        if (!repoData.containsKey(repo.url)) loadRepoData(repo.url)
+        // Opening a repo fetches it only when there is nothing to show AND the
+        // last attempt was not a recent failure — otherwise every visit to a repo
+        // this network cannot reach would start the whole mirror race over again,
+        // which is exactly what made the screen look like it was permanently
+        // "Fetching repo…".
+        val known = repoData.containsKey(repo.url)
+        val waited = System.currentTimeMillis() - (repoFetchedAt[repo.url] ?: 0L) >= FAILED_RETRY_MS
+        // Quietly: a refresh must not take over the shell's activity chip while
+        // the user is reading the page — the "Loading plugins…" row is the
+        // feedback, and it sits exactly where the plugins will appear.
+        if (!known && waited) loadRepoData(repo.url, silent = true)
         renderAll()
     }
 
@@ -570,6 +589,20 @@ class ExtensionsScreenView {
                             Ui.button("Try again", primary = true) { refreshRepo(repo.url) },
                         )
                     )
+                    // A repo whose manifest cannot be fetched is NOT an empty
+                    // repo: everything already installed from it still works,
+                    // and saying so right here beats leaving the user with an
+                    // error and no idea whether their extensions survived.
+                    val mine = installedFrom(repo)
+                    if (mine.isNotEmpty()) {
+                        pluginsBox.children.add(
+                            themed(
+                                "Already installed from this repo — these keep working:",
+                                "tiny",
+                            )
+                        )
+                        mine.forEach { pluginsBox.children.add(installedRow(it)) }
+                    }
                 } else {
                     pluginsBox.children.add(Ui.loadingRow("Loading plugins…"))
                 }
@@ -677,12 +710,12 @@ class ExtensionsScreenView {
             if (manifest == null) {
                 Fx.run {
                     repoLoading.remove(url)
-                    // A FAILED fetch is retried soon (not on the six-hour cache
-                    // TTL): the failure may well have been this machine's
-                    // network stack, which the fetch ladder is learning to work
-                    // around — and once it has, the repo must reload on its own
-                    // rather than stay "unreachable" for the rest of the day.
-                    repoFetchedAt[url] = System.currentTimeMillis() - REPO_CACHE_TTL_MS + FAILED_RETRY_MS
+                    // A failed fetch is retried on its own only after a real
+                    // pause (see FAILED_RETRY_MS): a repo this network cannot
+                    // reach must not re-run the mirror race on every visit to the
+                    // screen, which is what the user sees as "it is fetching the
+                    // repo again". "Try again" always fetches immediately.
+                    repoFetchedAt[url] = System.currentTimeMillis()
                     val message = Http.humanMessage(result.exceptionOrNull())
                     // Cached contents beat an error message for a repo the user
                     // has already added: the failure is only worth showing when
@@ -1299,6 +1332,26 @@ class ExtensionsScreenView {
         }
     }
 
+    /**
+     * The extensions already installed from a repo, matched on the `owner/repo`
+     * part of its URL (that is what every install records in `extra`).
+     *
+     * Used when the repo's manifest cannot be fetched: those extensions are on
+     * disk and still load, and the repo's page should say so rather than show a
+     * failure and nothing else.
+     */
+    private fun installedFrom(repo: Cs3Repo): List<ProviderConfig> {
+        val slug = runCatching {
+            val path = java.net.URI(repo.url.trim()).path.orEmpty()
+            val parts = path.trim('/').split('/')
+            if (parts.size >= 2) parts[0] + "/" + parts[1] else ""
+        }.getOrDefault("")
+        if (slug.isBlank()) return emptyList()
+        return runCatching {
+            AppShell.app.store.providers().filter { cfg -> cfg.extra.orEmpty().contains(slug, ignoreCase = true) }
+        }.getOrDefault(emptyList())
+    }
+
     /** Providers installed from a given repo plugin URL. Hikari/CloudStream
      *  bundle providers share the download URL as their extra prefix
      *  (`<url>|<index>`); Nuvio/SkyStream/Aniyomi record the source URL whole. */
@@ -1853,16 +1906,13 @@ class ExtensionsScreenView {
     }
 
     private companion object {
-        /** How long a cached repo is trusted before it is refreshed in the
-         *  background. Long on purpose: the point is that opening the app (or
-         *  the Extensions screen) never waits on the network. */
-        const val REPO_CACHE_TTL_MS = 6 * 60 * 60 * 1000L
-
-        /** How long after a failed repo fetch the background refresh tries
-         *  again. Short: a repo that failed because of this machine's network
-         *  stack must come back on its own once the fetch ladder finds a stack
-         *  that works. */
-        const val FAILED_RETRY_MS = 2 * 60 * 1000L
+        /** How long after an attempt before a repo that has NEVER loaded is tried
+         *  again on its own. Long on purpose: a repo this network cannot reach
+         *  must not re-run the whole mirror race every time the screen is
+         *  opened — that is the "why is it fetching the repo again" the user
+         *  sees. Explicit reloads ("Reload this repo", "Reload all", "Try
+         *  again") always fetch, so nothing is ever stuck. */
+        const val FAILED_RETRY_MS = 15 * 60 * 1000L
 
         const val MODE_HIKARI = 0
         const val MODE_CS3 = 1

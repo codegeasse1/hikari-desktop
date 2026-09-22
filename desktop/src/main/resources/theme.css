@@ -427,8 +427,19 @@
 .combo-box-popup .list-view .list-cell:hover { -fx-background-color: -h-surface-3; -fx-text-fill: -h-fg; }
 .combo-box-popup .list-view .list-cell:filled:selected { -fx-background-color: -h-accent-soft; -fx-text-fill: -h-accent; }
 
-.slider .track { -fx-background-color: -h-surface-4; -fx-background-radius: 999; -fx-pref-height: 5; }
-.slider .thumb { -fx-background-color: -h-accent; -fx-background-radius: 999; -fx-pref-width: 15; -fx-pref-height: 15; }
+/*
+ * The slider radii are deliberately SMALL and are not the usual 999 "pill"
+ * value: JavaFX's SliderSkin widens its `.track` node by that radius on BOTH
+ * sides — `track.resizeRelocate(trackStart - trackRadius, …, trackLength +
+ * trackRadius + trackRadius, …)` — exactly so a pill-shaped track keeps its
+ * rounded ends flush with the slider. With `-fx-background-radius: 999` that put
+ * ~1000px of extra track on each side of every slider in the app: a hairline
+ * running from the window's left edge to its right edge, straight under the
+ * player's Source/Audio/Subs buttons. A radius of half the track's height rounds
+ * the ends just as well and widens the node by 3px.
+ */
+.slider .track { -fx-background-color: -h-surface-4; -fx-background-radius: 3; -fx-pref-height: 5; }
+.slider .thumb { -fx-background-color: -h-accent; -fx-background-radius: 8; -fx-pref-width: 15; -fx-pref-height: 15; }
 .slider .thumb:hover { -fx-effect: dropshadow(gaussian, -h-accent-glow, 10, 0, 0, 0); }
 
 .progress-bar > .bar   { -fx-background-color: linear-gradient(to right, -h-accent, -h-accent-2); -fx-background-radius: 999; -fx-background-insets: 0; }
@@ -1179,15 +1190,19 @@
 }
 .player-time-total { -fx-text-fill: #6d7488; }
 
+/* The track's radius is 3, NOT the 999 used by the pills: see the note on
+   `.slider .track` above — the slider skin adds the radius to the track's width
+   on both sides, so a "pill" radius draws a full-width hairline under the
+   controls. Half the track's 6px height rounds the ends the same. */
 .player-seek { -fx-padding: 0; }
 .player-seek .track {
-    -fx-background-color: rgba(255, 255, 255, 0.15);
-    -fx-background-radius: 999;
-    -fx-pref-height: 5;
+    -fx-background-color: rgba(255, 255, 255, 0.22);
+    -fx-background-radius: 3;
+    -fx-pref-height: 6;
 }
 .player-seek .thumb {
     -fx-background-color: #a970ff;
-    -fx-background-radius: 999;
+    -fx-background-radius: 8;
     -fx-pref-width: 14;
     -fx-pref-height: 14;
 }

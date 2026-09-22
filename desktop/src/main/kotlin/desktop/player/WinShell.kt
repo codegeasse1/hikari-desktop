@@ -2,6 +2,7 @@ package desktop.player
 
 import com.sun.jna.Native
 import com.sun.jna.Pointer
+import com.sun.jna.Structure
 import com.sun.jna.platform.win32.User32
 import com.sun.jna.platform.win32.WinDef
 import com.sun.jna.platform.win32.WinUser
@@ -53,6 +54,26 @@ object WinShell {
         fun SetWindowLongPtr(hWnd: WinDef.HWND?, nIndex: Int, dwNewLong: Long): Long
 
         fun GetWindowLongPtr(hWnd: WinDef.HWND?, nIndex: Int): Long
+
+        /** The pointer's screen position. Asked for by the player on a timer: the
+         *  video surface is another process's window, so a move over the picture
+         *  never reaches the app as an event. */
+        fun GetCursorPos(p: Point): Boolean
+
+        /** Whether a virtual key is currently held down (the high bit of the
+         *  result). Used to notice a click on the video surface. */
+        fun GetAsyncKeyState(vKey: Int): Short
+    }
+
+    /** A Win32 POINT, declared here so nothing about the out-parameter depends
+     *  on the JNA platform package's structure layout. */
+    @Structure.FieldOrder("x", "y")
+    class Point : Structure() {
+        @JvmField
+        var x: Int = 0
+
+        @JvmField
+        var y: Int = 0
     }
 
     private val extra: Extra? by lazy {
@@ -93,6 +114,9 @@ object WinShell {
     private const val SWP_NOMOVE = 0x0002
     private const val SWP_NOACTIVATE = 0x0010
     private const val SWP_FRAMECHANGED = 0x0020
+
+    /** Virtual-key code for the left mouse button (see [leftButtonDown]). */
+    private const val VK_LBUTTON = 0x01
 
     /** Where a parked (off-screen) video window is kept: nowhere near any
      *  plausible monitor origin, but still a *shown*, correctly sized window so
@@ -224,6 +248,28 @@ object WinShell {
     /** Kept for the CI smoke test: resizes a child window to fill its parent. */
     fun fillWindow(hwnd: Long, w: Int, h: Int): Boolean = call(false) {
         User32.INSTANCE.MoveWindow(toHwnd(hwnd), 0, 0, w, h, true)
+    }
+
+    // ── the pointer ─────────────────────────────────────────────────────────
+
+    /** The pointer's screen position as [x, y] in physical pixels, or null.
+     *
+     *  Polled rather than hooked, because the window that covers the picture
+     *  belongs to another process and takes every mouse message for its whole
+     *  rectangle — the app is never told the pointer moved at all. */
+    fun cursorPos(): IntArray? = call(null) {
+        val fn = extra ?: return@call null
+        val p = Point()
+        if (!fn.GetCursorPos(p)) return@call null
+        intArrayOf(p.x, p.y)
+    }
+
+    /** True while the left mouse button is down anywhere on the desktop; null
+     *  when the question cannot be asked. Used to notice a click on the video
+     *  surface, whose window never forwards the click to the app. */
+    fun leftButtonDown(): Boolean? = call(null) {
+        val fn = extra ?: return@call null
+        (fn.GetAsyncKeyState(VK_LBUTTON).toInt() and 0x8000) != 0
     }
 
     private inline fun <T> call(fallback: T, block: () -> T): T =

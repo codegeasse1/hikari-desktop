@@ -35,7 +35,8 @@ fun main() {
     check("a TLS-library failure is recognised", Http.isTlsStackFailure(tlsError))
     check("a 404 is not a TLS failure", !Http.isTlsStackFailure(Exception("HTTP 404 for https://x/y")))
     val summary = Http.summariseFailures(listOf(tlsError, tlsError, Exception("HTTP 404 for https://x/y")))
-    check("the failure summary names the real cause first", summary.startsWith("the TLS handshake"), summary)
+    check("the failure summary reads as a sentence", summary.startsWith("No server answered"), summary)
+    check("the failure summary names the real cause", summary.contains("the TLS handshake"), summary)
     check("and counts the mirrors", summary.contains("(2)"), summary)
 
     // A local origin server, so this test never depends on the internet.

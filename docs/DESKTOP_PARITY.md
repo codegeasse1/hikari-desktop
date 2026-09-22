@@ -176,8 +176,13 @@ elsewhere) and driven over its JSON IPC:
   is reported as a failed stream.
 - **The bars fit the window they are in** (`PlayerWindow.applyResponsive`): below
   780px the pickers drop their labels, below 560px the audio/subtitle pickers and
-  the separators go away. Before that, a 460px-wide window squeezed the seek bar to
-  a dot and pushed the fullscreen button off the right edge.
+  the separators go away, below 620px the total-time label goes, and the seek bar's
+  length is what is left of the row after the other controls (capped at 620px,
+  floored at 90px) so it can never reach the pickers. Before that, a 460px-wide
+  window squeezed the seek bar to a dot and pushed the fullscreen button off the
+  right edge; on a maximised window the growing seek bar ran into the Source
+  button. See Stage 7 for the bars appearing and disappearing
+  (`pokeChrome`/`applyChrome`).
 - **The player's UI is verified by looking at it**, not by arguing:
   `desktop/uitest/UiShotTest.kt` renders the real screens and the real player layer
   (loading, failure, wide, phone-width) to PNGs on every CI run and uploads them as
@@ -245,6 +250,77 @@ own mirror list serially inside the race. Now:
   the file already on disk (that is what the "signed" badge means).
 - `DexJar` already cached the dex→jar translation by path+mtime: measured 4.6s
   cold / 0.45s warm for a 225KB dex, so an install after the first is ~1s of work.
+
+## Stage 7 — the bars come and go, and repos stop re-fetching themselves (done)
+
+Three complaints from a released build.
+
+**1. The player's controls covered the picture permanently.** The bars are now
+shown, not always there: a mouse move (or click, or key press) brings the top
+strip and the control bar back and starts a **two-second** countdown; when it
+expires they go, and their height goes back to the video area, so the picture
+grows into the space. They stay up while paused, while a stream is loading, and
+while an explanation is on screen, and `PauseTransition` is restarted by every
+new activity (`PlayerWindow.pokeChrome` / `applyChrome`).
+
+The hard half is *noticing* the mouse. The picture is mpv's own Win32 window glued
+over the video area, so it consumes the mouse messages for its whole rectangle and
+JavaFX never sees a move over it. `WinShell.cursorPos()` (`GetCursorPos`) and
+`WinShell.leftButtonDown()` (`GetAsyncKeyState`) are polled from the timer the
+layer already runs every 120 ms for the video surface; a move — or a click while
+the bars are hidden — inside the app's window counts as activity. No hook is
+installed, and `WinShellSelfTest` proves both bindings answer on CI (a silently
+broken one would leave the bars unreachable over the picture). The pointer is
+hidden (`Cursor.NONE`) while the bars are away; mpv hides its own over the video.
+
+**2. The seek bar ran the width of the window and into the pickers.** Two causes,
+and the second is the one that actually drew the line.
+
+The layout cause: the seek bar used to be the growing child of the control bar, so
+it stretched from the time label to the Source button — on a maximised window the
+two were in each other's lap. The row is now: transport
+(`play · time · seek · total`) on the left, a flexible gap, then the pickers and
+window buttons on the right. The seek bar's length is what is left of the row after
+the controls that must always be there, capped at 620 px and floored at 90 px
+(`applyResponsive`), so it can never reach the pickers at any window size; below
+620 px the total-time label gives way as well. Clicking or dragging the bar moves
+the readout with the pointer and posts ONE seek on release
+(`seekTo`/`previewScrub`).
+
+The drawing cause: the timeline still ran edge to edge. JavaFX's `SliderSkin`
+widens its `.track` node by the CSS `-fx-background-radius` on EACH side
+(`track.resizeRelocate(trackStart - trackRadius, …, trackLength + trackRadius +
+trackRadius, …)`) so that a pill-shaped track keeps its rounded ends flush — and
+`theme.css` gave every slider a `-fx-background-radius: 999` "pill". Every slider
+in the app therefore painted ~1000 px of extra track on each side: measured on CI,
+a 620 px scrubber had a **2604 px** track node, i.e. a hairline from the window's
+left edge to its right edge, straight under the Source/Audio/Subs pills. The fix is
+a radius of half the track's height (3 px for the player's 6 px track, 8 for the
+15 px thumb), which rounds the ends identically and widens the node by 3 px.
+`UiShotTest` now measures `layoutBounds` of the seek bar and of its `.track` and
+**fails the build** if the track is wider than its slider, so this cannot come back
+unnoticed. (`boundsInParent` is useless for this check: it is the union with the
+children's bounds, so it reports the overflow as if it were the control's own.)
+
+**3. "Why is it fetching the repo again?"** The Extensions screen refreshed every
+repo on a six-hour TTL, so a repo added days ago — every one of its extensions
+installed — could still put `Fetching repo… (racing 16 mirrors)` on screen for no
+reason the user could see. Now a repo that already has contents is only fetched
+when the user asks (`Reload this repo`, `Reload all`, `Try again`); the background
+pass is left to repos that have NEVER loaded, and not more than once per
+`FAILED_RETRY_MS` (15 min). Opening a repo refreshes quietly (no shell activity
+chip) and never restarts the mirror race for a repo that just failed. A repo whose
+manifest cannot be fetched now lists the extensions already installed from it, says
+they keep working, and its error reads as a sentence
+(`No server answered from this network — the TLS handshake is being blocked by
+this network (4); DNS lookup failed (4). Extensions you already installed keep
+working. Try again in a minute, or switch network/VPN…`) rather than a bare
+network-stack summary. The mirror list dropped three hosts that had stopped
+answering (`cdn.statically.io`, `raw.gitmirror.com`, `github.moeyy.xyz`) and gained
+two more jsDelivr edges (`testingcf.`, `jsdelivr.b-cdn.net`), and each stack on the
+compatibility ladder now gets an EQUAL share of the fetch deadline instead of the
+first one helping itself to half of it — a first pass that ate the whole budget is
+how a repo reported "unreachable" while the next stack would have loaded it.
 
 ## Still to do
 
