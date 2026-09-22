@@ -48,6 +48,15 @@ fun main() {
         ex.sendResponseHeaders(200, body.size.toLong())
         ex.responseBody.use { it.write(body) }
     }
+    // A source that takes 2 seconds to say hello — the reason "the video takes
+    // ages to start" while a better server sits below it in the list.
+    server.createContext("/slow.mp4") { ex ->
+        runCatching { Thread.sleep(2_000L) }
+        val body = ByteArray(64)
+        ex.responseHeaders.set("Content-Type", "video/mp4")
+        runCatching { ex.sendResponseHeaders(200, body.size.toLong()) }
+        runCatching { ex.responseBody.use { it.write(body) } }
+    }
     server.executor = java.util.concurrent.Executors.newCachedThreadPool()
     server.start()
     val local = "http://127.0.0.1:" + server.address.port + "/repo.json"
@@ -98,6 +107,33 @@ fun main() {
     } else {
         check("DoH resolves without the OS resolver", addrs.isNotEmpty())
     }
+
+    // ── 5. "play straight away": the server race ────────────────────────────
+    // The race that decides which server the Play button starts is only honest
+    // if it MEASURES the servers: a source that answers in 30 ms must beat one
+    // that needs two seconds, and a source that misses the probe budget must
+    // lose rather than hang the button.
+    val fast = Http.streamLatencyMs(local, emptyMap(), 2_500L)
+    println("  streamLatencyMs(fast local origin) = " + fast)
+    check("the fastest-server probe answers for a reachable source", fast != null && fast < 2_000L, "got " + fast)
+
+    val slowUrl = "http://127.0.0.1:" + server.address.port + "/slow.mp4"
+    val slowShort = Http.streamLatencyMs(slowUrl, emptyMap(), 800L)
+    println("  streamLatencyMs(slow source, 800ms budget) = " + slowShort)
+    check("a slow server MISSES the probe budget", slowShort == null, "got " + slowShort)
+    val slowReal = Http.streamLatencyMs(slowUrl, emptyMap(), 6_000L)
+    println("  streamLatencyMs(slow source, 6s budget) = " + slowReal)
+    check("…and is measured honestly when the budget allows it", (slowReal ?: 0L) >= 1_500L, "got " + slowReal)
+    check(
+        "so the race picks the fast server",
+        fast != null && slowReal != null && fast < slowReal,
+        "fast=" + fast + " slow=" + slowReal,
+    )
+    check(
+        "a signed single-use link is never probed",
+        Http.isSignedStreamUrl("https://mmcdn.com/v1/edge/streams/abc.m3u8") &&
+            !Http.isSignedStreamUrl("https://cdn.example.com/movie.m3u8"),
+    )
 
     server.stop(0)
     if (failures > 0) {
