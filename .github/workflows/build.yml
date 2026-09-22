@@ -24,6 +24,9 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-latest
+    # A wedged step (a GUI test waiting on a window, an install waiting on a
+    # black-holed host) must fail the run, not occupy a runner for hours.
+    timeout-minutes: 45
     env:
       # Manual releases pin the installer/app version to the requested one
       # (e.g. 1.0.0); regular builds keep a unique per-run number so WiX
@@ -67,8 +70,16 @@ jobs:
         shell: bash
 
       - name: Bundle mpv player (video engine)
+        if: always()
         run: |
-          curl -fsSL -o mpv.7z "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20260814/mpv-x86_64-20260814-git-7b8915bc1d.7z"
+          set -e
+          mpv_url="https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20260814/mpv-x86_64-20260814-git-7b8915bc1d.7z"
+          if ! curl -fsSL -o mpv.7z "$mpv_url"; then
+            echo "pinned mpv build is unavailable - resolving the newest release asset"
+            mpv_url=$(curl -fsSL "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest" | grep -o '"browser_download_url": *"[^"]*mpv-x86_64-[^"]*\.7z"' | head -n 1 | cut -d'"' -f4)
+            echo "newest: $mpv_url"
+            curl -fsSL -o mpv.7z "$mpv_url"
+          fi
           7z x -bso0 -bsp0 -ompv-tmp mpv.7z
           mkdir -p jpackage-input/mpv
           cp -r mpv-tmp/* jpackage-input/mpv/
@@ -120,27 +131,61 @@ jobs:
         shell: bash
 
       - name: Dex->JVM loader self-test (real .cs3 plugin)
+        if: always()
+        timeout-minutes: 8
         run: |
           set -e
           java -cp "jpackage-input/*" com.hikari.app.cs3.DexJarSelfTest
         shell: bash
 
       - name: Real plugin self-test (third-party .cs3 extensions)
+        if: always()
+        timeout-minutes: 8
         run: |
           set -e
           java -cp "jpackage-input/*" com.hikari.app.cs3.RealPluginSelfTest
         shell: bash
 
       - name: JS engine self-test (V8 via javet)
+        if: always()
+        timeout-minutes: 8
         run: |
           set -e
           java -cp "jpackage-input/*" com.hikari.app.js.JsSelfTest
         shell: bash
 
       - name: Win32 player-embed self-test (JNA)
+        if: always()
+        timeout-minutes: 8
         run: |
           set -e
           java -cp "jpackage-input/*" desktop.player.WinShellSelfTestKt
+        shell: bash
+
+      - name: Player embed self-test (adopt mpv's window, Win32 + IPC)
+        if: always()
+        timeout-minutes: 8
+        run: |
+          set -e
+          java -cp "jpackage-input/*" desktop.player.EmbedSelfTestKt
+        shell: bash
+
+      - name: UI shots (render the app and the player layer to PNGs)
+        if: always()
+        timeout-minutes: 8
+        run: |
+          set +e
+          java -cp "jpackage-input/*" desktop.uitest.UiShotTestKt ui-shots
+          echo "ui shots exit: $?"
+          ls -la ui-shots || true
+        shell: bash
+
+      - name: Network ladder self-test (repo fetch over a dead proxy + DoH)
+        if: always()
+        timeout-minutes: 8
+        run: |
+          set -e
+          java -cp "jpackage-input/*" com.hikari.app.net.NetworkSelfTestKt
         shell: bash
 
       - name: Diagnose packaged runtime
@@ -220,6 +265,14 @@ jobs:
           rm -f signing.pfx
         shell: bash
 
+
+      - name: Upload UI shots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-shots
+          path: ui-shots/*.png
+          if-no-files-found: ignore
 
       - name: Upload build log
         if: always()

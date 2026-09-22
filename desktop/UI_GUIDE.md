@@ -19,9 +19,11 @@ Read this before touching anything under `desktop/src/main/kotlin/desktop/ui/`.
 | `CatalogScreen.kt` | The full grid behind a rail's "See all". |
 | `LibraryScreen.kt`, `DownloadsScreen.kt`, `SettingsScreen.kt`, `ExtensionsScreen.kt` | The remaining screens. |
 | `WindowChrome.kt` | Resize edges, window controls, drag-to-maximise. |
-| `desktop/player/PlayerWindow.kt` | The in-app player layer: mpv renders into a surface the app owns (attached to the app window), with ONE slim control bar — Back, play/pause, time + seek, **Source**, audio/subtitle tracks, next episode, fullscreen — driven over mpv's JSON IPC. |
-| `desktop/player/WinShell.kt` | The raw Win32 calls (via JNA) that glue the surface mpv renders into over the player's video area. |
+| `desktop/player/PlayerWindow.kt` | The in-app player layer: a top strip (Back, title, status, window controls) over the picture and ONE control bar under it — play/pause, time + seek, **Source**, audio/subtitle tracks, next episode, fullscreen — driven over mpv's JSON IPC. |
+| `desktop/player/WinShell.kt` | The raw Win32 calls (via JNA) that adopt mpv's own window (find it by process id, strip its chrome, own it) and glue it over the player's video area. |
 | `desktop/player/DesktopPlayer.kt` | Launches/drives mpv, the HLS relay and the stream fallbacks. |
+| `desktop/player/MpvIpc.kt` | The client for mpv's JSON IPC. Writes are queued and performed by one writer thread so a wedged pipe can never block a caller (the player's controls run on the FX thread). |
+| `desktop/uitest/UiShotTest.kt` | Renders the real screens and the real player layer to PNGs (CI artifact `ui-shots`) so the layout can be looked at. Not shipped — a test harness. |
 
 Outside `desktop/ui/`, but part of this layer's picture: the download queue lives in
 `com/hikari/app/download/` — `DownloadModels` (task/status + JSON), `DownloadStore`
@@ -79,6 +81,21 @@ Outside `desktop/ui/`, but part of this layer's picture: the download queue live
 11. **Controls inside a clickable container need `Ui.isolateClicks`.** A poster's
     "More" button, the hero's arrows/dots and a source row's buttons all live inside a
     container that opens something — without it, one click does both.
+12. **A bar with fixed-width controls must give something up as it narrows.**
+    The player's control bar carries thirteen things (transport, seek, three
+    pickers, window controls). At 460px that cannot fit, and JavaFX answers an
+    overflowing `HBox` by shrinking its children to their minima — which cost the
+    seek bar (it collapsed to a purple dot) and the fullscreen button (pushed off
+    the right edge). Any bar laid out like this needs an explicit narrowing rule:
+    see `PlayerWindow.applyResponsive` — labels off first, then the pickers that
+    are only occasionally needed, so what is left is the transport and a *usable*
+    seek. Bind it to the width that actually changes (the layer's own width), not
+    to a screen size.
+13. **Never let a layout change ship unseen.** `desktop/uitest/UiShotTest.kt`
+    renders the real screens and the player's states (wide, phone-width, loading,
+    failed) to PNGs; CI runs it and uploads the `ui-shots` artifact. When you
+    touch a screen, look at the picture before believing the layout is right — the
+    narrow-window breakage above survived a compile, a boot test and code review.
 
 ## Screen patterns
 
@@ -92,20 +109,24 @@ Outside `desktop/ui/`, but part of this layer's picture: the download queue live
   provider (the hero is re-seeded whenever the provider selector changes) and the
   overline names that provider.
 - **Player** (`desktop/player/PlayerWindow.kt` + `WinShell.kt`): the video plays
-  INSIDE the app window. mpv is handed a borderless surface window the app owns
-  as its `--wid`, glued exactly over the video area, so the picture is part of
-  the app rather than a second window; mpv's own controller is switched off and
-  the app draws **one** slim bar under the picture (Back, title, play/pause,
-  time + a scrubbable seek, **Source** — every server the title offered,
-  switchable mid-playback — the file's own audio and subtitle tracks, "Next
-  episode", fullscreen, and the window's minimise/maximise/close cluster). The
-  video area takes every remaining pixel: no panel of buttons, nothing drawn
-  over the picture. A status chip appears in the bar only when there is
-  something to say (a dead control channel, why a stream stopped). The surface
-  is *shrunk* to a couple of pixels while the loading overlay or an explanation
-  is up — never hidden, which used to kill mpv's video output — and
-  `DesktopPlayer` reopens the stream in mpv's own window if the embed produced
-  no picture at all on this machine.
+  INSIDE the app window. mpv keeps its own window — so its video output is
+  always created by mpv, for mpv, which is what makes the picture reliable — and
+  the app *adopts* that window: it is found by process id, its caption and
+  taskbar button are stripped, it is owned by the app window, and it is glued
+  exactly over the video area. mpv's own controller is switched off and the app
+  draws the controls: a **top strip** (Back, title, status chip only when there
+  is something to say, and the window's minimise/maximise/close cluster) and one
+  **control bar** under the picture (play/pause, elapsed time, a scrubbable
+  seek, total time, **Source** — every server the title offered, switchable
+  mid-playback, labelled with the one playing — the file's own audio and
+  subtitle tracks, "Next episode", fullscreen). The video area takes every
+  remaining pixel: no panel of buttons, nothing drawn over the picture. While a
+  spinner or an explanation covers the video area, the adopted window is
+  *parked* far off-screen at its full size — never hidden and never shrunk,
+  both of which used to kill or mis-size mpv's video output. If a stream loads
+  and no picture ever arrives, the player says so over the video area and offers
+  Retry / Open in browser / Close: it never spawns a second player window behind
+  the user's back.
 - **Rails** (`Ui.rail` + `Ui.railWithArrows`): the vertical mouse wheel is mapped
   to horizontal movement and only consumed while the rail can still move, so the
   page keeps scrolling normally when the rail is at its end.
@@ -172,11 +193,11 @@ for the audio-merge step).
 
 The SkyStream, Nuvio and Aniyomi engines are ported, IPTV playlists are a
 provider, and the player is an in-app layer: mpv renders into a surface the app
-owns (`--wid`, via JNA in `WinShell`) so the video is attached to the app window,
-with ONE slim control bar of the app's own — Back, play/pause, seek, **Source**
-(switch servers mid-playback), audio/subtitle tracks, next episode, fullscreen —
-driving it over mpv's JSON IPC. The Extensions screen is where all of them are
-added. `desktop/UI_GUIDE.md`'s rules apply to any UI added for them.
+adopts mpv's own window (via JNA in `WinShell`) so the video is attached to the
+app window, with the app's own top strip and ONE control bar — play/pause, seek,
+**Source** (switch servers mid-playback), audio/subtitle tracks, next episode,
+fullscreen — driving it over mpv's JSON IPC. The Extensions screen is where all
+of them are added. `desktop/UI_GUIDE.md`'s rules apply to any UI added for them.
 
 Still missing: i18n and the TMDB metadata/ratings/collections/backup features.
 See `docs/DESKTOP_PARITY.md` for the state of each and the remaining plan.

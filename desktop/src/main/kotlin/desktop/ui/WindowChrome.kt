@@ -26,16 +26,28 @@ class WindowChrome(private val stage: Stage) {
     private var restoreW = 0.0
     private var restoreH = 0.0
 
-    private val maximizeButton = Ui.iconButton(Icons.MAXIMIZE, "Maximise", size = 13.0) { toggleMaximize() }
+    /** Every maximise button ever handed out. [controls] is called more than
+     *  once (the app's top bar, and the player's own strip while it covers the
+     *  window), and each caller needs its OWN button instance: a JavaFX node has
+     *  one parent, so sharing one would silently remove it from the first caller
+     *  — which is how the top bar's maximise button used to disappear for good
+     *  after the first play. */
+    private val maximizeButtons = mutableListOf<Button>()
 
     /** The minimise / maximise / close cluster for the window's top bar. */
     fun controls(): HBox {
         val minimize = Ui.iconButton(Icons.MINIMIZE, "Minimise", size = 13.0) { stage.isIconified = true }
+        val maximize = Ui.iconButton(
+            if (maximized) Icons.RESTORE else Icons.MAXIMIZE,
+            "Maximise",
+            size = 13.0,
+        ) { toggleMaximize() }
         val close = Ui.iconButton(Icons.CLOSE, "Close", size = 13.0) { stage.close() }
+        maximizeButtons.add(maximize)
         minimize.styleClass.add("win-btn")
-        maximizeButton.styleClass.add("win-btn")
+        maximize.styleClass.add("win-btn")
         close.styleClass.addAll("win-btn", "win-btn-close")
-        return HBox(minimize, maximizeButton, close).apply {
+        return HBox(minimize, maximize, close).apply {
             alignment = Pos.CENTER_RIGHT
             spacing = 0.0
             styleClass.add("win-controls")
@@ -102,7 +114,9 @@ class WindowChrome(private val stage: Stage) {
             stage.height = bounds.height
             maximized = true
         }
-        maximizeButton.graphic = Icons.of(if (maximized) Icons.RESTORE else Icons.MAXIMIZE, 13.0)
+        maximizeButtons.forEach {
+            it.graphic = Icons.of(if (maximized) Icons.RESTORE else Icons.MAXIMIZE, 13.0)
+        }
     }
 
     /** Edge bitmask: 1=W, 2=E, 4=N, 8=S. Corners combine two. */

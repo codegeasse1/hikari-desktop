@@ -134,23 +134,54 @@ elsewhere) and driven over its JSON IPC:
   changes and events out to callbacks.
 - `desktop/player/PlayerWindow.kt` — the app's own player **layer** (mounted into
   `AppShell.playerHost`, so the video is part of the app window instead of a
-  second window): a single slim control bar under the picture — Back, title,
-  play/pause, time + scrubbable seek, **Source** (every server the title offered,
-  switchable mid-playback), the file's own audio and subtitle tracks by name and
-  language, "Next episode" and fullscreen, plus the window's minimise/maximise/
-  close cluster. A status chip shows only while there is something to say (a dead
-  control channel, why a stream stopped). Keyboard: space, ←/→, ↑/↓, F, N, Esc.
-- **The video renders INSIDE the app.** mpv is handed a borderless surface window
-  the app owns as its `--wid` (`desktop/player/WinShell.kt`, the only raw Win32 in
-  the app, reached through JNA); mpv creates its video as a child of it, and mpv's
-  own on-screen controller is off, so the picture is integrated with the app's bar
-  and nothing else is drawn over it. The surface is glued to the video area on
-  move/resize/maximise/fullscreen and mpv's child window is re-sized to fill it,
-  so maximising or dragging the app keeps the video lined up. It is *shrunk* (never
-  closed) while the loading overlay or an explanation is up, because it is a native
-  window that would otherwise cover that text. If the embed produces no picture at
-  all on a machine (driver-dependent), `DesktopPlayer` reopens the stream in mpv's
-  own window — a visible picture always beats a tidier window.
+  second window): a **top strip** — Back, title, a status chip that shows only
+  while there is something to say, and the window's minimise/maximise/close
+  cluster — over the picture, and ONE **control bar** under it: play/pause,
+  elapsed time, a scrubbable seek, total time, **Source** (every server the title
+  offered, switchable mid-playback, labelled with the one playing), the file's own
+  audio and subtitle tracks by name and language, "Next episode" and fullscreen.
+  Keyboard: space, ←/→, ↑/↓, F, N, Esc.
+- **The video renders INSIDE the app.** The app *adopts* mpv's own window:
+  `desktop/player/WinShell.kt` (the only raw Win32 in the app, reached through
+  JNA) finds the window by the mpv process id, strips its caption/frame, makes it
+  an owned, non-activating tool window (so it takes no taskbar slot, stays above
+  the app, and the app keeps keyboard focus and its shortcuts) and glues it
+  exactly over the video area. mpv keeps rendering into its OWN window, which is
+  the whole point: the video output is created by mpv, for mpv, so it always comes
+  up — the previous approach handed mpv a window JavaFX owned (and once shrank it
+  to 2×2 while loading), and on real machines that produced "sound but no
+  picture", after which the app reopened the stream in a second, visible window.
+  While a spinner or an explanation covers the video area the adopted window is
+  *parked* far off-screen at full size (never hidden, never shrunk, neither of
+  which mpv's video output survives), and it is re-glued on
+  move/resize/maximise/fullscreen. `--no-config --no-border --no-osc
+  --no-input-default-bindings` keep the user's own mpv.conf and mpv's own
+  controller/keys out of the app's player. If a stream loads and no picture ever
+  arrives, the player says so over the video area with Retry / Open in browser /
+  Close actions — it never spawns a second window behind the user's back.
+- **IPC writes never block a caller.** A named-pipe write blocks when the
+  other end stops draining it, and the callers are the player's controls (some on
+  the JavaFX thread), so `MpvIpc` queues commands and writes them from one writer
+  thread. A wedged pipe now costs the commands, never the UI; a write that has not
+  returned in 10s marks the connection dead. `close()` closes the transport from a
+  **daemon thread** for the same reason — closing a stream with an in-flight write
+  blocks too (this was not theoretical: on CI a single `get_property` sat inside
+  `WriteFile` and `close()` inside `RandomAccessFile`, hanging the step for eight
+  minutes).
+- **The watchdog never blames the stream for a player it could not talk to.** On a
+  machine whose GPU falls back to software, mpv spends the first seconds of a
+  stream compiling shaders and answers no IPC at all. If nothing has been answered
+  `PlayerWindow.setStatus("Still opening the stream…")` says so and the failure
+  dialog is withheld — only a player that HAS answered and still shows no picture
+  is reported as a failed stream.
+- **The bars fit the window they are in** (`PlayerWindow.applyResponsive`): below
+  780px the pickers drop their labels, below 560px the audio/subtitle pickers and
+  the separators go away. Before that, a 460px-wide window squeezed the seek bar to
+  a dot and pushed the fullscreen button off the right edge.
+- **The player's UI is verified by looking at it**, not by arguing:
+  `desktop/uitest/UiShotTest.kt` renders the real screens and the real player layer
+  (loading, failure, wide, phone-width) to PNGs on every CI run and uploads them as
+  the `ui-shots` artifact.
 - Releases ship the **.exe installer only** — there is no `.zip` app image.
 - `DetailScreen` hands the player what only it knows: `next` (advance to the next
   episode, then play its first source), `position` (throttled history writes, so a
@@ -255,6 +286,63 @@ NUVIO, CloudStream `plugins`/`pluginLists` (or a `.sky` plugin list) →
 CS3/SKYSTREAM. That mix-up is what made pasting e.g. an `All-in-One-Nuvio`
 `manifest.json` into the Scraper box report "Scraper added" while the repo
 appeared nowhere.
+
+## Repos that "couldn't be reached" — the network compatibility ladder (done)
+
+A user's repo came back as `unreachable` with
+`Read error: Failure in SSL library, usually a protocol error` — for one repo,
+while other things in the app loaded fine. That message is the network talking,
+not the site: it is the same failure mode as the earlier "install latency" work
+(blocked hosts, a leftover OS proxy), except that only the *download* paths had a
+rescue stack and the repo/manifest paths had none.
+
+`Http` now owns one compatibility ladder and every fetch walks it
+(`fetchRepoJson`, `fetchStringRobust`, `fetchBytesRobust`, `getStringStrict`):
+
+1. the normal stack (Conscrypt TLS, DNS-over-HTTPS, the OS proxy),
+2. the same with **TLS pinned to 1.2** — some Windows machines/networks fail
+   every Conscrypt TLS 1.3 handshake with exactly the error above,
+3. the same with the **OS proxy bypassed** (an uninstalled VPN/Clash/Psiphon
+   entry left in the system proxy settings makes every JVM request fail while the
+   browser works).
+
+The pass that worked is remembered in `~/.hikari/cache/net.json`, so the second
+launch (and every request after the first) starts on the stack this machine can
+actually use. A TLS-library failure is never blamed on the host — it would
+otherwise blacklist every GitHub host for ten minutes — and a failed repo fetch
+is retried in two minutes rather than after the six-hour cache TTL, so a repo
+that failed on the network comes back by itself.
+
+**Authoritative URLs are raced before any mirror**, and a mirror is only allowed to
+answer once they have failed (`originVariants` / `mirrorVariants`). Racing them
+together was wrong in two separate ways, both of which shipped and both of which
+were caught by the self-tests:
+
+- a CDN copy of a *branch* file can be days stale (jsDelivr caches a branch ref),
+  so "the newest extension is missing from my repo" and "this extension installs
+  but will not load" are the same bug — an old `.cs3` with no `manifest.json`;
+- a proxy frontdoor can answer **HTTP 200 with a 122-byte error page**, and being
+  tiny it wins every race (`gh-proxy.net`, now removed). Every "robust" fetch
+  rejects a body that is really a web page (`Http.isWebPage`, `looksLikeHtmlFile`
+  for downloads), because a race has no other way to tell a fast wrong answer from
+  a right one.
+
+Both were found by `RealPluginSelfTest`, which downloads two real third-party
+`.cs3` files and loads them — the reason that test exists at all.
+
+The mirror list also grew (`fastly.`/`gcore.jsdelivr.net` — three independent
+jsDelivr edges — plus `gh-proxy.com`, `ghproxy.cc`, `gh.llkk.cc`,
+`github.moeyy.xyz`, `raw.gitmirror.com`). DoH now queries several providers **in
+parallel** and always includes IP-literal endpoints (`1.1.1.1`, `8.8.8.8`,
+`9.9.9.9:5053`) — the only kind that can rescue
+a machine whose OS resolver is filtered, since a named endpoint has to be
+resolved by the very resolver being worked around. When everything still fails,
+the card shows a count of the real causes ("the TLS handshake is being blocked by
+this network (8)") instead of whichever attempt happened to finish last.
+
+`NetworkSelfTest` (CI) proves the ladder offline: it starts a local HTTP server,
+installs a *dead* proxy, and requires the body to still arrive — and the
+no-proxy pass to be remembered.
 
 ## Risks
 

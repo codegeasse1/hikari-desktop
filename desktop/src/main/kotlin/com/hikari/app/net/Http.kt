@@ -72,6 +72,192 @@ object Http {
         }
     }
 
+    // ── the compatibility ladder ────────────────────────────────────────────
+
+    /**
+     * One way of talking to the network. A machine can be unable to reach the
+     * GitHub family (and *only* it) for reasons that have nothing to do with
+     * the site — Conscrypt's TLS 1.3 handshake dying inside a network filter
+     * ("Read error: Failure in SSL library, usually a protocol error"), or a
+     * leftover OS proxy (an uninstalled VPN/Clash/Psiphon entry) answering
+     * every request with garbage. Both are invisible to the user and both look
+     * exactly like "this repo is unreachable".
+     *
+     * So instead of betting on one stack, every fetch walks a ladder of them,
+     * and the one that worked is remembered in `~/.hikari/cache/net.json`, so
+     * the next launch goes straight to it instead of paying for the dead stack
+     * again.
+     */
+    private data class NetPass(val tls12: Boolean, val noProxy: Boolean) {
+        val key: String get() = (if (tls12) "tls12" else "tls13") + (if (noProxy) "-noproxy" else "")
+    }
+
+    /** Remembers which pass got through, so the ladder is walked in the order
+     *  this machine needs. */
+    private object NetMemory {
+
+        private val file: java.io.File by lazy {
+            val f = java.io.File(
+                java.io.File(System.getProperty("user.home"), ".hikari/cache"),
+                "net.json",
+            )
+            runCatching { f.parentFile?.mkdirs() }
+            f
+        }
+
+        @Volatile private var loaded = false
+        @Volatile private var tls12 = false
+        @Volatile private var noProxy = false
+
+        private fun load() {
+            if (loaded) return
+            synchronized(this) {
+                if (loaded) return
+                loaded = true
+                val text = runCatching { file.takeIf { it.isFile }?.readText() }.getOrNull() ?: return
+                val root = runCatching { org.json.JSONObject(text) }.getOrNull() ?: return
+                tls12 = root.optBoolean("tls12", false)
+                noProxy = root.optBoolean("noProxy", false)
+            }
+        }
+
+        /** The pass that last worked, or null when nothing has been learned
+         *  (a machine whose normal stack works learns nothing, which is the
+         *  point — there is nothing to change). */
+        fun pass(): NetPass? {
+            load()
+            return if (tls12 || noProxy) NetPass(tls12, noProxy) else null
+        }
+
+        fun remember(pass: NetPass) {
+            load()
+            if (tls12 == pass.tls12 && noProxy == pass.noProxy) return
+            tls12 = pass.tls12
+            noProxy = pass.noProxy
+            val json = runCatching {
+                org.json.JSONObject().put("tls12", tls12).put("noProxy", noProxy).toString()
+            }.getOrElse { """{"tls12":$tls12,"noProxy":$noProxy}""" }
+            runCatching {
+                file.parentFile?.mkdirs()
+                file.writeText(json)
+            }.onFailure {
+                // Never silent: a machine that cannot remember the rescue pays
+                // for the dead stack on every launch, and the only way to find
+                // that out is in the log.
+                System.err.println("NetMemory: cannot persist the rescue pass to " + file.absolutePath + ": " + it)
+            }
+        }
+    }
+
+    /** Which pass this machine has learned (for the self-test and the logs). */
+    fun learnedPassKey(): String? = NetMemory.pass()?.key
+
+    /** Which pass served the most recent robust fetch, or null when the fetch
+     *  went through on the ordinary stack (the only non-newsworthy outcome). */
+    @Volatile private var lastWinPassKey: String? = null
+
+    fun lastWinningPassKey(): String? = lastWinPassKey
+
+    private val clientCache = ConcurrentHashMap<String, OkHttpClient>()
+
+    /** TLS pinned to 1.2: everything a modern site accepts, and none of the
+     *  TLS 1.3 machinery a broken network filter chokes on. */
+    private val tls12Spec: okhttp3.ConnectionSpec by lazy {
+        okhttp3.ConnectionSpec.Builder(okhttp3.ConnectionSpec.MODERN_TLS)
+            .tlsVersions(okhttp3.TlsVersion.TLS_1_2)
+            .build()
+    }
+
+    private fun buildClient(tls12: Boolean, noProxy: Boolean, connectMs: Long, readMs: Long): OkHttpClient {
+        val b = OkHttpClient.Builder()
+        applyConscryptTls(b)
+        // CLEARTEXT is included on purpose: a spec list holding only a TLS spec
+        // makes OkHttp refuse every http:// URL ("cleartext communication …
+        // not permitted by network security policy"), which silently disabled
+        // the TLS-1.2 and no-proxy rescue passes for plain-HTTP repos/streams —
+        // the NetworkSelfTest caught exactly that.
+        if (tls12) b.connectionSpecs(listOf(okhttp3.ConnectionSpec.CLEARTEXT, tls12Spec))
+        if (noProxy) b.proxy(java.net.Proxy.NO_PROXY) else b.proxySelector(java.net.ProxySelector.getDefault())
+        return b.dns(HikariDns)
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .connectTimeout(connectMs, TimeUnit.MILLISECONDS)
+            .readTimeout(readMs, TimeUnit.MILLISECONDS)
+            .build()
+    }
+
+    /** A short-timeout client for one pass: the timeouts are what keep a
+     *  black-holed host cheap. */
+    private fun passClient(pass: NetPass): OkHttpClient =
+        cached("p-" + pass.key) { buildClient(pass.tls12, pass.noProxy, 6_000L, 10_000L) }
+
+    /** The same pass with full timeouts, for hosts that are merely slow. */
+    private fun slowClient(pass: NetPass): OkHttpClient =
+        cached("s-" + pass.key) { buildClient(pass.tls12, pass.noProxy, 20_000L, 30_000L) }
+
+    /** One client per (pass, timeout) pair, built once. */
+    private fun cached(key: String, build: () -> OkHttpClient): OkHttpClient {
+        clientCache[key]?.let { return it }
+        val made = runCatching { build() }.getOrElse { client }
+        return clientCache.putIfAbsent(key, made) ?: made
+    }
+
+    /** The ladder, most-likely-to-work first: what this machine learned last
+     *  time, then the normal stack, then TLS 1.2, then TLS 1.2 with the OS
+     *  proxy bypassed (only when one is configured — otherwise it is the same
+     *  client twice). */
+    private fun passes(): List<NetPass> {
+        val out = LinkedHashSet<NetPass>()
+        NetMemory.pass()?.let { out.add(it) }
+        out.add(NetPass(tls12 = false, noProxy = false))
+        out.add(NetPass(tls12 = true, noProxy = false))
+        if (systemProxyInUse()) out.add(NetPass(tls12 = true, noProxy = true))
+        System.err.println(
+            "net-ladder: systemProxy=" + systemProxyInUse() + " learned=" + (NetMemory.pass()?.key ?: "-") +
+                " ladder=" + out.joinToString(",") { it.key },
+        )
+        return out.toList()
+    }
+
+    /** True when the failure is the TLS stack unable to talk to the host at all
+     *  — the signature of a network filter or a broken TLS 1.3 path, not of a
+     *  dead host. The ladder handles it; the host must not be blacklisted for
+     *  it. */
+    fun isTlsStackFailure(t: Throwable?): Boolean {
+        val text = (t?.message ?: "").lowercase()
+        if (text.isBlank()) return false
+        return text.contains("failure in ssl library") ||
+            text.contains("ssl routines") ||
+            text.contains("wrong_version_number") ||
+            text.contains("unsupported protocol") ||
+            text.contains("tlsv1 alert") ||
+            text.contains("handshake_failure")
+    }
+
+    /**
+     * A short, honest reason for a failed fetch across many mirrors: the most
+     * common distinct causes with how many hosts reported them, so the user
+     * reads "TLS handshake blocked by this network (8)" instead of whichever
+     * attempt happened to fail last.
+     */
+    fun summariseFailures(failures: Collection<Throwable>): String {
+        if (failures.isEmpty()) return "no server answered"
+        val groups = LinkedHashMap<String, Int>()
+        for (t in failures) {
+            val label = when {
+                isTlsStackFailure(t) -> "the TLS handshake is being blocked by this network"
+                t is UnknownHostException -> "DNS lookup failed"
+                t is java.net.ConnectException -> "connection refused"
+                t is java.net.SocketTimeoutException -> "timed out"
+                t is java.io.InterruptedIOException -> "timed out"
+                else -> humanMessage(t).take(90)
+            }
+            groups[label] = (groups[label] ?: 0) + 1
+        }
+        return groups.entries.sortedByDescending { it.value }.take(3)
+            .joinToString("; ") { it.key + " (" + it.value + ")" }
+    }
+
     /** Runs the call. No JDK-TLS retry: the Conscrypt stack above is the one and
      *  only TLS path — a broken alternative that touches sun.security.ssl can
      *  poison the JVM (NoClassDefFoundError: SSLSessionImpl). */
@@ -108,7 +294,11 @@ object Http {
             items.forEach { item ->
                 pool.execute {
                     val value = runCatching { task(item) }.getOrNull()
-                    done.put(item to value)
+                    // The pool is shut down (interrupting the losers) as soon as
+                    // one candidate answers, so this hand-off can be interrupted
+                    // too — swallowing that keeps the console free of
+                    // "Uncaught ... InterruptedException" noise on every fetch.
+                    runCatching { done.put(item to value) }
                 }
             }
             val rounds = (items.size + threads - 1) / threads
@@ -132,6 +322,15 @@ object Http {
         }
     }
 
+    /** How long the authoritative URLs of a file get before the CDN/proxy
+     *  mirrors are allowed to answer. A blocked origin usually fails in
+     *  milliseconds (connection reset / TLS refusal), so this window is only
+     *  ever fully spent on a black-holed host. */
+    private const val ORIGIN_WINDOW_MS = 12_000L
+
+    /** How long the mirror wave gets per network pass. */
+    private const val MIRROR_WINDOW_MS = 25_000L
+
     /** How many mirror candidates are raced at once. Four covers the realistic
      *  "one CDN + one proxy frontdoor + the origin" spread without hammering a
      *  slow network with eight parallel sockets. */
@@ -151,7 +350,7 @@ object Http {
      * The mirror list is bounded (8-16 URLs of a few hundred KB), so starting
      * them all costs nothing worth saving.
      */
-    private const val FANOUT = 12
+    private const val FANOUT = 20
 
     /**
      * What this machine's network can actually reach, learned as it goes.
@@ -284,29 +483,12 @@ object Http {
         is java.net.ConnectException -> true
         is java.net.SocketTimeoutException -> true
         is java.net.NoRouteToHostException -> true
-        is javax.net.ssl.SSLException -> true
+        // A TLS-stack failure is this machine's problem, not the host's (see
+        // [isTlsStackFailure]) — the ladder retries it on another stack, and the
+        // host must not be blacklisted for it.
+        is javax.net.ssl.SSLException -> !isTlsStackFailure(t)
         is java.io.InterruptedIOException -> true
         else -> isHostFailure(t.cause)
-    }
-
-    /** A client for the FIRST pass over the mirrors: a host that is black-holed
-     *  (packets dropped, no RST — the usual shape of a censored CDN) costs the
-     *  full connect timeout, so the probe uses a short one. Whatever answers
-     *  still returns the complete body; the longer-timeout clients below only
-     *  come out when this pass found nothing at all.
-     */
-    private val mirrorProbeClient: OkHttpClient by lazy {
-        try {
-            applyConscryptTls(OkHttpClient.Builder())
-                .dns(HikariDns)
-                .followRedirects(true)
-                .followSslRedirects(true)
-                .connectTimeout(6, TimeUnit.SECONDS)
-                .readTimeout(10, TimeUnit.SECONDS)
-                .build()
-        } catch (t: Throwable) {
-            client
-        }
     }
 
     fun get(url: String, headers: Map<String, String> = emptyMap()): Response {
@@ -476,13 +658,23 @@ object Http {
         // blocked raw.githubusercontent.com sitting in front of a working
         // jsDelivr cost a full connect timeout before the good URL was even
         // tried — several waves of that is the 30-40s wait.
-        val flattened = LinkedHashSet<String>()
-        for (c in live) flattened.addAll(urlVariants(c))
+        // The live candidates split into the AUTHORITATIVE URLs (which always
+        // reflect the branch as it is now) and the CDN/proxy copies, which can
+        // be days stale. A stale repo.json is not a crash: it is the repo
+        // silently missing its newest extensions, which is why the origins are
+        // raced on their own before any mirror gets a chance (see
+        // [mirrorVariants]).
+        val liveOrigins = LinkedHashSet<String>()
+        val liveMirrors = LinkedHashSet<String>()
+        for (c in live) {
+            liveOrigins.addAll(originVariants(c))
+            liveMirrors.addAll(mirrorVariants(c))
+        }
         val snapshotUrls = LinkedHashSet<String>()
         for (c in snapshot) snapshotUrls.addAll(urlVariants(c))
 
-        fun tryOne(u: String): String? {
-            val r = getStringStrict(u)
+        fun tryOne(c: OkHttpClient, u: String): String? {
+            val r = getStringStrictOn(c, u)
             val text = r.getOrNull()
             if (text == null) {
                 val cause = r.exceptionOrNull()
@@ -507,18 +699,43 @@ object Http {
             return null
         }
 
-        onStep?.invoke("Fetching repo… (racing ${flattened.size} mirrors)")
-        raceFirst(MirrorMemory.order(raw, flattened.toList()), FANOUT, 35_000L) { tryOne(it) }
-            ?.let { return Result.success(it.first to it.second) }
+        onStep?.invoke("Fetching repo… (racing ${liveOrigins.size + liveMirrors.size} mirrors)")
+        val ladder = passes()
+
+        // The live candidates are raced once per network pass (see [passes]): a
+        // machine that cannot complete a TLS 1.3 handshake to the GitHub family
+        // still loads its repos, just on the second pass. Within a pass the
+        // authoritative URLs go first, the CDN copies only after they fail.
+        for ((index, pass) in ladder.withIndex()) {
+            if (System.currentTimeMillis() >= deadline) break
+            val window = if (index == 0) 30_000L else 18_000L
+            for ((wave, ms) in listOf(MirrorMemory.order(raw, liveOrigins.toList()) to ORIGIN_WINDOW_MS, MirrorMemory.order(raw, liveMirrors.toList()) to window)) {
+                if (wave.isEmpty()) continue
+                if (System.currentTimeMillis() >= deadline) break
+                val got = raceFirst(wave, FANOUT, ms) { tryOne(passClient(pass), it) }
+                if (got != null) {
+                    System.err.println("net-ladder(repo): served by pass '" + pass.key + "' (" + got.first + ")")
+                    lastWinPassKey = pass.key
+                    NetMemory.remember(pass)
+                    return Result.success(got.first to got.second)
+                }
+            }
+            System.err.println("net-ladder(repo): pass '" + pass.key + "' exhausted every candidate")
+        }
 
         if (snapshotUrls.isNotEmpty() && System.currentTimeMillis() < deadline) {
             onStep?.invoke("Fetching repo… (last-resort mirror)")
-            raceFirst(snapshotUrls.toList(), RACE_PARALLELISM, 25_000L) { tryOne(it) }
-                ?.let { return Result.success(it.first to it.second) }
+            for (pass in ladder) {
+                if (System.currentTimeMillis() >= deadline) break
+                raceFirst(snapshotUrls.toList(), RACE_PARALLELISM, 20_000L) {
+                    tryOne(passClient(pass), it)
+                }?.let {
+                    NetMemory.remember(pass)
+                    return Result.success(it.first to it.second)
+                }
+            }
         }
-        return Result.failure(
-            failures.lastOrNull() ?: Exception("No candidate URL served a valid repo.json")
-        )
+        return Result.failure(Exception(summariseFailures(failures)))
     }
 
     /** Resolves [url] against [baseUrl] when it is relative. The CloudStream
@@ -581,6 +798,9 @@ object Http {
     /** Short human-readable reason for a failed network call: collapses the
      *  multi-line Conscrypt/BoringSSL TLS noise into a single line. */
     fun humanMessage(t: Throwable?): String {
+        // The single most common desktop failure deserves a sentence a user can
+        // act on, not an OpenSSL routine dump.
+        if (isTlsStackFailure(t)) return "the TLS handshake is being blocked by this network"
         val raw = t?.message?.trim().orEmpty().ifBlank { t?.javaClass?.simpleName ?: "unknown network error" }
         val firstLine = raw.lineSequence().firstOrNull { it.isNotBlank() } ?: raw
         return firstLine
@@ -792,8 +1012,13 @@ object Http {
         humanMessage(e)
     }
 
-    fun getStringStrict(url: String, headers: Map<String, String> = emptyMap()): Result<String> =
-        getStringStrictOn(client, url, headers)
+    /** A single GET with the stack this machine has been found to need (see
+     *  [NetMemory]) — a machine whose TLS 1.3 is blocked must not have every
+     *  catalog call fail just because the repo path learned the workaround. */
+    fun getStringStrict(url: String, headers: Map<String, String> = emptyMap()): Result<String> {
+        val learned = NetMemory.pass() ?: return getStringStrictOn(client, url, headers)
+        return getStringStrictOn(slowClient(learned), url, headers)
+    }
 
     private fun getStringStrictOn(c: OkHttpClient, url: String, headers: Map<String, String> = emptyMap()): Result<String> =
         try {
@@ -845,50 +1070,95 @@ object Http {
         return GhTarget(user, repo, ref, path)
     }
 
+
     /**
-     * Download sources for a URL. For GitHub-hosted files a chain of public
-     * mirrors is generated so a single blocked/unreachable host can't kill an
-     * install — networks routinely block raw.githubusercontent.com or throttle
-     * it (~60 req/hr per IP) while the CDNs still work, and vice versa:
-     *
-     *  1. jsDelivr — global CDN mirror of GitHub files (rate-limit-free),
-     *  2. the original URL as typed,
-     *  3. the canonical raw URL (refs/heads forms normalized, query stripped),
-     *  4. statically.io — a second independent CDN,
-     *  5. raw.githack.com — a third,
-     *  6. github.com's own /raw/ path (serves the bytes, follows redirects),
-     *  7-8. GitHub proxy frontdoors (ghfast.top, ghproxy.net) — different
-     *     hostnames that stream the same raw files, for networks that
-     *     SNI-block/TLS-break every GitHub-family host. Last resort only.
-     *
-     * Google Drive share links are rewritten to the direct-download form
-     * first (otherwise the "file" downloaded is a virus-scan HTML page).
+     * The AUTHORITATIVE URLs for a file: the URL the caller gave (normalized),
+     * raw.githubusercontent's canonical form, and github.com's own `/raw/`
+     * path. These cannot be a stale CDN copy of a branch file, so they are
+     * always tried before any mirror.
      */
-    private fun urlVariants(url: String): List<String> {
+    private fun originVariants(url: String): List<String> {
         val base = normalizeDriveUrl(url.trim())
         val gh = parseGhTarget(base) ?: return listOf(base)
+        val p = gh.path.substringBefore('?')
+        val out = linkedSetOf<String>()
+        out.add(base)
+        out.add("https://raw.githubusercontent.com/${gh.user}/${gh.repo}/${gh.ref}/$p")
+        out.add("https://github.com/${gh.user}/${gh.repo}/raw/${gh.ref}/$p")
+        return out.toList()
+    }
+
+    /**
+     * CDN and proxy copies of the same file. Two things make these a FALLBACK
+     * and never a first choice:
+     *
+     *  - a CDN (jsDelivr especially) caches a branch file for days, so a mirror
+     *    can serve an OLD revision — for an extension `.cs3` that means a jar
+     *    whose `manifest.json` is missing, i.e. "the extension won't load";
+     *  - a proxy frontdoor can answer HTTP 200 with a small HTML error page.
+     *    A 100-byte page beats a 90 KB file in a race, so racing mirrors first
+     *    is how a download "succeeds" with garbage ([isWebPage] is the belt to
+     *    this braces).
+     */
+    private fun mirrorVariants(url: String): List<String> {
+        val base = normalizeDriveUrl(url.trim())
+        val gh = parseGhTarget(base) ?: return emptyList()
         // Mirror URLs are built from the bare path — a query string that is
         // fine on raw.githubusercontent ("…?token=x") makes CDN/proxy mirrors
         // answer HTTP 400, so it never leaks into generated variants.
         val p = gh.path.substringBefore('?')
         val raw = "https://raw.githubusercontent.com/${gh.user}/${gh.repo}/${gh.ref}/$p"
         val out = linkedSetOf<String>()
+        // jsDelivr's three independent edges: the same files on three different
+        // hostnames, which is exactly what is needed when ONE of them is
+        // SNI-blocked by the local network.
         out.add("https://cdn.jsdelivr.net/gh/${gh.user}/${gh.repo}@${gh.ref}/$p")
-        out.add(base)
-        out.add(raw)
+        out.add("https://fastly.jsdelivr.net/gh/${gh.user}/${gh.repo}@${gh.ref}/$p")
+        out.add("https://gcore.jsdelivr.net/gh/${gh.user}/${gh.repo}@${gh.ref}/$p")
         out.add("https://cdn.statically.io/gh/${gh.user}/${gh.repo}/${gh.ref}/$p")
         out.add("https://raw.githack.com/${gh.user}/${gh.repo}/${gh.ref}/$p")
-        out.add("https://github.com/${gh.user}/${gh.repo}/raw/${gh.ref}/$p")
         // Frontdoors for networks where TLS to every GitHub-family host dies
         // (the classic "SSL protocol error" on raw + jsDelivr while normal
-        // sites still load). Different hostnames, same files.
+        // sites still load) or where the whole family is blocked by name.
+        // Different hostnames, same files; a dead one costs nothing because they
+        // are all raced at once. (gh-proxy.net was removed: it answers 200 with
+        // a 122-byte stub, and being tiny it won every race.)
         out.add("https://ghfast.top/$raw")
         out.add("https://ghproxy.net/$raw")
+        out.add("https://gh-proxy.com/$raw")
+        out.add("https://ghproxy.cc/$raw")
+        out.add("https://gh.llkk.cc/$raw")
+        out.add("https://github.moeyy.xyz/$raw")
+        out.add("https://raw.gitmirror.com/${gh.user}/${gh.repo}/${gh.ref}/$p")
         return out.toList()
     }
 
+    /** Every candidate URL for a file: authoritative first, mirrors after. */
+    private fun urlVariants(url: String): List<String> =
+        originVariants(url) + mirrorVariants(url)
+
+    /**
+     * True when a body is plainly NOT the file that was asked for — an HTML or
+     * XML page, which is what a proxy frontdoor or a captive portal returns
+     * (with HTTP 200) instead of the bytes. Every "robust" fetch races mirrors,
+     * and the wrong answer is usually the FASTEST one, so this check is what
+     * keeps a race from "succeeding" with an error page.
+     */
+    fun isWebPage(bytes: ByteArray?): Boolean {
+        if (bytes == null || bytes.isEmpty()) return false
+        val head = String(bytes, 0, minOf(bytes.size, 512), Charsets.ISO_8859_1)
+            .trimStart('\uFEFF', ' ', '\t', '\r', '\n')
+            .lowercase()
+        if (head.startsWith("<!doctype") || head.startsWith("<html")) return true
+        if (head.startsWith("<") && (head.contains("<head") || head.contains("<body") || head.contains("<title"))) return true
+        // An XML error document (S3/Cloudflare style) — still not the asset.
+        if (head.startsWith("<?xml") && head.contains("error")) return true
+        return false
+    }
+
     /** True when the OS has an HTTP(S) proxy configured — used to decide
-     *  whether a final no-proxy rescue pass is worth trying. */    private fun systemProxyInUse(): Boolean {
+     *  whether a final no-proxy rescue pass is worth trying. */
+    private fun systemProxyInUse(): Boolean {
         return try {
             java.net.ProxySelector.getDefault()
                 ?.select(java.net.URI("https://raw.githubusercontent.com/"))
@@ -928,7 +1198,7 @@ object Http {
                 .build()
             applyConscryptTls(OkHttpClient.Builder())
                 .proxy(java.net.Proxy.NO_PROXY)
-                .connectionSpecs(listOf(tls12))
+                .connectionSpecs(listOf(okhttp3.ConnectionSpec.CLEARTEXT, tls12))
                 .dns(HikariDns)
                 .followRedirects(true)
                 .followSslRedirects(true)
@@ -941,10 +1211,11 @@ object Http {
     }
 
     fun fetchStringRobust(url: String, headers: Map<String, String> = emptyMap()): Result<String> {
-        val variants = MirrorMemory.order(url, urlVariants(url))
+        val origins = MirrorMemory.order(url, originVariants(url))
+        val mirrors = MirrorMemory.order(url, mirrorVariants(url))
         val failures = java.util.concurrent.ConcurrentLinkedQueue<Throwable>()
-        fun attempt(u: String): String? {
-            val r = getStringStrictOn(mirrorProbeClient, u, headers)
+        fun attempt(c: OkHttpClient, u: String): String? {
+            val r = getStringStrictOn(c, u, headers)
             if (r.isSuccess) {
                 MirrorMemory.markAlive(u)
                 MirrorMemory.rememberWinner(url, u)
@@ -955,47 +1226,69 @@ object Http {
             }
             return r.getOrNull()
         }
-        // Short-timeout pass over EVERY mirror at once: the answer is the
-        // fastest host, not the sum of the dead ones (see [raceFirst] and
-        // [FANOUT] for why four-at-a-time was not enough).
-        raceFirst(variants, FANOUT, 30_000L) { attempt(it) }
-            ?.let { return Result.success(it.second) }
-        // Second pass on the full-timeout client, for hosts that are merely slow
-        // rather than dead (a throttled link can need longer than the probe).
-        raceFirst(variants, FANOUT, 40_000L) { u -> runCatching { getStringStrictOn(client, u, headers).getOrNull() }.getOrNull()?.also { MirrorMemory.markAlive(u) } }
-            ?.let { return Result.success(it.second) }
-        // Rescue pass with the system proxy bypassed (see [noProxyClient]).
-        if (systemProxyInUse()) {
-            raceFirst(variants, RACE_PARALLELISM, 30_000L) { u ->
-                val r = getStringStrictOn(noProxyClient, u, headers)
-                r.exceptionOrNull()?.let { failures += it }
-                if (r.isSuccess) MirrorMemory.markAlive(u) else if (isHostFailure(r.exceptionOrNull())) MirrorMemory.markDead(u)
-                r.getOrNull()
-            }?.let { return Result.success(it.second) }
+        // One wave of passes over EVERY candidate at once, so the answer is the
+        // fastest host on the first stack that works — not the sum of the dead
+        // ones, and not "the repo is unreachable" just because this machine
+        // cannot do TLS 1.3 through its network filter (see [passes]).
+        //
+        // Within a pass the AUTHORITATIVE URLs are raced first ([originVariants])
+        // and the CDN/proxy mirrors only if those all fail: racing them together
+        // lets a stale CDN copy of a branch file answer first, which is how a
+        // repo add shows an old extension list and an install fetches an old jar.
+        for (pass in passes()) {
+            for ((wave, kind) in listOf(origins to "origin", mirrors to "mirror")) {
+                if (wave.isEmpty()) continue
+                val window = if (kind == "origin") ORIGIN_WINDOW_MS else MIRROR_WINDOW_MS
+                val got = raceFirst(wave, FANOUT, window) { attempt(passClient(pass), it) }
+                if (got != null) {
+                    System.err.println("net-ladder: served by pass '" + pass.key + "' (" + kind + " " + got.first + ")")
+                    lastWinPassKey = pass.key
+                    NetMemory.remember(pass)
+                    return Result.success(got.second)
+                }
+            }
+            System.err.println("net-ladder: pass '" + pass.key + "' exhausted every candidate")
         }
-        return Result.failure(failures.lastOrNull() ?: Exception("Failed to fetch $url"))
+        // The full-timeout client, for hosts that are merely slow rather than
+        // dead (a throttled link can need longer than the probe) — on the
+        // compatibility stack, since every normal attempt has now failed.
+        raceFirst(origins + mirrors, FANOUT, 40_000L) { u -> runCatching { getStringStrictOn(client, u, headers).getOrNull() }.getOrNull()?.also { MirrorMemory.markAlive(u) } }
+            ?.let { return Result.success(it.second) }
+        return Result.failure(Exception(summariseFailures(failures)))
     }
 
     fun fetchBytesRobust(url: String, headers: Map<String, String> = emptyMap()): ByteArray? {
-        val variants = MirrorMemory.order(url, urlVariants(url))
-        raceFirst(variants, FANOUT, 40_000L) { u ->
-            val b = runCatching { getBytes(u, headers) }.getOrNull()
-            if (b != null) {
-                MirrorMemory.markAlive(u)
-                MirrorMemory.rememberWinner(url, u)
-            } else {
+        val origins = MirrorMemory.order(url, originVariants(url))
+        val mirrors = MirrorMemory.order(url, mirrorVariants(url))
+        fun attempt(c: OkHttpClient, u: String): ByteArray? {
+            val b = runCatching {
+                getOn(c, u, headers).use { r -> if (r.isSuccessful) r.body?.bytes() else null }
+            }.getOrNull()
+            if (b == null) {
                 MirrorMemory.markDead(u)
+                return null
             }
-            b
-        }?.let { return it.second }
+            if (isWebPage(b)) {
+                // A frontdoor answering 200 with an HTML error page is the one
+                // way a mirror can "win" a race with the wrong answer — a
+                // 122-byte stub beats an 88 KB extension every time. See
+                // [mirrorVariants].
+                System.err.println("net: ignoring a web page served for $u")
+                MirrorMemory.markDead(u)
+                return null
+            }
+            MirrorMemory.markAlive(u)
+            MirrorMemory.rememberWinner(url, u)
+            return b
+        }
+        // Authoritative URLs first, mirrors after — a CS3/JAR downloaded from a
+        // stale CDN copy installs an extension that cannot load.
+        for (pass in passes()) {
+            raceFirst(origins, FANOUT, ORIGIN_WINDOW_MS) { attempt(passClient(pass), it) }?.let { return it.second }
+            raceFirst(mirrors, FANOUT, MIRROR_WINDOW_MS) { attempt(passClient(pass), it) }?.let { return it.second }
+        }
         if (systemProxyInUse()) {
-            raceFirst(variants, RACE_PARALLELISM, 30_000L) { u ->
-                runCatching {
-                    getOn(noProxyClient, u, headers).use { r ->
-                        if (r.isSuccessful) r.body?.bytes() else null
-                    }
-                }.getOrNull()
-            }?.let { return it.second }
+            raceFirst(origins + mirrors, RACE_PARALLELISM, 30_000L) { attempt(noProxyClient, it) }?.let { return it.second }
         }
         return null
     }
@@ -1017,13 +1310,17 @@ object Http {
         onProgress: ((Long, Long) -> Unit)? = null,
         onAttempt: ((url: String, ok: Boolean, reason: String?) -> Unit)? = null,
     ): Boolean {
-        val variants = urlVariants(url)
+        // Authoritative URLs first, CDN/proxy mirrors second (see
+        // [mirrorVariants]): an extension install must never "succeed" with a
+        // stale or wrong file just because a mirror answered first.
+        val origins = MirrorMemory.order(url, originVariants(url))
+        val ordered = origins + MirrorMemory.order(url, mirrorVariants(url))
         // Overall budget: on a black-hole network every mirror costs a full
         // connect timeout; bound the walk so the UI doesn't sit for minutes
         // (the Android app caps installs at 90s for the same reason).
         val deadline = System.currentTimeMillis() + DOWNLOAD_BUDGET_MS
         sweepParts(dest)
-        val ordered = MirrorMemory.order(url, variants)
+        if (raceDownload(origins, dest, headers, onProgress, onAttempt, deadline, null, MAIN_RACE_MS, url)) return true
         if (raceDownload(ordered, dest, headers, onProgress, onAttempt, deadline, null, MAIN_RACE_MS, url)) return true
         // Rescue passes with the system proxy bypassed ([noProxyClient]) and then
         // with TLS pinned to 1.2 ([rescueClient]) — the two desktop
@@ -1039,6 +1336,17 @@ object Http {
     /** How long one wave of raced mirrors may take before the next wave starts. */
     private const val MAIN_RACE_MS = 45_000L
     private const val RESCUE_RACE_MS = 20_000L
+
+    /** True when what landed on disk is really an HTML page (a mirror's error
+     *  page) rather than the asset — read back from the file, so it also covers
+     *  a body that was compressed on the wire. */
+    private fun looksLikeHtmlFile(f: java.io.File): Boolean = runCatching {
+        if (!f.isFile || f.length() <= 0L) return@runCatching true
+        val len = minOf(f.length(), 512L).toInt()
+        val head = ByteArray(len)
+        java.io.FileInputStream(f).use { it.read(head) }
+        isWebPage(head)
+    }.getOrDefault(false)
 
     /** Part-file name for one raced attempt at [dest]. */
     private fun partOf(dest: java.io.File, key: String): java.io.File =
@@ -1087,20 +1395,26 @@ object Http {
             val part = partOf(dest, u)
             staging[u] = part
             val reason = downloadToReason(u, part, headers, onProgress, via)
-            if (reason == null) {
+            if (reason == null && !looksLikeHtmlFile(part)) {
                 MirrorMemory.markAlive(u)
                 part
             } else {
+                // A frontdoor that answers 200 with a small HTML page "wins" a
+                // race every time (100 bytes beats 100 KB), so a body that is
+                // really a web page is a FAILED download, not a fast one.
+                val why = reason ?: "an HTML error page, not the file"
                 // A host that refused, timed out or broke TLS is skipped for the
                 // next ten minutes (see [MirrorMemory]) — the difference between
                 // one slow install and every install being slow.
-                val r = reason.lowercase()
+                val r = why.lowercase()
                 if (r.contains("timed out") || r.contains("timeout") || r.contains("refused") ||
-                    r.contains("ssl") || r.contains("unreachable") || r.contains("protocol error")
+                    r.contains("ssl") || r.contains("unreachable") || r.contains("protocol error") ||
+                    reason == null
                 ) {
                     MirrorMemory.markDead(u)
                 }
-                onAttempt?.invoke(u, false, if (note.isBlank()) reason else "$reason $note")
+                runCatching { part.delete() }
+                onAttempt?.invoke(u, false, if (note.isBlank()) why else "$why $note")
                 null
             }
         }
@@ -1179,49 +1493,95 @@ object DoH {
             .build()
     }
 
+    /**
+     * DoH endpoints, in two deliberate flavours.
+     *
+     * IP-literal endpoints first (`1.1.1.1`, `8.8.8.8`, `9.9.9.9:5053`,
+     * `1.0.0.1`): they need no name resolution at all, which makes them the
+     * only endpoints that can rescue the case DoH exists for here — an ISP
+     * resolver that is filtered, hijacked, or unreachable. A named endpoint
+     * (`cloudflare-dns.com`) has to be resolved by the very resolver being
+     * worked around, so it is a useful fallback but a useless rescue. The
+     * regional resolvers (AliDNS, DNSPod, AdGuard) are included for networks
+     * where the global ones are the blocked ones.
+     */
     private val ENDPOINTS = listOf(
+        "https://1.1.1.1/dns-query",
+        "https://8.8.8.8/resolve",
+        "https://9.9.9.9:5053/dns-query",
+        "https://1.0.0.1/dns-query",
         "https://cloudflare-dns.com/dns-query",
         "https://dns.google/resolve",
+        "https://dns.adguard-dns.com/dns-query",
+        "https://doh.alidns.com/dns-query",
+        "https://doh.pub/dns-query",
+        "https://dns.quad9.net/dns-query",
     )
 
     private data class Entry(val addrs: List<InetAddress>, val expiry: Long)
     private val cache = ConcurrentHashMap<String, Entry>()
     private const val TTL_MS = 60_000L
+    /** A failed lookup is cached for much less long than a good one: an ISP
+     *  filter that drops out for a moment must not pin "no such host" for a
+     *  whole minute. */
+    private const val FAILED_TTL_MS = 10_000L
 
+    /** How many endpoints are queried at once. The IP-literal ones are first in
+     *  [ENDPOINTS], so a rescue never waits behind a named endpoint. */
+    private const val PARALLEL = 6
+
+    /** Resolves [host], asking several providers in PARALLEL and taking the
+     *  first non-empty answer. Serial querying was the wrong shape here: with
+     *  ten endpoints and an 8s timeout, one blocked provider per lookup cost
+     *  the app eight seconds *per host*, on the way to a timeout that the next
+     *  provider would have answered immediately. */
     fun resolve(host: String): List<InetAddress> {
         cache[host]?.let { if (System.currentTimeMillis() < it.expiry) return it.addrs }
-        var addrs = emptyList<InetAddress>()
-        for (ep in ENDPOINTS) {
-            try {
-                val url = "$ep?name=${URLEncoder.encode(host, StandardCharsets.UTF_8)}&type=A"
-                val req = Request.Builder().url(url)
-                    .header("accept", "application/dns-json")
-                    .header("User-Agent", Http.UA)
-                    .build()
-                client.newCall(req).execute().use { resp ->
-                    if (resp.isSuccessful) {
-                        val obj = org.json.JSONObject(resp.body?.string() ?: "")
-                        val answers = obj.optJSONArray("Answer")
-                        if (answers != null) {
-                            val ips = mutableListOf<InetAddress>()
-                            for (i in 0 until answers.length()) {
-                                val a = answers.optJSONObject(i) ?: continue
-                                if (a.optInt("type") == 1) {
-                                    a.optString("data").takeIf { it.isNotBlank() }?.let { raw ->
-                                        runCatching { ips.add(InetAddress.getByName(raw)) }
-                                    }
-                                }
-                            }
-                            if (ips.isNotEmpty()) { addrs = ips; break }
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                // try the next endpoint
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(minOf(PARALLEL, ENDPOINTS.size)) { r ->
+            Thread(r, "hikari-doh").apply { isDaemon = true }
+        }
+        val answered = java.util.concurrent.LinkedBlockingQueue<List<InetAddress>>()
+        ENDPOINTS.take(PARALLEL * 2).forEach { endpoint ->
+            pool.execute {
+                val addrs = runCatching { query(endpoint, host) }.getOrDefault(emptyList())
+                if (addrs.isNotEmpty()) runCatching { answered.put(addrs) }
             }
         }
-        cache[host] = Entry(addrs, System.currentTimeMillis() + TTL_MS)
+        var addrs = emptyList<InetAddress>()
+        runCatching {
+            val first = answered.poll(6, TimeUnit.SECONDS)
+            if (first != null) addrs = first
+        }
+        pool.shutdownNow()
+        cache[host] = Entry(
+            addrs,
+            System.currentTimeMillis() + if (addrs.isEmpty()) FAILED_TTL_MS else TTL_MS,
+        )
         return addrs
+    }
+
+    /** One JSON DoH query. Returns the A records, or an empty list. */
+    private fun query(endpoint: String, host: String): List<InetAddress> {
+        val url = "$endpoint?name=${URLEncoder.encode(host, StandardCharsets.UTF_8)}&type=A"
+        val req = Request.Builder().url(url)
+            .header("accept", "application/dns-json")
+            .header("User-Agent", Http.UA)
+            .build()
+        client.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) return emptyList()
+            val obj = org.json.JSONObject(resp.body?.string() ?: "")
+            val answers = obj.optJSONArray("Answer") ?: return emptyList()
+            val ips = mutableListOf<InetAddress>()
+            for (i in 0 until answers.length()) {
+                val a = answers.optJSONObject(i) ?: continue
+                if (a.optInt("type") == 1) {
+                    a.optString("data").takeIf { it.isNotBlank() }?.let { raw ->
+                        runCatching { ips.add(InetAddress.getByName(raw)) }
+                    }
+                }
+            }
+            return ips
+        }
     }
 }
 

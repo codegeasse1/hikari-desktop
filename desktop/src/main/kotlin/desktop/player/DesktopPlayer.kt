@@ -21,11 +21,13 @@ import desktop.ui.Theme
  * release (`app/mpv/mpv.exe`, bundled by CI) and plays HLS/MP4/MKV natively,
  * sending the stream's Referer/Cookie/UA headers itself.
  *
- * mpv renders INTO the app's own player layer (`--wid`, see [PlayerWindow]), so
- * playback happens inside the app window; mpv's own on-screen controller is
- * switched off because the app draws the one control bar. If the embed cannot
- * produce a picture on this machine, the stream is reopened in mpv's own window
- * — a visible picture always beats a tidier window.
+ * mpv's own window is ADOPTED by the app's player layer (see [PlayerWindow] and
+ * [WinShell]): its caption and taskbar button are stripped and it is glued
+ * exactly over the video area, so playback happens inside the app window. mpv's
+ * own on-screen controller is switched off because the app draws the one control
+ * bar. mpv keeps rendering into its own window (never into a window JavaFX
+ * owns), which is what makes the picture reliable: the video output is always
+ * created by mpv, for mpv.
  *
  * If mpv is missing, DASH/torrent/YouTube streams are not playable, the user
  * gets a clear dialog with an "Open in browser" path — never a silent black
@@ -161,24 +163,31 @@ object DesktopPlayer {
             }
             ipcTarget = openIpcEndpoint()
             // The app's own player layer comes up first: it is what the user
-            // sees, and its video surface is the window mpv is told to render
-            // into (--wid below). Null — not Windows, no JNA, no handle — keeps
-            // mpv's own window.
-            val surface = PlayerWindow.open(
+            // sees, and it adopts mpv's window once it exists. False — not
+            // Windows, no JNA — leaves mpv's window as a window of its own.
+            val glued = PlayerWindow.open(
                 title = title,
                 hasNext = false,
                 next = null,
                 position = null,
                 closed = { stopPlayback() },
             )
+            if (!glued) {
+                PlayerWindow.note("This machine can't draw the video inside the app window, so it plays in the player's own window.")
+            }
             val args = buildList {
                 add(mpv.absolutePath)
                 add("--force-window=yes")
                 add("--no-ytdl")
                 add("--no-osc")
                 add("--no-config")
+                // The app is the frame, and the app's keys are the shortcuts:
+                // mpv must not draw a border of its own, and must not swallow
+                // space/arrows/q once its window has been clicked.
+                add("--no-border")
+                add("--auto-window-resize=no")
+                add("--no-input-default-bindings")
                 add("--title=" + title.take(200).replace('\n', ' '))
-                surface?.let { add("--wid=$it") }
                 ipcArg()?.let { add(it) }
                 add(file.absolutePath)
             }
@@ -190,6 +199,7 @@ object DesktopPlayer {
             proc?.let { runCatching { it.destroy() } }
             proc = p
             dialogShown = false
+            if (glued) PlayerWindow.attachProcess(p.pid())
             attachPlayerWindow(title)
             Thread(
                 {
@@ -221,7 +231,6 @@ object DesktopPlayer {
         stream: StreamSource,
         refresh: (() -> StreamSource?)?,
         attemptsLeft: Int,
-        embed: Boolean = true,
     ) {
         Fx.run {
             ipcTarget = openIpcEndpoint()
@@ -235,10 +244,10 @@ object DesktopPlayer {
             val url = com.hikari.app.net.Http.sanitizeStreamUrl(stream.url)
             val signed = isSignedStreamUrl(url)
             // The app's own player layer comes up FIRST: it is the window the
-            // user sees, and the window mpv is told to render its video into
-            // (`--wid`). A null surface means the embed isn't possible here and
-            // mpv opens its own window instead.
-            val surface = PlayerWindow.open(
+            // user sees, and it adopts mpv's window (gluing it over the video
+            // area) as soon as mpv has created it. False means this machine
+            // can't do that and the video stays in a window of its own.
+            val glued = PlayerWindow.open(
                 title = title,
                 hasNext = onEnded != null,
                 next = onEnded,
@@ -247,11 +256,10 @@ object DesktopPlayer {
                 sources = sourceList,
                 sourceName = sourceName,
                 onPickSource = onPickSource,
-                embed = embed,
             )
-            if (surface == null && embed) {
+            if (!glued) {
                 PlayerWindow.note(
-                    "Embedded video isn't available on this machine, so the video plays in the player's own window.",
+                    "This machine can't draw the video inside the app window, so it plays in the player's own window.",
                 )
             }
             // Debug: record the EXACT characters of the provider URL and the
@@ -270,11 +278,20 @@ object DesktopPlayer {
                 "[" + java.time.Instant.now() + "] raw=" + debugEscaped(stream.url) +
                     "\n  san=" + debugEscaped(url) +
                     "\n  ply=" + debugEscaped(playUrl) +
-                    "\n  wid=" + (surface?.toString() ?: "none") + "\n"
+                    "\n  glue=" + glued + "\n"
             )
             val args = buildList {
                 add(mpv.absolutePath)
                 add("--force-window=yes")
+                // The user's own mpv.conf must never decide how the app's player
+                // looks or renders: this is one embedded surface, not their mpv.
+                add("--no-config")
+                // The app supplies the frame and the shortcuts.
+                add("--no-border")
+                // mpv must never resize its own window when a file's dimensions
+                // become known: the app owns the window's geometry ([WinShell]).
+                add("--auto-window-resize=no")
+                add("--no-input-default-bindings")
                 // No youtube-dl hook: for direct HLS/MP4 URLs it fires a SECOND,
                 // header-less probe (no Referer/Cookie) that 403s on protected
                 // CDNs and only adds confusing [ytdl_hook] errors to the dialog.
@@ -285,9 +302,6 @@ object DesktopPlayer {
                 add("--title=" + title.take(200).replace('\n', ' '))
                 val logDir2 = logDir
                 add("--log-file=${File(logDir2, "mpv.log").absolutePath}")
-                // Render INTO the app's player layer (see WinShell): this is
-                // what attaches the video to the app window.
-                surface?.let { add("--wid=$it") }
                 ipcArg()?.let { add(it) }
                 // Providers may ship stream headers (Referer/Cookie/UA) their
                 // CDN validates — hand them straight to mpv. If no User-Agent is
@@ -310,38 +324,67 @@ object DesktopPlayer {
             }
             proc?.let { runCatching { it.destroy() } }
             proc = p
+            // Adopt mpv's window and glue it over the video area (see
+            // PlayerWindow/WinShell). Off the FX thread: mpv creates its window
+            // a moment after launch.
+            if (glued) PlayerWindow.attachProcess(p.pid())
             attachPlayerWindow(title)
             // Only the FIRST explanation per launch shows: the mpv error path and
             // the stream probe both try to explain a dead player, never both.
             dialogShown = false
-            if (embed) {
-                // mpv rendering INTO the app's own window can fail on some
-                // drivers, and the symptom is exactly "the sound works but the
-                // picture never appears". If the file is loaded and still no
-                // video format has been reported, reopen once in mpv's own
-                // window — a visible picture beats a tidier window.
+            if (glued) {
+                // A stream can load and still never produce a picture (a dead
+                // CDN edge, an unsupported codec, a geo-block that only bites
+                // the media segments). Say so over the video area — never leave
+                // a black rectangle sitting there, and never spawn a second
+                // player window behind the user's back.
                 Thread(
                     {
-                        val deadline = System.currentTimeMillis() + 20_000
+                        val startedAt = System.currentTimeMillis()
+                        var saidStillTrying = false
+                        val deadline = startedAt + 45_000
                         while (System.currentTimeMillis() < deadline) {
-                            Thread.sleep(1_000)
+                            Thread.sleep(500)
                             if (proc !== p || !p.isAlive) return@Thread
                             if (PlayerWindow.hasVideo()) return@Thread
-                            if (PlayerWindow.isLoaded()) {
-                                Fx.run {
-                                    if (proc !== p) return@run
-                                    proc = null
-                                    runCatching { p.destroy() }
-                                    PlayerWindow.note(
-                                        "Embedded video didn't start on this machine, so it has been reopened in the player's own window.",
-                                    )
-                                    launchMpv(title, stream, refresh, 0, embed = false)
-                                }
-                                return@Thread
+                            // The file is open and there is still nothing to
+                            // show: the wait is over, and it failed.
+                            if (PlayerWindow.isLoaded()) break
+                            // A player that has not answered a single IPC message
+                            // is not evidence of a broken stream: on a machine
+                            // whose GPU falls back to software, mpv spends this
+                            // time compiling shaders (observed on CI: the picture
+                            // arrived long after every request had timed out). Say
+                            // so instead of sitting on a silent spinner.
+                            if (!saidStillTrying && System.currentTimeMillis() - startedAt > 12_000 &&
+                                !PlayerWindow.ipcWorking()
+                            ) {
+                                saidStillTrying = true
+                                Fx.run { if (proc === p) PlayerWindow.setStatus("Still opening the stream…", busy = true) }
                             }
                         }
+                        Fx.run {
+                            if (dialogShown || proc !== p || PlayerWindow.hasVideo()) return@run
+                            // Never blame the stream for a player we could not
+                            // talk to — that is the one thing we cannot see.
+                            if (!PlayerWindow.ipcWorking() && !PlayerWindow.isLoaded()) {
+                                PlayerWindow.setStatus("Still opening the stream…", busy = true)
+                                return@run
+                            }
+                            dialogShown = true
+                            showBrowserFallback(
+                                title, url,
+                                "The stream loaded but no picture came up. Try another source, or open it in your browser.",
+                                retry = refresh?.let { r ->
+                                    {
+                                        val fresh = runCatching { r() }.getOrNull()
+                                        if (fresh != null && fresh.url.isNotBlank()) launchMpv(title, fresh, r, 1)
+                                    }
+                                },
+                            )
+                        }
                     },
-                    "hikari-embed-watchdog",
+                    "hikari-video-watchdog",
                 ).apply { isDaemon = true; start() }
             }
             val startedAt = System.currentTimeMillis()
@@ -367,7 +410,7 @@ object DesktopPlayer {
                         if (attemptsLeft > 0 && refresh != null && (signed || forbidden)) {
                             val fresh = runCatching { refresh() }.getOrNull()
                             if (fresh != null && fresh.url.isNotBlank()) {
-                                Fx.run { launchMpv(title, fresh, refresh, attemptsLeft - 1, embed) }
+                                Fx.run { launchMpv(title, fresh, refresh, attemptsLeft - 1) }
                                 return@Thread
                             }
                         }

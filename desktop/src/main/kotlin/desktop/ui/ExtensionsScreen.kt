@@ -677,7 +677,12 @@ class ExtensionsScreenView {
             if (manifest == null) {
                 Fx.run {
                     repoLoading.remove(url)
-                    repoFetchedAt[url] = System.currentTimeMillis()
+                    // A FAILED fetch is retried soon (not on the six-hour cache
+                    // TTL): the failure may well have been this machine's
+                    // network stack, which the fetch ladder is learning to work
+                    // around — and once it has, the repo must reload on its own
+                    // rather than stay "unreachable" for the rest of the day.
+                    repoFetchedAt[url] = System.currentTimeMillis() - REPO_CACHE_TTL_MS + FAILED_RETRY_MS
                     val message = Http.humanMessage(result.exceptionOrNull())
                     // Cached contents beat an error message for a repo the user
                     // has already added: the failure is only worth showing when
@@ -1852,6 +1857,12 @@ class ExtensionsScreenView {
          *  background. Long on purpose: the point is that opening the app (or
          *  the Extensions screen) never waits on the network. */
         const val REPO_CACHE_TTL_MS = 6 * 60 * 60 * 1000L
+
+        /** How long after a failed repo fetch the background refresh tries
+         *  again. Short: a repo that failed because of this machine's network
+         *  stack must come back on its own once the fetch ladder finds a stack
+         *  that works. */
+        const val FAILED_RETRY_MS = 2 * 60 * 1000L
 
         const val MODE_HIKARI = 0
         const val MODE_CS3 = 1
