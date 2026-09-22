@@ -1,6 +1,7 @@
 package desktop.player
 
 import com.hikari.app.data.StreamSource
+import desktop.Build
 import desktop.fx.DesktopUi
 import desktop.fx.Fx
 import javafx.geometry.Insets
@@ -76,6 +77,15 @@ object DesktopPlayer {
     /** True once the current launch has shown its failure dialog (mpv error or
      *  stream-probe fallback), so the two can't double-popup. Reset per launch. */
     @Volatile private var dialogShown = false
+
+    /** The exact command line the current player was launched with, and what it
+     *  was asked to play. Kept for the player report — "which flags did it
+     *  actually get" is the first question about a player that misbehaves. */
+    @Volatile private var lastArgs: List<String> = emptyList()
+
+    @Volatile private var lastTitle: String = ""
+
+    @Volatile private var lastStreamUrl: String = ""
 
     /** Signed, short-lived stream URLs (chaturbate's `mmcdn.com`/`edge-hls`
      *  LL-HLS links) — their token is single-use and expires in seconds, so:
@@ -183,7 +193,14 @@ object DesktopPlayer {
             }
             val args = buildList {
                 add(mpv.absolutePath)
-                add("--force-window=yes")
+                // Create the window AT PROGRAM START, not once the file has
+                // finished initialising. `--force-window=yes` only creates it
+                // after initialisation — which on a slow (or hung) network
+                // stream never happens, so the window the app has to adopt does
+                // not exist and a working player looks broken. mpv's own manual
+                // warns about exactly this and its built-in [network] profile
+                // uses `immediate` for the same reason.
+                add("--force-window=immediate")
                 // Never let mpv EXIT on its own: without this the process dies at
                 // the end of a segment or on a decode error, its window vanishes,
                 // and the app is left talking to a closed pipe ("the player stopped
@@ -210,10 +227,20 @@ object DesktopPlayer {
                 showBrowserFallback(title, path, "Couldn't launch the video player.")
                 return@run
             }
+            lastArgs = args
+            lastTitle = title
+            lastStreamUrl = path
             killPrevious(proc)
             proc = p
             dialogShown = false
-            if (glued) PlayerWindow.attachProcess(p.pid()) { onAdoptionFailed() }
+            PlayerWindow.onCopyReport = { copyPlayerReport() }
+            if (glued) {
+                PlayerWindow.attachProcess(
+                    p.pid(),
+                    onFailed = { onAdoptionFailed() },
+                    onAdopted = { onAdopted() },
+                )
+            }
             attachPlayerWindow(title)
             // If the player dies under a live window, recover instead of showing
             // a black rectangle (see PlayerWindow.onPlayerDied).
@@ -301,7 +328,16 @@ object DesktopPlayer {
             )
             val args = buildList {
                 add(mpv.absolutePath)
-                add("--force-window=yes")
+                // Create the window AT PROGRAM START, not once the stream has
+                // finished initialising. `--force-window=yes` creates the window
+                // only AFTER initialisation — and a slow (or hung) HLS/CDN
+                // stream initialises for as long as it likes, so the window the
+                // app has to adopt does not exist for minutes, or ever. That is
+                // the "the app says it cannot draw the video inside the app
+                // window" report: a working mpv, adopted by nobody, because its
+                // window was not there yet. mpv's manual warns about this and
+                // its own built-in [network] profile uses `immediate`.
+                add("--force-window=immediate")
                 // Never let mpv EXIT on its own: without this the process dies at
                 // the end of a segment or on a decode error, its window vanishes,
                 // and the app is left talking to a closed pipe ("the player stopped
@@ -349,12 +385,24 @@ object DesktopPlayer {
                 showBrowserFallback(title, url, "Couldn't launch the video player. Open it in your browser instead?")
                 return@run
             }
+            lastArgs = args
+            lastTitle = title
+            lastStreamUrl = url
             killPrevious(proc)
             proc = p
             // Adopt mpv's window and glue it over the video area (see
             // PlayerWindow/WinShell). Off the FX thread: mpv creates its window
-            // a moment after launch.
-            if (glued) PlayerWindow.attachProcess(p.pid()) { onAdoptionFailed() }
+            // a moment after launch. A window that turns up late is still
+            // adopted — onAdopted takes the "it is playing in a window of its
+            // own" explanation back down when that happens.
+            PlayerWindow.onCopyReport = { copyPlayerReport() }
+            if (glued) {
+                PlayerWindow.attachProcess(
+                    p.pid(),
+                    onFailed = { onAdoptionFailed() },
+                    onAdopted = { onAdopted() },
+                )
+            }
             attachPlayerWindow(title)
             // If the player dies under a live window, recover instead of showing
             // a black rectangle (see PlayerWindow.onPlayerDied).
@@ -377,6 +425,11 @@ object DesktopPlayer {
                             Thread.sleep(500)
                             if (proc !== p || !p.isAlive) return@Thread
                             if (PlayerWindow.hasVideo()) return@Thread
+                            // The picture may be in a window of its own: the
+                            // layer has already explained that, and "no picture
+                            // came up" would be a second, wrong reason for the
+                            // same thing.
+                            if (!PlayerWindow.isEmbedded()) return@Thread
                             // The file is open and there is still nothing to
                             // show: the wait is over, and it failed.
                             if (PlayerWindow.isLoaded()) break
@@ -395,6 +448,7 @@ object DesktopPlayer {
                         }
                         Fx.run {
                             if (dialogShown || proc !== p || PlayerWindow.hasVideo()) return@run
+                            if (!PlayerWindow.isEmbedded()) return@run
                             // Never blame the stream for a player we could not
                             // talk to — that is the one thing we cannot see.
                             if (!PlayerWindow.ipcWorking() && !PlayerWindow.isLoaded()) {
@@ -605,24 +659,120 @@ object DesktopPlayer {
     }
 
     /**
-     * mpv's window could not be adopted (the machine has no JNA/Win32, or the
-     * window never appeared): the picture is playing in a window of its own.
+     * mpv's window was not adopted within the first wait: the picture is playing
+     * in a window of its own — for now. The wait keeps running in the player
+     * layer, and [onAdopted] takes this explanation back down if the window
+     * turns up after all.
      *
      * mpv's own on-screen controller was switched off at launch because the app
-     * draws the control bar — so turn it back on here, or the user has a
-     * borderless video window with no way to pause, seek or close it.
+     * draws the control bar, and its window was stripped of its border — so both
+     * are switched back on here, or the user is left with a borderless,
+     * control-less video window and no way to pause, seek or close it.
      */
     private fun onAdoptionFailed() {
-        val h = ipc ?: return
-        System.err.println("player: could not adopt mpv's window — leaving it as a window of its own")
-        runCatching { h.command(2_000L, "script-message", "osc-visibility", "auto") }
-        runCatching { h.command(2_000L, "set_property", "border", "yes") }
+        System.err.println("player: mpv's window was not adopted in time — leaving it as a window of its own")
+        val h = ipc
+        if (h != null) {
+            // `set_property osc` LOADS the controller script at runtime. Passing
+            // --no-osc at launch means the process has no on-screen controller
+            // in it at all, so a script-message to one would silently do
+            // nothing — the reason "its controls are back on" was not true
+            // before this.
+            runCatching { h.setProperty("osc", true) }
+            runCatching { h.setProperty("border", true) }
+            // The app's shortcuts are bound to the APP's window, so the bindings
+            // mpv came with are what the user has left in this one.
+            runCatching { h.setProperty("input-default-bindings", true) }
+            runCatching { h.command(2_000L, "script-message", "osc-visibility", "auto") }
+        }
         Fx.run {
-            PlayerWindow.note(
+            PlayerWindow.showOwnWindowNote(
                 "This machine cannot draw the video inside the app window, so it is playing in " +
-                    "the player's own window — its controls are back on. Close that window when " +
-                    "you are done.",
+                    "the player's own window — its border and controls are back on. Use this bar " +
+                    "to control it, and close that window when you are done.",
+                actions = listOf("Copy player report" to { copyPlayerReport() }),
             )
+        }
+    }
+
+    /**
+     * mpv's window WAS adopted after all — it turned up late. mpv's own chrome
+     * goes away again and the explanation comes down, so what the user sees is
+     * the picture inside the app with nothing drawn over it claiming otherwise.
+     */
+    private fun onAdopted() {
+        System.err.println("player: mpv's window was adopted late — the picture is inside the app")
+        val h = ipc
+        if (h != null) {
+            runCatching { h.setProperty("osc", false) }
+            runCatching { h.setProperty("border", false) }
+        }
+        Fx.run { PlayerWindow.clearNote() }
+    }
+
+    /**
+     * The player report: everything the app knows about the current playback,
+     * as one paste.
+     *
+     * It exists because the failures that matter here only happen on the user's
+     * own machine ("the picture is in a window of its own") and cannot be
+     * reproduced or guessed at from a screenshot. It carries the facts that
+     * decide the question — the build, the machine, the exact mpv command line,
+     * what the window handling saw, and the tail of mpv's own log.
+     */
+    private fun playerReport(): String = buildString {
+        append("Hikari player report\n")
+        append("build: ").append(Build.VERSION).append("  (").append(Build.DATE).append(", ")
+            .append(Build.COMMIT).append(")\n")
+        append("os: ").append(System.getProperty("os.name")).append(' ')
+            .append(System.getProperty("os.version")).append("  arch=")
+            .append(System.getProperty("os.arch")).append("  java=")
+            .append(System.getProperty("java.version")).append('\n')
+        append("title: ").append(lastTitle).append('\n')
+        append("stream: ").append(lastStreamUrl.take(300)).append('\n')
+        append("source: \"").append(sourceName).append("\"  (")
+            .append(sourceList.size).append(" offered)\n")
+        val p = proc
+        append("mpv process: ").append(if (p == null) "none" else "pid=" + p.pid() + " alive=" + p.isAlive)
+            .append('\n')
+        append("ipc: ").append(if (ipc == null) "not connected" else "connected").append('\n')
+        if (lastArgs.isNotEmpty()) {
+            append("commands (one per line, as mpv received them):\n")
+            lastArgs.forEach { append("  ").append(it).append('\n') }
+        }
+        append('\n').append(PlayerWindow.windowReport())
+        val dir = File(System.getProperty("user.home"), ".hikari")
+        append('\n').append(tailOf(File(dir, "mpv.log"), 60))
+        append('\n').append(tailOf(File(dir, "hikari-player.log"), 20))
+    }
+
+    /** The last [lines] of a log file, as a titled block. */
+    private fun tailOf(file: File, lines: Int): String {
+        val all = runCatching { file.readLines() }.getOrNull()
+            ?: return "--- " + file.name + ": not written (" + file.absolutePath + ") ---"
+        return "--- " + file.name + " (last " + minOf(lines, all.size) + " of " + all.size + " lines) ---\n" +
+            all.takeLast(lines).joinToString("\n")
+    }
+
+    /** Writes the report next to the app's other logs, then copies it. */
+    private fun copyPlayerReport() {
+        val text = runCatching { playerReport() }.getOrElse { "player report failed: " + it }
+        val saved = runCatching {
+            val f = File(System.getProperty("user.home"), ".hikari").apply { mkdirs() }
+            File(f, "player-report.txt").also { it.writeText(text) }
+        }.getOrNull()
+        val copied = runCatching {
+            val content = javafx.scene.input.ClipboardContent()
+            content.putString(text)
+            javafx.scene.input.Clipboard.getSystemClipboard().setContent(content)
+        }.isSuccess
+        System.err.println("player: report written to " + (saved?.absolutePath ?: "?"))
+        Fx.run {
+            when {
+                copied -> desktop.ui.AppShell.toast("Player report copied", "ok")
+                saved != null -> desktop.ui.AppShell.toast("Report saved to " + saved.absolutePath, "ok")
+                else -> desktop.ui.AppShell.toast("Could not write the player report", "error")
+            }
         }
     }
 

@@ -63,6 +63,11 @@ object WinShell {
         /** Whether a virtual key is currently held down (the high bit of the
          *  result). Used to notice a click on the video surface. */
         fun GetAsyncKeyState(vKey: Int): Short
+
+        /** A window's class name. Declared here rather than used from JNA's
+         *  [User32]: this object only needs it for the report, and a name
+         *  resolved by the loader cannot go missing from a JNA build. */
+        fun GetClassName(hWnd: WinDef.HWND?, lpClassName: CharArray, nMaxCount: Int): Int
     }
 
     /** A Win32 POINT, declared here so nothing about the out-parameter depends
@@ -148,31 +153,112 @@ object WinShell {
         if (pid <= 0L) return@call null
         val best = longArrayOf(0L)
         val bestArea = longArrayOf(-1L)
+        val anyHwnd = longArrayOf(0L)
+        val anyArea = longArrayOf(-1L)
         val hinted = longArrayOf(0L)
         val buffer = CharArray(512)
         val callback = object : WinUser.WNDENUMPROC {
             override fun callback(hwnd: WinDef.HWND?, data: Pointer?): Boolean {
                 val h = hwnd ?: return true
-                if (!User32.INSTANCE.IsWindowVisible(h)) return true
                 val owner = IntByReference()
                 User32.INSTANCE.GetWindowThreadProcessId(h, owner)
                 if (owner.value.toLong() != pid) return true
+                // The hint is checked before the visibility test on purpose: a
+                // window that Windows does not call visible yet is still the
+                // window we are looking for.
                 if (!titleHint.isNullOrBlank() && hinted[0] == 0L) {
                     val len = User32.INSTANCE.GetWindowText(h, buffer, buffer.size)
                     if (len > 0 && String(buffer, 0, len) == titleHint) hinted[0] = Pointer.nativeValue(h.pointer)
                 }
                 val rect = WinDef.RECT()
                 if (!User32.INSTANCE.GetWindowRect(h, rect)) return true
-                val area = (rect.right - rect.left).toLong() * (rect.bottom - rect.top).toLong()
-                if (area > bestArea[0]) {
+                val w = rect.right - rect.left
+                val hh = rect.bottom - rect.top
+                if (w <= 0 || hh <= 0) return true
+                val area = w.toLong() * hh.toLong()
+                // A window the player has not shown yet is the LAST resort, not
+                // a candidate the moment one is visible: mpv's video output is
+                // visible as soon as it exists, so anything invisible here is
+                // either not the player's window or not ready.
+                if (User32.INSTANCE.IsWindowVisible(h) && area > bestArea[0]) {
                     bestArea[0] = area
                     best[0] = Pointer.nativeValue(h.pointer)
+                }
+                if (area > anyArea[0]) {
+                    anyArea[0] = area
+                    anyHwnd[0] = Pointer.nativeValue(h.pointer)
                 }
                 return true
             }
         }
         User32.INSTANCE.EnumWindows(callback, null)
-        hinted[0].takeIf { it != 0L } ?: best[0].takeIf { it != 0L }
+        hinted[0].takeIf { it != 0L } ?: best[0].takeIf { it != 0L } ?: anyHwnd[0].takeIf { it != 0L }
+    }
+
+    /**
+     * One top-level window of a process, as far as Windows will describe it.
+     *
+     * This exists for the report the player can copy: when a window cannot be
+     * adopted, the first question is what Windows thought the player's windows
+     * were, and this is the only honest answer to it.
+     */
+    data class WinInfo(
+        val hwnd: Long,
+        val visible: Boolean,
+        val title: String,
+        val className: String,
+        val width: Int,
+        val height: Int,
+    ) {
+        fun describe(): String = "hwnd=0x" + java.lang.Long.toHexString(hwnd) +
+            (if (visible) " visible" else " hidden") +
+            " " + width + "x" + height +
+            " class=" + className.ifBlank { "?" } +
+            " title=\"" + title.take(80) + "\""
+    }
+
+    /**
+     * Every top-level window of [pid], biggest first — visible or not, which is
+     * the point: a report has to show the windows that were NOT good enough to
+     * adopt as well as the one that was.
+     */
+    fun windowsOf(pid: Long): List<WinInfo> = call(emptyList<WinInfo>()) {
+        if (pid <= 0L) return@call emptyList()
+        val found = ArrayList<WinInfo>()
+        val buffer = CharArray(512)
+        val classBuffer = CharArray(256)
+        val callback = object : WinUser.WNDENUMPROC {
+            override fun callback(hwnd: WinDef.HWND?, data: Pointer?): Boolean {
+                val h = hwnd ?: return true
+                val owner = IntByReference()
+                User32.INSTANCE.GetWindowThreadProcessId(h, owner)
+                if (owner.value.toLong() != pid) return true
+                val titleLen = User32.INSTANCE.GetWindowText(h, buffer, buffer.size)
+                val classLen = runCatching { extra?.GetClassName(h, classBuffer, classBuffer.size) }
+                    .getOrNull() ?: 0
+                val rect = WinDef.RECT()
+                User32.INSTANCE.GetWindowRect(h, rect)
+                found += WinInfo(
+                    hwnd = Pointer.nativeValue(h.pointer),
+                    visible = User32.INSTANCE.IsWindowVisible(h),
+                    title = if (titleLen > 0) String(buffer, 0, titleLen) else "",
+                    className = if (classLen > 0) String(classBuffer, 0, classLen) else "",
+                    width = rect.right - rect.left,
+                    height = rect.bottom - rect.top,
+                )
+                return true
+            }
+        }
+        User32.INSTANCE.EnumWindows(callback, null)
+        found.sortedByDescending { it.width.toLong() * it.height.toLong() }
+    }
+
+    /** [windowsOf] as report lines — or one line saying there are none. */
+    fun describeWindows(pid: Long): List<String> {
+        if (!available) return listOf("(Win32 window lookups unavailable)")
+        val windows = windowsOf(pid)
+        if (windows.isEmpty()) return listOf("no top-level windows at all")
+        return windows.mapIndexed { i, w -> (i + 1).toString() + ". " + w.describe() }
     }
 
     /** The first visible child window of [parent] — a window nested inside it. */

@@ -156,7 +156,12 @@ elsewhere) and driven over its JSON IPC:
   which mpv's video output survives), and it is re-glued on
   move/resize/maximise/fullscreen. `--no-config --no-border --no-osc
   --no-input-default-bindings` keep the user's own mpv.conf and mpv's own
-  controller/keys out of the app's player. If a stream loads and no picture ever
+  controller/keys out of the app's player, and mpv is launched with
+  **`--force-window=immediate`** — not `yes` — so its window exists from the
+  moment the process starts rather than after the file has finished
+  initialising. That distinction is the whole difference between "the app
+  adopted the player" and "the app gave up on a stream that was still loading"
+  (see Stage 9). If a stream loads and no picture ever
   arrives, the player says so over the video area with Retry / Open in browser /
   Close actions — it never spawns a second window behind the user's back.
 - **IPC writes never block a caller.** A named-pipe write blocks when the
@@ -500,6 +505,60 @@ shapes, so "this repo will not load" cannot come back unnoticed.
   otherwise show the reason with Retry — never an unexplained black rectangle.
 - If mpv's window cannot be adopted, mpv's own controls are re-enabled and the layer
   says why, rather than leaving a black area under a dead overlay.
+
+### "This machine cannot draw the video inside the app window" — the window was not there yet
+
+A report showed a working mpv in a window of its own, the app's layer carrying the
+"cannot draw the video inside the app window" note, and a stream still on
+"Loading GeoDailymotion…". Nothing was broken — the app had simply given up.
+
+mpv was launched with `--force-window=yes`. Its manual says what that does:
+
+> The window is created only after initialization … This can be a problem if
+> initialization doesn't work perfectly, such as **when opening URLs with bad
+> network connection**.
+
+and mpv's own built-in `[network]` profile therefore uses `--force-window=immediate`.
+On a slow (or hung) stream, `yes` meant no window for as long as initialisation took,
+so `PlayerWindow.attachProcess` spent its whole 10 s budget looking for a window that
+did not exist yet, and then announced that this machine could not embed the player —
+while mpv was fine and playing. On CI the window always appeared at once because the
+embed test plays a **local file**, which initialises instantly. That is why the test
+was green and the user's machine was not.
+
+Three things changed, not one:
+
+- **`--force-window=immediate`** on every launch (app and embed test), so the window
+  exists from startup and can be adopted before the stream has even answered.
+- **The wait is no longer a deadline.** `attachProcess` keeps looking for as long as
+  the player process lives (120 ms, then 500 ms, then every 2 s), and a window that
+  turns up late is adopted anyway — the note is taken back down
+  (`showOwnWindowNote`/`clearNote`) and mpv's own chrome is switched off again, so a
+  slow window ends up embedded rather than explained away. The window is searched for
+  by process id *with mpv's own `--title` winning outright* — never by title alone,
+  which could seize another application's window.
+- **The fallback tells the truth and can be diagnosed.** `--no-osc` means mpv has no
+  on-screen controller *in the process at all*, so the old
+  `script-message osc-visibility auto` did nothing and "its controls are back on" was
+  false; the fallback now sets `osc`, `border` and `input-default-bindings` as
+  runtime **properties**. And every explanation (and the failure pane) carries
+  **Copy player report**: the build, the machine, the exact mpv command line, the app
+  window and candidate window handles, the whole timestamped adoption trace with the
+  reason each attempt was refused, and the tails of `mpv.log` and
+  `hikari-player.log` — written to `~/.hikari/player-report.txt` as well as copied,
+  so a failure that only exists on the user's machine can be read instead of guessed
+  at. `WinShell.describeWindows` lists what Windows thought that process's windows
+  were, which is the question a "no window" report raises.
+
+`EmbedSelfTest` now proves it: it launches mpv on a **TCP server that accepts the
+connection and never answers** and asserts the window exists and can be restyled and
+placed while the stream is still loading (on CI: window at 32,90 960x540, ~0.2 s
+after launch). That assertion fails under `--force-window=yes`, which is the point.
+
+- The player layer also refuses to call a window adopted when the **app's own** window
+  could not be identified: with no owner there is nothing to glue the video to, and
+  "adopted" would only have stripped mpv's chrome and left the picture wherever mpv
+  chose to put it. Each refusal is recorded with its reason.
 
 ### The episode pager (as asked)
 

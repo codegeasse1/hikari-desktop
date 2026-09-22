@@ -105,7 +105,7 @@ fun main() {
         add("--auto-window-resize=no")
         add("--no-osc")
         add("--no-input-default-bindings")
-        add("--force-window=yes")
+        add("--force-window=immediate")
         add("--image-display-duration=inf")
         add("--title=HikariEmbedTest")
         add("--input-ipc-server=\\\\.\\pipe\\$ipcName")
@@ -150,6 +150,79 @@ fun main() {
             "got " + placed?.joinToString(","),
         )
     }
+
+    // ── 2b. the window must exist WHILE the stream is still loading ─────────
+    // The reported bug: mpv's `--force-window=yes` creates the window only AFTER
+    // the file has finished initialising, and a network stream that is slow (or
+    // hung) initialises for as long as it likes. The app adopts that window — so
+    // on a slow stream there was nothing to adopt, and a perfectly good player
+    // was announced as "this machine cannot draw the video inside the app
+    // window". A server that accepts the connection and never answers
+    // reproduces exactly that, and the window has to be there anyway: that is
+    // what `--force-window=immediate` (mpv's own [network] profile) is for.
+    val stall = runCatching { java.net.ServerSocket(0) }.getOrNull()
+    val heldSockets = java.util.Collections.synchronizedList(ArrayList<java.net.Socket>())
+    if (stall != null) {
+        Thread(
+            {
+                while (!stall.isClosed) {
+                    val s = runCatching { stall.accept() }.getOrNull() ?: break
+                    heldSockets.add(s)
+                }
+            },
+            "embed-test-stall-server",
+        ).apply { isDaemon = true; start() }
+    }
+    val stallArgs = buildList {
+        add(mpv.absolutePath)
+        add("--no-config")
+        add("--no-border")
+        add("--auto-window-resize=no")
+        add("--no-osc")
+        add("--no-input-default-bindings")
+        add("--force-window=immediate")
+        add("--keep-open=yes")
+        add("--title=HikariEmbedStall")
+        add("--input-ipc-server=\\\\.\\pipe\\hikari-embed-stall-" + ProcessHandle.current().pid())
+        add("http://127.0.0.1:" + (stall?.localPort ?: 0) + "/stream-that-never-answers.ts")
+    }
+    println("  launching mpv on a stream that never answers: " + stallArgs.joinToString(" "))
+    val stallProc = runCatching { ProcessBuilder(stallArgs).redirectErrorStream(true).start() }.getOrNull()
+    if (stallProc == null) {
+        check("mpv launches for the stalled-stream case", false, "ProcessBuilder failed")
+    } else {
+        Thread(
+            { runCatching { stallProc.inputStream.bufferedReader().forEachLine { } } },
+            "embed-test-stall-drain",
+        ).apply { isDaemon = true; start() }
+        var stallHwnd: Long? = null
+        val stallUntil = System.currentTimeMillis() + 12_000
+        while (stallHwnd == null && System.currentTimeMillis() < stallUntil && stallProc.isAlive) {
+            stallHwnd = WinShell.findWindowOf(stallProc.pid())
+            if (stallHwnd == null) Thread.sleep(150)
+        }
+        val elapsed = 12_000 - (stallUntil - System.currentTimeMillis())
+        check(
+            "mpv's window EXISTS while the stream is still loading (--force-window=immediate)",
+            stallHwnd != null,
+            "no window after " + elapsed + " ms on a stream that never answers",
+        )
+        if (stallHwnd == null) {
+            println("  windows of the stalled player's pid:")
+            WinShell.describeWindows(stallProc.pid()).forEach { println("    " + it) }
+        } else {
+            println("  stall hwnd=" + stallHwnd + " rect=" + WinShell.windowRect(stallHwnd)?.joinToString(","))
+            // The same two calls the app makes, on a window that exists only
+            // because the flag is `immediate`.
+            check("restyleAsVideoSurface(stalled mpv)", WinShell.restyleAsVideoSurface(stallHwnd, host))
+            check("placeWindow(stalled mpv)", WinShell.placeWindow(stallHwnd, 160, 130, 640, 360))
+        }
+        runCatching { stallProc.descendants().forEach { c -> runCatching { c.destroyForcibly() } } }
+        runCatching { stallProc.destroyForcibly() }
+        runCatching { stallProc.waitFor(5, java.util.concurrent.TimeUnit.SECONDS) }
+    }
+    runCatching { stall?.close() }
+    heldSockets.forEach { runCatching { it.close() } }
 
     // ── 3. did a video output actually come up? ─────────────────────────────
     val ipc = MpvIpc(ipcName, true)

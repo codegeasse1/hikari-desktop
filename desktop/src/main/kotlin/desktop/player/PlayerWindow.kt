@@ -74,6 +74,18 @@ object PlayerWindow {
      *  control bar with a picture behind it". */
     private const val CHROME_IDLE_MS = 2000.0
 
+    /**
+     * How long the player's window is waited for before the user is told the
+     * picture is playing in a window of its own.
+     *
+     * mpv is launched with `--force-window=immediate`, so its window exists from
+     * startup and this is a formality — the wait only has to cover mpv's own
+     * process start. It is deliberately no longer a DEADLINE, though: the wait
+     * keeps running past it (see `adoptLoop`), because a window that turns up
+     * late is still a window that gets glued over the video area.
+     */
+    private const val FIRST_WAIT_MS = 10_000L
+
     private var root: BorderPane? = null
     private var mounted = false
 
@@ -187,6 +199,48 @@ object PlayerWindow {
      */
     @Volatile
     var onPlayerDied: (() -> Unit)? = null
+
+    /**
+     * Installed by the player so that every explanation this layer shows can
+     * offer "Copy player report" — a failure that only happens on the user's
+     * machine is worth more as text they can send than as a description they
+     * have to write.
+     */
+    @Volatile
+    var onCopyReport: (() -> Unit)? = null
+
+    /** The title mpv was launched with (`--title=…`). Its window carries that
+     *  title verbatim, which is a second way to find the window when the
+     *  process-id search comes up empty. */
+    @Volatile
+    private var mpvTitle = ""
+
+    /** What the adoption attempt saw, one timestamped line per event. This is
+     *  the only honest answer to "why is the picture not inside the app?", so it
+     *  is kept for [windowReport] instead of being written to a log nobody
+     *  reads. */
+    private val adoptTrace = java.util.Collections.synchronizedList(ArrayList<String>())
+    private var adoptStartedAt = 0L
+
+    /** The last thing the status chip said — read off the FX thread by
+     *  [windowReport]. */
+    @Volatile
+    private var lastStatus = ""
+
+    /** The window [findWindowOf] settled on for the player, for the report. */
+    @Volatile
+    private var candidateHwnd = 0L
+
+    /** Why the last adoption attempt was refused — "refused" alone is not
+     *  something anyone can act on. */
+    @Volatile
+    private var adoptRefusal = ""
+
+    /** True while the "it is playing in the player's own window" explanation is
+     *  on screen, so a LATE adoption can take it back down again. */
+    @Volatile
+    private var ownWindowNoteUp = false
+
     private var sources: List<StreamSource> = emptyList()
     private var currentSource: StreamSource? = null
     private var currentSourceName = ""
@@ -215,6 +269,9 @@ object PlayerWindow {
         onClosed = closed
         this.sources = sources
         this.onPickSource = onPickSource
+        // Exactly what mpv is given as `--title=…` (see DesktopPlayer), so the
+        // window can be found by title if the process-id search fails.
+        this.mpvTitle = title.take(200).replace('\n', ' ')
         return Fx.runBlock {
             val host = runCatching { AppShell.playerHost }.getOrNull() ?: return@runBlock false
             teardown = false
@@ -298,6 +355,7 @@ object PlayerWindow {
      *  a chip in the top strip that is absent while there is nothing to say, so
      *  the strip never carries an empty label. */
     fun setStatus(text: String, isError: Boolean = false, busy: Boolean = false) {
+        lastStatus = text
         // Whatever the layer has to say ("Volume 40%", "Playback stopped: …") is
         // said in the top strip, so saying it is a reason to have the strip up.
         if (text.isNotBlank()) pokeChrome()
@@ -337,6 +395,7 @@ object PlayerWindow {
         }
         tryAnyway?.let { it0 -> actions.add("Play anyway" to { clearMessage(); it0() }) }
         actions.add("Close player" to { closeAll() })
+        onCopyReport?.let { copy -> actions.add("Copy player report" to { copy() }) }
         setLoading(false)
         // The strip stops claiming the player is still starting once it has
         // failed — the message says what happened, and a stale "Starting the
@@ -353,11 +412,37 @@ object PlayerWindow {
         return true
     }
 
-    /** A short note over the video area (no buttons) — used when the video is
-     *  playing somewhere this layer cannot show. */
-    fun note(text: String) {
+    /** A short note over the video area — used when the video is playing
+     *  somewhere this layer cannot show. [actions] gives the user something to
+     *  do about it (in practice: copy a report of why it happened). */
+    fun note(text: String, actions: List<Pair<String, () -> Unit>> = emptyList()) {
         if (!isOpen()) return
-        message(text, emptyList())
+        message(text, actions)
+    }
+
+    /**
+     * The note that says the picture is playing in a window of its own — the
+     * one note that a LATE adoption has to be able to take back down
+     * ([clearNote]), so it is remembered as such.
+     */
+    fun showOwnWindowNote(text: String, actions: List<Pair<String, () -> Unit>> = emptyList()) {
+        if (!isOpen()) return
+        ownWindowNoteUp = true
+        adoptTrace += stamp("note shown: the video is playing in a window of its own")
+        message(text, actions)
+    }
+
+    /** Takes [showOwnWindowNote]'s explanation back down, because the window WAS
+     *  adopted after all — the picture is inside the app now, so an explanation
+     *  of why it is not would be a lie sitting over it. */
+    fun clearNote() {
+        if (!ownWindowNoteUp) return
+        ownWindowNoteUp = false
+        adoptTrace += stamp("late adoption: taking the note back down")
+        Fx.run {
+            clearMessage()
+            if (!sawVideo) setStatus("Opening the stream…", busy = true)
+        }
     }
 
     /** Closes the player layer without notifying the owner (used while tearing
@@ -382,41 +467,149 @@ object PlayerWindow {
     }
 
     /**
-     * Adopts the window of a freshly launched mpv: finds it by process id,
-     * strips its chrome and glues it over the video area. Runs off the FX thread
-     * (mpv creates its window a moment after launch) and is safe to call for a
-     * player that has already been adopted.
+     * Adopts the window of a freshly launched mpv: finds it, strips its chrome
+     * and glues it over the video area. Runs off the FX thread (mpv creates its
+     * window a moment after launch).
+     *
+     * [onFailed] fires once, if the window has not been adopted by
+     * [FIRST_WAIT_MS] — the caller then explains where the picture went.
+     * [onAdopted] fires once if the window shows up LATER and is adopted then,
+     * so a slow window is not the end of the story.
      */
-    fun attachProcess(pid: Long, onFailed: (() -> Unit)? = null) {
+    fun attachProcess(pid: Long, onFailed: (() -> Unit)? = null, onAdopted: (() -> Unit)? = null) {
+        adoptTrace.clear()
+        adoptStartedAt = System.currentTimeMillis()
+        candidateHwnd = 0L
         if (pid <= 0L || !WinShell.available) {
+            adoptTrace += stamp(
+                "cannot embed on this machine: " +
+                    (if (pid <= 0L) "no player process id" else "Win32 window lookups unavailable"),
+            )
             onFailed?.let { cb -> Fx.run { cb() } }
             return
         }
-        Thread(
-            {
-                val deadline = System.currentTimeMillis() + 10_000
-                var adopted = false
-                while (!adopted && System.currentTimeMillis() < deadline) {
-                    val handle = WinShell.findWindowOf(pid)
-                    if (handle != null) {
-                        adopted = Fx.runBlock { adopt(handle) }
-                    }
-                    if (!adopted) runCatching { Thread.sleep(120) }
-                }
-                // The picture is playing in a window of its own: say so (and let
-                // mpv draw its controls again), rather than leaving the app's
-                // video area black forever — see [DesktopPlayer.onAdoptionFailed].
-                if (!adopted) onFailed?.let { cb -> Fx.run { cb() } }
-            },
-            "hikari-video-adopt",
-        ).apply { isDaemon = true; start() }
+        Thread({ adoptLoop(pid, onFailed, onAdopted) }, "hikari-video-adopt").apply {
+            isDaemon = true
+            start()
+        }
     }
 
-    /** Dresses mpv's window up and glues it over the video area. Runs on the FX
-     *  thread. False means it could not be adopted yet (retry). */
+    /**
+     * Waits for the player's window and glues it over the video area.
+     *
+     * mpv is launched with `--force-window=immediate`, so its window exists from
+     * startup and this succeeds almost immediately. It does NOT give up after
+     * the first wait, though, because giving up is the bug this replaces: the
+     * layer used to stop looking after ten seconds, announce that it could not
+     * draw the video inside the app, and leave a working player in a window of
+     * its own for the rest of the stream — even if the window turned up a second
+     * later. The loop now runs for as long as the player process lives.
+     */
+    private fun adoptLoop(pid: Long, onFailed: (() -> Unit)?, onAdopted: (() -> Unit)?) {
+        var announced = false
+        var lastLoggedNoWindow = 0L
+        var lastCandidate = 0L
+        var lastOutcome: Boolean? = null
+        while (true) {
+            if (embedded) return
+            if (!playerAlive(pid)) {
+                adoptTrace += stamp("the player process is gone — stopping the wait")
+                return
+            }
+            val handle = findPlayerWindow(pid)
+            if (handle != null && handle != lastCandidate) {
+                lastCandidate = handle
+                candidateHwnd = handle
+                lastOutcome = null
+                adoptTrace += stamp(
+                    "found a window for the player: 0x" + java.lang.Long.toHexString(handle) +
+                        " rect=" + (WinShell.windowRect(handle)?.joinToString(",") ?: "?"),
+                )
+            }
+            if (handle != null) {
+                val ok = runCatching { Fx.runBlock { adopt(handle) } }.getOrDefault(false)
+                // Once per CHANGE of outcome, never once per attempt: this loop
+                // runs many times a second and the report has to stay readable.
+                if (ok != lastOutcome) {
+                    lastOutcome = ok
+                    adoptTrace += stamp(
+                        "dress and glue 0x" + java.lang.Long.toHexString(handle) + " -> " +
+                            (if (ok) "adopted" else "refused: " + adoptRefusal),
+                    )
+                }
+                if (ok) {
+                    if (announced) onAdopted?.let { cb -> Fx.run { cb() } }
+                    return
+                }
+            } else {
+                val now = System.currentTimeMillis()
+                if (now - lastLoggedNoWindow > 2_000L) {
+                    lastLoggedNoWindow = now
+                    adoptTrace += stamp("no window of the player's own yet (" + ageMs() + " ms in)")
+                }
+            }
+            val waited = ageMs()
+            if (!announced && waited >= FIRST_WAIT_MS) {
+                announced = true
+                adoptTrace += stamp("no window to adopt after " + waited + " ms — saying so")
+                adoptTrace += WinShell.describeWindows(pid).map { "  window: " + it }
+                onFailed?.let { cb -> Fx.run { cb() } }
+            }
+            // Slow down once the fast window is behind us: a window that did not
+            // appear in the first seconds is worth a look every half second, and
+            // after a minute every two — this thread can outlive a long stream.
+            val nap = when {
+                waited < FIRST_WAIT_MS -> 120L
+                waited < 60_000L -> 500L
+                else -> 2_000L
+            }
+            runCatching { Thread.sleep(nap) }
+        }
+    }
+
+    /** True while the process behind [pid] is still running. Unknown is treated
+     *  as alive: losing the ability to ask must not end the wait. */
+    private fun playerAlive(pid: Long): Boolean =
+        runCatching { ProcessHandle.of(pid).map { it.isAlive }.orElse(true) }.getOrDefault(true)
+
+    /** The player's own window: the largest visible window of mpv's process, with
+     *  mpv's own title (`--title=…`) winning outright when one of its windows
+     *  carries it.
+     *
+     *  The process id is never dropped from the search: a window that merely
+     *  happens to share the episode's title is somebody else's window, and
+     *  dressing THAT up as the video surface would wreck it. */
+    private fun findPlayerWindow(pid: Long): Long? {
+        val title = mpvTitle
+        return WinShell.findWindowOf(pid, title.takeIf { it.isNotBlank() })
+    }
+
+    /**
+     * Dresses mpv's window up and glues it over the video area. Runs on the FX
+     * thread. False means it could not be adopted yet (retry) — and
+     * [adoptRefusal] says which step refused, because "refused" on its own is
+     * not something anyone can act on.
+     */
     private fun adopt(handle: Long): Boolean {
-        ownedByApp()
-        if (!WinShell.restyleAsVideoSurface(handle, ownerHwnd ?: 0L)) return false
+        adoptRefusal = ""
+        if (!WinShell.windowExists(handle)) {
+            adoptRefusal = "that window no longer exists"
+            return false
+        }
+        // The app's own window has to be known before anything is glued: without
+        // it the video window has no owner and nowhere to be placed, so
+        // "adopting" would only strip mpv's chrome and leave the picture sitting
+        // wherever mpv put it.
+        if (!ownedByApp()) {
+            adoptRefusal = "the app's own window could not be identified"
+            return false
+        }
+        val owner = ownerHwnd
+        adoptTrace += stamp("the app's own window is " + hwndText(owner))
+        if (!WinShell.restyleAsVideoSurface(handle, owner ?: 0L)) {
+            adoptRefusal = "Win32 refused to restyle mpv's window"
+            return false
+        }
         surfaceHwnd = handle
         embedded = true
         safeSync()
@@ -424,6 +617,46 @@ object PlayerWindow {
         // the window manager.
         if (loadingBox?.isVisible != true && !sawVideo) setStatus("Opening the stream…", busy = true)
         return true
+    }
+
+    /** Millis since [attachProcess] started looking. */
+    private fun ageMs(): Long =
+        if (adoptStartedAt == 0L) 0L else System.currentTimeMillis() - adoptStartedAt
+
+    private fun stamp(message: String): String = "+" + ageMs() + "ms " + message
+
+    private fun hwndText(hwnd: Long?): String =
+        if (hwnd == null || hwnd == 0L) "none" else "0x" + java.lang.Long.toHexString(hwnd)
+
+    /**
+     * Everything this layer knows about putting the picture inside the app
+     * window, as text — what the player's "Copy player report" button hands
+     * over.
+     *
+     * It exists because this failure cannot be seen from outside: "the video is
+     * in a window of its own" has a dozen possible causes (no Win32, no window
+     * yet, a window Windows will not let us restyle, no owner handle) that look
+     * identical on screen and are told apart only by asking the machine that
+     * failed.
+     */
+    fun windowReport(): String = buildString {
+        append("player layer\n")
+        append("  embedded inside the app: ").append(embedded).append('\n')
+        append("  video surface hwnd: ").append(hwndText(surfaceHwnd)).append('\n')
+        append("  app-window hwnd: ").append(hwndText(ownerHwnd)).append('\n')
+        append("  candidate hwnd: ").append(hwndText(candidateHwnd)).append('\n')
+        append("  mpv window title: \"").append(mpvTitle).append("\"\n")
+        append("  Win32 window lookups: ").append(WinShell.available).append('\n')
+        append("  video seen: ").append(sawVideo)
+            .append("   file loaded: ").append(loaded)
+            .append("   ipc answered: ").append(ipcAnswered).append('\n')
+        append("  overlay up: ").append(overlayUp)
+            .append("   own-window note up: ").append(ownWindowNoteUp).append('\n')
+        append("  status chip: \"").append(lastStatus).append("\"\n")
+        append("  adoption watched for: ").append(ageMs()).append(" ms\n")
+        if (adoptRefusal.isNotBlank()) append("  last refusal: ").append(adoptRefusal).append('\n')
+        append("  adoption trace (").append(adoptTrace.size).append(" lines):\n")
+        synchronized(adoptTrace) { adoptTrace.forEach { append("    ").append(it).append('\n') } }
     }
 
     /** True while the video is glued inside the app. */
