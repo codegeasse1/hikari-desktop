@@ -878,7 +878,19 @@ class ExtensionsScreenView {
             val root = manifest.root
             val name = root?.optString("name").orEmpty().ifBlank { Http.repoDisplayName(resolved) }
             val description = root?.optString("description").orEmpty()
-            val plugins = parsePlugins(kind, manifest)
+            // The SHAPE of what came back decides how it is read, not the box the
+            // URL was pasted into: a Nuvio manifest (`scrapers`) or an Aniyomi
+            // index ARRAY filed as "Hikari" was read as a CloudStream repo, found
+            // no `plugins` and showed nothing. Re-file it under the kind its
+            // content names, so its install path (jar / js / apk) matches too.
+            val shape = effectiveKind(kind, manifest)
+            if (shape != kind) {
+                val known = runCatching {
+                    AppShell.app.store.repos().firstOrNull { it.url == url }
+                }.getOrNull()
+                if (known != null) runCatching { AppShell.app.store.addCs3Repo(known.copy(kind = shape)) }
+            }
+            val plugins = parsePlugins(shape, manifest)
             Fx.run {
                 repoLoading.remove(url)
                 repoErrors.remove(url)
@@ -915,6 +927,21 @@ class ExtensionsScreenView {
             u.endsWith("index.min.json") -> RepoKind.ANIYOMI
             else -> RepoKind.CS3
         }
+    }
+
+    /**
+     * The kind a repo's own CONTENT says it is.
+     *
+     * The stored kind comes from whichever box the URL was pasted into, and the
+     * same file can arrive through any of them: a Nuvio `manifest.json` pasted
+     * into the Hikari box was read as a CloudStream repo (no `plugins`, so it
+     * loaded nothing), and a Mihon `index.json` (a bare array) likewise. What
+     * came back is the authority; the stored kind is only a fallback.
+     */
+    private fun effectiveKind(stored: RepoKind, manifest: Manifest): RepoKind = when {
+        manifest.array != null -> RepoKind.ANIYOMI
+        manifest.root?.has("scrapers") == true -> RepoKind.NUVIO
+        else -> stored
     }
 
     private fun manifestFileName(kind: RepoKind): String = when (kind) {
@@ -974,8 +1001,12 @@ class ExtensionsScreenView {
             val pair = r.getOrNull()
                 ?: return Result.failure(r.exceptionOrNull() ?: Exception("Could not fetch repo"))
             val root = runCatching { JSONObject(pair.second) }.getOrNull()
-                ?: return Result.failure(Exception("Invalid repo.json"))
-            return Result.success(Manifest(pair.first, root, null))
+            if (root != null) return Result.success(Manifest(pair.first, root, null))
+            // An Aniyomi/Mihon `index.json` is a bare ARRAY — a repo file like any
+            // other, however it was added (see [effectiveKind]).
+            val arr = runCatching { JSONArray(pair.second) }.getOrNull()
+            if (arr != null && arr.length() > 0) return Result.success(Manifest(pair.first, null, arr))
+            return Result.failure(Exception("Invalid repo.json"))
         }
         val fileName = manifestFileName(kind)
         val candidates = manifestCandidates(url, fileName)

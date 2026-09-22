@@ -382,10 +382,7 @@ object Http {
                 return
             }
             val chosen = if (built is java.security.cert.CertificateException) built else given
-            throw java.security.cert.CertificateException(
-                chosen.message?.take(400) ?: "the certificate chain could not be verified",
-                chosen,
-            )
+            throw java.security.cert.CertificateException(describeFailure(chosen, list), chosen)
         }
 
         /** Strategy 1: the chain as received, validated as a complete path. */
@@ -414,6 +411,55 @@ object Http {
 
         private fun sha256(md: java.security.MessageDigest, bytes: ByteArray): String =
             md.digest(bytes).joinToString("") { "%02x".format(it) }
+
+        /**
+         * Turns a path-validation failure into something worth reading.
+         *
+         * "validity check failed" is the JDK's wording for a certificate that is
+         * outside its validity window **for this machine's clock**, and neither of
+         * the two possible causes is visible in it:
+         *
+         *  - the network served a chain whose certificate has expired (a mirror or
+         *    a middlebox that never rotated its intermediate), or
+         *  - this machine's clock is wrong.
+         *
+         * Both are named here, with the dates, because the difference decides
+         * whether the user has to fix their clock or their network.
+         */
+        private fun describeFailure(
+            t: Throwable,
+            chain: List<java.security.cert.X509Certificate>,
+        ): String {
+            val base = (t.message ?: "").trim()
+            if (t is java.security.cert.CertPathValidatorException && t.index >= 0) {
+                val cert = chain.getOrNull(t.index)
+                if (cert != null) {
+                    val now = java.util.Date()
+                    val clock = java.time.ZonedDateTime.now().format(CLOCK_FORMAT)
+                    if (now.after(cert.notAfter)) {
+                        return "the certificate \"" + cert.subjectX500Principal.name +
+                            "\" is EXPIRED (" + stamp(cert.notAfter) + ") and this machine's clock reads " + clock
+                    }
+                    if (now.before(cert.notBefore)) {
+                        return "the certificate \"" + cert.subjectX500Principal.name +
+                            "\" is not valid until " + stamp(cert.notBefore) +
+                            " and this machine's clock reads " + clock
+                    }
+                    return "the certificate \"" + cert.subjectX500Principal.name +
+                        "\" was rejected" + (if (base.isBlank()) "" else ": " + base.take(160))
+                }
+            }
+            return base.take(400).ifBlank { "the certificate chain could not be verified" }
+        }
+
+        private fun stamp(d: java.util.Date): String = DATE_FORMAT.format(d.toInstant())
+
+        private val CLOCK_FORMAT: java.time.format.DateTimeFormatter =
+            java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss z")
+
+        private val DATE_FORMAT: java.time.format.DateTimeFormatter =
+            java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss 'UTC'")
+                .withZone(java.time.ZoneOffset.UTC)
     }
 
     private fun addCertificates(dest: java.security.KeyStore, src: java.security.KeyStore?, already: Int): Int {
@@ -977,7 +1023,7 @@ object Http {
             val m = c.message?.trim().orEmpty()
             if (m.isNotBlank()) {
                 val line = m.lineSequence().firstOrNull { it.isNotBlank() }?.trim().orEmpty()
-                if (line.isNotBlank()) return line.take(220)
+                if (line.isNotBlank()) return line.take(280)
             }
             c = c.cause
             depth++
@@ -1458,20 +1504,50 @@ object Http {
                 if (isHostFailure(cause)) MirrorMemory.markDead(u)
                 return null
             }
-            val root = runCatching { org.json.JSONObject(text) }.getOrNull() ?: return null
-            if (root.has("plugins")) {
-                MirrorMemory.markAlive(u)
-                MirrorMemory.rememberWinner(raw, u)
-                return text
+            // A repo file is JSON, and its SHAPE says which kind it is: an object
+            // with `plugins`/`pluginLists` (CloudStream, Hikari) or `scrapers`
+            // (Nuvio/Stremio), or a bare ARRAY (an Aniyomi/Mihon `index.json`).
+            val root = runCatching { org.json.JSONObject(text) }.getOrNull()
+            val array = if (root == null) runCatching { org.json.JSONArray(text) }.getOrNull() else null
+            if (root == null && array == null) {
+                // A silent null here was the whole problem: the file came back, was
+                // not a repo manifest, and the reason the USER was shown was
+                // whichever OTHER candidate happened to fail loudly — a mirror's
+                // certificate error, which has nothing to do with this repo at all.
+                walk.record(u, Exception(notAManifest(text)), throughProxy)
+                MirrorMemory.markDead(u)
+                return null
             }
             // CloudStream v2 manifests (manifestVersion + pluginLists): fetch the
             // pluginLists file and merge its plugins array in, so callers keep
             // seeing a plain "plugins" key.
-            if (root.has("pluginLists")) {
+            if (root != null && root.has("pluginLists")) {
                 MirrorMemory.markAlive(u)
                 MirrorMemory.rememberWinner(raw, u)
                 return resolvePluginLists(root, u)
             }
+            if (root != null && (root.has("plugins") || root.has("scrapers"))) {
+                // `scrapers` is a NUVIO repo (a Stremio-style manifest) — a repo
+                // file like any other, read by the screen exactly as it arrives
+                // (ExtensionsScreen.parsePlugins). It used to fall through to the
+                // null below: fetched perfectly, then thrown away, so a repo that
+                // HAD loaded was reported as unloadable.
+                MirrorMemory.markAlive(u)
+                MirrorMemory.rememberWinner(raw, u)
+                return text
+            }
+            if (array != null && array.length() > 0) {
+                // An Aniyomi/Mihon index: a bare array of extensions.
+                MirrorMemory.markAlive(u)
+                MirrorMemory.rememberWinner(raw, u)
+                return text
+            }
+            walk.record(
+                u,
+                Exception("a JSON file that is not a repo manifest (no plugins, pluginLists, scrapers or index array)"),
+                throughProxy,
+            )
+            MirrorMemory.markDead(u)
             return null
         }
 
@@ -1895,6 +1971,24 @@ object Http {
         return execute(c, builder.build())
     }
 
+    /**
+     * An honest name for an answer that is not the file we asked for.
+     *
+     * "The host answered with something else" and "the host is unreachable" are
+     * different problems with different fixes, and a silent null turned the first
+     * into the second — the user was shown a mirror's certificate error as the
+     * reason a repo would not load, when the repo file itself had come back fine
+     * and been thrown away (see [fetchRepoJson]).
+     */
+    private fun notAManifest(text: String): String {
+        val t = text.trim()
+        return when {
+            t.isEmpty() -> "an empty answer"
+            isWebPage(t.toByteArray()) -> "a web page instead of the repo file (the host is blocking or broken)"
+            else -> "an answer that is not JSON (" + t.replace(Regex("\\s+"), " ").take(48) + ")"
+        }
+    }
+
     private val GITHUB_RAW =
         Regex("^https://raw\\.githubusercontent\\.com/([^/]+)/([^/]+)/([^/]+)/(.+)$")
     private val GITHUB_ALT =
@@ -1935,7 +2029,7 @@ object Http {
      * path. These cannot be a stale CDN copy of a branch file, so they are
      * always tried before any mirror.
      */
-    private fun originVariants(url: String): List<String> {
+    internal fun originVariants(url: String): List<String> {
         val base = normalizeDriveUrl(url.trim())
         val gh = parseGhTarget(base) ?: return listOf(base)
         val p = gh.path.substringBefore('?')
@@ -1958,7 +2052,7 @@ object Http {
      *    is how a download "succeeds" with garbage ([isWebPage] is the belt to
      *    this braces).
      */
-    private fun mirrorVariants(url: String): List<String> {
+    internal fun mirrorVariants(url: String): List<String> {
         val base = normalizeDriveUrl(url.trim())
         val gh = parseGhTarget(base) ?: return emptyList()
         // Mirror URLs are built from the bare path — a query string that is
@@ -2159,6 +2253,24 @@ object Http {
      * rescues, and a proxy can present its own chain), so a host failed through
      * the proxy is still asked again directly.
      */
+    /**
+     * The third-party copies of a file — CDN edges and proxy frontdoors, exactly
+     * the hostnames [mirrorVariants] builds. Their TLS is their own: a broken
+     * certificate there says nothing about the file or its real host, which is
+     * why the ladder does not treat their failures as the file's fate.
+     */
+    private val MIRROR_HOSTS = listOf(
+        "jsdelivr.net", "githack.com", "b-cdn.net", "ghfast.top",
+        "ghproxy.net", "gh-proxy.com", "ghproxy.cc", "llkk.cc",
+        "statically.io", "gitmirror.com", "moeyy.xyz",
+    )
+
+    internal fun isMirrorHost(url: String): Boolean {
+        val host = runCatching { java.net.URI(url.trim()).host ?: "" }.getOrDefault("").lowercase()
+        if (host.isBlank()) return false
+        return MIRROR_HOSTS.any { host == it || host.endsWith("." + it) }
+    }
+
     private class Walk {
 
         val failures = java.util.concurrent.ConcurrentLinkedQueue<Throwable>()
@@ -2171,12 +2283,19 @@ object Http {
         /** Route-keyed: "url|p" through the system proxy, "url|d" direct. */
         private val spent = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
 
+        /** Failures of THIS pass, split by who answered: an authoritative URL of
+         *  the file, or one of the third-party copies of it. See [hopeless]. */
+        private val originPassFailures = java.util.concurrent.ConcurrentHashMap<String, Throwable>()
+        private val mirrorPassFailures = java.util.concurrent.ConcurrentHashMap<String, Throwable>()
+
         private var passFailures = java.util.concurrent.ConcurrentHashMap<String, Throwable>()
 
         private var viaProxy = false
 
         fun startPass(throughProxy: Boolean) {
             passFailures = java.util.concurrent.ConcurrentHashMap()
+            originPassFailures.clear()
+            mirrorPassFailures.clear()
             viaProxy = throughProxy
         }
 
@@ -2190,6 +2309,9 @@ object Http {
             runCatching { MirrorMemory.hostOf(url).let { if (it.isNotBlank()) hostFailures[it] = cause } }
             val key = route(url, throughProxy)
             passFailures[key] = cause
+            // Split by who answered: the file's own host or a third-party copy of
+            // it. Only the former says anything about the file being reachable.
+            if (Http.isMirrorHost(url)) mirrorPassFailures[key] = cause else originPassFailures[key] = cause
             if (!Http.isTlsStackFailure(cause)) spent[key] = true
         }
 
@@ -2206,8 +2328,15 @@ object Http {
          *  has no proxy configured the "proxy" passes ARE direct, and waiting
          *  for one of them would only delay the error by a whole pass. */
         fun hopeless(): Boolean {
-            if (passFailures.isEmpty()) return false
-            if (!passFailures.values.all { Http.isCertTrustFailure(it) }) return false
+            // Only the file's OWN hosts can prove the file is unreachable: a
+            // mirror is a third party whose TLS can be broken (and often is)
+            // while the file itself is perfectly available — which is exactly
+            // how "this machine's certificate store doesn't trust the site's CA
+            // chain, asked: ghproxy.cc" became the reason a GitHub repo would
+            // not load.
+            if (originPassFailures.isEmpty()) return false
+            if (!originPassFailures.values.all { Http.isCertTrustFailure(it) }) return false
+            if (mirrorPassFailures.values.any { !Http.isCertTrustFailure(it) }) return false
             return !viaProxy || !Http.systemProxyInUse()
         }
 

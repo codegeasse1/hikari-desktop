@@ -237,6 +237,14 @@ jobs:
         shell: bash
 
 
+      - name: Repo fetch self-test (the repos from the bug reports)
+        if: always()
+        timeout-minutes: 8
+        run: |
+          set -e
+          java -cp "jpackage-input/*" com.hikari.app.net.RepoFetchSelfTestKt
+        shell: bash
+
       - name: Diagnose packaged runtime
         run: |
           set +e

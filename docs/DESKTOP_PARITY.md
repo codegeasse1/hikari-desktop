@@ -461,6 +461,33 @@ it into `~/.hikari/extra-trusted.pem`, and the same chain then verifies.
   published exe claimed to be "0.1.0", so there was no way to tell which build a
   user was running.
 
+### Why the repos still would not load after the certificate fix
+
+The certificate was one wall; behind it was another, and it had nothing to do with
+the network. `Http.fetchRepoJson` accepted only CloudStream/Hikari shapes
+(`plugins`, `pluginLists`) and **returned null in silence for everything else**,
+and the Extensions screen read every repo through the kind of the box the URL had
+been pasted into:
+
+- a **Nuvio** repo (`manifest.json` with a `scrapers` array — `D3adlyRocket/
+  All-In-One-Nuvio`, 65 scrapers) was fetched perfectly and then thrown away;
+- a **Mihon/Aniyomi** index (`index.json`, a bare JSON ARRAY — `codegeasse1/
+  codegeasse-mihon-extension`, 89 entries) failed one step earlier, on
+  `JSONObject(text)`;
+- and because the only *recorded* failure was then one third-party mirror's
+  expired certificate, the user was told his machine's certificate store did not
+  trust the site's CA chain — for a repo file that had arrived fine.
+
+Now: every repo shape is accepted (`plugins`, `pluginLists`, `scrapers`, or an
+index array), the SHAPE of what comes back decides how it is read — not the box it
+was pasted into — and the repo is re-filed under the kind its content names, so
+its install path (jar / js / apk) matches as well. Every unusable answer is
+recorded as such instead of a silent null, and a mirror's certificate failure can
+no longer end the ladder or be reported as the file's own fate: `Walk.hopeless`
+now needs the file's OWN host to fail that way, and the mirrors to agree.
+`RepoFetchSelfTest` fetches the exact two URLs from the reports and asserts the
+shapes, so "this repo will not load" cannot come back unnoticed.
+
 ### The player that went black (and the second window)
 
 - `--keep-open=yes` on every mpv launch: a stream that ends keeps its last frame and
