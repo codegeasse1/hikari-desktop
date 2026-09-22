@@ -1,10 +1,14 @@
 package desktop.uitest
 
 import com.hikari.app.HikariApp
+import com.hikari.app.data.Episode
+import com.hikari.app.data.MediaItem
+import com.hikari.app.data.MediaType
 import com.hikari.app.data.StreamSource
 import desktop.fx.Fx
 import desktop.player.PlayerWindow
 import desktop.ui.AppShell
+import desktop.ui.DetailScreenTestSeam
 import desktop.ui.Screen
 import desktop.ui.Theme
 import java.io.File
@@ -194,6 +198,104 @@ class UiShotApp : Application() {
             stage.height = WIDE_H
         }
 
+        // ── a long season's episode pager ───────────────────────────────────
+        // The state that matters is the one a 379-episode series opens on: page
+        // one of the season, the range picker, and the hint that says where in
+        // the season the user is looking. The season is handed in through the
+        // screen's own seam so this drives the REAL renderEpisodes/
+        // renderEpisodeGrid path (no provider, no network, no mock-up) — and the
+        // numbers are checked here, not just looked at.
+        steps += 300L to {
+            PlayerWindow.closeAll()
+            DetailScreenTestSeam.season = { media ->
+                media to (1..379).map { n ->
+                    Episode(
+                        number = n,
+                        id = "ep-" + n,
+                        name = "One Hundred Thousand Years of Qi Refining Episode " + n + " English Subtitles",
+                    )
+                }
+            }
+            AppShell.openDetail(
+                MediaItem(
+                    providerId = "demo",
+                    id = "qi-refining",
+                    title = "One Hundred Thousand Years of Qi Refining",
+                    type = MediaType.SERIES,
+                    overview = "Wang Lin refuses the life he was handed, and pays for it.",
+                    genres = listOf("Anime", "Fantasy"),
+                    year = 2023,
+                ),
+            )
+        }
+        steps += 3200L to { }
+        steps += 300L to {
+            val nums = episodeNumbers(scene)
+            val range = selectedRange(scene)
+            println("UiShotTest: episode page 1: count=" + nums.size + " nums=" +
+                nums.firstOrNull() + ".." + nums.lastOrNull() + " range=" + range)
+            if (nums.size == 30 && nums.firstOrNull() == 1 && nums.lastOrNull() == 30 && range == "1 - 30") {
+                println("UiShotTest: OK   the season opens on episodes 1..30 (range " + range + ")")
+            } else {
+                println("UiShotTest: FAIL the episode pager did not open on the first 30 of 379 episodes")
+                failures[0]++
+            }
+        }
+        shot("j-detail-episodes-page1", "hero + page one of a 379-episode season")
+
+        // The range picker, driven the way the user drives it: pick "121 - 150".
+        steps += 300L to {
+            (scene.lookup(".ep-range") as? javafx.scene.control.ComboBox<*>)?.selectionModel?.select(4)
+        }
+        steps += 900L to { }
+        steps += 300L to {
+            val nums = episodeNumbers(scene)
+            println("UiShotTest: range pick: count=" + nums.size + " nums=" +
+                nums.firstOrNull() + ".." + nums.lastOrNull() + " range=" + selectedRange(scene))
+            if (nums.size == 30 && nums.firstOrNull() == 121 && nums.lastOrNull() == 150) {
+                println("UiShotTest: OK   picking a range loads exactly those episodes")
+            } else {
+                println("UiShotTest: FAIL picking the range did not load its episodes")
+                failures[0]++
+            }
+        }
+        shot("k-detail-episodes-range", "the range picker set to 121 - 150")
+
+        // …and "Next 30", which is the same walk one page at a time.
+        steps += 200L to {
+            scene.root.lookupAll(".button").filterIsInstance<javafx.scene.control.Button>()
+                .firstOrNull { it.text == "Next 30" }?.fire()
+        }
+        steps += 600L to { }
+        steps += 300L to {
+            val nums = episodeNumbers(scene)
+            println("UiShotTest: next 30: count=" + nums.size + " nums=" +
+                nums.firstOrNull() + ".." + nums.lastOrNull() + " range=" + selectedRange(scene))
+            if (nums.firstOrNull() == 151 && nums.lastOrNull() == 180) {
+                println("UiShotTest: OK   Next 30 walks to the following page")
+            } else {
+                println("UiShotTest: FAIL Next 30 did not advance the page")
+                failures[0]++
+            }
+        }
+
+        // …and searching, which must reach an episode on any page.
+        steps += 200L to {
+            (scene.root.lookupAll(".ep-filter").firstOrNull() as? javafx.scene.control.TextField)?.text = "187"
+        }
+        steps += 900L to { }
+        steps += 300L to {
+            val nums = episodeNumbers(scene)
+            println("UiShotTest: search 187: count=" + nums.size + " nums=" + nums)
+            if (nums.size == 1 && nums.firstOrNull() == 187) {
+                println("UiShotTest: OK   searching an episode number jumps straight to it")
+            } else {
+                println("UiShotTest: FAIL searching an episode number did not find it")
+                failures[0]++
+            }
+        }
+        shot("l-detail-episodes-search", "searching episode 187 of 379")
+
         // ── run it ──────────────────────────────────────────────────────────
         var index = 0
         fun pump() {
@@ -220,6 +322,17 @@ class UiShotApp : Application() {
         }
         pump()
     }
+
+    /** The episode numbers currently on screen — read off the real tiles. */
+    private fun episodeNumbers(scene: Scene): List<Int> =
+        scene.root.lookupAll(".ep-num").toList()
+            .filterIsInstance<javafx.scene.control.Button>()
+            .mapNotNull { it.text?.trim()?.toIntOrNull() }
+            .sorted()
+
+    /** What the episode range picker currently says, e.g. "121 - 150". */
+    private fun selectedRange(scene: Scene): String? =
+        (scene.lookup(".ep-range") as? javafx.scene.control.ComboBox<*>)?.selectionModel?.selectedItem?.toString()
 
     private fun save(image: javafx.scene.image.Image, file: File) {
         val w = image.width.toInt()

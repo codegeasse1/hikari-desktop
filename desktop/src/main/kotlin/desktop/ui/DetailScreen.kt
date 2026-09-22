@@ -56,6 +56,20 @@ import kotlinx.coroutines.withContext
  * the source list report their full content size as a minimum, which pushed the
  * panel off the window and made both unscrollable.
  */
+/**
+ * Test seam, set only by `desktop.uitest.UiShotTest`.
+ *
+ * The episode pager has to be looked at with a season of hundreds of episodes on
+ * screen, and what is worth photographing is the REAL load path — so instead of
+ * faking a finished screen (which would prove nothing about this file), the shot
+ * harness hands [DetailScreenView.load] a season through here. Null in the
+ * shipped app, where the season always comes from the providers.
+ */
+internal object DetailScreenTestSeam {
+    @Volatile
+    var season: ((MediaItem) -> Pair<MediaItem, List<Episode>>)? = null
+}
+
 class DetailScreenView(private val item: MediaItem) {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -73,9 +87,17 @@ class DetailScreenView(private val item: MediaItem) {
     @Volatile
     private var lastPositionSave = 0L
 
-    /** How many tiles the episode grid shows; a "Show more" button extends it,
-     *  so an anime season with 1000 episodes doesn't build 1000 buttons. */
-    private var episodeLimit = EPISODE_PAGE
+    /**
+     * One PAGE of episodes at a time — 30 by default — plus a range picker.
+     *
+     * A season with 400 episodes used to scroll as one endless grid (and a
+     * filter box you had to already know the number for). Now the grid shows the
+     * page you are on, the picker lists every range ("1 - 30", "31 - 60", …) so
+     * any part of the season is one click away, and Prev/Next walk the pages.
+     * Searching still looks across the WHOLE season — the picker governs the
+     * grid only when the search box is empty.
+     */
+    private var episodePage = 0
 
     // ── hero ────────────────────────────────────────────────────────────────
 
@@ -194,10 +216,38 @@ class DetailScreenView(private val item: MediaItem) {
     private val facts = VBox(9.0)
 
     private val episodeFilter = TextField().apply {
-        styleClass.add("field")
+        styleClass.addAll("field", "ep-filter")
         promptText = "Find episode by number or name…"
-        textProperty().addListener { _, _, _ ->
-            episodeLimit = EPISODE_PAGE
+        textProperty().addListener { _, _, _ -> renderEpisodeGrid() }
+    }
+
+    /** "1 - 30", "31 - 60", … — every range the season can be read in. */
+    private val episodeRange = javafx.scene.control.ComboBox<String>().apply {
+        styleClass.add("ep-range")
+        isFocusTraversable = false
+        prefWidth = 132.0
+        // A listener on the VALUE, not onAction: JavaFX only fires onAction for a
+        // range the user picked, so a range selected by code (the page an episode
+        // lives on) would silently not load the episodes it names.
+        valueProperty().addListener { _, _, label ->
+            if (label == null) return@addListener
+            val i = items.indexOf(label)
+            if (i >= 0 && i != episodePage) {
+                episodePage = i
+                renderEpisodeGrid()
+            }
+        }
+    }
+    private val episodePrev = Ui.button("Prev 30", ghost = true) {
+        if (episodePage > 0) {
+            episodePage--
+            renderEpisodeGrid()
+        }
+    }
+    private val episodeNext = Ui.button("Next 30", ghost = true) {
+        val pages = maxOf(1, (episodes.size + EPISODE_PAGE - 1) / EPISODE_PAGE)
+        if (episodePage < pages - 1) {
+            episodePage++
             renderEpisodeGrid()
         }
     }
@@ -209,10 +259,7 @@ class DetailScreenView(private val item: MediaItem) {
         minWidth = 0.0
     }
     private val episodeHint = themed("", "tiny").apply { isWrapText = true }
-    private val episodeMore = Ui.button("Show more episodes", ghost = true) {
-        episodeLimit += EPISODE_PAGE
-        renderEpisodeGrid()
-    }
+
     private val episodeSection = VBox(Theme.S3)
 
     /** The scrolling column that holds the episodes, so the selected episode can
@@ -306,10 +353,17 @@ class DetailScreenView(private val item: MediaItem) {
 
     private fun load() {
         scope.launch {
-            val loaded = runCatching { AppShell.app.repository.metaFor(item) }.getOrDefault(item)
-            val eps = if (loaded.type == MediaType.SERIES) {
-                runCatching { AppShell.app.repository.episodesFor(loaded) }.getOrNull().orEmpty()
-            } else emptyList()
+            // A UI shot has to page through a season of hundreds of episodes to
+            // prove the pager works; the shot harness hands one in through this
+            // seam instead of waiting on (and depending on) a provider. Null in
+            // the real app — see [DetailScreenTestSeam].
+            val seam = DetailScreenTestSeam.season?.invoke(item)
+            val loaded = seam?.first
+                ?: runCatching { AppShell.app.repository.metaFor(item) }.getOrDefault(item)
+            val eps = seam?.second
+                ?: if (loaded.type == MediaType.SERIES) {
+                    runCatching { AppShell.app.repository.episodesFor(loaded) }.getOrNull().orEmpty()
+                } else emptyList()
             // Resume where the user left off when we know that episode.
             val resumeId = runCatching {
                 AppShell.app.store.history()
@@ -567,10 +621,12 @@ class DetailScreenView(private val item: MediaItem) {
         episodeSection.isManaged = true
         episodeSection.children.setAll(
             Ui.sectionHeader("Episodes", "${episodes.size} available — pick one to load its sources"),
-            episodeFilter,
+            HBox(Theme.S2, episodeFilter, episodeRange, episodePrev, episodeNext).apply {
+                alignment = Pos.CENTER_LEFT
+                HBox.setHgrow(episodeFilter, Priority.ALWAYS)
+            },
             episodeGrid,
             episodeHint,
-            episodeMore,
         )
         renderEpisodeGrid()
     }
@@ -592,7 +648,33 @@ class DetailScreenView(private val item: MediaItem) {
                     ep.name?.lowercase()?.contains(needle) == true
             }
         }
-        val shown = matches.take(episodeLimit)
+        val searching = needle.isNotEmpty()
+        val pages = maxOf(1, (episodes.size + EPISODE_PAGE - 1) / EPISODE_PAGE)
+        if (episodePage >= pages) episodePage = pages - 1
+        if (episodePage < 0) episodePage = 0
+        // The range picker lists the whole season as 30-episode ranges, so any
+        // part of it is one click away — and it follows the page the code
+        // selects (resuming mid-season lands on that page's range).
+        if (!searching) {
+            val labels = (0 until pages).map { p ->
+                val from = p * EPISODE_PAGE + 1
+                val to = minOf(episodes.size, (p + 1) * EPISODE_PAGE)
+                "$from - $to"
+            }
+            if (episodeRange.items.size != labels.size) {
+                val keep = episodePage
+                episodeRange.items.setAll(labels)
+                if (keep in labels.indices) episodeRange.selectionModel.select(keep)
+            } else if (episodeRange.selectionModel.selectedIndex != episodePage) {
+                episodeRange.selectionModel.select(episodePage)
+            }
+        }
+        val shown = if (searching) {
+            matches.take(EPISODE_PAGE * 4)
+        } else {
+            val from = episodePage * EPISODE_PAGE
+            matches.filter { it in from until minOf(episodes.size, from + EPISODE_PAGE) }
+        }
         episodeTiles.clear()
         val tiles = shown.map { i ->
             val ep = episodes[i]
@@ -618,20 +700,30 @@ class DetailScreenView(private val item: MediaItem) {
             episodeGrid.children.setAll(tiles)
         }
         episodeHint.text = when {
-            needle.isNotEmpty() -> "${matches.size} episode(s) match “${episodeFilter.text.trim()}”."
-            episodes.size > shown.size -> "Showing the first ${shown.size} of ${episodes.size} episodes."
+            needle.isNotEmpty() ->
+                "${matches.size} episode(s) match “${episodeFilter.text.trim()}” —" +
+                    " clear the box to page through the season 30 at a time."
+            episodes.size > shown.size ->
+                "Showing episodes " + (episodePage * EPISODE_PAGE + 1) + " - " +
+                    (episodePage * EPISODE_PAGE + shown.size) + " of " + episodes.size +
+                    " — pick another range above, or search by number or name."
             else -> ""
         }
         episodeHint.isVisible = episodeHint.text.isNotBlank()
         episodeHint.isManaged = episodeHint.isVisible
-        episodeMore.isVisible = shown.size < matches.size
-        episodeMore.isManaged = episodeMore.isVisible
+        episodePrev.isDisable = searching || episodePage <= 0
+        episodeNext.isDisable = searching || episodePage >= pages - 1
+        episodeRange.isDisable = searching || pages <= 1
     }
 
     private fun numOf(text: String): String? = Regex("(\\d{1,4})").find(text)?.groupValues?.get(1)
 
     private fun selectEpisode(ep: Episode) {
         selectedEpisode = ep
+        // Put the page holding this episode on screen: picking "Next episode",
+        // or resuming at episode 187 of 379, must not leave the grid on page 1.
+        val idx = episodes.indexOfFirst { it.id == ep.id }
+        if (idx >= 0) episodePage = idx / EPISODE_PAGE
         renderEpisodeGrid()
         updateNowPlaying()
         loadStreams()
@@ -1024,7 +1116,7 @@ class DetailScreenView(private val item: MediaItem) {
         const val HERO_MIN = 300.0
 
         /** Tiles rendered per "page" before the Show-more button appears. */
-        const val EPISODE_PAGE = 240
+        const val EPISODE_PAGE = 30
 
         /** Minimum gap between two history position writes while playing. */
         const val POSITION_SAVE_INTERVAL_MS = 10_000L

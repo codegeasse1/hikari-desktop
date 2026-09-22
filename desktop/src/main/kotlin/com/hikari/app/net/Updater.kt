@@ -3,14 +3,21 @@ package com.hikari.app.net
 import org.json.JSONObject
 
 /**
- * Checks GitHub for a newer build. Desktop builds compare the `continuous`
- * release tag against the app's current version, like the Android app.
+ * Checks GitHub for a newer build.
+ *
+ * The release the app is published to is `continuous`, and it is NOT the
+ * repository's "latest" release — so the old check (`/releases/latest`, compared
+ * against a hardcoded 0.1.0) answered the wrong question. It reads the release
+ * directly, picks the NEWEST `Hikari-<version>.exe` asset by version, compares
+ * that with the build identity this exe was stamped with (see `desktop.Build`),
+ * and hands back the ASSET url, so updating is one click on the right file
+ * instead of choosing between forty installers on the release page.
  */
 object Updater {
 
-    const val CURRENT_VERSION = "0.1.0"
-
     const val REPO = "codegeasse1/hikari-desktop"
+
+    private const val RELEASE = "continuous"
 
     data class UpdateInfo(
         val available: Boolean,
@@ -20,18 +27,38 @@ object Updater {
     )
 
     suspend fun checkForUpdate(): UpdateInfo? {
-        val url = "https://api.github.com/repos/$REPO/releases/latest"
-        val body = Http.getString(url) ?: return null
+        val body = Http.getString("https://api.github.com/repos/$REPO/releases/tags/$RELEASE")
+            ?: return null
         return runCatching {
             val o = JSONObject(body)
-            val latest = o.optString("tag_name").removePrefix("v").ifBlank { return@runCatching null }
             val page = o.optString("html_url").ifBlank { "https://github.com/$REPO/releases" }
-            val available = parseVersion(latest) > parseVersion(CURRENT_VERSION)
-            UpdateInfo(available, CURRENT_VERSION, latest, page)
+            var bestVersion = desktop.Build.VERSION
+            var bestUrl = page
+            val assets = o.optJSONArray("assets")
+            if (assets != null) {
+                for (i in 0 until assets.length()) {
+                    val a = assets.optJSONObject(i) ?: continue
+                    val name = a.optString("name")
+                    val m = Regex("hikari-(\\d+(?:\\.\\d+)+)\\.exe", RegexOption.IGNORE_CASE)
+                        .find(name) ?: continue
+                    val version = m.groupValues[1]
+                    if (parseVersion(version) > parseVersion(bestVersion)) {
+                        bestVersion = version
+                        bestUrl = a.optString("browser_download_url").ifBlank { page }
+                    }
+                }
+            }
+            val available = parseVersion(bestVersion) > parseVersion(desktop.Build.VERSION)
+            UpdateInfo(
+                available = available,
+                current = desktop.Build.VERSION,
+                latest = if (available) bestVersion else desktop.Build.VERSION,
+                url = bestUrl,
+            )
         }.getOrNull()
     }
 
-    /** "0.1.0" → 1000*100 + 100*1 + 0 style comparison (major*10^4 + minor*10^2 + patch). */
+    /** "0.1.196" -> a comparable number (major*10^4 + minor*10^2 + patch). */
     private fun parseVersion(v: String): Long {
         val parts = v.trim().trimStart('v').split(".")
         var n = 0L

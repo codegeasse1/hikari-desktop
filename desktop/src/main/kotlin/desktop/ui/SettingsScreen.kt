@@ -159,22 +159,51 @@ class SettingsScreenView {
 
     private fun updatesSection(): Region {
         val status = Theme.label("", size = 12.5, dim = true).apply { isWrapText = true }
+        // The build identity is the first thing a bug report needs, and it is the
+        // only way to tell whether the exe the user is running is the one that was
+        // just published — so it is one click to copy, not a treasure hunt.
+        val identity = "Hikari Desktop v" + desktop.Build.VERSION +
+            " (" + desktop.Build.DATE + ", " + desktop.Build.COMMIT + ")"
+        var downloadUrl: String? = null
+        val download = Ui.button("Download update", primary = true) {
+            val u = downloadUrl ?: return@button
+            runCatching { java.awt.Desktop.getDesktop().browse(java.net.URI(u)) }
+                .onFailure { AppShell.toast("Open this link: " + u, "error") }
+        }
+        download.isVisible = false
+        download.isManaged = false
         val check = Ui.button("Check for updates", icon = Icons.REFRESH, ghost = true) {
             status.text = "Checking…"
+            download.isVisible = false
+            download.isManaged = false
             AppShell.uiScope.launch {
                 val info = runCatching { Updater.checkForUpdate() }.getOrNull()
                 Fx.run {
                     status.text = when {
                         info == null -> "Could not reach the update server."
-                        !info.available -> "You're on the latest build (${info.current})."
-                        else -> "Update available: ${info.latest} — grab it from the GitHub release page."
+                        !info.available -> "You are on the latest build (" + info.current + ")."
+                        else -> "Update available: " + info.latest + "."
+                    }
+                    if (info != null && info.available) {
+                        downloadUrl = info.url
+                        download.text = "Download " + info.latest
+                        download.isVisible = true
+                        download.isManaged = true
                     }
                 }
             }
         }
+        val copyBuild = Ui.button("Copy build info", ghost = true) {
+            runCatching {
+                val content = javafx.scene.input.ClipboardContent()
+                content.putString(identity)
+                javafx.scene.input.Clipboard.getSystemClipboard().setContent(content)
+                AppShell.toast("Build info copied", "ok")
+            }
+        }
         return Ui.panel(
-            Ui.sectionHeader("Updates", "Hikari Desktop v${desktop.Build.VERSION} (${desktop.Build.DATE})"),
-            HBox(Theme.S3, check, status).apply { alignment = Pos.CENTER_LEFT },
+            Ui.sectionHeader("Updates", identity),
+            HBox(Theme.S3, check, copyBuild, download, status).apply { alignment = Pos.CENTER_LEFT },
         )
     }
 

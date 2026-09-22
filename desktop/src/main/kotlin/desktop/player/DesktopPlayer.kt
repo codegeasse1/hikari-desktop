@@ -162,6 +162,12 @@ object DesktopPlayer {
                 return@run
             }
             ipcTarget = openIpcEndpoint()
+            runCatching { PlayerWindow.parkSurface() }
+            // Park the previous stream's window FIRST (it belongs to the old mpv,
+            // which is killed below): a killed process can take a moment to let go
+            // of its window, and in that moment the previous picture sat behind the
+            // new player — "it opened another player".
+            runCatching { PlayerWindow.parkSurface() }
             // The app's own player layer comes up first: it is what the user
             // sees, and it adopts mpv's window once it exists. False — not
             // Windows, no JNA — leaves mpv's window as a window of its own.
@@ -178,6 +184,14 @@ object DesktopPlayer {
             val args = buildList {
                 add(mpv.absolutePath)
                 add("--force-window=yes")
+                // Never let mpv EXIT on its own: without this the process dies at
+                // the end of a segment or on a decode error, its window vanishes,
+                // and the app is left talking to a closed pipe ("the player stopped
+                // reading its command pipe") over a black video area. With it, mpv
+                // stays up, keeps the last frame, and the app keeps its controls —
+                // the end of the file is an `eof-reached` event we handle, not a
+                // process disappearing.
+                add("--keep-open=yes")
                 add("--no-ytdl")
                 add("--no-osc")
                 add("--no-config")
@@ -196,17 +210,16 @@ object DesktopPlayer {
                 showBrowserFallback(title, path, "Couldn't launch the video player.")
                 return@run
             }
-            proc?.let { old ->
-                // Replace any previous player outright: two mpv windows would
-                // both try to own the video area, and the old process's window
-                // dies with it.
-                runCatching { old.descendants().forEach { c -> runCatching { c.destroyForcibly() } } }
-                runCatching { old.destroyForcibly() }
-            }
+            killPrevious(proc)
             proc = p
             dialogShown = false
-            if (glued) PlayerWindow.attachProcess(p.pid())
+            if (glued) PlayerWindow.attachProcess(p.pid()) { onAdoptionFailed() }
             attachPlayerWindow(title)
+            // If the player dies under a live window, recover instead of showing
+            // a black rectangle (see PlayerWindow.onPlayerDied).
+            PlayerWindow.onPlayerDied = {
+                recoverFromPlayerDeath(title, StreamSource(name = title, url = path), null, 0, path)
+            }
             Thread(
                 {
                     runCatching { p.inputStream.bufferedReader().forEachLine { } }
@@ -289,6 +302,14 @@ object DesktopPlayer {
             val args = buildList {
                 add(mpv.absolutePath)
                 add("--force-window=yes")
+                // Never let mpv EXIT on its own: without this the process dies at
+                // the end of a segment or on a decode error, its window vanishes,
+                // and the app is left talking to a closed pipe ("the player stopped
+                // reading its command pipe") over a black video area. With it, mpv
+                // stays up, keeps the last frame, and the app keeps its controls —
+                // the end of the file is an `eof-reached` event we handle, not a
+                // process disappearing.
+                add("--keep-open=yes")
                 // The user's own mpv.conf must never decide how the app's player
                 // looks or renders: this is one embedded surface, not their mpv.
                 add("--no-config")
@@ -328,19 +349,16 @@ object DesktopPlayer {
                 showBrowserFallback(title, url, "Couldn't launch the video player. Open it in your browser instead?")
                 return@run
             }
-            proc?.let { old ->
-                // Replace any previous player outright: two mpv windows would
-                // both try to own the video area, and the old process's window
-                // dies with it.
-                runCatching { old.descendants().forEach { c -> runCatching { c.destroyForcibly() } } }
-                runCatching { old.destroyForcibly() }
-            }
+            killPrevious(proc)
             proc = p
             // Adopt mpv's window and glue it over the video area (see
             // PlayerWindow/WinShell). Off the FX thread: mpv creates its window
             // a moment after launch.
-            if (glued) PlayerWindow.attachProcess(p.pid())
+            if (glued) PlayerWindow.attachProcess(p.pid()) { onAdoptionFailed() }
             attachPlayerWindow(title)
+            // If the player dies under a live window, recover instead of showing
+            // a black rectangle (see PlayerWindow.onPlayerDied).
+            PlayerWindow.onPlayerDied = { recoverFromPlayerDeath(title, stream, refresh, attemptsLeft, url) }
             // Only the FIRST explanation per launch shows: the mpv error path and
             // the stream probe both try to explain a dead player, never both.
             dialogShown = false
@@ -584,6 +602,80 @@ object DesktopPlayer {
         }
         stage.scene = Theme.style(Scene(box, 640.0, 240.0))
         stage.show()
+    }
+
+    /**
+     * mpv's window could not be adopted (the machine has no JNA/Win32, or the
+     * window never appeared): the picture is playing in a window of its own.
+     *
+     * mpv's own on-screen controller was switched off at launch because the app
+     * draws the control bar — so turn it back on here, or the user has a
+     * borderless video window with no way to pause, seek or close it.
+     */
+    private fun onAdoptionFailed() {
+        val h = ipc ?: return
+        System.err.println("player: could not adopt mpv's window — leaving it as a window of its own")
+        runCatching { h.command(2_000L, "script-message", "osc-visibility", "auto") }
+        runCatching { h.command(2_000L, "set_property", "border", "yes") }
+        Fx.run {
+            PlayerWindow.note(
+                "This machine cannot draw the video inside the app window, so it is playing in " +
+                    "the player's own window — its controls are back on. Close that window when " +
+                    "you are done.",
+            )
+        }
+    }
+
+    /** Takes any previous mpv off the screen and out of the process table.
+     *
+     *  Its window belongs to it, so it is parked first (instant, whatever the kill
+     *  costs) and only then killed — and the kill is WAITED on, because starting
+     *  the next player while the old one is still alive is how two video windows
+     *  end up on screen.
+     */
+    private fun killPrevious(old: Process?) {
+        val victim = old ?: return
+        runCatching { PlayerWindow.parkSurface() }
+        runCatching { victim.descendants().forEach { c -> runCatching { c.destroyForcibly() } } }
+        runCatching { victim.destroyForcibly() }
+        runCatching { victim.waitFor(1200L, java.util.concurrent.TimeUnit.MILLISECONDS) }
+    }
+
+    /**
+     * The player process died (or its command pipe closed) while the app's layer
+     * was up.
+     *
+     * A fresh link from the provider is the best answer: signed/tokenised URLs
+     * expire and a dead CDN edge usually has a sibling server. Failing that, the
+     * layer gets the explanation and a Retry button — never a black window.
+     */
+    private fun recoverFromPlayerDeath(
+        title: String,
+        stream: StreamSource,
+        refresh: (() -> StreamSource?)?,
+        attemptsLeft: Int,
+        url: String,
+    ) {
+        if (dialogShown) return
+        System.err.println("player: the player process died — attemptsLeft=" + attemptsLeft)
+        killPrevious(proc)
+        proc = null
+        if (attemptsLeft > 0) {
+            val fresh = if (refresh != null) runCatching { refresh() }.getOrNull() else null
+            launchMpv(title, fresh ?: stream, refresh, attemptsLeft - 1)
+            return
+        }
+        dialogShown = true
+        showBrowserFallback(
+            title, url,
+            "The video player stopped unexpectedly. Try another source, or open this one in your browser.",
+            retry = refresh?.let { r ->
+                {
+                    val f = runCatching { r() }.getOrNull()
+                    if (f != null && f.url.isNotBlank()) launchMpv(title, f, r, 1)
+                }
+            },
+        )
     }
 
     /** True on Windows, where mpv's IPC transport is a named pipe. */

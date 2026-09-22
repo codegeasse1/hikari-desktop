@@ -49,6 +49,17 @@ class ExtensionsScreenView {
     val root: ScrollPane = Ui.vScroll(content)
 
     private val reposBox = VBox(Theme.S2)
+
+    /** The last network diagnosis, kept per repo so the panel survives re-renders. */
+    private var diagnoseFor: String? = null
+    private val diagnoseText = javafx.scene.control.TextArea().apply {
+        styleClass.add("diag")
+        isEditable = false
+        isWrapText = false
+        prefRowCount = 16
+        maxWidth = Double.MAX_VALUE
+    }
+    private val diagnoseBox = VBox(Theme.S2).apply { isVisible = false; isManaged = false }
     private val installedBox = VBox(Theme.S2)
     private val pluginsBox = VBox(Theme.S2)
     private val statusLabel = themed("", "tiny")
@@ -572,6 +583,100 @@ class ExtensionsScreenView {
         fillPlugins()
     }
 
+    /**
+     * Runs [Http.diagnoseServer] for a repo and shows the report here.
+     *
+     * This exists because the app spent months reporting a certificate problem
+     * as "the TLS handshake is being blocked by this network" — a sentence with
+     * nothing in it to act on, from a machine nobody can look at. The report
+     * names the exact certificate the network serves, every stack's real error,
+     * and which anchors were loaded.
+     */
+    private fun runDiagnosis(url: String) {
+        diagnoseFor = url
+        diagnoseBox.isVisible = true
+        diagnoseBox.isManaged = true
+        diagnoseText.text = "Running diagnosis…"
+        setStatus("Diagnosing the connection…", busy = true)
+        fillPlugins()
+        AppShell.uiScope.launch {
+            val report = runCatching { Http.diagnoseServer(url) }
+                .getOrElse { e -> "diagnosis failed: " + (e.message ?: e.javaClass.simpleName) }
+            val saved = runCatching {
+                val f = File(HikariApp.instance.filesDir, "network-diagnosis.txt")
+                f.writeText(report)
+                f.absolutePath
+            }.getOrNull()
+            Fx.run {
+                diagnoseText.text = report
+                setStatus(if (saved != null) "Diagnosis written to " + saved else "Diagnosis ready")
+            }
+        }
+    }
+
+    private fun copyDiagnosis() {
+        runCatching {
+            val content = javafx.scene.input.ClipboardContent()
+            content.putString(diagnoseText.text)
+            javafx.scene.input.Clipboard.getSystemClipboard().setContent(content)
+            setStatus("Report copied to the clipboard")
+            AppShell.toast("Report copied", "ok")
+        }.onFailure { e -> setStatus("Could not copy the report: " + e.message) }
+    }
+
+    private fun saveDiagnosis(): String {
+        val f = File(HikariApp.instance.filesDir, "network-diagnosis.txt")
+        runCatching { f.writeText(diagnoseText.text) }
+        return f.absolutePath
+    }
+
+    private fun fingerprintOf(c: java.security.cert.X509Certificate): String =
+        java.security.MessageDigest.getInstance("SHA-256").digest(c.encoded)
+            .joinToString("") { b -> "%02x".format(b) }
+
+    /**
+     * Accepts the certificate chain this network serves for a repo that will not
+     * load, then retries it.
+     *
+     * The alternative is not "better security" — it is an unusable app on a
+     * network the user cannot change. It is reversible (the file is shown in the
+     * panel below and named in the report) and it is per-machine.
+     */
+    private fun trustServedCertificates(url: String) {
+        setStatus("Reading the certificate this network serves…", busy = true)
+        AppShell.uiScope.launch {
+            val certs = runCatching { Http.certsToAccept(url) }.getOrDefault(emptyList())
+            if (certs.isEmpty()) {
+                Fx.run {
+                    setStatus("Could not read a certificate from " + url + " — nothing to trust")
+                    AppShell.toast("No certificate could be read", "error")
+                }
+                return@launch
+            }
+            val added = runCatching { Http.trustCertificates(certs) }.getOrDefault(0)
+            val report = buildString {
+                append("Accepted as extra trust anchors (this machine only):\n")
+                append("file: ").append(Http.extraTrustedFile().absolutePath).append("\n\n")
+                for (c in certs) {
+                    append(c.subjectX500Principal.name).append('\n')
+                    append("  issuer: ").append(c.issuerX500Principal.name).append('\n')
+                    append("  valid:  ").append(c.notBefore).append(" to ").append(c.notAfter).append('\n')
+                    append("  sha256: ").append(fingerprintOf(c)).append("\n\n")
+                }
+                append("Delete that file to withdraw the acceptance.\n")
+            }
+            Fx.run {
+                AppShell.toast("Accepted " + added + " certificate(s) — trying the repo again", "ok")
+                setStatus("Accepted " + added + " certificate(s); retrying the repo…")
+                diagnoseFor = url
+                diagnoseBox.isVisible = true
+                diagnoseBox.isManaged = true
+                diagnoseText.text = report
+            }
+            refreshRepo(url)
+        }
+    }
+
     /** Rebuilds only the plugin list (keeps focus in the filter field). */
     private fun fillPlugins() {
         pluginsBox.children.clear()
@@ -581,14 +686,52 @@ class ExtensionsScreenView {
             data == null -> {
                 val error = repoErrors[repo.url]
                 if (error != null) {
+                    val trustError = error.contains("certificate", ignoreCase = true) ||
+                        error.contains("CA chain", ignoreCase = true)
+                    val actions = HBox(Theme.S2).apply {
+                        alignment = Pos.CENTER
+                        children.add(Ui.button("Try again", primary = true) { refreshRepo(repo.url) })
+                        children.add(Ui.button("Diagnose network") { runDiagnosis(repo.url) })
+                        // The last resort, and only where it is relevant: a network that
+                        // rewrites TLS (an ISP filter, a corporate or antivirus inspector)
+                        // presents a chain no store on this machine can verify, and nothing
+                        // else can fix that — so the user gets to accept the certificate
+                        // they are actually being served, after seeing it.
+                        if (trustError) {
+                            children.add(
+                                Ui.button("Trust this network's certificate…") {
+                                    trustServedCertificates(repo.url)
+                                }
+                            )
+                        }
+                    }
                     pluginsBox.children.add(
                         Ui.emptyState(
                             Icons.WARNING,
                             "Couldn't load this repo",
                             error,
-                            Ui.button("Try again", primary = true) { refreshRepo(repo.url) },
+                            actions,
                         )
                     )
+                    if (diagnoseFor == repo.url) {
+                        diagnoseBox.children.setAll(
+                            themed(
+                                "Network diagnosis — copy this whole box and send it if the repo still will not load.",
+                                "tiny",
+                            ),
+                            diagnoseText,
+                            HBox(Theme.S2).apply {
+                                alignment = Pos.CENTER_LEFT
+                                children.add(Ui.button("Copy report") { copyDiagnosis() })
+                                children.add(
+                                    Ui.button("Save to file") {
+                                        setStatus("Report saved to " + saveDiagnosis())
+                                    },
+                                )
+                            },
+                        )
+                        pluginsBox.children.add(diagnoseBox)
+                    }
                     // A repo whose manifest cannot be fetched is NOT an empty
                     // repo: everything already installed from it still works,
                     // and saying so right here beats leaving the user with an

@@ -177,6 +177,16 @@ object PlayerWindow {
     private var onPosition: ((positionMs: Long, durationMs: Long) -> Unit)? = null
     private var onClosed: (() -> Unit)? = null
     private var onPickSource: ((StreamSource) -> Unit)? = null
+
+    /**
+     * Called (once, on the FX thread) when the PLAYER died under a live window:
+     * mpv stopped reading its command pipe, or the file ended with an error
+     * before a single frame was shown. Without this the layer sat on a black
+     * rectangle with "Playback stopped: …" and the user had nothing to click —
+     * the reported "player is blank, and it opened another window" state.
+     */
+    @Volatile
+    var onPlayerDied: (() -> Unit)? = null
     private var sources: List<StreamSource> = emptyList()
     private var currentSource: StreamSource? = null
     private var currentSourceName = ""
@@ -377,8 +387,11 @@ object PlayerWindow {
      * (mpv creates its window a moment after launch) and is safe to call for a
      * player that has already been adopted.
      */
-    fun attachProcess(pid: Long) {
-        if (pid <= 0L || !WinShell.available) return
+    fun attachProcess(pid: Long, onFailed: (() -> Unit)? = null) {
+        if (pid <= 0L || !WinShell.available) {
+            onFailed?.let { cb -> Fx.run { cb() } }
+            return
+        }
         Thread(
             {
                 val deadline = System.currentTimeMillis() + 10_000
@@ -390,6 +403,10 @@ object PlayerWindow {
                     }
                     if (!adopted) runCatching { Thread.sleep(120) }
                 }
+                // The picture is playing in a window of its own: say so (and let
+                // mpv draw its controls again), rather than leaving the app's
+                // video area black forever — see [DesktopPlayer.onAdoptionFailed].
+                if (!adopted) onFailed?.let { cb -> Fx.run { cb() } }
             },
             "hikari-video-adopt",
         ).apply { isDaemon = true; start() }
@@ -1222,13 +1239,28 @@ object PlayerWindow {
             // mpv has the file open and is about to render: the wait is over.
             "file-loaded", "playback-restart" -> Fx.run { playbackStarted() }
             "end-file", "ipc-closed" -> {
+                val fatalPipe = event == "ipc-closed"
                 val reason = data.optString("reason").ifBlank { data.optString("error") }
-                if (reason.isNotBlank() && reason != "eof" && reason != "quit" && reason != "stop") {
+                val realReason = reason.isNotBlank() && reason != "eof" && reason != "quit" && reason != "stop"
+                if (fatalPipe || realReason) {
+                    val neverPlayed = !sawVideo
                     Fx.run {
                         setLoading(false)
-                        setStatus("Playback stopped: $reason", isError = true)
                         statusSpinner?.isVisible = false
                         statusSpinner?.isManaged = false
+                        if (fatalPipe || neverPlayed) {
+                            // The player itself is gone (or never managed a frame):
+                            // hand it to the owner, which restarts playback on a fresh
+                            // link or takes the layer down. Leaving an error line over
+                            // a black window is the one thing that must not happen.
+                            val cb = onPlayerDied
+                            onPlayerDied = null
+                            if (!teardown && cb != null) {
+                                cb()
+                                return@run
+                            }
+                        }
+                        setStatus("Playback stopped: " + reason, isError = true)
                     }
                 }
             }

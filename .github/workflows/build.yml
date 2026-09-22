@@ -45,6 +45,27 @@ jobs:
           gradle-version: "8.11.1"
           cache-disabled: true
 
+      - name: Stamp the build (real version, time, commit)
+        run: |
+          set -e
+          # The installed app must be able to say WHICH build it is: the exe
+          # assets are all called "Hikari", and a user reporting a bug otherwise
+          # has no way to tell whether they are running the build we just fixed.
+          # Rewritten on every build, so the source copy is only a fallback for
+          # local runs.
+          {
+            echo "package desktop"
+            echo ""
+            echo "/** Build identity. Rewritten by CI on every build - see .github/workflows/build.yml. */"
+            echo "object Build {"
+            echo "    const val VERSION = \"$APP_VERSION\""
+            echo "    const val DATE = \"$(date -u '+%Y-%m-%d %H:%M') UTC\""
+            echo "    const val COMMIT = \"$(git rev-parse --short HEAD)\""
+            echo "}"
+          } > desktop/src/main/kotlin/desktop/Build.kt
+          cat desktop/src/main/kotlin/desktop/Build.kt
+        shell: bash
+
       - name: Build app
         run: |
           # Maven Central / plugins.gradle.org occasionally rate-limit runner IPs
@@ -188,12 +209,31 @@ jobs:
           java -cp "jpackage-input/*" com.hikari.app.net.NetworkSelfTestKt
         shell: bash
 
+      - name: Make a SHA-1-signed test certificate
+        if: always()
+        run: |
+          set -e
+          # The chain GitHub's CDN serves on some networks ends at a SHA-1-signed
+          # root, and the verifier this app used refused any chain containing
+          # one. The self-test below needs a certificate that hits exactly that
+          # rule, so it is generated here instead of read from the network.
+          rm -f sha1test.p12 sha1test.pem
+          keytool -genkeypair -alias sha1test -keyalg RSA -keysize 2048 \
+            -sigalg SHA1withRSA -dname "CN=Hikari SHA-1 test" -validity 30 \
+            -keystore sha1test.p12 -storetype PKCS12 \
+            -storepass changeit -keypass changeit
+          keytool -exportcert -alias sha1test -keystore sha1test.p12 \
+            -storepass changeit -rfc -file sha1test.pem
+          ls -la sha1test.pem
+          openssl x509 -in sha1test.pem -noout -subject -fingerprint -sha256 || true
+        shell: bash
+
       - name: TLS trust self-test (GitHub raw + repo manifest through Conscrypt)
         if: always()
         timeout-minutes: 8
         run: |
           set -e
-          java -cp "jpackage-input/*" com.hikari.app.net.TlsTrustSelfTestKt
+          java -cp "jpackage-input/*" com.hikari.app.net.TlsTrustSelfTestKt "$PWD/sha1test.pem"
         shell: bash
 
 
@@ -332,6 +372,24 @@ jobs:
           if [ "$published" != "1" ]; then
             echo "FAILED to publish release after retries"
             exit 1
+          fi
+
+          # Keep the release page legible and the release small: every build is
+          # a 168 MB installer, so the three newest are kept and the rest are
+          # deleted. (The updater reads the newest one, so nothing depends on
+          # the old ones.)
+          gh release view continuous --repo "$GITHUB_REPOSITORY" --json assets \
+            -q '.assets[].name' 2>/dev/null | grep -E '^Hikari-.*[.]exe' \
+            | sed 's/^Hikari-//; s/[.]exe$//' | sort -V | grep -v '^$' > /tmp/versions.txt || true
+          count=$(wc -l < /tmp/versions.txt | tr -d ' ')
+          echo "installers on the release: $count"
+          if [ "$count" -gt 3 ]; then
+            head -n $((count - 3)) /tmp/versions.txt | while read -r v; do
+              old="Hikari-$v.exe"
+              if [ "$old" = "$EXE" ]; then continue; fi
+              echo "pruning $old"
+              gh release delete-asset continuous "$old" --repo "$GITHUB_REPOSITORY" --yes || true
+            done
           fi
         shell: bash
 

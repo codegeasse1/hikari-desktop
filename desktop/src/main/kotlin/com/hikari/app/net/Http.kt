@@ -58,24 +58,17 @@ object Http {
             if (java.security.Security.getProvider("Conscrypt") == null) {
                 java.security.Security.insertProviderAt(org.conscrypt.Conscrypt.newProvider(), 1)
             }
-            val tmf = javax.net.ssl.TrustManagerFactory.getInstance("X509")
-            // The anchors are handed over EXPLICITLY. Left to itself Conscrypt
-            // takes them from the JDK's `lib/security/cacerts` snapshot (see
-            // Conscrypt's Platform.getDefaultCertKeyStore()), and that snapshot
-            // is what made every GitHub-family host unreachable on Windows — the
-            // "extensions won't load / no server answered" bug. See [trustStore].
-            val anchors = runCatching { trustStore() }.getOrNull()
-            if (anchors != null) {
-                tmf.init(anchors as java.security.KeyStore)
-            } else {
-                tmf.init(null as java.security.KeyStore?)
-            }
+            // The verifier is OURS: the anchors are handed over explicitly
+            // (left to itself Conscrypt takes them from the JDK's
+            // `lib/security/cacerts` snapshot — see Conscrypt's
+            // Platform.getDefaultCertKeyStore() — which is what made every
+            // GitHub-family host unreachable on Windows), AND the path building
+            // is ours too, because Conscrypt's refuses any chain containing a
+            // SHA-1-signed certificate. See [HikariTrustManager].
+            val trust = trustManager()
             val ctx = javax.net.ssl.SSLContext.getInstance("TLS")
-            ctx.init(null, tmf.trustManagers, null)
-            return builder.sslSocketFactory(
-                ctx.socketFactory,
-                tmf.trustManagers[0] as javax.net.ssl.X509TrustManager,
-            )
+            ctx.init(null, arrayOf<javax.net.ssl.TrustManager>(trust), null)
+            return builder.sslSocketFactory(ctx.socketFactory, trust)
         } catch (t: Throwable) {
             System.err.println("applyConscryptTls failed: $t")
             return builder
@@ -143,8 +136,11 @@ object Http {
             added += windows
             val extra = addPemCertificates(ks, "cacerts-extra.pem", added)
             added += extra
+            val accepted = addCertificates(ks, extraTrustedKeyStore(), added)
+            added += accepted
             trustStoreSummary =
-                "anchors=" + ks.size() + " (jdk=" + jdk + " windows=" + windows + " extra=" + extra + ")"
+                "anchors=" + ks.size() + " (jdk=" + jdk + " windows=" + windows + " extra=" + extra +
+                    " accepted=" + accepted + ")"
             System.err.println("tls-trust: " + trustStoreSummary)
             if (ks.size() == 0) {
                 // Nothing loaded at all (no JDK store on disk, no resources):
@@ -172,6 +168,253 @@ object Http {
         }
         out
     }.getOrDefault(emptySet())
+
+    /** Every certificate in a KeyStore (the anchors a verifier is built from). */
+    private fun certificatesOf(ks: java.security.KeyStore): List<java.security.cert.X509Certificate> {
+        val out = ArrayList<java.security.cert.X509Certificate>(ks.size())
+        val aliases = runCatching { ks.aliases() }.getOrNull() ?: return out
+        while (aliases.hasMoreElements()) {
+            val cert = runCatching { ks.getCertificate(aliases.nextElement()) }.getOrNull() ?: continue
+            if (cert is java.security.cert.X509Certificate) out.add(cert)
+        }
+        return out
+    }
+
+    @Volatile
+    private var verifierCache: javax.net.ssl.X509TrustManager? = null
+
+    /**
+     * The verifier every client in this object uses.
+     *
+     * It is [HikariTrustManager] unless that cannot be built at all, in which
+     * case the platform verifier is used (never a worse failure mode than the
+     * old behaviour).
+     */
+    fun trustManager(): javax.net.ssl.X509TrustManager {
+        verifierCache?.let { return it }
+        synchronized(trustStoreLock) {
+            verifierCache?.let { return it }
+            val made = runCatching {
+                val anchors = runCatching { certificatesOf(trustStore()) }.getOrDefault(emptyList())
+                if (anchors.isEmpty()) throw IllegalStateException("no anchors could be loaded")
+                System.err.println("tls-trust: verifying with " + anchors.size + " anchors (own PKIX verifier)")
+                HikariTrustManager(anchors) as javax.net.ssl.X509TrustManager
+            }.getOrElse { e ->
+                System.err.println(
+                    "tls-trust: own verifier unavailable (" + (e.message ?: e.javaClass.simpleName) +
+                        ") — using the platform verifier",
+                )
+                platformTrustManager()
+            }
+            verifierCache = made
+            return made
+        }
+    }
+
+    /** The stock verifier (Conscrypt's, since it is the first provider). */
+    private fun platformTrustManager(): javax.net.ssl.X509TrustManager = runCatching {
+        val tmf = javax.net.ssl.TrustManagerFactory.getInstance("X509")
+        val anchors = runCatching { trustStore() }.getOrNull()
+        if (anchors != null) tmf.init(anchors) else tmf.init(null as java.security.KeyStore?)
+        tmf.trustManagers[0] as javax.net.ssl.X509TrustManager
+    }.getOrElse {
+        val tmf = javax.net.ssl.TrustManagerFactory.getInstance("X509")
+        tmf.init(null as java.security.KeyStore?)
+        tmf.trustManagers[0] as javax.net.ssl.X509TrustManager
+    }
+
+    /** The user-accepted anchors as a KeyStore, merged into [trustStore] like
+     *  any other anchor source. */
+    private fun extraTrustedKeyStore(): java.security.KeyStore? {
+        val certs = extraTrustedAnchors()
+        if (certs.isEmpty()) return null
+        return runCatching {
+            java.security.KeyStore.getInstance("JKS").apply {
+                load(null, null)
+                var i = 0
+                for (c in certs) runCatching { setCertificateEntry("u" + i++, c) }
+            }
+        }.getOrNull()
+    }
+
+    /** Drops the built store/verifier so the next fetch rebuilds them (the
+     *  anchor set changed — see [trustCertificates]). */
+    private fun forgetAnchors() {
+        synchronized(trustStoreLock) {
+            trustStoreCache = null
+            verifierCache = null
+            extraTrustedCache = null
+        }
+    }
+
+    // ── anchors the user accepted by hand ────────────────────────────────────
+
+    @Volatile
+    private var extraTrustedCache: List<java.security.cert.X509Certificate>? = null
+
+    /** Where the user's accepted extra CAs live. */
+    fun extraTrustedFile(): java.io.File = java.io.File(
+        java.io.File(System.getProperty("user.home"), ".hikari").apply { mkdirs() },
+        "extra-trusted.pem",
+    )
+
+    /** The certificates the user has accepted ("Trust this network's
+     *  certificate…" on a repo that will not load). */
+    fun extraTrustedAnchors(): List<java.security.cert.X509Certificate> {
+        extraTrustedCache?.let { return it }
+        val f = runCatching { extraTrustedFile() }.getOrNull()
+        val list = if (f == null || !f.isFile) emptyList() else parsePemText(runCatching { f.readText() }.getOrDefault(""))
+        extraTrustedCache = list
+        return list
+    }
+
+    fun extraTrustedCount(): Int = extraTrustedAnchors().size
+
+    /**
+     * Accepts [certs] as extra trust anchors, for this machine only.
+     *
+     * This is the last resort, and it is deliberately explicit: a network that
+     * rewrites TLS (an ISP filter, a corporate/AV inspector) presents a chain no
+     * store here can verify, and the alternative to accepting it is that the
+     * network is simply unusable. The user sees the certificate (subject +
+     * SHA-256) before it is added, and the file it lands in is theirs to delete.
+     */
+    fun trustCertificates(certs: Collection<java.security.cert.X509Certificate>): Int {
+        if (certs.isEmpty()) return 0
+        val f = runCatching { extraTrustedFile() }.getOrNull() ?: return 0
+        val pem = java.util.Base64.getMimeEncoder(64, "\n".toByteArray())
+        val text = buildString {
+            if (!f.isFile || f.length() == 0L) {
+                append("# Hikari Desktop — extra TLS trust anchors accepted by the user.\n")
+                append("# Delete this file to withdraw them. One entry per certificate.\n")
+            }
+            for (c in certs) {
+                append("\n# ").append(c.subjectX500Principal.name).append("\n")
+                append("# sha256 ").append(sha256HexOf(c.encoded)).append("\n")
+                append("-----BEGIN CERTIFICATE-----\n")
+                append(pem.encodeToString(c.encoded)).append("\n")
+                append("-----END CERTIFICATE-----\n")
+            }
+        }
+        runCatching {
+            val existing = if (f.isFile) f.readText() else ""
+            f.writeText(existing + text)
+        }.onFailure { return 0 }
+        forgetAnchors()
+        System.err.println("tls-trust: accepted " + certs.size + " extra anchor(s) -> " + f.absolutePath)
+        return certs.size
+    }
+
+    private fun sha256HexOf(bytes: ByteArray): String =
+        java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+
+    /**
+     * Verifies a server's certificate chain against the anchors this app
+     * collected (see [trustStore], plus anything the user accepted by hand).
+     *
+     * Why not Conscrypt's own TrustManagerImpl, which is what every client here
+     * used to get: its path builder refuses to use ANY certificate in the
+     * server's chain whose own signature is SHA-1 (Conscrypt's
+     * ChainStrengthAnalyzer blacklists md2, md4, md5 and sha1 signature OIDs) —
+     * even when that certificate's issuer is a trusted anchor of ours, and even
+     * when a perfectly valid path exists through it. GitHub's CDN still serves
+     * chains containing the legacy Comodo/Sectigo **AAA Certificate Services**
+     * root (self-signed with SHA-1) on some networks and edges, and every such
+     * connection died with
+     *
+     *     Unacceptable certificate: CN=AAA Certificate Services, O=Comodo CA Limited …
+     *
+     * which the app then reported as "this machine's certificate store doesn't
+     * trust the site's CA chain" — a wrong name for a rule inside the verifier.
+     * The JDK's PKIX validator has no such rule (Java 17 only disables SHA-1 for
+     * *signed JARs*), so it builds the path through those cross-signed
+     * certificates and — when it really cannot — says exactly which certificate
+     * and why, which is what the user and the [diagnoseServer] report need.
+     *
+     * Two strategies, in order:
+     *  1. validate the chain exactly as the server sent it; if the server sent
+     *     the root (or a cross-signed variant of one we have), this is enough;
+     *  2. otherwise BUILD a path from the leaf to any of our anchors using the
+     *     server's certificates as the intermediate pool — the repair a browser
+     *     silently performs for a server that reports its chain incompletely.
+     */
+    private class HikariTrustManager(
+        anchors: List<java.security.cert.X509Certificate>,
+    ) : javax.net.ssl.X509TrustManager {
+
+        private val cam: java.security.cert.CertificateFactory =
+            java.security.cert.CertificateFactory.getInstance("X.509")
+
+        private val trustAnchors: Set<java.security.cert.TrustAnchor> =
+            anchors.map { java.security.cert.TrustAnchor(it, null) }.toSet()
+
+        /** Chains already verified in this session (TLS reconnects are frequent
+         *  and the answer cannot change while the anchor set is the same). */
+        private val accepted = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+
+        override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> =
+            trustAnchors.map { it.trustedCert }.toTypedArray()
+
+        override fun checkClientTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) =
+            verify(chain)
+
+        override fun checkServerTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) =
+            verify(chain)
+
+        private fun verify(chain: Array<out java.security.cert.X509Certificate>?) {
+            if (chain == null || chain.isEmpty()) {
+                throw java.security.cert.CertificateException("the server sent no certificate")
+            }
+            val list = chain.toList()
+            val key = runCatching {
+                val md = java.security.MessageDigest.getInstance("SHA-256")
+                list.joinToString("/") { sha256(md, it.encoded) }
+            }.getOrNull()
+            if (key != null && accepted.containsKey(key)) return
+            val given = runCatching { validateGiven(list) }.exceptionOrNull()
+            if (given == null) {
+                if (key != null) accepted[key] = true
+                return
+            }
+            val built = runCatching { build(list) }.exceptionOrNull()
+            if (built == null) {
+                if (key != null) accepted[key] = true
+                return
+            }
+            val chosen = if (built is java.security.cert.CertificateException) built else given
+            throw java.security.cert.CertificateException(
+                chosen.message?.take(400) ?: "the certificate chain could not be verified",
+                chosen,
+            )
+        }
+
+        /** Strategy 1: the chain as received, validated as a complete path. */
+        private fun validateGiven(chain: List<java.security.cert.X509Certificate>) {
+            val params = java.security.cert.PKIXParameters(trustAnchors)
+            params.isRevocationEnabled = false
+            java.security.cert.CertPathValidator.getInstance("PKIX")
+                .validate(cam.generateCertPath(chain), params)
+        }
+
+        /** Strategy 2: build a path from the leaf to one of our anchors. */
+        private fun build(chain: List<java.security.cert.X509Certificate>) {
+            val selector = java.security.cert.X509CertSelector().apply { certificate = chain.first() }
+            val params = java.security.cert.PKIXBuilderParameters(trustAnchors, selector)
+            params.isRevocationEnabled = false
+            params.addCertStore(
+                java.security.cert.CertStore.getInstance(
+                    "Collection",
+                    java.security.cert.CollectionCertStoreParameters(
+                        HashSet<java.security.cert.Certificate>(chain),
+                    ),
+                ),
+            )
+            java.security.cert.CertPathBuilder.getInstance("PKIX").build(params)
+        }
+
+        private fun sha256(md: java.security.MessageDigest, bytes: ByteArray): String =
+            md.digest(bytes).joinToString("") { "%02x".format(it) }
+    }
 
     private fun addCertificates(dest: java.security.KeyStore, src: java.security.KeyStore?, already: Int): Int {
         if (src == null) return 0
@@ -266,6 +509,13 @@ object Http {
                 ?: return emptyList()
             stream.use { it.readBytes().toString(Charsets.UTF_8) }
         }.getOrNull() ?: return emptyList()
+        val out = parsePemText(text)
+        if (out.isEmpty()) System.err.println("tls-trust: nothing parsed from " + resource)
+        return out
+    }
+
+    /** Every `-----BEGIN CERTIFICATE-----` block in [text], comments ignored. */
+    private fun parsePemText(text: String): List<java.security.cert.X509Certificate> {
         val factory = runCatching {
             java.security.cert.CertificateFactory.getInstance("X.509")
         }.getOrNull() ?: return emptyList()
@@ -277,7 +527,6 @@ object Http {
             val cert = runCatching { factory.generateCertificate(der.inputStream()) }.getOrNull() ?: continue
             if (cert is java.security.cert.X509Certificate) out.add(cert)
         }
-        if (out.isEmpty()) System.err.println("tls-trust: nothing parsed from " + resource)
         return out
     }
 
@@ -308,6 +557,182 @@ object Http {
             }.orEmpty()
         }
     }.getOrDefault(emptyList())
+
+    // ── diagnostics ─────────────────────────────────────────────────────────
+
+    /**
+     * A plain-text report on why a host cannot be reached from this machine —
+     * the trust anchors that were loaded, every stack's exact error, and the
+     * certificate chain the network ACTUALLY serves (read with a trust-all
+     * socket, so it is available even when verification fails: that is the whole
+     * point).
+     *
+     * It exists because "the TLS handshake is being blocked by this network" was
+     * for months the app's answer to a certificate problem nobody could see the
+     * details of. Everything here is written to
+     * `~/.hikari/network-diagnosis.txt` by the Extensions screen, which is also
+     * where the button that produces it lives.
+     */
+    fun diagnoseServer(rawUrl: String): String {
+        val url = sanitizeStreamUrl(rawUrl).ifBlank { rawUrl }
+        val sb = StringBuilder()
+        val now = java.time.ZonedDateTime.now()
+        sb.append("Hikari network diagnosis\n")
+        sb.append("generated: ").append(java.time.Instant.now()).append("\n")
+        sb.append("system clock: ").append(now).append("  (unix ms ").append(System.currentTimeMillis()).append(")\n")
+        sb.append("java: ").append(System.getProperty("java.version")).append(" / ")
+            .append(System.getProperty("java.vendor")).append("\n")
+        sb.append("java.home: ").append(System.getProperty("java.home")).append("\n")
+        sb.append("os: ").append(System.getProperty("os.name")).append(" ")
+            .append(System.getProperty("os.version")).append(" ").append(System.getProperty("os.arch")).append("\n")
+        sb.append("url: ").append(url).append("\n")
+        sb.append("trust store: ").append(trustStoreReport()).append("\n")
+        sb.append("accepted by the user: ").append(extraTrustedCount()).append("\n")
+        sb.append("system proxy configured: ").append(systemProxyInUse()).append("\n")
+        sb.append("verifier: ").append(runCatching { trustManager().javaClass.name }.getOrDefault("?")).append("\n")
+
+        // 1. every stack, and exactly what it said
+        sb.append("\n── each compatibility pass ─────────────────────────────\n")
+        for (pass in passes()) {
+            val t0 = System.currentTimeMillis()
+            // getStringStrictOn already returns a Result, so it must NOT be
+            // wrapped in another runCatching (that Double-Result swallowed the
+            // text type and the report could not print its length).
+            val r: Result<String> = try {
+                getStringStrictOn(passClient(pass), url, emptyMap())
+            } catch (t: Throwable) {
+                Result.failure(t)
+            }
+            val ms = System.currentTimeMillis() - t0
+            val err = r.exceptionOrNull()
+            if (err == null) {
+                val text: String = r.getOrNull() ?: ""
+                sb.append(pass.key).append(": OK in ").append(ms).append("ms (").append(text.length).append(" chars)\n")
+            } else {
+                sb.append(pass.key).append(": FAILED in ").append(ms).append("ms\n")
+                appendCauseChain(sb, err, "  ")
+            }
+        }
+
+        // 2. the chain the network serves, trust on or off
+        sb.append("\n── certificate chain the server actually sent ─────────\n")
+        val chain = servedChain(url)
+        if (chain.isEmpty()) {
+            sb.append("(no handshake could be completed at all)\n")
+        } else {
+            val seen = trustStoreFingerprints()
+            for ((i, cert) in chain.withIndex()) {
+                val fp = sha256HexOf(cert.encoded)
+                val self = cert.subjectX500Principal == cert.issuerX500Principal
+                sb.append("[").append(i).append("] ").append(cert.subjectX500Principal.name).append("\n")
+                sb.append("    issuer: ").append(cert.issuerX500Principal.name).append("\n")
+                sb.append("    signature: ").append(cert.sigAlgName).append(" (").append(cert.sigAlgOID).append(")")
+                    .append(sha1Like(cert) ?: "").append("\n")
+                sb.append("    key: ").append(cert.publicKey.algorithm).append(" ").append(keyBits(cert)).append("\n")
+                sb.append("    valid: ").append(cert.notBefore).append(" → ").append(cert.notAfter)
+                .append(validityNote(cert)).append("\n")
+                sb.append("    sha256: ").append(fp)
+                    .append(if (fp in seen) "   [it IS one of our anchors]" else "   [not in our trust store]")
+                    .append(if (self) "   [self-signed]" else "").append("\n")
+                if (!self) {
+                    val fits = runCatching {
+                        trustManager().acceptedIssuers.count {
+                            it.subjectX500Principal == cert.issuerX500Principal
+                        }
+                    }.getOrDefault(0)
+                    sb.append("    our anchors with that issuer name: ").append(fits).append("\n")
+                }
+            }
+        }
+        sb.append("\nThe two lines that matter: the reason under each pass, and whether the\n")
+        sb.append("bottom certificate of the served chain is in our trust store.\n")
+        return sb.toString()
+    }
+
+    /** Marks a SHA-1 signature — the signature Conscrypt's verifier refuses. */
+    private fun sha1Like(cert: java.security.cert.X509Certificate): String? =
+        if (cert.sigAlgOID == "1.2.840.113549.1.1.5" || cert.sigAlgOID == "1.2.840.10045.4.1") {
+            "   <-- SHA-1 SIGNATURE (Conscrypt refuses to build a path through this)"
+        } else null
+
+    private fun keyBits(cert: java.security.cert.X509Certificate): String = runCatching {
+        when (val k = cert.publicKey) {
+            is java.security.interfaces.RSAPublicKey -> k.modulus.bitLength().toString() + " bit"
+            is java.security.interfaces.ECPublicKey -> k.params.curve.field.fieldSize.toString() + " bit"
+            else -> ""
+        }
+    }.getOrDefault("")
+
+    private fun validityNote(cert: java.security.cert.X509Certificate): String {
+        val now = java.util.Date()
+        return when {
+            now.before(cert.notBefore) -> "   <-- NOT VALID YET for this machine's clock"
+            now.after(cert.notAfter) -> "   <-- EXPIRED for this machine's clock"
+            else -> ""
+        }
+    }
+
+    private fun appendCauseChain(sb: StringBuilder, t: Throwable?, indent: String) {
+        var c = t
+        var depth = 0
+        while (c != null && depth < 8) {
+            sb.append(indent).append(c.javaClass.name).append(": ").append(c.message?.take(400) ?: "").append("\n")
+            c = c.cause
+            depth++
+        }
+    }
+
+    /**
+     * The certificate chain a host hands over, read through a socket that
+     * accepts anything — the only way to SEE the chain when verification is the
+     * thing that failed. Used by [diagnoseServer] and by the "trust this
+     * network's certificate" action; never used for real requests.
+     */
+    fun servedChain(rawUrl: String): List<java.security.cert.X509Certificate> = runCatching {
+        val uri = java.net.URI(rawUrl.trim())
+        val host = uri.host ?: return emptyList()
+        val port = if (uri.port > 0) uri.port else if (uri.scheme.equals("http", true)) 80 else 443
+        if (port == 80) return emptyList()
+        val trustAll = object : javax.net.ssl.X509TrustManager {
+            override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = emptyArray()
+            override fun checkClientTrusted(c: Array<out java.security.cert.X509Certificate>?, a: String?) = Unit
+            override fun checkServerTrusted(c: Array<out java.security.cert.X509Certificate>?, a: String?) = Unit
+        }
+        val ctx = javax.net.ssl.SSLContext.getInstance("TLS")
+        ctx.init(null, arrayOf<javax.net.ssl.TrustManager>(trustAll), null)
+        (ctx.socketFactory.createSocket() as javax.net.ssl.SSLSocket).use { s ->
+            s.connect(java.net.InetSocketAddress(host, port), 8_000)
+            runCatching {
+                val params = s.sslParameters
+                params.serverNames = listOf(javax.net.ssl.SNIHostName(host))
+                s.sslParameters = params
+            }
+            s.soTimeout = 8_000
+            s.startHandshake()
+            s.session.peerCertificates.mapNotNull { it as? java.security.cert.X509Certificate }
+        }
+    }.getOrElse { e ->
+        System.err.println("tls-diagnose: reading the served chain failed: " + (e.message ?: e.javaClass.simpleName))
+        emptyList()
+    }
+
+    /** The user's accepted anchors that would let [url] verify — the certificate
+     *  offered by "Trust this network's certificate…". */
+    fun certsToAccept(url: String): List<java.security.cert.X509Certificate> {
+        val chain = servedChain(url)
+        if (chain.isEmpty()) return emptyList()
+        val known = trustStoreFingerprints()
+        // Everything in the chain we do NOT already trust: accepting the root
+        // alone would not help a chain that is also missing an intermediate, and
+        // an intermediate is a perfectly valid PKIX anchor. If nothing is new,
+        // offer the top-most certificate (the one a re-issue would have changed).
+        val fresh = LinkedHashMap<String, java.security.cert.X509Certificate>()
+        for (c in chain) {
+            val fp = sha256HexOf(c.encoded)
+            if (fp !in known) fresh[fp] = c
+        }
+        return if (fresh.isEmpty()) listOfNotNull(chain.lastOrNull()) else fresh.values.toList()
+    }
 
     // ── the compatibility ladder ────────────────────────────────────────────
 
@@ -484,10 +909,27 @@ object Http {
      * this network" was exactly the wrong thing to tell the user about it.
      */
     fun isCertTrustFailure(t: Throwable?): Boolean {
+        // The TYPE is the reliable signal: whatever text a JDK version puts in
+        // the message, a chain that could not be built or validated is a trust
+        // decision. ("Path does not chain with any of the trust anchors" is what
+        // our own verifier says, and nothing in the old message list matched it.)
+        var cause: Throwable? = t
+        var depth = 0
+        while (cause != null && depth < 8) {
+            if (cause is java.security.cert.CertificateException) return true
+            if (cause is java.security.cert.CertPathValidatorException) return true
+            if (cause is java.security.cert.CertPathBuilderException) return true
+            cause = cause.cause
+            depth++
+        }
         val text = ((t?.message ?: "") + " | " + (t?.cause?.message ?: "")).lowercase()
         if (text.isBlank()) return false
         return text.contains("unacceptable certificate") ||
             text.contains("unable to find valid certification path") ||
+            text.contains("trust anchor for certification path not found") ||
+            text.contains("trustanchornotfound") ||
+            text.contains("does not chain with any of the trust") ||
+            text.contains("certification path") ||
             text.contains("pkix path building failed") ||
             text.contains("no trusted certificate") ||
             text.contains("certpath") ||
@@ -521,18 +963,48 @@ object Http {
         "this machine's certificate store doesn't trust the site's CA chain"
 
     /**
+     * The reason line inside a failed verification — the peer certificate's own
+     * name ("Unacceptable certificate: CN=AAA Certificate Services, …") or the
+     * path error ("unable to find valid certification path to requested
+     * target"). Kept in the message on purpose: it used to be replaced by the
+     * friendly sentence alone, which made every trust problem look identical in
+     * the user's screenshot and left nothing to act on.
+     */
+    private fun certDetail(t: Throwable?): String {
+        var c = t
+        var depth = 0
+        while (c != null && depth < 6) {
+            val m = c.message?.trim().orEmpty()
+            if (m.isNotBlank()) {
+                val line = m.lineSequence().firstOrNull { it.isNotBlank() }?.trim().orEmpty()
+                if (line.isNotBlank()) return line.take(220)
+            }
+            c = c.cause
+            depth++
+        }
+        return ""
+    }
+
+    /** [CERT_TRUST_MESSAGE] with the verifier's own words appended. */
+    fun certTrustMessage(t: Throwable?): String {
+        val d = certDetail(t)
+        return if (d.isBlank() || d.equals(CERT_TRUST_MESSAGE, ignoreCase = true)) CERT_TRUST_MESSAGE
+        else CERT_TRUST_MESSAGE + ": " + d
+    }
+
+    /**
      * A short, honest reason for a failed fetch across many mirrors: the most
      * common distinct causes with how many hosts reported them, so the user
      * reads "TLS handshake blocked by this network (8)" instead of whichever
      * attempt happened to fail last.
      */
-    fun summariseFailures(failures: Collection<Throwable>): String {
+    fun summariseFailures(failures: Collection<Throwable>, hosts: Collection<String> = emptyList()): String {
         val real = failures.filterNot { isCancellation(it) }
         if (real.isEmpty()) return if (failures.isEmpty()) "no server answered" else "the fetch was cancelled"
         val groups = LinkedHashMap<String, Int>()
         for (t in real) {
             val label = when {
-                isCertTrustFailure(t) -> CERT_TRUST_MESSAGE
+                isCertTrustFailure(t) -> certTrustMessage(t)
                 isTlsStackFailure(t) -> "the TLS handshake is being blocked by this network"
                 t is UnknownHostException -> "DNS lookup failed"
                 t is java.net.ConnectException -> "connection refused"
@@ -543,7 +1015,12 @@ object Http {
             groups[label] = (groups[label] ?: 0) + 1
         }
         val detail = groups.entries.sortedByDescending { it.value }.take(3)
-            .joinToString("; ") { it.key + " (" + it.value + ")" }
+            .joinToString("; ") { it.key + " (" + it.value + ")" } +
+            // Naming the hosts is what makes a screenshot enough to diagnose:
+            // "raw.githubusercontent.com" failing is a different problem from a
+            // proxy frontdoor failing, and the reason above is only the most
+            // common one.
+            if (hosts.isNotEmpty() && hosts.size <= 4) "  [asked: " + hosts.joinToString(", ") + "]" else ""
         // Say what it means, not just what the network stack said: this string
         // ends up on screen under "Couldn't load this repo", and it is the one
         // place the user can judge whether to retry, change network, or stop
@@ -780,8 +1257,12 @@ object Http {
         is java.net.NoRouteToHostException -> true
         // A TLS-stack failure is this machine's problem, not the host's (see
         // [isTlsStackFailure]) — the ladder retries it on another stack, and the
-        // host must not be blacklisted for it.
-        is javax.net.ssl.SSLException -> !isTlsStackFailure(t)
+        // host must not be blacklisted for it. The same goes for a CERTIFICATE
+        // rejection: whether this machine trusts the chain says nothing about
+        // the host, and blacklisting it for 10 minutes is what left manual
+        // retries with a single candidate to try — so every retry failed the
+        // same way and looked like "this network can never load that repo".
+        is javax.net.ssl.SSLException -> !isTlsStackFailure(t) && !isCertTrustFailure(t)
         is java.io.InterruptedIOException -> true
         else -> isHostFailure(t.cause)
     }
@@ -1049,7 +1530,7 @@ object Http {
                 }
             }
         }
-        return Result.failure(Exception(summariseFailures(walk.failures)))
+        return Result.failure(Exception(summariseFailures(walk.failures, walk.hostsWithFailures())))
     }
 
     /** Resolves [url] against [baseUrl] when it is relative. The CloudStream
@@ -1114,7 +1595,7 @@ object Http {
     fun humanMessage(t: Throwable?): String {
         // The two desktop failures that deserve a sentence a user can act on,
         // not an OpenSSL/BoringSSL routine dump.
-        if (isCertTrustFailure(t)) return CERT_TRUST_MESSAGE
+        if (isCertTrustFailure(t)) return certTrustMessage(t)
         if (isTlsStackFailure(t)) return "the TLS handshake is being blocked by this network"
         val raw = t?.message?.trim().orEmpty().ifBlank { t?.javaClass?.simpleName ?: "unknown network error" }
         val firstLine = raw.lineSequence().firstOrNull { it.isNotBlank() } ?: raw
@@ -1656,7 +2137,7 @@ object Http {
             }?.let { return Result.success(it.second) }
         }
         System.err.println("net-fetch: gave up on $url after " + (System.currentTimeMillis() - started) + "ms")
-        return Result.failure(Exception(summariseFailures(walk.failures)))
+        return Result.failure(Exception(summariseFailures(walk.failures, walk.hostsWithFailures())))
     }
 
     /**
@@ -1682,6 +2163,11 @@ object Http {
 
         val failures = java.util.concurrent.ConcurrentLinkedQueue<Throwable>()
 
+        /** host → the last thing it said, for the user-facing summary. */
+        private val hostFailures = java.util.concurrent.ConcurrentHashMap<String, Throwable>()
+
+        fun hostsWithFailures(): List<String> = hostFailures.keys.sorted()
+
         /** Route-keyed: "url|p" through the system proxy, "url|d" direct. */
         private val spent = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
 
@@ -1701,6 +2187,7 @@ object Http {
         fun record(url: String, cause: Throwable?, throughProxy: Boolean) {
             if (cause == null) return
             failures += cause
+            runCatching { MirrorMemory.hostOf(url).let { if (it.isNotBlank()) hostFailures[it] = cause } }
             val key = route(url, throughProxy)
             passFailures[key] = cause
             if (!Http.isTlsStackFailure(cause)) spent[key] = true

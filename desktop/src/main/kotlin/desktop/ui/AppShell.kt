@@ -205,6 +205,7 @@ object AppShell {
         return VBox(2.0,
             Theme.label("Hikari Desktop", size = 11.5, bold = true),
             Theme.label("v${desktop.Build.VERSION} · $providers", size = 10.5, dim = true),
+            Theme.label("build ${desktop.Build.DATE} ${desktop.Build.COMMIT}", size = 10.0, dim = true),
         ).apply {
             styleClass.add("sidebar-foot")
             padding = Insets(9.0, 11.0, 9.0, 11.0)

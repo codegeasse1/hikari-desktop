@@ -36,7 +36,7 @@ import javax.net.ssl.TrustManagerFactory
  * It needs the network (the point of it is a real TLS handshake), so a runner
  * without internet fails loudly rather than passing silently.
  */
-fun main() {
+fun main(args: Array<String>) {
     println("TlsTrustSelfTest: start")
     var failures = 0
     fun check(name: String, condition: Boolean, detail: String = "") {
@@ -151,6 +151,75 @@ fun main() {
         println("  with ONLY the JDK's store, that same fetch succeeds: " + jdkOnly.getOrElse { "failed: " + (it.message ?: it.javaClass.simpleName) })
     }
 
+    // ── 5. the verifier itself ──────────────────────────────────────────────
+    // A SHA-1-signed certificate — exactly the shape of the legacy Comodo/Sectigo
+    // "AAA Certificate Services" root that Conscrypt's path builder refuses to
+    // build a path through (see Http.HikariTrustManager). CI generates one with
+    // keytool and passes it here, so this checks the REAL rules:
+    //   * a chain that is not anchored anywhere must fail;
+    //   * accepting that certificate must make it verify (the "Trust this
+    //     network's certificate…" path) through Http's own verifier;
+    //   * and the acceptance must survive a store rebuild.
+    val sha1Pem = args.firstOrNull()?.let { File(it) }
+    if (sha1Pem == null || !sha1Pem.isFile) {
+        println("  (no SHA-1 test certificate passed — skipping the verifier section)")
+    } else {
+        val sha1Cert = runCatching {
+            java.security.cert.CertificateFactory.getInstance("X.509")
+                .generateCertificate(sha1Pem.inputStream()) as java.security.cert.X509Certificate
+        }.getOrNull()
+        check("the test certificate could be read", sha1Cert != null, sha1Pem.absolutePath)
+        if (sha1Cert != null) {
+            check(
+                "and it really is SHA-1 signed (the case Conscrypt refuses)",
+                sha1Cert.sigAlgOID == "1.2.840.113549.1.1.5",
+                sha1Cert.sigAlgName + " (" + sha1Cert.sigAlgOID + ")",
+            )
+            val fingerprint = java.security.MessageDigest.getInstance("SHA-256")
+                .digest(sha1Cert.encoded).joinToString("") { b -> "%02x".format(b) }
+
+            val verifier = Http.trustManager()
+            check(
+                "the app verifies with its own verifier, not Conscrypt's path builder",
+                verifier.javaClass.name.contains("HikariTrustManager"),
+                verifier.javaClass.name,
+            )
+
+            // Not anchored yet: verification must FAIL (nothing is trusted blindly).
+            val before = runCatching { verifier.checkServerTrusted(arrayOf(sha1Cert), "ECDHE_RSA") }
+            check("an unanchored SHA-1 chain is rejected", before.isFailure, before.exceptionOrNull()?.message ?: "")
+            check(
+                "the rejection is classified as a certificate-trust failure",
+                Http.isCertTrustFailure(before.exceptionOrNull()),
+                before.exceptionOrNull()?.message ?: "",
+            )
+
+            val added = Http.trustCertificates(listOf(sha1Cert))
+            println("  accepted " + added + " anchor(s) into " + Http.extraTrustedFile().absolutePath)
+            check("the acceptance was written", added == 1, "added=" + added)
+            check(
+                "the accepted certificate is merged into the trust store",
+                fingerprint in Http.trustStoreFingerprints(),
+            )
+            val after = runCatching { Http.trustManager().checkServerTrusted(arrayOf(sha1Cert), "ECDHE_RSA") }
+            check(
+                "and the same chain now verifies through the app's verifier",
+                after.isSuccess,
+                after.exceptionOrNull()?.message ?: "",
+            )
+            // What the platform verifier (Conscrypt's path builder, the old
+            // behaviour) says about the same chain — the difference this whole
+            // section is about.
+            val platform = runCatching {
+                val tmf = javax.net.ssl.TrustManagerFactory.getInstance("X509")
+                tmf.init(Http.trustStore())
+                val tm = tmf.trustManagers[0] as javax.net.ssl.X509TrustManager
+                tm.checkServerTrusted(arrayOf(sha1Cert), "ECDHE_RSA")
+            }
+            println("  the platform verifier would accept that chain: " + platform.isSuccess +
+                (platform.exceptionOrNull()?.message?.let { " (" + it + ")" } ?: ""))
+        }
+    }
     if (failures > 0) {
         println("TlsTrustSelfTest: $failures FAILED")
         kotlin.system.exitProcess(1)
