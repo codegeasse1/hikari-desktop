@@ -95,7 +95,14 @@ class UiShotApp : Application() {
         shot("c-settings", "settings list")
 
         // ── the player layer, wide ──────────────────────────────────────────
+        // The player's bars float over the picture in windows of their own when
+        // the video can be embedded (see PlayerWindow.overlaysOn), and a window
+        // of its own is not in this scene to be snapshotted. These shots are the
+        // app-side look, so the bars are kept in the layout for them;
+        // FloatingBarsSelfTest verifies the floating arrangement with real mpv
+        // and real screen pixels.
         steps += 400L to {
+            PlayerWindow.setFloatBars(false)
             AppShell.show(Screen.Home)
             PlayerWindow.open(
                 title = "The Grand Budapest Hotel",
@@ -162,6 +169,62 @@ class UiShotApp : Application() {
                 println("UiShotTest: OK   seek track stays inside its slider")
             }
         }
+
+        // ── the bars float over the picture ─────────────────────────────────
+        // The point of the floating arrangement is that the video area is the
+        // WHOLE window — the bars take no layout space at all — so this measures
+        // the two floating bar windows and the video area against the player
+        // layer. (FloatingBarsSelfTest goes further and checks the composed
+        // pixels with a real mpv; this is the cheap half, runnable without a
+        // video, and it is what catches a bar that silently stopped floating.)
+        steps += 400L to {
+            PlayerWindow.setFloatBars(true)
+        }
+        steps += 600L to {
+            val floating = PlayerWindow.barsFloating()
+            val bar = PlayerWindow.floatingBarHwnd()
+            val strip = PlayerWindow.floatingStripHwnd()
+            val area = PlayerWindow.videoAreaSize()
+            val layer = PlayerWindow.layerSize()
+            val barRect = bar?.takeIf { it != 0L }?.let { desktop.player.WinShell.windowRect(it) }
+            val stripRect = strip?.takeIf { it != 0L }?.let { desktop.player.WinShell.windowRect(it) }
+            val appHwnd = runCatching {
+                val own = ProcessHandle.current().pid()
+                desktop.player.WinShell.findWindowOf(own, stage.title)
+                    ?: desktop.player.WinShell.findWindowOf(own)
+            }.getOrNull()
+            val appRect = appHwnd?.let { desktop.player.WinShell.windowRect(it) }
+            println("UiShotTest: floating bars=$floating barHwnd=$bar stripHwnd=$strip")
+            println("UiShotTest: video area=" + area?.joinToString(",") + " layer=" + layer?.joinToString(","))
+            println("UiShotTest: bar rect=" + barRect?.joinToString(",") + " strip rect=" +
+                stripRect?.joinToString(",") + " app rect=" + appRect?.joinToString(","))
+            if (!desktop.player.WinShell.available) {
+                println("UiShotTest: OK   floating bars not applicable (no Win32 on this runner)")
+            } else if (!floating || bar == null || bar == 0L || strip == null || strip == 0L) {
+                println("UiShotTest: FAIL the bars did not get their own windows")
+                failures[0]++
+            } else if (area == null || layer == null || area[0] < layer[0] - 1.0 || area[1] < layer[1] - 1.0) {
+                println("UiShotTest: FAIL the video area does not fill the player layer")
+                failures[0]++
+            } else if (barRect != null && barRect[3] > 140) {
+                // The bars float over a full-bleed video, so a bar that is a
+                // PANEL (a stage that kept the window's height) covers the
+                // picture with a translucent sheet: the scene checks above all
+                // still pass, because the video area really is the whole window.
+                // Measuring the bar's own window height is what catches it.
+                println("UiShotTest: FAIL the floating control bar is " + barRect[3] +
+                    "px tall — a bar, not a panel over the picture")
+                failures[0]++
+            } else if (barRect != null && appRect != null &&
+                kotlin.math.abs((barRect[1] + barRect[3]) - (appRect[1] + appRect[3])) > 8
+            ) {
+                println("UiShotTest: FAIL the floating control bar is not at the bottom of the window")
+                failures[0]++
+            } else {
+                println("UiShotTest: OK   the bars float and the video area is the whole window")
+            }
+        }
+        steps += 200L to { PlayerWindow.setFloatBars(false) }
 
         // ── the player layer on a phone-width window ────────────────────────
         steps += 200L to {

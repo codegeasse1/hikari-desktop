@@ -1162,6 +1162,29 @@
     -fx-padding: 10 14 10 14;
 }
 
+/* ── the floating bars ─────────────────────────────────────────────────────
+   When the video can be embedded inside the app, the bars are NOT part of the
+   window's layout: they live in two small transparent windows of their own,
+   placed over the picture (see `PlayerWindow.overlaysOn`). That is why the
+   background here is translucent and the frame is gone — a floating control has
+   to read as something laid OVER the picture, not as a black bar that took the
+   bottom of it. The compound selectors are deliberate: a floating bar must beat
+   the plain `.player-top` / `.player-bar` rules above. */
+
+.player-top.player-floating {
+    -fx-background-color: rgba(8, 9, 14, 0.80);
+    -fx-border-color: transparent;
+    -fx-border-width: 0;
+    -fx-padding: 8 12 8 12;
+}
+
+.player-bar.player-floating {
+    -fx-background-color: rgba(8, 9, 14, 0.80);
+    -fx-border-color: transparent;
+    -fx-border-width: 0;
+    -fx-padding: 8 14 8 14;
+}
+
 .player-sep { -fx-background-color: rgba(255, 255, 255, 0.10); }
 
 .player-play {

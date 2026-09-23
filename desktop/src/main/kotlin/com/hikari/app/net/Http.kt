@@ -2437,11 +2437,18 @@ object Http {
             }
             onAttempt?.invoke(u, ok, why)
         }
-        if (raceDownload(origins, dest, headers, onProgress, counting, deadline, null, MAIN_RACE_MS, url)) return true
+        if (raceDownload(origins, dest, headers, onProgress, counting, deadline, null, ORIGIN_FIRST_MS, url)) return true
         if (certRejected) {
             System.err.println("downloadToRobust: every candidate was rejected by the certificate store — stopping")
             return false
         }
+        // Everything in one wave from here: the origins get another chance
+        // ALONGSIDE the mirrors, with the rest of the budget. Waiting the whole
+        // origin window before a single mirror was tried is what made a
+        // blocked-but-not-dead origin (the common case on a filtered network,
+        // where the connect hangs instead of failing) turn every install into a
+        // one-minute spinner. A slow-but-working origin is not lost by that —
+        // it is in this wave too, and this wave is the long one.
         if (raceDownload(ordered, dest, headers, onProgress, counting, deadline, null, MAIN_RACE_MS, url)) return true
         if (certRejected) {
             System.err.println("downloadToRobust: every candidate was rejected by the certificate store — stopping")
@@ -2461,6 +2468,21 @@ object Http {
     /** How long one wave of raced mirrors may take before the next wave starts. */
     private const val MAIN_RACE_MS = 45_000L
     private const val RESCUE_RACE_MS = 20_000L
+
+    /**
+     * How long the AUTHORITATIVE hosts alone get before the mirrors are brought
+     * in.
+     *
+     * This exists because of what the user sees: on a network that filters
+     * GitHub (the mirrors in [mirrorVariants] exist precisely for that case) the
+     * origin does not usually fail fast — it hangs — so waiting a full 45 s
+     * window on it, and only then racing the mirrors, is a one-minute install
+     * for a file a proxy frontdoor would have served in a second. Twelve seconds
+     * is comfortably more than an origin needs to prove it is usable (bytes on
+     * the wire, or a connect that failed outright) and it costs a working origin
+     * nothing, because the second wave includes the origins again.
+     */
+    private const val ORIGIN_FIRST_MS = 12_000L
 
     /** True when what landed on disk is really an HTML page (a mirror's error
      *  page) rather than the asset — read back from the file, so it also covers

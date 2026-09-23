@@ -27,6 +27,7 @@ import javafx.stage.FileChooser
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
@@ -127,6 +128,45 @@ class ExtensionsScreenView {
      */
     private val busyPlugins = HashMap<String, String>()
 
+    /**
+     * Plugin URL → when its current install started (ms since the epoch).
+     *
+     * Only used for the seconds readout in the row: a download or a dex
+     * translation that takes ten seconds and says so is a progress bar, while
+     * the same ten seconds behind a spinner that never changes is a hang.
+     */
+    private val busySince = HashMap<String, Long>()
+
+    /**
+     * Plugin URLs whose bytes are on disk and verified, and which are being set
+     * up — the extension is registered and usable, and the slower work (loading
+     * its classes, which for a dex archive means translating dex → JVM) is
+     * finishing in the background.
+     */
+    private val settingUpPlugins = HashSet<String>()
+
+    /** True while the one-second ticker that repaints the busy rows is running. */
+    private var tickerRunning = false
+
+    /**
+     * The live parts of each rendered plugin row, keyed by plugin URL.
+     *
+     * A plugin's state changes many times during one install (working → installed
+     * → error), and every one of those used to rebuild the ENTIRE list — 144
+     * rows, each one asking the store for its providers — to change the contents
+     * of a single row. That is what made the screen crawl while an install was
+     * running. Now the row's parts are kept and rewritten in place.
+     */
+    private class RowParts(
+        val plugin: PluginRef,
+        val state: HBox,
+        val action: HBox,
+        val error: Label,
+    )
+
+    private val rowParts = HashMap<String, RowParts>()
+
+
     // ── composer state (kept across re-renders) ─────────────────────────────
 
     private var mode = 0
@@ -167,6 +207,9 @@ class ExtensionsScreenView {
 
     private fun renderAll() {
         content.children.clear()
+        // The rows that are about to be rebuilt are gone; the parts map has to
+        // forget them or a repaint would touch detached nodes.
+        rowParts.clear()
         content.children.add(header())
         // The live status line sits directly under the header: an install that
         // finishes while the user is looking at the top of the page must not
@@ -680,6 +723,7 @@ class ExtensionsScreenView {
     /** Rebuilds only the plugin list (keeps focus in the filter field). */
     private fun fillPlugins() {
         pluginsBox.children.clear()
+        rowParts.clear()
         val repo = openRepo ?: return
         val data = repoData[repo.url]
         when {
@@ -775,8 +819,13 @@ class ExtensionsScreenView {
         }
     }
 
+    /**
+     * One repo-plugin row. The row is built ONCE and its changing parts (the
+     * install-state badges, the action button, the error line) are filled by
+     * [fillRowParts], so a later state change can rewrite just this row instead
+     * of the list around it (see [refreshRow]).
+     */
     private fun pluginRow(plugin: PluginRef): Node {
-        val installed = providersFor(plugin.url)
         val name = themed(plugin.name, "src-name").apply {
             isWrapText = true
             minWidth = 0.0
@@ -789,38 +838,104 @@ class ExtensionsScreenView {
         val info = VBox(3.0, name, url).apply { minWidth = 0.0 }
         HBox.setHgrow(info, Priority.ALWAYS)
 
-        val state = HBox(6.0).apply {
-            alignment = Pos.CENTER_RIGHT
-            if (installed.isNotEmpty()) {
-                children.add(Ui.badge("${installed.size} installed", "badge-ok"))
-            }
-            if (plugin.jarHash != null || plugin.fileHash != null) {
-                children.add(Ui.badge("signed", "badge"))
-            }
-        }
-        // While the click is being acted on, the button becomes the answer.
-        val working = busyPlugins[plugin.url]
-        val action: Node = if (working != null) {
-            HBox(8.0, tinySpinner(), themed(working, "tiny")).apply { alignment = Pos.CENTER_RIGHT }
-        } else if (installed.isEmpty()) {
-            Ui.button("Install", primary = true) { installFromRepo(plugin) }
-        } else {
-            Ui.button("Uninstall", danger = true) { uninstallFromRepo(plugin) }
+        val state = HBox(6.0).apply { alignment = Pos.CENTER_RIGHT }
+        val action = HBox(8.0).apply { alignment = Pos.CENTER_RIGHT }
+        val error = themed("", "tiny").apply {
+            styleClass.add("h-danger")
+            isWrapText = true
+            maxWidth = 620.0
+            isVisible = false
+            isManaged = false
         }
         val row = HBox(12.0, info, state, action).apply {
             styleClass.add("src-row")
             alignment = Pos.CENTER_LEFT
         }
-        val error = installErrors[plugin.url]
-        return if (error == null) {
-            row
-        } else {
-            VBox(6.0, row, themed("⚠ $error", "tiny").apply {
-                styleClass.add("h-danger")
-                isWrapText = true
-                maxWidth = 620.0
-            })
+        val parts = RowParts(plugin, state, action, error)
+        rowParts[plugin.url] = parts
+        fillRowParts(parts)
+        // The error line is part of the row (not a separate node swapped in and
+        // out) so a failure can appear and disappear without the list moving.
+        return VBox(6.0, row, error)
+    }
+
+    /** Rewrites the changing parts of one rendered row. */
+    private fun fillRowParts(parts: RowParts) {
+        val url = parts.plugin.url
+        val installed = providersFor(url)
+        val working = busyPlugins[url]
+        parts.state.children.setAll()
+        if (installed.isNotEmpty()) {
+            parts.state.children.add(Ui.badge("${installed.size} installed", "badge-ok"))
         }
+        if (parts.plugin.jarHash != null || parts.plugin.fileHash != null) {
+            parts.state.children.add(Ui.badge("signed", "badge"))
+        }
+        parts.action.children.setAll(rowAction(parts.plugin, working, installed.size))
+        val error = installErrors[url]
+        parts.error.text = if (error == null) "" else "⚠ $error"
+        parts.error.isVisible = error != null
+        parts.error.isManaged = error != null
+    }
+
+    /** What the row's action slot shows right now: a spinner, or a button. */
+    private fun rowAction(plugin: PluginRef, working: String?, installedCount: Int): Node {
+        val url = plugin.url
+        if (working != null) {
+            val seconds = busySeconds(url)
+            val text = if (seconds < 1) working else "$working ${seconds}s"
+            return HBox(8.0, tinySpinner(), themed(text, "tiny")).apply { alignment = Pos.CENTER_RIGHT }
+        }
+        if (settingUpPlugins.contains(url)) {
+            // The bytes are in and verified: this is the tail of the install
+            // (loading the extension, which for a dex archive means translating
+            // it), and it no longer blocks anything.
+            val seconds = busySeconds(url)
+            val text = if (seconds < 1) "Finishing setup…" else "Finishing setup… ${seconds}s"
+            return HBox(8.0, tinySpinner(), themed(text, "tiny")).apply { alignment = Pos.CENTER_RIGHT }
+        }
+        return if (installedCount == 0) {
+            Ui.button("Install", primary = true) { installFromRepo(plugin) }
+        } else {
+            Ui.button("Uninstall", danger = true) { uninstallFromRepo(plugin) }
+        }
+    }
+
+    /** Seconds since this plugin's current install began (0 when unknown). */
+    private fun busySeconds(url: String): Long {
+        val from = busySince[url] ?: return 0L
+        return ((System.currentTimeMillis() - from) / 1000L).coerceAtLeast(0L)
+    }
+
+    /** Repaints ONE plugin row, if it is on screen. */
+    private fun refreshRow(url: String) {
+        rowParts[url]?.let { parts -> runCatching { fillRowParts(parts) } }
+    }
+
+    /** Repaints every row that is currently working, once a second, so the
+     *  seconds readout in them keeps moving. Stops itself when nothing is
+     *  working — this runs for the length of an install, not for the life of the
+     *  screen. */
+    private fun startBusyTicker() {
+        if (tickerRunning) return
+        tickerRunning = true
+        AppShell.uiScope.launch {
+            while (true) {
+                delay(1000L)
+                val active = Fx.runBlock { (busyPlugins.keys + settingUpPlugins).toList() }
+                if (active.isEmpty()) {
+                    Fx.run { tickerRunning = false }
+                    return@launch
+                }
+                Fx.run { active.forEach { refreshRow(it) } }
+            }
+        }
+    }
+
+    /** The header carries the installed/repo counts, so it is rewritten in
+     *  place when one of them changes — the rest of the page is left alone. */
+    private fun refreshHeader() {
+        runCatching { if (content.children.isNotEmpty()) content.children.set(0, header()) }
     }
 
     /** The 14px spinner used inline in a row's action slot. */
@@ -1317,9 +1432,11 @@ class ExtensionsScreenView {
         if (busyPlugins.containsKey(url)) return
         installErrors.remove(url)
         busyPlugins[url] = "Installing…"
+        busySince[url] = System.currentTimeMillis()
         busy.isVisible = true
         setStatus("Installing ${plugin.name}…", busy = true)
-        fillPlugins()
+        refreshRow(url)
+        startBusyTicker()
         AppShell.uiScope.launch {
             val result = runCatching {
                 val bytes = Http.fetchBytesRobust(url)
@@ -1345,9 +1462,11 @@ class ExtensionsScreenView {
         if (busyPlugins.containsKey(url)) return
         installErrors.remove(url)
         busyPlugins[url] = "Installing…"
+        busySince[url] = System.currentTimeMillis()
         busy.isVisible = true
         setStatus("Installing ${plugin.name}…", busy = true)
-        fillPlugins()
+        refreshRow(url)
+        startBusyTicker()
         AppShell.uiScope.launch {
             val result = runCatching {
                 val bytes = Http.fetchBytesRobust(url)
@@ -1370,9 +1489,11 @@ class ExtensionsScreenView {
         if (busyPlugins.containsKey(url)) return
         installErrors.remove(url)
         busyPlugins[url] = "Installing…"
+        busySince[url] = System.currentTimeMillis()
         busy.isVisible = true
         setStatus("Installing ${plugin.name}…", busy = true)
-        fillPlugins()
+        refreshRow(url)
+        startBusyTicker()
         AppShell.uiScope.launch {
             val result = runCatching {
                 val bytes = Http.fetchBytesRobust(url)
@@ -1409,7 +1530,8 @@ class ExtensionsScreenView {
             return
         }
         busyPlugins[plugin.url] = "Uninstalling…"
-        fillPlugins()
+        busySince[plugin.url] = System.currentTimeMillis()
+        refreshRow(plugin.url)
         AppShell.uiScope.launch {
             val targets = providersFor(plugin.url).mapNotNull { it.extra }.distinct()
                 .ifEmpty { listOf(plugin.url) }
@@ -1417,10 +1539,14 @@ class ExtensionsScreenView {
             for (t in targets) removed += runCatching { uninstallByKind(kind, t) }.getOrDefault(0)
             Fx.run {
                 busyPlugins.remove(plugin.url)
+                busySince.remove(plugin.url)
+                busy.isVisible = busyPlugins.isNotEmpty() || settingUpPlugins.isNotEmpty()
                 val count = if (removed > 0) removed else targets.size
                 setStatus("Uninstalled ${plugin.name} ($count provider${if (count == 1) "" else "s"}).")
                 AppShell.toast("Uninstalled ${plugin.name}", "ok")
-                renderAll()
+                refreshRow(plugin.url)
+                fillInstalled()
+                refreshHeader()
             }
             reloadProvidersQuietly()
         }
@@ -1438,7 +1564,9 @@ class ExtensionsScreenView {
     private fun finishInstall(name: String, url: String, result: Result<Int>) {
         Fx.run {
             busyPlugins.remove(url)
-            busy.isVisible = false
+            settingUpPlugins.remove(url)
+            busySince.remove(url)
+            busy.isVisible = busyPlugins.isNotEmpty() || settingUpPlugins.isNotEmpty()
             val count = result.getOrNull()
             val isErr = count == null
             val message = if (isErr) {
@@ -1454,7 +1582,10 @@ class ExtensionsScreenView {
                 if (isErr) "$name could not be installed" else "$name installed",
                 if (isErr) "error" else "ok",
             )
-            renderAll()
+            // One row changed, so one row is repainted.
+            refreshRow(url)
+            fillInstalled()
+            refreshHeader()
         }
         reloadProvidersQuietly()
     }
@@ -1534,7 +1665,10 @@ class ExtensionsScreenView {
             val keys = sourceKeys(url)
             AppShell.app.store.providers().filter { cfg ->
                 when (cfg.type) {
-                    ProviderType.HIKARI, ProviderType.CS3 -> cfg.extra?.startsWith("$url|") == true
+                    ProviderType.HIKARI, ProviderType.CS3 -> {
+                        val extra = cfg.extra ?: return@filter false
+                        keys.any { k -> extra.startsWith("$k|") }
+                    }
                     ProviderType.NUVIO, ProviderType.SKYSTREAM, ProviderType.ANIYOMI -> {
                         val extra = cfg.extra ?: return@filter false
                         keys.any { k -> extra == k || extra.startsWith("$k|") }
@@ -1549,6 +1683,13 @@ class ExtensionsScreenView {
      * can move the file (a new branch, `refs/heads/x` vs `x`, the jsDelivr
      * mirror) between listing and uninstall, and a literal comparison used to
      * greet an already-installed extension with an Install button again.
+     *
+     * The `.hiki`/`.cs3`/`.jar` siblings are here for the same reason, and they
+     * are the ones that bite hardest: the same plugin is published side by side
+     * as a dex archive and a JVM jar, the install records whichever one it
+     * actually fetched (`.hiki` is swapped for `.jar` on purpose — see
+     * [installPlugin]), and so a row listed as `x.hiki` answered "Install" again
+     * after installing it. To the user that is an install that did nothing.
      */
     private fun sourceKeys(url: String): Set<String> {
         val u = url.trim()
@@ -1556,6 +1697,14 @@ class ExtensionsScreenView {
         out.add(u.replace("/refs/heads/", "/"))
         out.add(u.replace("https://cdn.jsdelivr.net/gh/", "https://raw.githubusercontent.com/"))
         out.add(u.removeSuffix("/"))
+        for (ext in listOf(".hiki", ".cs3", ".jar")) {
+            if (u.endsWith(ext)) {
+                val stem = u.removeSuffix(ext)
+                out.add(stem + ".jar")
+                out.add(stem + ".cs3")
+                out.add(stem + ".hiki")
+            }
+        }
         return out
     }
 
@@ -1572,16 +1721,31 @@ class ExtensionsScreenView {
         if (dl.endsWith(".hiki")) dl = dl.removeSuffix(".hiki") + ".jar"
         installErrors.remove(url)
         busyPlugins[url] = "Installing…"
+        busySince[url] = System.currentTimeMillis()
         busy.isVisible = true
         setStatus("Installing $name…", busy = true)
-        fillPlugins()
+        refreshRow(url)
+        startBusyTicker()
         AppShell.uiScope.launch {
             val startedAt = System.currentTimeMillis()
             var statusText = "Install failed: unknown error"
             var isErr = true
+            // The file the two-phase install has to finish setting up, once the
+            // candidate loop has found one.
+            var setupFile: File? = null
+            var setupName = ""
+            // Set when the archive's own manifest was enough to register the
+            // extension: the bytes are on disk and it is "installed", while the
+            // real load (the slow part, for a dex plugin) finishes behind it.
+            // Declared out here, not inside the try — the code that acts on it
+            // (the row's state, the status line, the setup itself) runs after
+            // the catch.
+            var pendingSetup = false
             try {
                 val safeName = name.lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-').ifBlank { "ext" }
                 val dest = File(extDir, "$safeName.jar")
+                setupFile = dest
+                setupName = safeName
                 // Downloads are the only slow part of an install, so nothing is
                 // downloaded when this machine already has the exact bytes:
                 //  1. the extension itself is on disk and matches the repo's
@@ -1651,6 +1815,22 @@ class ExtensionsScreenView {
                     // uninstall, or from another repo that lists it — is then
                     // instant, because nothing has to be downloaded at all.
                     ExtCache.put(expectedShaFor(c, fileHash, jarHash), dest)
+                    // Register the extension from the archive's OWN manifest
+                    // first. Reading that is one zip entry — no class loading,
+                    // and therefore no dex→JVM translation — so the install
+                    // finishes the moment the bytes are on disk and verified.
+                    // The real load, which is the part that takes seconds on a
+                    // dex plugin, runs behind it and reconciles what was
+                    // registered (see [finishSetup]).
+                    val planned = registerFromManifest(name, safeName, dest, dl)
+                    if (planned != null) {
+                        registered = planned
+                        pendingSetup = true
+                        break
+                    }
+                    // Only when the manifest cannot be read that way does the
+                    // install have to WAIT for the load, which is the slow path
+                    // it used to always take.
                     val result = registerExtension(name, safeName, dest, dl)
                     if (result != null) {
                         registered = result
@@ -1682,24 +1862,185 @@ class ExtensionsScreenView {
             }
             Fx.run {
                 busyPlugins.remove(url)
-                busy.isVisible = false
+                if (pendingSetup && !isErr) {
+                    // The bytes are in and verified and the extension is
+                    // registered: the row is "installed" now, and the tail of the
+                    // install is finishing behind it.
+                    settingUpPlugins.add(url)
+                } else {
+                    busySince.remove(url)
+                }
+                busy.isVisible = busyPlugins.isNotEmpty() || settingUpPlugins.isNotEmpty()
                 if (isErr) installErrors[url] = statusText.take(700) else installErrors.remove(url)
-                setStatus(statusText, isErr)
+                setStatus(statusText, isErr, busy = pendingSetup && !isErr)
                 AppShell.toast(
                     if (isErr) "$name could not be installed" else "$name installed",
                     if (isErr) "error" else "ok",
                 )
-                // The extension is registered and usable NOW — render it as
-                // installed immediately. Reloading every OTHER provider is
-                // background work: waiting for it here is what made an install
-                // that had already finished look like it was still going.
-                renderAll()
+                // Only THIS row changed. Rebuilding the whole list (144 rows,
+                // each one asking the store for its providers) for one row's
+                // state change is what made the screen crawl during an install;
+                // the installed list and the header's count are refreshed, and
+                // nothing else is touched.
+                refreshRow(url)
+                fillInstalled()
+                refreshHeader()
                 System.err.println(
-                    "install: " + name + (if (isErr) " FAILED" else "") + " in " +
-                        (System.currentTimeMillis() - startedAt) + "ms",
+                    "install: " + name + (if (isErr) " FAILED" else if (pendingSetup) " registered" else "") +
+                        " in " + (System.currentTimeMillis() - startedAt) + "ms",
                 )
             }
             reloadProvidersQuietly()
+            val file = setupFile
+            if (pendingSetup && !isErr && file != null) {
+                finishSetup(name, setupName, url, file, dl)
+            }
+        }
+    }
+
+    /**
+     * The background half of a two-phase install.
+     *
+     * [registerFromManifest] registered the extension the moment its bytes were
+     * on disk, which is what makes an install feel instant. This is the real
+     * work: loading it (a dex plugin is translated to JVM bytecode here, which
+     * is the seconds-long part), then making the registered providers match what
+     * the plugin actually holds — the manifest names one entry point, but a
+     * bundle can register several providers from it, and only the load knows.
+     *
+     * If it turns out the plugin cannot be loaded at all, the optimistic
+     * registration is taken back and the reason is shown on the row: an install
+     * that says "installed" and then silently does nothing would be worse than
+     * the wait it replaced.
+     */
+    private fun finishSetup(name: String, safeName: String, url: String, dest: File, sourceUrl: String) {
+        AppShell.uiScope.launch {
+            val startedAt = System.currentTimeMillis()
+            val loaded = runCatching {
+                val hiki = HikariPluginManager.reload(HikariApp.instance, dest)
+                if (hiki.isNotEmpty()) {
+                    hiki.map { it.name.ifBlank { name } }
+                } else {
+                    Cs3PluginManager.reload(HikariApp.instance, dest).map { it.name.ifBlank { name } }
+                }
+            }
+            Fx.run {
+                settingUpPlugins.remove(url)
+                busySince.remove(url)
+                busy.isVisible = busyPlugins.isNotEmpty() || settingUpPlugins.isNotEmpty()
+                val names = loaded.getOrNull().orEmpty()
+                if (names.isEmpty()) {
+                    val why = listOfNotNull(HikariPluginManager.lastError, Cs3PluginManager.lastError)
+                        .joinToString("  |  ")
+                        .ifBlank { "the extension registered no providers" }
+                    providersFor(url).forEach { AppShell.app.store.removeProvider(it.id) }
+                    installErrors[url] = "Couldn't load $name: ${why.take(300)}"
+                    setStatus("Couldn't load $name — see the row for the reason.", isError = true)
+                    AppShell.toast("$name could not be loaded", "error")
+                } else {
+                    installErrors.remove(url)
+                    syncProviders(name, safeName, url, dest, sourceUrl, names)
+                }
+                refreshRow(url)
+                fillInstalled()
+                refreshHeader()
+                System.err.println(
+                    "install: " + name + " ready in " +
+                        (System.currentTimeMillis() - startedAt) + "ms (" + names.size + " provider(s))",
+                )
+            }
+            reloadProvidersQuietly()
+        }
+    }
+
+    /**
+     * Registers an extension from the manifest inside its own archive.
+     *
+     * This is the whole trick behind an instant install: the manifest names the
+     * entry point (`pluginClassName` for a CloudStream plugin, `mainClass` — one
+     * or a list — for a Hikari one), and reading it costs one zip entry. Nothing
+     * is loaded, so a dex archive is not translated and the install does not
+     * wait for it; that happens in [finishSetup].
+     *
+     * Returns null when the archive has no usable manifest, which is the signal
+     * to fall back to the old (synchronous, slower) path — a plugin whose
+     * manifest cannot be understood is still worth loading the real way.
+     */
+    private fun registerFromManifest(name: String, safeName: String, dest: File, sourceUrl: String): String? {
+        if (!dest.isFile) return null
+        val root = runCatching {
+            java.util.zip.ZipFile(dest).use { z ->
+                val entry = z.getEntry("manifest.json") ?: return null
+                val text = z.getInputStream(entry).use { it.readBytes().toString(Charsets.UTF_8) }
+                JSONObject(text)
+            }
+        }.getOrNull() ?: return null
+        if (root.has("pluginClassName")) {
+            AppShell.app.store.addProvider(
+                ProviderConfig(
+                    id = "cs3|$safeName|0",
+                    name = name,
+                    type = ProviderType.CS3,
+                    url = dest.absolutePath,
+                    extra = "$sourceUrl|0",
+                )
+            )
+            return "Installed $name."
+        }
+        val mainClasses = when (val mc = root.opt("mainClass")) {
+            null -> emptyList()
+            is JSONArray -> (0 until mc.length()).mapNotNull { mc.optString(it).ifBlank { null } }
+            else -> listOf(mc.toString()).filter { it.isNotBlank() }
+        }
+        if (mainClasses.isEmpty()) return null
+        mainClasses.forEachIndexed { idx, _ ->
+            AppShell.app.store.addProvider(
+                ProviderConfig(
+                    id = "hiki|$safeName|$idx",
+                    name = if (mainClasses.size > 1) "$name · ${root.optString("name").ifBlank { "Provider ${idx + 1}" }}" else name,
+                    type = ProviderType.HIKARI,
+                    url = dest.absolutePath,
+                    extra = "$sourceUrl|$idx",
+                )
+            )
+        }
+        return "Installed $name (${mainClasses.size} extension${if (mainClasses.size > 1) "s" else ""})."
+    }
+
+    /**
+     * Makes the registered provider list match what the plugin really holds.
+     *
+     * `extra` is `<source url>|<index>` for both loaders and the index is the
+     * position in the loaded provider list, so the count IS part of the
+     * registration: the optimistically registered list is replaced by exactly
+     * what the load found, with the names the plugin gives itself. Replacing
+     * rather than merging keeps this idempotent — it runs once per install, and
+     * a re-registration of the same extension cannot leave duplicates behind.
+     */
+    private fun syncProviders(
+        name: String,
+        safeName: String,
+        pluginUrl: String,
+        file: File,
+        sourceUrl: String,
+        names: List<String>,
+    ) {
+        val mine = providersFor(pluginUrl)
+        val type = mine.firstOrNull()?.type ?: ProviderType.CS3
+        val prefix = if (type == ProviderType.HIKARI) "hiki" else "cs3"
+        val wanted = names.size.coerceAtLeast(1)
+        mine.forEach { AppShell.app.store.removeProvider(it.id) }
+        for (idx in 0 until wanted) {
+            val provider = names.getOrNull(idx).orEmpty().ifBlank { "Provider ${idx + 1}" }
+            AppShell.app.store.addProvider(
+                ProviderConfig(
+                    id = "$prefix|$safeName|$idx",
+                    name = if (wanted > 1) "$name · $provider" else name,
+                    type = type,
+                    url = file.absolutePath,
+                    extra = "$sourceUrl|$idx",
+                )
+            )
         }
     }
 
@@ -1711,7 +2052,15 @@ class ExtensionsScreenView {
     private fun reloadProvidersQuietly() {
         AppShell.uiScope.launch {
             runCatching { AppShell.app.providers.refresh() }
-            Fx.run { renderAll() }
+            // Only what actually depends on the provider list is repainted: the
+            // header's "N loaded" count and the installed list. Rebuilding the
+            // whole screen here — every plugin row, the repo cards, the composer
+            // — is what made the seconds AFTER an install as slow as the install
+            // itself, for a change that affects one line of the header.
+            Fx.run {
+                fillInstalled()
+                refreshHeader()
+            }
         }
     }
 
@@ -1810,16 +2159,24 @@ class ExtensionsScreenView {
         val matches = providersFor(url)
         if (matches.isEmpty()) return
         busyPlugins[url] = "Uninstalling…"
-        fillPlugins()
+        busySince[url] = System.currentTimeMillis()
+        refreshRow(url)
         // Removing an extension is entirely local work — the row must never wait
         // on the network or on any other extension to update.
         matches.forEach { AppShell.app.store.removeProvider(it.id) }
         val file = matches.first().url.takeIf { it.isNotBlank() }?.let { File(it) }
         if (file != null && file.exists()) runCatching { file.delete() }
         busyPlugins.remove(url)
+        busySince.remove(url)
+        settingUpPlugins.remove(url)
+        busy.isVisible = busyPlugins.isNotEmpty() || settingUpPlugins.isNotEmpty()
+        // The provider is gone from the store and its file is off the disk: the
+        // row is repainted in place, so uninstall is as immediate as it looks.
         setStatus("Uninstalled $name (${matches.size} extension${if (matches.size > 1) "s" else ""}).")
         AppShell.toast("Uninstalled $name", "ok")
-        renderAll()
+        refreshRow(url)
+        fillInstalled()
+        refreshHeader()
         // Removing an extension is local work only (store row + file), so this
         // is the whole wait the user has: the provider list refresh below runs
         // in the background and never blocks the row.
@@ -1895,7 +2252,7 @@ class ExtensionsScreenView {
                 statusText = "Install failed: ${t.message?.take(300) ?: t.javaClass.simpleName}"
             }
             Fx.run {
-                busy.isVisible = false
+                busy.isVisible = busyPlugins.isNotEmpty() || settingUpPlugins.isNotEmpty()
                 setStatus(statusText, isErr)
                 AppShell.toast(if (isErr) "${file.name} could not be installed" else "${file.name} installed", if (isErr) "error" else "ok")
                 renderAll()

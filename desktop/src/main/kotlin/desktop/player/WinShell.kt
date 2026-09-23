@@ -68,6 +68,10 @@ object WinShell {
          *  [User32]: this object only needs it for the report, and a name
          *  resolved by the loader cannot go missing from a JNA build. */
         fun GetClassName(hWnd: WinDef.HWND?, lpClassName: CharArray, nMaxCount: Int): Int
+
+        /** Whether the window is minimised. Declared here because JNA's [User32]
+         *  wrapper does not expose it. */
+        fun IsIconic(hWnd: WinDef.HWND?): Boolean
     }
 
     /** A Win32 POINT, declared here so nothing about the out-parameter depends
@@ -314,6 +318,37 @@ object WinShell {
         return windows.mapIndexed { i, w -> (i + 1).toString() + ". " + w.describe() }
     }
 
+    /**
+     * True when [above] is higher in the desktop's z-order than [below], false
+     * when it is behind it, null when either window is gone.
+     *
+     * `EnumWindows` walks the top-level windows topmost-first, so the whole
+     * question is which one it reaches first — and unlike [windowsOf] this does
+     * not filter by process, which it must not: the point of the player's
+     * floating bars is that they sit above mpv's window, and that window belongs
+     * to another process.
+     */
+    fun isAbove(above: Long, below: Long): Boolean? = call(null) {
+        if (!windowExists(above) || !windowExists(below)) return@call null
+        val order = zOrder()
+        val a = order.indexOf(above)
+        val b = order.indexOf(below)
+        if (a < 0 || b < 0) null else a < b
+    }
+
+    /** Every top-level window, topmost first (the order `EnumWindows` walks). */
+    private fun zOrder(): List<Long> {
+        val order = ArrayList<Long>()
+        val callback = object : WinUser.WNDENUMPROC {
+            override fun callback(hwnd: WinDef.HWND?, data: Pointer?): Boolean {
+                if (hwnd != null) order.add(Pointer.nativeValue(hwnd.pointer))
+                return true
+            }
+        }
+        User32.INSTANCE.EnumWindows(callback, null)
+        return order
+    }
+
     /** The first visible child window of [parent] — a window nested inside it. */
     fun firstVisibleChild(parent: Long): Long? = call(null) {
         val user32 = User32.INSTANCE
@@ -329,6 +364,14 @@ object WinShell {
      *  discarded once the process behind it has exited. */
     fun windowExists(hwnd: Long): Boolean = call(false) {
         hwnd != 0L && User32.INSTANCE.IsWindow(toHwnd(hwnd))
+    }
+
+    /** True when the window is minimised. Used to tell "the player's own X closed
+     *  the player" apart from "the player's X took the app down with it". */
+    fun isIconified(hwnd: Long): Boolean = call(false) {
+        if (hwnd == 0L) return@call false
+        val fn = extra ?: return@call false
+        fn.IsIconic(toHwnd(hwnd))
     }
 
     /** A window's screen rectangle as [x, y, width, height], or null.
@@ -390,6 +433,70 @@ object WinShell {
     /** Kept for the CI smoke test: resizes a child window to fill its parent. */
     fun fillWindow(hwnd: Long, w: Int, h: Int): Boolean = call(false) {
         User32.INSTANCE.MoveWindow(toHwnd(hwnd), 0, 0, w, h, true)
+    }
+
+    /**
+     * Moves and sizes a window, and puts it directly ABOVE [sibling] in the
+     * z-order.
+     *
+     * This is what lets the player's bars float over the picture. mpv's window
+     * is a real window owned by the app window, and Windows draws an owned
+     * window above everything its owner paints — so a bar drawn by the app's own
+     * JavaFX scene can never appear over the video. A bar in a window of its own
+     * can, and this is the call that puts it there.
+     *
+     * `HWND_TOP` is deliberately not used as the normal case: it would put the
+     * bar above other applications' windows too. It is only the fallback for
+     * when there is no video window to sit above (which is not a state the
+     * player should ever be in, but a bar that is one window too high is still
+     * better than one that cannot be seen).
+     *
+     * Win32 has no "insert above X": `SetWindowPos`'s `hWndInsertAfter` names the
+     * window that is to PRECEDE (sit above) the one being moved, so handing it X
+     * puts the moved window BELOW X. Doing exactly that is what the first version
+     * of this did, and it put both bars BEHIND the picture — measured, the bar's
+     * pixels were pure video. The window immediately above X is looked up
+     * instead, and the bar is inserted below THAT; when X is already the topmost
+     * window, `HWND_TOP` is the only thing above it.
+     */
+    fun placeAbove(hwnd: Long, sibling: Long, x: Int, y: Int, w: Int, h: Int): Boolean = call(false) {
+        if (w <= 0 || h <= 0) return@call false
+        if (!windowExists(hwnd)) return@call false
+        val insertAfter: WinDef.HWND? = if (sibling == 0L || sibling == hwnd || !windowExists(sibling)) {
+            null
+        } else {
+            val order = zOrder()
+            val i = order.indexOf(sibling)
+            if (i <= 0) null else toHwnd(order[i - 1])
+        }
+        User32.INSTANCE.SetWindowPos(toHwnd(hwnd), insertAfter, x, y, w, h, SWP_NOACTIVATE)
+    }
+
+    /**
+     * Dresses a window the app created for one of the player's floating bars:
+     * not in the taskbar, and never activated.
+     *
+     * Never-activated matters more than it looks: these windows are on screen
+     * over the picture, and if clicking a button on one took the focus, the
+     * player's own keyboard shortcuts (space, Esc, F) would stop arriving —
+     * because they are handled by the app window's scene, which would no longer
+     * be the focused window. `WS_EX_LAYERED`, which JavaFX set for a transparent
+     * window, is left exactly as it is.
+     */
+    fun makeOverlayWindow(hwnd: Long, owner: Long): Boolean = call(false) {
+        val fn = extra ?: return@call false
+        if (!windowExists(hwnd)) return@call false
+        val h = toHwnd(hwnd)
+        val exStyle = runCatching { fn.GetWindowLongPtr(h, GWL_EXSTYLE) }.getOrDefault(0L)
+        fn.SetWindowLongPtr(
+            h,
+            GWL_EXSTYLE,
+            (exStyle and WS_EX_APPWINDOW.inv()) or WS_EX_TOOLWINDOW or WS_EX_NOACTIVATE,
+        )
+        // For a window without WS_CHILD this sets its OWNER, which is what keeps
+        // it above the app window (and below it in the taskbar's bookkeeping).
+        if (owner != 0L) fn.SetWindowLongPtr(h, GWLP_HWNDPARENT, owner)
+        true
     }
 
     /**

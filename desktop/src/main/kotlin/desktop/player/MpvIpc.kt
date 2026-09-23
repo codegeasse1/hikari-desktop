@@ -59,6 +59,10 @@ class MpvIpc(private val target: String, private val windowsPipe: Boolean) {
     @Volatile
     private var writingSince = 0L
 
+    /** True once the current stuck write has been noted in the log (see [send]). */
+    @Volatile
+    private var stuckNoted = false
+
     private val nextRequestId = AtomicLong(1)
     private val waiting = ConcurrentHashMap<Long, ((JSONObject) -> Unit)?>()
 
@@ -74,6 +78,32 @@ class MpvIpc(private val target: String, private val windowsPipe: Boolean) {
     /** Most commands that may be waiting to go out at once. */
     private val MAX_QUEUED = 64
 
+    /**
+     * The last few commands and connection events, timestamped — what the player
+     * report carries.
+     *
+     * "Did the click even reach mpv?" is the first question about a control that
+     * does nothing, and it cannot be answered from a screenshot: a fire-and-forget
+     * command that was dropped looks exactly like a button whose handler never
+     * ran. This is the record that tells them apart.
+     */
+    private val recent = java.util.Collections.synchronizedList(ArrayList<String>())
+
+    /** [recent] as report lines, oldest first. */
+    fun recentLog(): List<String> = synchronized(recent) { ArrayList(recent) }
+
+    /** False once the transport has been found unusable (or closed) — a caller
+     *  polling for a reply can stop instead of waiting out its deadline. */
+    fun isAlive(): Boolean = !closed
+
+    private fun note(line: String) {
+        val stamp = runCatching { java.time.LocalTime.now().toString().take(8) }.getOrDefault("--:--:--")
+        synchronized(recent) {
+            recent.add("$stamp $line")
+            while (recent.size > 60) recent.removeAt(0)
+        }
+    }
+
     /** Connects, retrying while mpv comes up (it creates the pipe a moment
      *  after it is launched). Returns false if it never appeared. */
     fun connect(timeoutMs: Long = 6_000L): Boolean {
@@ -81,6 +111,7 @@ class MpvIpc(private val target: String, private val windowsPipe: Boolean) {
         var lastError: Throwable? = null
         while (System.currentTimeMillis() < deadline) {
             if (open()) {
+                note("connected ($target)")
                 startReader()
                 return true
             }
@@ -167,6 +198,7 @@ class MpvIpc(private val target: String, private val windowsPipe: Boolean) {
         if (event == "property-change") {
             val name = json.optString("name")
             val value = json.opt("data")?.takeIf { it !== JSONObject.NULL }
+            if (name != "time-pos") note("< " + name + " = " + value)
             onProperty?.invoke(name, value)
         }
         onEvent?.invoke(event, json)
@@ -177,6 +209,11 @@ class MpvIpc(private val target: String, private val windowsPipe: Boolean) {
     fun command(timeoutMs: Long = 4_000L, vararg args: Any): JSONObject? {
         if (closed) return null
         val id = nextRequestId.getAndIncrement()
+        val verb = args.firstOrNull()?.toString().orEmpty()
+        // Reads are polled and would drown the log; the commands the user
+        // triggered (pause, seek, track picks) are what it is for.
+        val worthLogging = verb.isNotEmpty() && verb != "get_property" && verb != "observe_property"
+        if (worthLogging) note("-> " + args.joinToString(" "))
         val payload = JSONObject()
         payload.put("command", org.json.JSONArray(args.toList()))
         payload.put("request_id", id)
@@ -187,9 +224,15 @@ class MpvIpc(private val target: String, private val windowsPipe: Boolean) {
             latch.countDown()
         }
         return try {
-            if (!send(payload)) return null
+            if (!send(payload)) {
+                note("!! " + verb + " was not sent: the connection is closed")
+                return null
+            }
             latch.await(timeoutMs, TimeUnit.MILLISECONDS)
-            if (response == null) waiting.remove(id)
+            if (response == null) {
+                waiting.remove(id)
+                if (worthLogging) note("!! no reply to " + verb + " in " + timeoutMs + " ms")
+            }
             response
         } catch (e: Throwable) {
             waiting.remove(id)
@@ -203,6 +246,7 @@ class MpvIpc(private val target: String, private val windowsPipe: Boolean) {
 
     /** Fire-and-forget command (seek during a scrub must not queue up replies). */
     fun post(vararg args: Any) {
+        note("-> " + args.joinToString(" "))
         val payload = JSONObject()
         payload.put("command", org.json.JSONArray(args.toList()))
         runCatching { send(payload) }
@@ -223,8 +267,27 @@ class MpvIpc(private val target: String, private val windowsPipe: Boolean) {
         if (closed) return false
         val since = writingSince
         if (since != 0L && System.currentTimeMillis() - since > WRITE_STUCK_MS) {
-            fail("the player stopped reading its command pipe")
-            return false
+            // A write that has not come back in this long means the pipe is not
+            // being drained: mpv stops servicing its command pipe while it is
+            // busy building a video output (measured on the CI runner — one
+            // write sat inside WriteFile for eight minutes, and the probe in
+            // FloatingBarsSelfTest shows the same pipe answering in 200 ms once
+            // mpv is idle again).
+            //
+            // A SLOW pipe is not a DEAD one, and the old answer here — declaring
+            // the connection dead — cost every control for the rest of the
+            // stream, which is exactly the reported "pause worked once, and then
+            // pressing it again did nothing". So the pipe is left alone: the
+            // answer and property observations keep flowing, this command is
+            // queued, and the queue (bounded, newest kept) drains the moment the
+            // pipe starts moving again — in order, so a `cycle` followed by the
+            // `set_property` that fixes its result still ends on the right state.
+            if (!stuckNoted) {
+                stuckNoted = true
+                note("!! the command pipe is not draining — commands are queued, not lost")
+            }
+        } else if (since == 0L) {
+            stuckNoted = false
         }
         // Bounded: a backed-up queue means the player is not reading, and the
         // newest command (a pause, a seek) is the one that matters.
@@ -270,6 +333,7 @@ class MpvIpc(private val target: String, private val windowsPipe: Boolean) {
     private fun fail(message: String) {
         if (closed) return
         closed = true
+        note("!! connection dead: " + message)
         outbox.clear()
         runCatching { onEvent?.invoke("ipc-closed", JSONObject().put("error", message)) }
         runCatching { reader?.interrupt() }

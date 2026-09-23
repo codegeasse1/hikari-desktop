@@ -71,6 +71,12 @@ jobs:
           # Maven Central / plugins.gradle.org occasionally rate-limit runner IPs
           # with HTTP 429 — retry the build a few times (Gradle caches what it
           # already downloaded, so later attempts usually succeed).
+          # `set +e`: the runner starts bash with -e, which would abort the whole
+          # step on the first failing gradle call — before the diagnostics below
+          # could ever run, leaving a failed build with nothing in the log saying
+          # why. That is exactly how this step used to fail silently.
+          set +e
+          FAILED=0
           for attempt in 1 2 3 4; do
             gradle desktop:jpackageInput --no-daemon --stacktrace > gradle-build.log 2>&1
             code=$?
@@ -78,16 +84,43 @@ jobs:
               echo "==== BUILD OK (attempt $attempt) ===="
               exit 0
             fi
-            echo "==== BUILD FAILED (attempt $attempt, exit $code) — retrying in 20s ===="
+            FAILED=$code
+            # A compile error is not worth a retry: only a download/rate-limit
+            # failure is, and those are recognisable in the log. Retrying blindly
+            # just added ~7 minutes to every broken build.
+            if ! grep -qE "Received status code 429|Could not GET|Could not resolve|Connection reset|Read timed out|Temporary failure in name resolution" gradle-build.log; then
+              echo "==== BUILD FAILED (attempt $attempt, exit $code) — a real build error, not a network one; not retrying ===="
+              break
+            fi
+            echo "==== BUILD FAILED (attempt $attempt, exit $code) — network problem, retrying in 20s ===="
             grep -E "Received status code 429|Could not GET" gradle-build.log | head -n 5 || true
             sleep 20
           done
+          if [ $FAILED -eq 0 ]; then
+            echo "==== BUILD STEP DID NOT RUN ===="
+          fi
           echo "==== BUILD FAILED (all attempts) ===="
-          tail -n 200 gradle-build.log
-          echo "==== KOTLIN ERRORS ===="
-          grep -E "^e: " gradle-build.log | head -n 60
+          {
+            echo "==== KOTLIN ERRORS ===="
+            grep -E "^e: " gradle-build.log | head -n 80 || true
+            echo "==== GRADLE FAILURE LINES ===="
+            grep -E "FAILURE|What went wrong|Execution failed|error: |Caused by" gradle-build.log | head -n 40 || true
+            echo "==== TAIL OF gradle-build.log ===="
+            tail -n 120 gradle-build.log
+          } > build-errors.txt
+          cat build-errors.txt
           grep -E "^e: " gradle-build.log | head -n 60 | sed -E 's/^e: (.+): \(([0-9]+), ([0-9]+)\): (.*)/::error file=\1,line=\2,col=\3::\4/' || true
           exit 1
+        shell: bash
+
+      - name: Kotlin errors (captured for diagnosis)
+        if: always()
+        run: |
+          if [ -f build-errors.txt ]; then
+            cat build-errors.txt
+          else
+            echo "no build-errors.txt — the build succeeded, or it failed before compiling"
+          fi
         shell: bash
 
       - name: Bundle mpv player (video engine)
@@ -189,6 +222,14 @@ jobs:
         run: |
           set -e
           java -cp "jpackage-input/*" desktop.player.EmbedSelfTestKt
+        shell: bash
+
+      - name: Floating player bars self-test (video full-bleed, bars above it)
+        if: always()
+        timeout-minutes: 8
+        run: |
+          set -e
+          java -cp "jpackage-input/*" desktop.player.FloatingBarsSelfTestKt
         shell: bash
 
       - name: UI shots (render the app and the player layer to PNGs)

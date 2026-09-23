@@ -13,6 +13,7 @@ import javafx.event.ActionEvent
 import javafx.event.EventHandler
 import javafx.geometry.Pos
 import javafx.scene.Cursor
+import javafx.scene.Scene
 import javafx.scene.control.Button
 import javafx.scene.control.Label
 import javafx.scene.control.MenuButton
@@ -28,8 +29,11 @@ import javafx.scene.layout.Priority
 import javafx.scene.layout.Region
 import javafx.scene.layout.StackPane
 import javafx.scene.layout.VBox
+import javafx.scene.paint.Color
 import javafx.scene.text.TextAlignment
 import javafx.stage.Screen
+import javafx.stage.Stage
+import javafx.stage.StageStyle
 import javafx.util.Duration
 import org.json.JSONArray
 import org.json.JSONObject
@@ -86,8 +90,63 @@ object PlayerWindow {
      */
     private const val FIRST_WAIT_MS = 10_000L
 
+    /** The floor and ceiling for a floating bar's height. A control bar is a
+     *  BAR: this is a sanity guard on the measurement below, so that no stage
+     *  or scene quirk can ever turn one into a full-height panel over the
+     *  picture again. */
+    private const val BAR_MIN_H = 24.0
+    private const val BAR_MAX_H = 96.0
+
     private var root: BorderPane? = null
     private var mounted = false
+
+    /**
+     * The two bars have TWO possible homes, and this is which one they are in.
+     *
+     * `false` — the ordinary one — keeps the top strip and the control bar in
+     * the window's own layout (`BorderPane.top`/`.bottom`). It is the fallback:
+     * it works everywhere, including a machine where the video cannot be
+     * embedded at all.
+     *
+     * `true` is the player the user asked for: the video area is the WHOLE
+     * window (so the picture is never squeezed into the space the controls left
+     * over — the reported "the video is cropped until the buttons hide"), and
+     * the bars float on top of it in two small transparent windows of their own
+     * ([stripStage] / [barStage]).
+     *
+     * Floating is not a style choice here, it is the only thing that works.
+     * mpv's window is a real window owned by the app window, and Windows draws
+     * an owned window above EVERYTHING its owner paints — so a bar drawn by
+     * JavaFX inside the app window can never appear over the picture, no matter
+     * what the layout says. A bar in its own window can: it is placed directly
+     * above the video window in the z-order (see [positionOverlays]).
+     */
+    private var overlaysOn = false
+
+    /** The floating top strip and control bar, once they have been handed their
+     *  own windows. Null while [overlaysOn] is false. */
+    private var stripStage: Stage? = null
+    private var barStage: Stage? = null
+
+    /** True once each floating bar's CURRENT native window has been dressed
+     *  (see [dressOverlay]); reset when the window is hidden, because a hidden
+     *  Stage's native window is destroyed. */
+    private var stripDressed = false
+    private var barDressed = false
+
+    /** The window titles the floating bars are created with. They are never
+     *  drawn (the windows have no frame), and they are how the Win32 side finds
+     *  the window again — see [overlayHwnd]. */
+    private val overlayTitles = arrayOf("hikari-player-strip", "hikari-player-bar")
+
+    /** Whether the bars may be given floating windows at all.
+     *
+     *  Always true in the real player; a harness that renders the player into a
+     *  scene snapshot turns it off, because a bar in a window of its own is not
+     *  in the app's scene to be snapshotted (see UiShotTest — the composed look
+     *  is verified with real screen pixels in FloatingBarsSelfTest instead). */
+    @Volatile
+    private var floatBarsEnabled = true
 
     /** The adopted mpv window, and the app window that owns it. */
     private var surfaceHwnd: Long? = null
@@ -112,6 +171,7 @@ object PlayerWindow {
 
     private var topStrip: HBox? = null
     private var bottomBar: HBox? = null
+    private var closePlayerButton: Button? = null
     private var titleLabel: Label? = null
     private var statusLabel: Label? = null
     private var statusChip: HBox? = null
@@ -222,6 +282,11 @@ object PlayerWindow {
     private val adoptTrace = java.util.Collections.synchronizedList(ArrayList<String>())
     private var adoptStartedAt = 0L
 
+    /** The measured geometry of each floating bar (see [placeOverlay]), for the
+     *  report — "the bar floats over the picture" says nothing about whether it
+     *  floats as a BAR or as a panel over the whole video. */
+    private val overlayNotes = java.util.concurrent.ConcurrentHashMap<String, String>()
+
     /** The last thing the status chip said — read off the FX thread by
      *  [windowReport]. */
     @Volatile
@@ -291,11 +356,16 @@ object PlayerWindow {
             renderSources(sourceName)
             releaseSurface()
             refreshFullscreenButton()
+            // Whether the picture can be shown inside the app at all: embedding
+            // needs Win32 (to adopt mpv's window) and the app's own window to
+            // own it.
+            val canEmbed = WinShell.available && ownedByApp()
+            // …and when it can, the bars leave the layout and float on top of
+            // the picture (see [overlaysOn]) so the video fills the window.
+            if (canEmbed && floatBarsEnabled) useOverlayBars() else releaseOverlayBars()
             resetForNewStream()
             refreshOverlay()
-            // Embedding needs Win32 (to adopt mpv's window) and the app's own
-            // window to own it.
-            WinShell.available && ownedByApp()
+            canEmbed
         }
     }
 
@@ -658,11 +728,25 @@ object PlayerWindow {
             .append("   ipc answered: ").append(ipcAnswered).append('\n')
         append("  overlay up: ").append(overlayUp)
             .append("   own-window note up: ").append(ownWindowNoteUp).append('\n')
+        append("  bars floating over the picture: ").append(overlaysOn)
+            .append("   strip hwnd: ").append(hwndText(overlayHwnd(stripStage)))
+            .append("   bar hwnd: ").append(hwndText(overlayHwnd(barStage))).append('\n')
+        if (overlaysOn) {
+            append("  video area: ").append(videoArea.width.roundToInt()).append("x")
+                .append(videoArea.height.roundToInt())
+                .append(" logical px (the whole window)\n")
+        }
+        overlayNotes.toSortedMap().forEach { (label, note) ->
+            append("  floating ").append(label).append(": ").append(note).append('\n')
+        }
         append("  status chip: \"").append(lastStatus).append("\"\n")
         append("  adoption watched for: ").append(ageMs()).append(" ms\n")
         if (adoptRefusal.isNotBlank()) append("  last refusal: ").append(adoptRefusal).append('\n')
         append("  adoption trace (").append(adoptTrace.size).append(" lines):\n")
         synchronized(adoptTrace) { adoptTrace.forEach { append("    ").append(it).append('\n') } }
+        val commands = ipc?.recentLog().orEmpty()
+        append("  player commands (").append(commands.size).append(" lines):\n")
+        if (commands.isEmpty()) append("    (nothing sent)\n") else commands.forEach { append("    ").append(it).append('\n') }
     }
 
     /** True while the video is glued inside the app. */
@@ -688,6 +772,223 @@ object PlayerWindow {
         runCatching { WinShell.parkAndHide(h) }
         surfaceHwnd = null
         embedded = false
+    }
+
+    // ── the bars, floating over the picture ─────────────────────────────────
+
+    /**
+     * Gives the top strip and the control bar windows of their own, so the
+     * video area can be the whole window and the picture is never inset.
+     *
+     * Returns false — leaving the bars where they were, in the window's own
+     * layout — when this machine cannot float them: no Win32 lookups, no app
+     * window to own the floating windows, or JavaFX refusing to create them.
+     * The player then behaves exactly as it did before, which is the point of a
+     * fallback.
+     *
+     * A node belongs to exactly ONE scene, so both bars are detached from the
+     * window's layout BEFORE either gets a scene of its own; if anything fails
+     * after that, they are put straight back.
+     */
+    private fun useOverlayBars(): Boolean {
+        if (overlaysOn) return true
+        if (!floatBarsEnabled) return false
+        val strip = topStrip ?: return false
+        val bar = bottomBar ?: return false
+        val ui = root ?: return false
+        val owner = ownerHwnd ?: return false
+        if (!WinShell.windowExists(owner)) return false
+        val app = runCatching { AppShell.stage }.getOrNull() ?: return false
+        val css = runCatching { app.scene?.stylesheets?.toList() }.getOrNull().orEmpty()
+        return runCatching {
+            val ss = stripStage ?: Stage().apply {
+                runCatching { initOwner(app) }
+                initStyle(StageStyle.TRANSPARENT)
+                title = overlayTitles[0]
+            }.also { stripStage = it }
+            val bs = barStage ?: Stage().apply {
+                runCatching { initOwner(app) }
+                initStyle(StageStyle.TRANSPARENT)
+                title = overlayTitles[1]
+            }.also { barStage = it }
+            ui.top = null
+            ui.bottom = null
+            strip.styleClass.add("player-floating")
+            bar.styleClass.add("player-floating")
+            // The scenes are created around the SAME bars when they come back
+            // out of the layout (see [releaseOverlayBars]), so this checks that
+            // the bar really is in the target scene rather than in some earlier
+            // one.
+            if (ss.scene == null || strip.scene !== ss.scene) {
+                ss.scene = Scene(strip, Color.TRANSPARENT).also { it.stylesheets.addAll(css) }
+            }
+            if (bs.scene == null || bar.scene !== bs.scene) {
+                bs.scene = Scene(bar, Color.TRANSPARENT).also { it.stylesheets.addAll(css) }
+            }
+            overlaysOn = true
+            adoptTrace += stamp("the bars float over the picture (video area is the whole window)")
+            true
+        }.getOrElse { e ->
+            adoptTrace += stamp(
+                "could not float the bars (" + (e.message ?: e.javaClass.simpleName) +
+                    ") — they stay inside the window's layout",
+            )
+            overlaysOn = false
+            runCatching { if (stripStage?.isShowing == true) stripStage?.hide() }
+            runCatching { if (barStage?.isShowing == true) barStage?.hide() }
+            // Detach whatever did make it into a floating scene before putting
+            // the bars back, or the add below is refused (one scene per node).
+            runCatching { stripStage?.scene = Scene(StackPane(), Color.TRANSPARENT) }
+            runCatching { barStage?.scene = Scene(StackPane(), Color.TRANSPARENT) }
+            runCatching { if (ui.top == null) ui.top = strip }
+            runCatching { if (ui.bottom == null) ui.bottom = bar }
+            false
+        }
+    }
+
+    /** Puts the bars back into the window's own layout — the state a machine
+     *  that cannot embed the video runs in. */
+    private fun releaseOverlayBars() {
+        if (!overlaysOn) return
+        overlaysOn = false
+        Fx.run {
+            runCatching { if (stripStage?.isShowing == true) stripStage?.hide() }
+            runCatching { if (barStage?.isShowing == true) barStage?.hide() }
+            val ui = root ?: return@run
+            val strip = topStrip
+            val bar = bottomBar
+            // A node belongs to exactly ONE scene, so each floating stage is
+            // given an empty scene of its own before its bar goes back into the
+            // window's layout — that detaches the bar from the floating scene,
+            // which is what makes it addable to the window's layout again. (An
+            // empty stand-in rather than `scene = null`: a Stage is not
+            // documented to accept a null scene.)
+            runCatching { stripStage?.scene = Scene(StackPane(), Color.TRANSPARENT) }
+            runCatching { barStage?.scene = Scene(StackPane(), Color.TRANSPARENT) }
+            strip?.let { runCatching { if (ui.top == null) ui.top = it } }
+            bar?.let { runCatching { if (ui.bottom == null) ui.bottom = it } }
+        }
+    }
+
+    /** The live Win32 handle of a floating bar, or null when it has none yet. */
+    private fun overlayHwnd(stage: Stage?): Long? {
+        val st = stage ?: return null
+        if (!st.isShowing) return null
+        val title = st.title ?: return null
+        return runCatching { WinShell.windowByTitle(title) }.getOrNull()
+    }
+
+    /**
+     * Glues the two floating bars to the app window's edges and puts them above
+     * the video surface in the z-order.
+     *
+     * This runs on the player's own timer (see [syncTimer]) for the same reason
+     * the video surface does: the bars are real windows, and a move of the app
+     * window — a drag, a maximise, a DPI change, leaving fullscreen — is not
+     * something they follow on their own. The z-order is re-asserted here too,
+     * because mpv re-raises its own window when a file's dimensions become
+     * known.
+     */
+    private fun positionOverlays() {
+        if (!overlaysOn) return
+        val owner = ownerHwnd ?: return
+        val app = WinShell.windowRect(owner) ?: return
+        val scale = screenScale().takeIf { it > 0.0 } ?: 1.0
+        val logicalWidth = app[2] / scale
+        if (logicalWidth < 80.0) return
+        val video = surfaceHwnd ?: 0L
+        placeOverlay(stripStage, topStrip, video, app, scale, logicalWidth, atBottom = false)
+        placeOverlay(barStage, bottomBar, video, app, scale, logicalWidth, atBottom = true)
+    }
+
+    private fun placeOverlay(
+        stage: Stage?,
+        node: Region?,
+        video: Long,
+        app: IntArray,
+        scale: Double,
+        logicalWidth: Double,
+        atBottom: Boolean,
+    ) {
+        val st = stage ?: return
+        val n = node ?: return
+        if (!st.isShowing) return
+        val label = if (atBottom) "bar" else "strip"
+        runCatching {
+            // The bar's OWN preferred size decides the floating window's size.
+            // Asking the stage instead is what shipped a translucent panel over
+            // the entire picture: `sizeToScene()` is a no-op on a window that is
+            // already showing, so the stage kept the height it was first shown
+            // at, and the bar was placed 815px tall over a full-bleed video. The
+            // scene-level checks all passed (the video area really was the whole
+            // window); only measuring the bar's own window showed it.
+            val prefH = n.prefHeight(logicalWidth).coerceIn(BAR_MIN_H, BAR_MAX_H)
+            if (n.prefWidth != logicalWidth) {
+                n.minWidth = logicalWidth
+                n.prefWidth = logicalWidth
+                n.maxWidth = logicalWidth
+            }
+            if (n.prefHeight != prefH) {
+                n.minHeight = prefH
+                n.prefHeight = prefH
+                n.maxHeight = prefH
+            }
+            // …and the stage is told outright, because `sizeToScene()` cannot
+            // resize a window that is already on screen.
+            if (st.width != logicalWidth) st.width = logicalWidth
+            if (st.height != prefH) st.height = prefH
+            val w = (logicalWidth * scale).roundToInt()
+            val h = (prefH * scale).roundToInt()
+            overlayNotes[label] = "stage=" + st.width.roundToInt() + "x" + st.height.roundToInt() +
+                "  bar=" + logicalWidth.roundToInt() + "x" + prefH.roundToInt() +
+                "  placed=" + w + "x" + h + " at the " + (if (atBottom) "bottom" else "top") +
+                "  scale=" + scale
+            if (w < 40 || h < 16) return@runCatching
+            val hwnd = overlayHwnd(st) ?: return@runCatching
+            // Dressed once per native window: see [dressOverlay].
+            val dressed = if (st === stripStage) stripDressed else barDressed
+            if (!dressed && dressOverlay(st)) {
+                if (st === stripStage) stripDressed = true else barDressed = true
+            }
+            val x = app[0]
+            val y = if (atBottom) app[1] + app[3] - h else app[1]
+            WinShell.placeAbove(hwnd, video, x, y, w, h)
+        }
+    }
+
+    /**
+     * Dresses a freshly shown bar window: no taskbar slot, and it never takes
+     * focus — the app window must keep it, or the player's own keyboard
+     * shortcuts (space, Esc, F) would stop arriving the moment a button on a
+     * floating bar was clicked.
+     *
+     * Called from [placeOverlay] rather than from [showOverlay] because the
+     * native window does not always answer to its title on the same tick it was
+     * shown: this is retried on the player's timer (which is already looking the
+     * window up), instead of sleeping on the JavaFX thread waiting for it.
+     */
+    private fun dressOverlay(stage: Stage?): Boolean {
+        val st = stage ?: return false
+        if (!st.isShowing) return false
+        val hwnd = overlayHwnd(st) ?: return false
+        return WinShell.makeOverlayWindow(hwnd, ownerHwnd ?: 0L)
+    }
+
+    private fun showOverlay(stage: Stage?) {
+        val st = stage ?: return
+        runCatching {
+            if (!st.isShowing) {
+                st.show()
+                // A hidden Stage's native window is destroyed, so the next show
+                // creates a new one that has to be dressed again.
+                if (st === stripStage) stripDressed = false else barDressed = false
+            }
+        }
+    }
+
+    private fun hideOverlay(stage: Stage?) {
+        val st = stage ?: return
+        runCatching { if (st.isShowing) st.hide() }
     }
 
     private fun safeSync() {
@@ -835,13 +1136,12 @@ object PlayerWindow {
             AppShell.makeDraggable(title)
             AppShell.makeDraggable(stripSpacer)
         }
-        runCatching { strip.children.add(AppShell.windowControls()) }
+        runCatching { strip.children.add(playerWindowControls()) }
         topStrip = strip
 
         // ── control bar: transport, then the pickers ────────────────────────
-        val play = roundButton(Icons.PAUSE, "Play / pause (space)", 18.0, 38.0) {
-            runCatching { ipc?.post("cycle", "pause") }
-        }.apply { styleClass.add("player-play") }
+        val play = roundButton(Icons.PAUSE, "Play / pause (space)", 18.0, 38.0) { togglePause() }
+            .apply { styleClass.add("player-play") }
         playButton = play
 
         val time = Label("00:00").apply { styleClass.add("player-time") }
@@ -967,6 +1267,9 @@ object PlayerWindow {
         // fullscreen button pushed off the edge) — see [applyResponsive].
         applyResponsive()
         root?.widthProperty()?.addListener { _, _, _ -> applyResponsive() }
+        // The floating control bar is sized by [positionOverlays], not by the
+        // window's layout, so its own width is the trigger there.
+        bottomBar?.widthProperty()?.addListener { _, _, _ -> applyResponsive() }
 
         // Anything that moves or resizes the video area has to move the window
         // glued to it.
@@ -982,6 +1285,7 @@ object PlayerWindow {
         syncTimer = Timeline(
             KeyFrame(Duration.millis(SYNC_MS), EventHandler<ActionEvent> {
                 safeSync()
+                positionOverlays()
                 pollPointer()
             }),
         ).apply {
@@ -1001,7 +1305,11 @@ object PlayerWindow {
      * so the transport controls and a USABLE seek bar always survive.
      */
     private fun applyResponsive() {
-        val width = runCatching { root?.width ?: 0.0 }.getOrDefault(0.0)
+        // Whichever container the bars are actually in decides how much room
+        // they have: the window's own layout, or the floating bar window.
+        val width = runCatching {
+            (if (overlaysOn) bottomBar?.width else root?.width) ?: 0.0
+        }.getOrDefault(0.0)
         if (width <= 0.0) return
         val narrow = width < 780.0
         val tiny = width < 560.0
@@ -1084,6 +1392,10 @@ object PlayerWindow {
         // not to JavaFX, so a half-finished teardown (or a slow kill) would
         // otherwise leave its last frame frozen over the app.
         parkSurface()
+        // The floating bars are windows of their own: they do not go away with
+        // the app's own content, so they are taken down explicitly.
+        runCatching { hideOverlay(stripStage) }
+        runCatching { hideOverlay(barStage) }
         // Leaving the app fullscreen with no player in it would strand the user
         // on a screen with no controls.
         runCatching {
@@ -1144,16 +1456,35 @@ object PlayerWindow {
     }
 
     /**
-     * The one place that puts the bars on screen or takes them away. Hiding them
-     * gives their height back to the video area, which is the entire point: the
-     * picture grows into the space instead of being permanently wrapped in
-     * controls. [safeSync] then moves the video surface to the new rectangle.
+     * The one place that puts the bars on screen or takes them away.
+     *
+     * In the ordinary (in-layout) case, hiding them gives their height back to
+     * the video area, so the picture grows into the space instead of being
+     * permanently wrapped in controls; [safeSync] then moves the video surface
+     * to the new rectangle.
+     *
+     * When the bars float ([overlaysOn]) there is nothing to give back — the
+     * video area is already the whole window — so hiding them is purely "take
+     * the two little windows away", and the picture is uncovered rather than
+     * resized. That is the difference the user sees: the video is the same size
+     * with the controls up as with them hidden.
      */
     private fun applyChrome() {
         val show = chromeVisible || paused || overlayUp
         if (!show) runCatching { hideChrome?.stop() }
-        topStrip?.let { it.isVisible = show; it.isManaged = show }
-        bottomBar?.let { it.isVisible = show; it.isManaged = show }
+        if (overlaysOn) {
+            if (show) {
+                showOverlay(stripStage)
+                showOverlay(barStage)
+                positionOverlays()
+            } else {
+                hideOverlay(stripStage)
+                hideOverlay(barStage)
+            }
+        } else {
+            topStrip?.let { it.isVisible = show; it.isManaged = show }
+            bottomBar?.let { it.isVisible = show; it.isManaged = show }
+        }
         // The pointer is the only thing left on the picture when the bars are
         // away, and a player that keeps an arrow parked in the middle of the
         // frame is not a player. (mpv hides its own cursor over the video; this
@@ -1224,6 +1555,87 @@ object PlayerWindow {
      *  agent's pointer never moves and the real trigger cannot fire there. */
     fun previewChrome(visible: Boolean) {
         Fx.run { setChromeVisible(visible) }
+    }
+
+    // ── harness hooks (see UiShotTest / FloatingBarsSelfTest) ───────────────
+
+    /** True when the bars live in their own floating windows rather than in the
+     *  window's layout. */
+    fun barsFloating(): Boolean = overlaysOn
+
+    /** The floating control bar's own window, once it has one. */
+    fun floatingBarHwnd(): Long? = overlayHwnd(barStage)
+
+    /** The floating top strip's own window, once it has one. */
+    fun floatingStripHwnd(): Long? = overlayHwnd(stripStage)
+
+    /** The adopted video window (mpv's), for a test that measures where the
+     *  picture actually is. */
+    fun videoSurfaceHwnd(): Long? = surfaceHwnd
+
+    /** Presses the control bar's play/pause button, exactly as a click does, so
+     *  a test can check that pausing and RESUMING both reach mpv. */
+    fun clickPlayPause(): Boolean = runCatching {
+        Fx.runBlock {
+            val b = playButton ?: return@runBlock false
+            b.fire()
+            true
+        }
+    }.getOrDefault(false)
+
+    /** Presses the player's own close button — the one that used to take the
+     *  whole app down with it. */
+    fun clickClose(): Boolean = runCatching {
+        Fx.runBlock {
+            val b = closePlayerButton ?: return@runBlock false
+            b.fire()
+            true
+        }
+    }.getOrDefault(false)
+
+    /** mpv's current `pause` value, straight from the control channel — the
+     *  outside view of whether a click on play/pause did anything. */
+    fun mpvPaused(): Boolean? = runCatching {
+        ipc?.getProperty("pause")?.toString()?.let { it == "true" }
+    }.getOrNull()
+
+    /** True when the player layer is mounted in the app's window. */
+    fun isMounted(): Boolean = mounted && (root?.scene != null)
+
+    /** The control bar node, wherever it currently lives. */
+    fun controlBar(): javafx.scene.Node? = bottomBar
+
+    /** The video area's own size, so a test can check that it is the whole
+     *  window (i.e. that the bars take no layout space). */
+    fun videoAreaSize(): DoubleArray? = runCatching {
+        val a = videoArea
+        if (a.scene == null) null else doubleArrayOf(a.width, a.height)
+    }.getOrNull()
+
+    /** The player layer's own size (the host the player is mounted in). */
+    fun layerSize(): DoubleArray? = runCatching {
+        val host = AppShell.playerHost
+        doubleArrayOf(host.width, host.height)
+    }.getOrNull()
+
+    /**
+     * Harness hook (see UiShotTest): let the bars float over the picture, or
+     * keep them inside the window's own layout.
+     *
+     * Turning it OFF while the player is open returns the bars to the layout —
+     * which is the same state a machine that cannot embed the video runs in, so
+     * this exercises that path too.
+     */
+    fun setFloatBars(enabled: Boolean) {
+        floatBarsEnabled = enabled
+        Fx.run {
+            if (enabled) {
+                if (root != null && topStrip != null) useOverlayBars()
+            } else {
+                releaseOverlayBars()
+            }
+            applyChrome()
+        }
     }
 
     // ── overlays over the video ─────────────────────────────────────────────
@@ -1330,6 +1742,98 @@ object PlayerWindow {
         stage.isFullScreen = !stage.isFullScreen
         refreshFullscreenButton()
         pokeChrome()
+        settleSurface()
+    }
+
+    /**
+     * The window buttons the PLAYER offers: minimise the app window, and a close
+     * that closes the PLAYER.
+     *
+     * The app's own window controls are deliberately not used here. The player
+     * takes over the whole window, so the app's close button sat in the player's
+     * strip looking like "close the player" and actually took the whole app (and
+     * the playback) down — a click that reads as one thing and does another is
+     * worse than no button. Getting back to the app is what [requestClose] (and
+     * Esc, and the back arrow) already do.
+     */
+    private fun playerWindowControls(): HBox = HBox(2.0).apply {
+        alignment = Pos.CENTER_RIGHT
+        children.add(
+            Ui.iconButton(Icons.MINIMIZE, "Minimise", size = 13.0) {
+                runCatching { AppShell.stage.isIconified = true }
+            }
+        )
+        // Held so a test can press it: "the player's X closes only the player"
+        // is a claim about what a click on THIS button does, and nothing short of
+        // clicking it can check that.
+        closePlayerButton = Ui.iconButton(Icons.CLOSE, "Close the player (Esc)", size = 13.0) {
+            requestClose()
+        }
+        children.add(closePlayerButton)
+    }
+
+    /**
+     * Pauses or resumes, and makes sure it actually happened.
+     *
+     * A single `cycle pause` is what this used to be, and it is not enough: the
+     * click that paused worked and the next one did nothing, because a dropped
+     * or stale command is invisible to a fire-and-forget post. So the current
+     * value is read from mpv first, the toggle is sent, and if the value has not
+     * moved the intent is stated outright (`set pause <the opposite>`). Whatever
+     * happens is written into the command log the player report carries.
+     */
+    private fun togglePause() {
+        val h = ipc
+        if (h == null) {
+            setStatus("The player's control channel is not connected — controls are unavailable.", isError = true)
+            return
+        }
+        Thread(
+            {
+                val before = runCatching { h.getProperty("pause")?.toString() }.getOrNull()
+                var ok = h.command(2_000L, "cycle", "pause") != null
+                if (!ok) ok = h.command(2_000L, "cycle", "pause") != null
+                if (before != null) {
+                    Thread.sleep(400L)
+                    val after = runCatching { h.getProperty("pause")?.toString() }.getOrNull()
+                    if (after != null && after == before) {
+                        val want = before != "true"
+                        h.command(2_000L, "set_property", "pause", want)
+                    }
+                }
+                if (!ok) {
+                    Fx.run {
+                        setStatus("Couldn't reach the player to pause — try again.", isError = true)
+                    }
+                }
+            },
+            "hikari-pause",
+        ).apply { isDaemon = true; start() }
+    }
+
+    /**
+     * Re-places the video surface now, and again over the next second.
+     *
+     * A window-state change is not instant on the OS side: whether the app is
+     * entering fullscreen, leaving it, being maximised or being moved by the
+     * window manager, the window rectangle Win32 reports settles a few hundred
+     * milliseconds AFTER JavaFX thinks it has changed. Gluing the video to the
+     * stale rectangle is what leaves the picture cropped at a screen edge until
+     * something else happens to re-place it.
+     */
+    private fun settleSurface() {
+        listOf(0L, 60L, 180L, 400L, 800L).forEach { delay ->
+            Thread(
+                {
+                    if (delay > 0L) runCatching { Thread.sleep(delay) }
+                    Fx.run {
+                        safeSync()
+                        positionOverlays()
+                    }
+                },
+                "hikari-surface-settle",
+            ).apply { isDaemon = true; start() }
+        }
     }
 
     // ── seeking ─────────────────────────────────────────────────────────────
@@ -1377,7 +1881,7 @@ object PlayerWindow {
         // bars back.
         pokeChrome()
         when (e.code) {
-            KeyCode.SPACE -> runCatching { ipc?.post("cycle", "pause") }
+            KeyCode.SPACE -> togglePause()
             KeyCode.LEFT -> runCatching { ipc?.post("seek", -10, "relative") }
             KeyCode.RIGHT -> runCatching { ipc?.post("seek", 10, "relative") }
             KeyCode.UP -> setVolume(volume + 5)

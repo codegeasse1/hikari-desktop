@@ -616,6 +616,170 @@ window again (`spread=152`, `vo-configured=true`).
 - **The release is pruned after every publish**: the newest three installers are kept
   and the rest deleted. 37 assets / 6.2 GB had piled up on `continuous`.
 
+## Stage 10 — instant installs, and the bars float over the picture (done)
+
+Four things the user reported after 0.1.214, and what each one actually was.
+
+### 1. "Installing an extension takes up to a minute"
+
+Two separate causes, and both had to go — the honest answer is that the wait was
+real work plus a real wait, and each needed its own fix.
+
+**The wait: the download ladder spent 45 s on a blocked origin before trying a
+single mirror.** `Http.downloadToRobust` raced the *authoritative* hosts first and
+the CDN/proxy mirrors only after that wave's window closed — and that window was
+`MAIN_RACE_MS = 45_000`. On a network that filters GitHub the origin does not
+fail fast, it hangs, so an install sat in wave 1 for 45 s and then raced the
+mirrors with what was left of the 60 s budget. That is the one-minute spinner
+exactly. The origins now get `ORIGIN_FIRST_MS = 12_000` alone, and the second wave
+races origins **and** mirrors with the rest of the budget: a working origin is
+unchanged (it wins wave 1 in about a second), a dead one costs 12 s instead of 45,
+and a slow-but-working one still finishes — it is in the second wave too.
+
+**The work: dex → JVM translation ran on the visible path of every install.**
+Measured on CI: **4.3 s** to translate one 88 KB `.cs3` (an 88 KB archive holds a
+~225 KB dex), and it grows with the plugin. Three changes in `DexJar`:
+
+- the cache is keyed on a **sha256 of the content**, not on the path + mtime, so a
+  reinstall — the same bytes written to the same file name with a new timestamp —
+  skips the translation entirely, and the converted jar is kept in
+  `~/.hikari/dexjars` (the temp directory is only the fallback), where a temp
+  cleaner will not delete it;
+- dex2jar is pointed at a **zip target** (`Dex2jar.to` writes a zip whenever the
+  path is not an existing directory), and the classes are streamed from it
+  straight into the output jar — no directory of `.class` files, no second walk
+  over them;
+- the class-file **version is patched at its fixed offset** in the header (minor
+  at bytes 4..5, major at 6..7 → 50) instead of an ASM
+  `ClassReader`→`ClassWriter` round trip per class, which re-parsed and re-encoded
+  every one of them to change two bytes;
+- and the translation is serialised **per content**, so an install and the first
+  catalog fetch that uses the extension cannot both translate the same dex.
+
+**And the row no longer waits for any of it.** `installPlugin` is two-phase: the
+extension is registered from the manifest *inside its own archive*
+(`pluginClassName` for a CS3 plugin, `mainClass` — one or a list — for a Hikari
+one), which is one zip entry and no class loading at all, so the row flips to
+"installed" the moment the bytes are on disk and verified. The real load — the
+translation — then runs behind it in `finishSetup`, which reconciles the registered
+provider list with what the plugin actually holds (a bundle can register several
+providers from one entry point, and only the load knows) and takes the optimistic
+registration back with a visible reason if the plugin cannot be loaded after all.
+
+The screen itself stopped rebuilding itself: `pluginRow` used to build a fresh
+`HBox` every time any plugin's state changed, and every state change called
+`fillPlugins()` (144 rows, each asking the store for its providers) or
+`renderAll()`. Rows are now built once and their changing parts (badges, the
+action slot, the error line) are rewritten in place by `refreshRow`, and the
+seconds a job has been running are shown in that row (`Installing… 7s`) off a
+one-second ticker that stops itself when nothing is working.
+
+One related bug fell out of the same report: `providersFor` compared a plugin's
+URL literally, but the candidate loop records whichever file it actually fetched
+(`.hiki` is swapped for `.jar` on purpose) — so a plugin listed as `x.hiki` kept
+answering "Install" after installing it. The spellings now include the
+`.hiki`/`.cs3`/`.jar` siblings.
+
+### 2. "The video is cropped while the buttons are showing"
+
+The player's video is **mpv's own window**, glued over the app window, and Windows
+draws an owned window above everything its owner paints. That has a consequence
+the layout could not work around: a bar drawn by the app's JavaFX scene can never
+appear over the picture, so making the bars overlay the video inside the layout
+was never possible. What the user saw was the honest consequence — with the bars
+up, the video area was smaller than the window, and the picture was inset.
+
+The bars now live in **two small transparent windows of their own**
+(`PlayerWindow.overlaysOn`), placed over the picture and put directly above the
+video window in the z-order. That last part is subtler than it looks: Win32 has no
+"insert above X". `SetWindowPos`'s `hWndInsertAfter` names the window that is to
+*precede* (sit above) the one being moved, so handing it the video window puts the
+bar **below** the video — which is what the first version did, and what the pixels
+said: the bar's area measured as pure video. `WinShell.placeAbove` now looks up the
+window immediately above the video and inserts the bar below *that* (falling back
+to `HWND_TOP` only when the video is already the topmost window). The video area is
+the whole window, so the picture is the same size with the controls up and with
+them away: showing the bars covers the bottom of the frame and hiding them
+uncovers it, and nothing is ever resized. `WinShell.makeOverlayWindow` dresses each
+window as a never-activated tool window — never activated matters, because the
+player's own keyboard shortcuts (space, Esc, F) are handled by the app window's
+scene, and a click on a floating button that took the focus would silently stop
+them working.
+
+Each floating window is sized from the **bar's own** preferred size, not from the
+stage's. Asking the stage was the second half of the same bug: `sizeToScene()` does
+nothing to a window that is already on screen, so the stage kept whatever size it
+was first shown with and the bar was placed *the height of the whole window* —
+a translucent sheet over the picture, with every scene-level check still passing
+(the video area really was the whole window). The bar's height is now pinned to its
+own computed preferred height and clamped to a sane range, and both tests assert the
+bar is a short strip at an edge (`UiShotTest`, and `FloatingBarsSelfTest` against
+the window's real rectangle).
+
+The bars keep their own translucent, frameless look in that mode
+(`.player-floating` in `theme.css`), and the whole thing falls back to the old
+in-layout bars on any machine where the video cannot be embedded — the same state
+a non-Windows build runs in.
+
+`FloatingBarsSelfTest` (CI) proves it with real mpv and real screen pixels: the
+video window's rectangle equals the app window's, the bar's rectangle is at the
+window's bottom edge **and is a bar's height** (54px, checked against the window),
+the bar window is above the video window in the z-order, the bar's area is
+measurably darker than the picture behind it (it is translucent on purpose), that
+same area becomes the picture again when the bars are hidden, and the video window
+does not move or resize when they come and go.
+`UiShotTest` keeps its scene snapshots (with the bars pinned back into the layout,
+since a window of its own is not in the scene) and adds a geometry check that the
+video area still fills the player layer.
+
+### the control channel, when mpv stops draining its pipe
+
+mpv stops servicing its command pipe while it is busy building a video output: on
+the CI runner a single write sat inside `WriteFile` for **eight minutes**, and
+`FloatingBarsSelfTest`'s probe shows the same pipe answering a fresh connection in
+200 ms once mpv is idle again (it also shows mpv accepts a second client). The
+player used to answer that with `fail(...)` — the connection was declared dead and
+every control was gone for the rest of the stream. That is the shape of the
+reported "pause worked once, then pressing it again did nothing", so `MpvIpc.send`
+now treats a slow pipe as a **slow** pipe: the connection is left alone (replies
+and property observations keep flowing), the command is queued, the queue is bounded
+(newest kept) and drains in order when the pipe moves again — so a `cycle pause`
+followed by the `set_property` that fixes its result still ends on the right state.
+The channel only gives up when it is actually closed.
+
+
+### 3. "Pause works, but clicking it again does not resume"
+
+`cycle pause` was posted fire-and-forget, so a dropped or stale command was
+invisible — a second click that did nothing looked exactly like a button whose
+handler never ran. `PlayerWindow.togglePause` now reads `pause` from mpv, sends the
+toggle, re-reads it after 400 ms, and if the value has not moved states the intent
+outright (`set_property pause <the opposite>`); a failure says so in the status
+chip. Every command the player sends is kept in `MpvIpc.recentLog()` (skipping the
+polled `get_property` traffic) and is carried in the player report, so "did the
+click even reach mpv?" is answerable from a user's copy of it. Because the fallback
+states an absolute value *after* the toggle, the two commands also land on the right
+state if they are delivered late (see the pipe note above).
+
+`FloatingBarsSelfTest` checks this against a **controlled control channel**
+(`FakeMpvChannel`: a real `MpvIpc` client over a real unix socket, with a real
+mpv-style command/reply loop on the other end and a switch for the interesting
+failure). It presses the control bar's own play/pause button and asserts the channel
+goes playing → paused → playing, and then that a toggle command which is *dropped*
+— answered, but with no effect, which is exactly what a lost command looks like from
+the player's side — is noticed and recovered from, ending paused. mpv's own pipe is
+not usable for this on the CI runner (see the pipe note above), which is why the
+channel is a stand-in; the probe that establishes that runs in the same test and
+prints its measurement.
+
+
+### 4. "The player's X closed the whole app"
+
+The player's strip carried the app's own window controls, so the X sat in the
+player looking like "close the player" and took the whole app (and the playback)
+down. The player now has its own two controls: minimise, and a close that closes
+the PLAYER (`requestClose`, the same thing the back arrow and Esc do).
+
 ## Still to do
 
 ### i18n
