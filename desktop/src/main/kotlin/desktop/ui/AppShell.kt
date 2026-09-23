@@ -380,9 +380,18 @@ object AppShell {
         )
     }
 
+    /** The screen currently on screen. Read by the UI tests, which have to be
+     *  able to tell "the arrow navigated" from "the arrow did nothing". */
+    val current: Screen get() = currentScreen
+
     /** Returns to the previously shown screen (Escape / the in-page back arrow). */
     fun back() {
-        val previous = backStack.pollLast()
+        var previous = backStack.pollLast()
+        // Never step back into the screen we are already looking at: a Detail
+        // screen opened from another Detail screen would otherwise make the arrow
+        // a visible no-op ("the back button does not work").
+        var guard = 0
+        while (previous == currentScreen && guard++ < 24) previous = backStack.pollLast()
         show(previous ?: Screen.Home, remember = false)
     }
 

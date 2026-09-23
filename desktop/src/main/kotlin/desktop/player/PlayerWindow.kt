@@ -182,6 +182,19 @@ object PlayerWindow {
     private var playButton: Button? = null
     private var nextButton: Button? = null
     private var sourceMenu: MenuButton? = null
+
+    /**
+     * The Quality picker — the desktop twin of the Android player's "Video
+     * quality" button (Auto (adaptive) + one row per video track). Its rows come
+     * from mpv's own `track-list` (see [renderTracks]) and it drives `vid`.
+     */
+    private var qualityMenu: MenuButton? = null
+
+    /** Video tracks mpv reported (id → label), and the current choice ("auto").
+     *  Written on the IPC reader thread, read on the FX thread (hence volatile). */
+    @Volatile private var videoTracks: List<Pair<String, String>> = emptyList()
+    @Volatile private var videoChoice: String = "auto"
+
     private var audioMenu: MenuButton? = null
     private var subMenu: MenuButton? = null
     private var fullscreenButton: Button? = null
@@ -394,6 +407,12 @@ object PlayerWindow {
         subMenu?.items?.setAll()
         audioMenu?.isDisable = true
         subMenu?.isDisable = true
+        // A new file brings its own tracks: forget the previous pick (a stale
+        // `vid` would select the wrong track, or none at all).
+        videoTracks = emptyList()
+        videoChoice = "auto"
+        qualityMenu?.items?.setAll()
+        qualityMenu?.isDisable = true
         videoFormat = ""
         renderTime()
         setStatus("Starting the player…", busy = true)
@@ -1183,6 +1202,18 @@ object PlayerWindow {
         }
         sourceMenu = source
 
+        // Quality: which video track/rendition to play. Same shape as the Source
+        // picker (and as the Android player's) — a pill that opens a list, with
+        // the current choice ticked.
+        val quality = MenuButton("Quality").apply {
+            styleClass.add("player-pill")
+            graphic = Icons.of(Icons.QUALITY, 14.0)
+            isFocusTraversable = false
+            isDisable = true
+            javafx.scene.control.Tooltip.install(this, Ui.tooltip("Video quality"))
+        }
+        qualityMenu = quality
+
         val audio = MenuButton("Audio").apply {
             styleClass.add("player-pill")
             graphic = Icons.of(Icons.VOLUME, 14.0)
@@ -1232,7 +1263,7 @@ object PlayerWindow {
                 play, time, seek, total,
                 barGap,
                 sepA,
-                source, audio, subs,
+                source, quality, audio, subs,
                 sepB,
                 next, full,
             )
@@ -1297,8 +1328,9 @@ object PlayerWindow {
     /**
      * Fits the two bars to the width the window actually has.
      *
-     * The player's bar carries thirteen things (transport, a seek bar, three
-     * pickers, the window controls) — on a 460px-wide window that cannot fit,
+     * The player's bar carries fourteen things (transport, a seek bar, four
+     * pickers — source, quality, audio, subtitles — the window controls) — on a
+     * 460px-wide window that cannot fit,
      * and what used to happen was the worst outcome: the seek bar collapsed to
      * a purple dot and the fullscreen button was pushed off the right edge.
      * The labels go first, then the pickers that are only occasionally needed,
@@ -1314,12 +1346,13 @@ object PlayerWindow {
         val narrow = width < 780.0
         val tiny = width < 560.0
         sourceMenu?.let { it.text = if (narrow) "" else "Source" }
+        qualityMenu?.let { it.text = if (narrow) "" else "Quality" }
         audioMenu?.let { it.text = if (narrow) "" else "Audio" }
         subMenu?.let { it.text = if (narrow) "" else "Subs" }
         // Source stays (switching server is the first thing to reach for when a
-        // stream dies); audio/subtitle tracks live behind the same kind of
+        // stream dies); quality/audio/subtitle live behind the same kind of
         // control and are one tap away once there is room for them.
-        for (menu in listOf(audioMenu, subMenu)) {
+        for (menu in listOf(qualityMenu, audioMenu, subMenu)) {
             menu ?: continue
             menu.isVisible = !tiny
             menu.isManaged = !tiny
@@ -2041,12 +2074,22 @@ object PlayerWindow {
         totalLabel?.text = "/ " + clock(duration.toLong())
     }
 
-    /** One menu row per real track, chosen via `aid`/`sid`. */
+    /**
+     * One menu row per real track: video tracks drive the Quality picker (`vid`),
+     * audio tracks `aid`, subtitles `sid`.
+     *
+     * mpv publishes the whole shape of the file here — including how many video
+     * renditions it has and at what resolution/bitrate — which is why the Quality
+     * menu is built from this and not from the provider's source list: this is
+     * what the file ACTUALLY contains (the Android player reads its quality menu
+     * from its track list for the same reason).
+     */
     private fun renderTracks(value: Any?) {
         val array = value as? JSONArray ?: run {
             val text = value?.toString() ?: return
             runCatching { JSONArray(text) }.getOrNull() ?: return
         }
+        val video = ArrayList<Pair<String, String>>()
         val audio = ArrayList<Pair<String, String>>()
         val subs = ArrayList<Pair<String, String>>()
         for (i in 0 until array.length()) {
@@ -2061,11 +2104,17 @@ object PlayerWindow {
                 ?: "Track $id"
             val formatted = if (lang != null && label != lang) "$label ($lang)" else label
             when (type) {
+                "video" -> video.add(id.toString() to videoTrackLabel(t, formatted))
                 "audio" -> audio.add(id.toString() to formatted)
                 "sub" -> subs.add(id.toString() to formatted)
             }
         }
+        videoTracks = video
+        // A track that is no longer there must not stay "chosen": `vid` is the
+        // stream's own business again (Auto).
+        if (videoChoice != "auto" && video.none { it.first == videoChoice }) videoChoice = "auto"
         Fx.run {
+            fillQualityMenu(updateTooltip = true)
             audioMenu?.items?.setAll(*audio.map { (id, name) ->
                 MenuItem(name).apply {
                     setOnAction { runCatching { ipc?.setProperty("aid", id.toInt()) } }
@@ -2082,6 +2131,90 @@ object PlayerWindow {
             audioMenu?.isDisable = audio.isEmpty()
             subMenu?.isDisable = subs.isEmpty()
         }
+    }
+
+    /**
+     * "1080p · 1920x1080 · 4.2 Mbps" — the resolution first, because that is the
+     * thing being chosen between, and the bitrate only when the stream declares
+     * one (a bare HLS variant often does not).
+     */
+    private fun videoTrackLabel(t: JSONObject, fallback: String): String {
+        val w = t.optInt("demux-w", t.optInt("w", 0))
+        val h = t.optInt("demux-h", t.optInt("h", 0))
+        val declared = t.optLong("demux-bitrate", 0L).let { if (it > 0L) it else t.optLong("bitrate", 0L) }
+        val parts = ArrayList<String>(3)
+        if (h > 0) parts.add("${h}p")
+        if (w > 0) parts.add("${w}x${if (h > 0) h else 0}")
+        if (declared > 0L) parts.add(bitrateLabel(declared))
+        if (parts.isEmpty()) parts.add(fallback)
+        return parts.joinToString(" · ")
+    }
+
+    private fun bitrateLabel(bits: Long): String = when {
+        bits >= 1_000_000L -> "%.1f Mbps".format(bits / 1_000_000.0)
+        bits >= 1_000L -> "%d kbps".format(bits / 1_000L)
+        else -> "$bits bps"
+    }
+
+    /**
+     * Fills the Quality menu: `Auto (adaptive)` first, then every video track the
+     * stream carries, with the current choice ticked — the same list the Android
+     * player's Video quality button shows.
+     */
+    private fun fillQualityMenu(updateTooltip: Boolean = false) {
+        val menu = qualityMenu ?: return
+        val tracks = videoTracks
+        menu.isDisable = tracks.isEmpty()
+        menu.items.setAll(
+            *buildList {
+                add(MenuItem("Auto (adaptive)").apply {
+                    if (videoChoice == "auto") graphic = Icons.of(Icons.CHECK, 13.0)
+                    setOnAction { chooseVideo("auto") }
+                })
+                tracks.forEach { (id, label) ->
+                    add(MenuItem(label).apply {
+                        if (videoChoice == id) graphic = Icons.of(Icons.CHECK, 13.0)
+                        setOnAction { chooseVideo(id) }
+                    })
+                }
+            }.toTypedArray()
+        )
+        if (updateTooltip) {
+            val current = tracks.firstOrNull { it.first == videoChoice }?.second
+            javafx.scene.control.Tooltip.install(
+                menu,
+                Ui.tooltip(
+                    when {
+                        current != null -> "Video quality — $current"
+                        tracks.size > 1 -> "Video quality (${tracks.size} renditions)"
+                        else -> "Video quality"
+                    },
+                ),
+            )
+        }
+    }
+
+    /** Applies a Quality choice to the player (`vid`). */
+    private fun chooseVideo(id: String) {
+        videoChoice = id
+        val value: Any = if (id == "auto") "auto" else id.toIntOrNull() ?: "auto"
+        runCatching { ipc?.setProperty("vid", value) }
+        fillQualityMenu(updateTooltip = true)
+        setStatus("")
+        pokeChrome()
+    }
+
+    /** The Quality menu's rows — ["Auto (adaptive)", "1080p · …"], for the tests. */
+    fun qualityItems(): List<String> = qualityMenu?.items?.mapNotNull { it.text } ?: emptyList()
+
+    /** The quality mpv is pinned to ("auto", or a track id), for the tests. */
+    fun qualityChoice(): String = videoChoice
+
+    /** Fires the Quality row at [index] (0 = Auto), exactly as a click would. */
+    fun pickQuality(index: Int): Boolean {
+        val item = qualityMenu?.items?.getOrNull(index) ?: return false
+        item.fire()
+        return true
     }
 
     private fun clock(seconds: Long): String {

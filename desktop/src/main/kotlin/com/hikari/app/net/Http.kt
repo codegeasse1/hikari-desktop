@@ -1606,6 +1606,29 @@ object Http {
                 }
             }
         }
+        // The in-JVM ladder is exhausted, but the OS's own HTTP client has a
+        // different trust store and a different TLS stack (see [osHttpClient]),
+        // so it gets the same candidate list before this repo is called
+        // unreachable.
+        if (osHttpClient() != null) {
+            val all = (liveOrigins + liveMirrors + snapshotUrls).toList()
+            val got = raceFirst(all, OS_PARALLELISM, OS_WINDOW_MS) { u ->
+                val text = osFetchString(u) ?: return@raceFirst null
+                if (!looksLikeManifest(text)) {
+                    walk.record(u, Exception(notAManifest(text)), false)
+                    return@raceFirst null
+                }
+                // A CloudStream v2 manifest keeps its plugins in separate
+                // pluginLists files; merge them in exactly as tryOne does, or the
+                // caller sees a manifest with no plugins in it.
+                val root = runCatching { org.json.JSONObject(text) }.getOrNull()
+                if (root != null && root.has("pluginLists")) resolvePluginLists(root, u) ?: text else text
+            }
+            if (got != null) {
+                System.err.println("os-http(repo): served by " + got.first)
+                return Result.success(got.first to got.second)
+            }
+        }
         return Result.failure(Exception(summariseFailures(walk.failures, walk.hostsWithFailures())))
     }
 
@@ -2023,11 +2046,22 @@ object Http {
     }
 
 
+    /** True when a body parses as a repo manifest of any kind — an object
+     *  (CloudStream/Hikari/Nuvio) or a bare array (Aniyomi) — which is the same
+     *  shape test [fetchRepoJson] applies to its in-JVM candidates. */
+    private fun looksLikeManifest(text: String): Boolean =
+        runCatching { org.json.JSONObject(text) }.isSuccess ||
+            runCatching { org.json.JSONArray(text) }.isSuccess
+
     /**
      * The AUTHORITATIVE URLs for a file: the URL the caller gave (normalized),
      * raw.githubusercontent's canonical form, and github.com's own `/raw/`
      * path. These cannot be a stale CDN copy of a branch file, so they are
      * always tried before any mirror.
+     *
+     * A RELEASE ASSET has no such family — the bytes live on github.com alone —
+     * so this list is the single URL the caller gave, and [mirrorVariants] is
+     * what supplies its alternatives (see [githubFrontdoors]).
      */
     internal fun originVariants(url: String): List<String> {
         val base = normalizeDriveUrl(url.trim())
@@ -2054,37 +2088,83 @@ object Http {
      */
     internal fun mirrorVariants(url: String): List<String> {
         val base = normalizeDriveUrl(url.trim())
-        val gh = parseGhTarget(base) ?: return emptyList()
-        // Mirror URLs are built from the bare path — a query string that is
-        // fine on raw.githubusercontent ("…?token=x") makes CDN/proxy mirrors
-        // answer HTTP 400, so it never leaks into generated variants.
-        val p = gh.path.substringBefore('?')
-        val raw = "https://raw.githubusercontent.com/${gh.user}/${gh.repo}/${gh.ref}/$p"
+        val gh = parseGhTarget(base)
         val out = linkedSetOf<String>()
-        // jsDelivr's edges: the same files on several different hostnames, which
-        // is exactly what is needed when ONE of them is SNI-blocked by the local
-        // network. (cdn.statically.io, raw.gitmirror.com and github.moeyy.xyz
-        // were removed: all three stopped answering, and a host that only ever
-        // fails makes the race shorter for the ones that work.)
-        out.add("https://cdn.jsdelivr.net/gh/${gh.user}/${gh.repo}@${gh.ref}/$p")
-        out.add("https://fastly.jsdelivr.net/gh/${gh.user}/${gh.repo}@${gh.ref}/$p")
-        out.add("https://gcore.jsdelivr.net/gh/${gh.user}/${gh.repo}@${gh.ref}/$p")
-        out.add("https://testingcf.jsdelivr.net/gh/${gh.user}/${gh.repo}@${gh.ref}/$p")
-        out.add("https://jsdelivr.b-cdn.net/gh/${gh.user}/${gh.repo}@${gh.ref}/$p")
-        out.add("https://raw.githack.com/${gh.user}/${gh.repo}/${gh.ref}/$p")
-        // Frontdoors for networks where TLS to every GitHub-family host dies
-        // (the classic "SSL protocol error" on raw + jsDelivr while normal
-        // sites still load) or where the whole family is blocked by name.
-        // Different hostnames, same files; a dead one costs nothing because they
-        // are all raced at once. (gh-proxy.net was removed: it answers 200 with
-        // a 122-byte stub, and being tiny it won every race.)
-        out.add("https://ghfast.top/$raw")
-        out.add("https://ghproxy.net/$raw")
-        out.add("https://gh-proxy.com/$raw")
-        out.add("https://ghproxy.cc/$raw")
-        out.add("https://gh.llkk.cc/$raw")
-        return out.toList()
+        if (gh != null) {
+            // Mirror URLs are built from the bare path — a query string that is
+            // fine on raw.githubusercontent ("…?token=x") makes CDN/proxy
+            // mirrors answer HTTP 400, so it never leaks into generated
+            // variants.
+            val p = gh.path.substringBefore('?')
+            // jsDelivr's edges: the same files on several different hostnames,
+            // which is exactly what is needed when ONE of them is SNI-blocked by
+            // the local network. (cdn.statically.io, raw.gitmirror.com and
+            // github.moeyy.xyz were removed: all three stopped answering, and a
+            // host that only ever fails makes the race shorter for the ones that
+            // work.)
+            out.add("https://cdn.jsdelivr.net/gh/${gh.user}/${gh.repo}@${gh.ref}/$p")
+            out.add("https://fastly.jsdelivr.net/gh/${gh.user}/${gh.repo}@${gh.ref}/$p")
+            out.add("https://gcore.jsdelivr.net/gh/${gh.user}/${gh.repo}@${gh.ref}/$p")
+            out.add("https://testingcf.jsdelivr.net/gh/${gh.user}/${gh.repo}@${gh.ref}/$p")
+            out.add("https://jsdelivr.b-cdn.net/gh/${gh.user}/${gh.repo}@${gh.ref}/$p")
+            out.add("https://raw.githack.com/${gh.user}/${gh.repo}/${gh.ref}/$p")
+            out.addAll(
+                githubFrontdoors("https://raw.githubusercontent.com/${gh.user}/${gh.repo}/${gh.ref}/$p"),
+            )
+            return out.toList()
+        }
+        // NOT a raw file path — and this is the case this branch exists for: a
+        // RELEASE ASSET (`github.com/<u>/<r>/releases/download/<tag>/<file>`).
+        // Those bytes are published nowhere but github.com, so jsDelivr and
+        // githack cannot serve them and this list used to come back EMPTY. A repo
+        // that ships its extensions as release assets (the official Hikari one
+        // does: `…/releases/download/continuous/<name>.jar`) therefore had
+        // exactly ONE candidate URL, and on a network where github.com is
+        // blocked or TLS-filtered every install of it ended in "no mirror served
+        // the file" — which is the bug report this fixes.
+        if (isGithubUrl(base)) return githubFrontdoors(base)
+        return emptyList()
     }
+
+    /** Hosts that serve only GitHub's own content: repo pages, raw files, release
+     *  assets, and the CDN edge those assets redirect to. */
+    private val GITHUB_HOSTS = listOf(
+        "github.com",
+        "raw.githubusercontent.com",
+        "objects.githubusercontent.com",
+        "release-assets.githubusercontent.com",
+        "github-releases.githubusercontent.com",
+        "codeload.github.com",
+        "gist.githubusercontent.com",
+    )
+
+    /** True when [url] is served by GitHub (or its asset CDN). */
+    internal fun isGithubUrl(url: String): Boolean {
+        val host = runCatching { java.net.URI(url.trim()).host?.lowercase() }.getOrNull() ?: return false
+        return GITHUB_HOSTS.any { host == it || host.endsWith("." + it) }
+    }
+
+    /**
+     * Frontdoors for networks where TLS to every GitHub-family host dies (the
+     * classic "SSL protocol error" on raw + jsDelivr while normal sites still
+     * load) or where the whole family is blocked by name.
+     *
+     * Each one is handed the FULL GitHub URL, which is what makes them the only
+     * mirrors a release asset can have — and is why they are now generated for
+     * every github.com URL and not only for raw file paths (see
+     * [mirrorVariants]). Different hostnames, same files; a dead one costs
+     * nothing because they are all raced at once. (gh-proxy.net was removed: it
+     * answers 200 with a 122-byte stub, and being tiny it won every race.)
+     */
+    private fun githubFrontdoors(url: String): List<String> = listOf(
+        "https://ghfast.top/$url",
+        "https://ghproxy.net/$url",
+        "https://gh-proxy.com/$url",
+        "https://ghproxy.cc/$url",
+        "https://gh.llkk.cc/$url",
+        "https://github.moeyy.xyz/$url",
+        "https://hub.gitmirror.com/$url",
+    )
 
     /** Every candidate URL for a file: authoritative first, mirrors after. */
     private fun urlVariants(url: String): List<String> =
@@ -2229,6 +2309,15 @@ object Http {
                 runCatching { getStringStrictOn(client, u, headers).getOrNull() }
                     .getOrNull()?.also { MirrorMemory.markAlive(u) }
             }?.let { return Result.success(it.second) }
+        }
+        // The JVM's TLS stack is out of ideas; the machine's own stack still has
+        // a different trust store and a different TLS implementation (see
+        // [osHttpClient]).
+        if (osHttpClient() != null) {
+            raceFirst(origins + mirrors, OS_PARALLELISM, OS_WINDOW_MS) { osFetchString(it) }?.let {
+                System.err.println("os-http: served " + it.first + " for $url")
+                return Result.success(it.second)
+            }
         }
         System.err.println("net-fetch: gave up on $url after " + (System.currentTimeMillis() - started) + "ms")
         return Result.failure(Exception(summariseFailures(walk.failures, walk.hostsWithFailures())))
@@ -2389,6 +2478,15 @@ object Http {
         if (systemProxyInUse()) {
             raceFirst(walk.live(origins + mirrors, true), FANOUT, 20_000L) { attempt(noProxyClient, it, true) }?.let { return it.second }
         }
+        // The JVM's TLS stack is out of ideas; the machine's own stack still has
+        // a different trust store and a different TLS implementation (see
+        // [osHttpClient]).
+        if (osHttpClient() != null) {
+            raceFirst(origins + mirrors, OS_PARALLELISM, OS_WINDOW_MS) { osFetchBytes(it) }?.let {
+                System.err.println("os-http: served " + it.first + " for $url")
+                return it.second
+            }
+        }
         System.err.println("net-bytes: gave up on $url after " + (System.currentTimeMillis() - started) + "ms")
         return null
     }
@@ -2419,6 +2517,14 @@ object Http {
         // connect timeout; bound the walk so the UI doesn't sit for minutes
         // (the Android app caps installs at 90s for the same reason).
         val deadline = System.currentTimeMillis() + DOWNLOAD_BUDGET_MS
+        // A release asset's "authoritative" list is github.com on its own — there
+        // is no raw/CDN family to fall back on — so a network that filters
+        // github.com has nothing to succeed with until the frontdoors are
+        // brought in. Giving that single host the full origin window meant every
+        // install from a release-asset repo (the official Hikari one) waited out
+        // the window before a single proxy was tried. See RELEASE_ORIGIN_FIRST_MS.
+        val releaseAsset = parseGhTarget(normalizeDriveUrl(url.trim())) == null && isGithubUrl(url)
+        val originWindow = if (releaseAsset) RELEASE_ORIGIN_FIRST_MS else ORIGIN_FIRST_MS
         sweepParts(dest)
         // A certificate rejection is not worth walking the rest of the ladder
         // for: the TLS-1.2 pass, the direct route and the mirrors all present
@@ -2437,7 +2543,7 @@ object Http {
             }
             onAttempt?.invoke(u, ok, why)
         }
-        if (raceDownload(origins, dest, headers, onProgress, counting, deadline, null, ORIGIN_FIRST_MS, url)) return true
+        if (raceDownload(origins, dest, headers, onProgress, counting, deadline, null, originWindow, url)) return true
         if (certRejected) {
             System.err.println("downloadToRobust: every candidate was rejected by the certificate store — stopping")
             return false
@@ -2461,6 +2567,12 @@ object Http {
             raceDownload(ordered, dest, headers, onProgress, counting, deadline, noProxyClient, RESCUE_RACE_MS, url, "(no proxy)")
         ) return true
         if (raceDownload(ordered, dest, headers, onProgress, counting, deadline, rescueClient, RESCUE_RACE_MS, url, "(TLS 1.2)")) return true
+        // Every in-JVM stack has now failed. Hand the SAME candidate list to the
+        // OS's own HTTP client — Schannel + the Windows certificate store, i.e.
+        // the browser's TLS stack, running in a process of its own (see
+        // [osHttpClient]). This is the only path that can turn "the browser
+        // loads it, the app does not" into a finished install.
+        if (raceDownloadViaOs(ordered, dest, counting, maxOf(20_000L, deadline - System.currentTimeMillis()))) return true
         System.err.println("downloadToRobust failed for $url")
         return false
     }
@@ -2483,6 +2595,18 @@ object Http {
      * nothing, because the second wave includes the origins again.
      */
     private const val ORIGIN_FIRST_MS = 12_000L
+
+    /**
+     * The origin window for a RELEASE ASSET, which is much shorter for a
+     * structural reason: there is only one authoritative host for those bytes
+     * (github.com), so "wait for the origin to prove itself" costs the whole
+     * window and buys nothing when that host is filtered — the frontdoors behind
+     * it are the only candidates that can answer. Four seconds is still ample for
+     * github.com to start streaming a `.jar` on a network where it works (the
+     * origin stays in the long wave behind this, so a slow-but-working host is
+     * not lost).
+     */
+    private const val RELEASE_ORIGIN_FIRST_MS = 4_000L
 
     /** True when what landed on disk is really an HTML page (a mirror's error
      *  page) rather than the asset — read back from the file, so it also covers
@@ -2599,6 +2723,204 @@ object Http {
         sweeper.name = "hikari-part-sweep"
         sweeper.start()
         return true
+    }
+
+    // ── the OS's own HTTP stack, as a last resort ───────────────────────────
+
+    /**
+     * The OS-native HTTP client, when this machine has one.
+     *
+     * Everything above this runs inside the JVM, on Conscrypt + our own trust
+     * store. There is a class of machine where that cannot work at all — a
+     * TLS-inspecting filter, a driver-level firewall, a certificate the JVM's
+     * stack refuses — while the user's BROWSER loads the very same URL. For
+     * those, `curl.exe` (Windows 10 1803+) and PowerShell are the honest answer:
+     * they use Schannel and the Windows certificate store, which is literally
+     * the stack the browser uses, and they are separate PROCESSES, so nothing
+     * about this JVM's TLS, trust store, proxy handling or DNS is involved.
+     *
+     * It is only ever reached after every in-JVM attempt has failed, so it costs
+     * the healthy path nothing.
+     */
+    @Volatile private var osHttpTool: String? = null
+
+    @Volatile private var osHttpProbed = false
+
+    /** The OS client's path (for the logs and the self-tests), or null. */
+    fun osHttpClient(): String? {
+        if (osHttpProbed) return osHttpTool
+        synchronized(this) {
+            if (osHttpProbed) return osHttpTool
+            val wind = System.getProperty("os.name").orEmpty().lowercase().contains("win")
+            // Windows is what this pass is FOR (Schannel + the Windows cert
+            // store). On every other platform plain `curl` is used when it
+            // happens to be installed, so the plumbing — process, timeout,
+            // HTML-page rejection, rename into place — is exercised by the CI
+            // run on the test machine instead of first being tried on a user's
+            // filtered Windows box. If there is no curl, this is simply null and
+            // nothing changes.
+            osHttpTool = if (wind) {
+                findOnPath("curl.exe") ?: findOnPath("curl") ?: findOnPath("powershell.exe")
+            } else {
+                findOnPath("curl")
+            }
+            osHttpProbed = true
+            System.err.println("os-http: " + (osHttpTool ?: "none on this machine"))
+            return osHttpTool
+        }
+    }
+
+    /** A program on PATH (System32 first: the msys/cygwin `curl` that ships with
+     *  Git for Windows carries its own CA bundle — a third trust decision again,
+     *  and not the browser's). */
+    private fun findOnPath(exe: String): String? {
+        val roots = ArrayList<String>()
+        System.getenv("SystemRoot")?.let { roots.add(java.io.File(it, "System32").absolutePath) }
+        System.getenv("PATH")?.split(java.io.File.pathSeparator)?.let { roots.addAll(it) }
+        for (d in roots) {
+            if (d.isBlank()) continue
+            val f = runCatching { java.io.File(d, exe) }.getOrNull() ?: continue
+            if (f.isFile) return f.absolutePath
+        }
+        return null
+    }
+
+    /** How long one OS-client attempt may take. curl is a ~50ms process, so a
+     *  window this size is only ever spent on a host that is black-holing. */
+    private const val OS_WINDOW_MS = 25_000L
+
+    /** How many candidate URLs are handed to the OS client at once. */
+    private const val OS_PARALLELISM = 4
+
+    /**
+     * Downloads [url] to [dest] with the OS's own HTTP client.
+     *
+     * Returns null on success, or a short reason on failure — the same contract
+     * as [downloadToReason], so callers can report it like any other attempt.
+     */
+    fun osFetchToFile(url: String, dest: java.io.File): String? {
+        val tool = osHttpClient() ?: return "no OS HTTP client on this machine"
+        val tmp = java.io.File(dest.parentFile, dest.name + ".osdl")
+        runCatching { tmp.delete() }
+        var proc: Process? = null
+        return try {
+            dest.parentFile?.mkdirs()
+            val cmd = if (tool.lowercase().endsWith("powershell.exe")) {
+                // PowerShell's own WebClient — Schannel underneath, and no
+                // `curl` requirements at all. TLS 1.2 is set explicitly: the
+                // PowerShell default on some machines is still SSL3/TLS1.0, and
+                // GitHub refuses those outright, which would look like the very
+                // failure this pass exists to rescue.
+                val safeUrl = url.replace("'", "''")
+                val safeOut = tmp.absolutePath.replace("'", "''")
+                listOf(
+                    tool, "-NoProfile", "-NonInteractive", "-Command",
+                    "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; " +
+                        "\$ProgressPreference = 'SilentlyContinue'; " +
+                        "\$wc = New-Object Net.WebClient; " +
+                        "\$wc.Headers.Add('User-Agent', '" + UA.replace("'", "''") + "'); " +
+                        "\$wc.DownloadFile('" + safeUrl + "', '" + safeOut + "')",
+                )
+            } else {
+                listOf(
+                    tool, "-fsSL", "--ssl-no-revoke", "--connect-timeout", "8",
+                    "--max-time", "90", "-A", UA, "-o", tmp.absolutePath, url,
+                )
+            }
+            val p = ProcessBuilder(cmd).redirectErrorStream(true).start()
+            proc = p
+            // Drain on its own thread: a full pipe buffer would deadlock the
+            // child, but draining *inline* would block this thread for as long
+            // as the child lives — i.e. the timeout below would never be reached.
+            Thread { runCatching { p.inputStream.readBytes() } }.apply {
+                isDaemon = true
+                name = "hikari-os-http-drain"
+                start()
+            }
+            if (!p.waitFor(110, TimeUnit.SECONDS)) {
+                p.destroyForcibly()
+                return "timed out"
+            }
+            if (p.exitValue() != 0) return "exit " + p.exitValue()
+            if (!tmp.isFile || tmp.length() <= 0L) return "no bytes came back"
+            if (looksLikeHtmlFile(tmp)) {
+                tmp.delete()
+                return "an HTML error page, not the file"
+            }
+            dest.delete()
+            if (!tmp.renameTo(dest)) {
+                tmp.copyTo(dest, overwrite = true)
+                tmp.delete()
+            }
+            if (dest.isFile && dest.length() > 0L) null else "couldn't write " + dest.name
+        } catch (e: InterruptedException) {
+            // The race moved on; don't leave the child behind holding a socket.
+            runCatching { proc?.destroyForcibly() }
+            Thread.currentThread().interrupt()
+            "interrupted"
+        } catch (t: Throwable) {
+            humanMessage(t)
+        }
+    }
+
+    /** [osFetchToFile] into a temp file, returning the bytes (web pages
+     *  rejected, exactly like [fetchBytesRobust]). */
+    fun osFetchBytes(url: String): ByteArray? {
+        if (osHttpClient() == null) return null
+        val tmp = runCatching {
+            java.io.File.createTempFile("hikari-osdl", ".bin").apply { deleteOnExit() }
+        }.getOrNull() ?: return null
+        return try {
+            val why = osFetchToFile(url, tmp)
+            if (why != null) {
+                System.err.println("os-http: $url — $why")
+                return null
+            }
+            val bytes = runCatching { tmp.readBytes() }.getOrNull()
+            if (bytes == null || bytes.isEmpty() || isWebPage(bytes)) null else bytes
+        } finally {
+            runCatching { tmp.delete() }
+        }
+    }
+
+    /** [osFetchToFile] into a temp file, returning the text. */
+    fun osFetchString(url: String): String? {
+        val bytes = osFetchBytes(url) ?: return null
+        return String(bytes, Charsets.UTF_8)
+    }
+
+    /**
+     * The same "race every candidate, first one to land wins" walk as
+     * [raceDownload], run through the OS's HTTP client instead of the JVM's TLS
+     * stack (see [osHttpClient]). Reached only when everything above failed.
+     */
+    private fun raceDownloadViaOs(
+        variants: List<String>,
+        dest: java.io.File,
+        onAttempt: ((String, Boolean, String?) -> Unit)?,
+        budgetMs: Long,
+    ): Boolean {
+        if (osHttpClient() == null || variants.isEmpty()) return false
+        val window = minOf(OS_WINDOW_MS, maxOf(4_000L, budgetMs))
+        val winner = raceFirst(variants, OS_PARALLELISM, window) { u ->
+            val part = partOf(dest, "os:" + u)
+            runCatching { part.delete() }
+            if (osFetchToFile(u, part) == null && part.isFile && part.length() > 0L) part else null
+        } ?: return false
+        val (from, part) = winner
+        val ok = runCatching {
+            dest.delete()
+            if (!part.renameTo(dest)) {
+                part.copyTo(dest, overwrite = true)
+                part.delete()
+            }
+            dest.isFile && dest.length() > 0L
+        }.getOrDefault(false)
+        if (ok) {
+            System.err.println("os-http: the download was served by " + from)
+            onAttempt?.invoke(from, true, "the OS HTTP client (Windows' own TLS stack)")
+        }
+        return ok
     }
 
     /**

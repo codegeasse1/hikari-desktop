@@ -117,6 +117,30 @@ class UiShotApp : Application() {
         }
         steps += 1200L to { }
         shot("d-player-loading", "title/status chips + control bar + loading pane")
+        steps += 200L to {
+            // The Quality picker has to BE there (the Android player's quality
+            // button). There is no mpv in this harness, so there is no track list
+            // yet: the picker must be present and honest about it (disabled,
+            // empty) rather than offering qualities it does not know.
+            val pills = scene.root.lookupAll(".player-pill")
+                .filterIsInstance<javafx.scene.control.MenuButton>()
+            println("UiShotTest: player pickers = " + pills.map { it.text }.joinToString(" | "))
+            val quality = pills.firstOrNull { it.text == "Quality" }
+            when {
+                quality == null -> {
+                    println("UiShotTest: FAIL the player bar has no Quality picker")
+                    failures[0]++
+                }
+                !quality.isDisable || quality.items.isNotEmpty() -> {
+                    println(
+                        "UiShotTest: FAIL the Quality picker claims qualities with no track list (items=" +
+                            quality.items.size + " disabled=" + quality.isDisable + ")",
+                    )
+                    failures[0]++
+                }
+                else -> println("UiShotTest: OK   the Quality picker is in the bar (no tracks without mpv)")
+            }
+        }
 
         steps += 200L to {
             PlayerWindow.showFailure(
@@ -270,6 +294,15 @@ class UiShotApp : Application() {
         // screen's own seam so this drives the REAL renderEpisodes/
         // renderEpisodeGrid path (no provider, no network, no mock-up) — and the
         // numbers are checked here, not just looked at.
+        val detailItem = MediaItem(
+            providerId = "demo",
+            id = "qi-refining",
+            title = "One Hundred Thousand Years of Qi Refining",
+            type = MediaType.SERIES,
+            overview = "Wang Lin refuses the life he was handed, and pays for it.",
+            genres = listOf("Anime", "Fantasy"),
+            year = 2023,
+        )
         steps += 300L to {
             PlayerWindow.closeAll()
             DetailScreenTestSeam.season = { media ->
@@ -281,17 +314,7 @@ class UiShotApp : Application() {
                     )
                 }
             }
-            AppShell.openDetail(
-                MediaItem(
-                    providerId = "demo",
-                    id = "qi-refining",
-                    title = "One Hundred Thousand Years of Qi Refining",
-                    type = MediaType.SERIES,
-                    overview = "Wang Lin refuses the life he was handed, and pays for it.",
-                    genres = listOf("Anime", "Fantasy"),
-                    year = 2023,
-                ),
-            )
+            AppShell.openDetail(detailItem)
         }
         steps += 3200L to { }
         steps += 300L to {
@@ -360,6 +383,134 @@ class UiShotApp : Application() {
             }
         }
         shot("l-detail-episodes-search", "searching episode 187 of 379")
+
+        // ── the detail banner's back arrow, clicked with a REAL mouse ───────
+        // The arrow in the banner was reported dead. Two things kill it silently:
+        // something painted over it taking the click, and the tooltip popup a
+        // hover puts on top of it (a JavaFX tooltip is a window of its own and a
+        // click while it is up is spent dismissing it). So this does exactly what
+        // the user does — point at the arrow, wait longer than the tooltip delay,
+        // press, release — through the OS, and it reports what is painted ON TOP of
+        // the arrow's own centre either way, so a change in paint order is caught
+        // here rather than in the next bug report.
+        steps += 300L to {
+            PlayerWindow.closeAll()
+            AppShell.show(Screen.Home)
+            AppShell.openDetail(detailItem)
+        }
+        steps += 1600L to { }
+        steps += 200L to {
+            // A window off the display (or not focused) cannot be clicked through
+            // the OS, so it is pinned to the top-left corner first.
+            stage.x = 0.0
+            stage.y = 0.0
+            val btn = detailBackButton(scene)
+            if (btn == null) {
+                println("UiShotTest: FAIL the detail banner has no back arrow")
+                failures[0]++
+            } else {
+                val centre = btn.localToScreen(btn.boundsInLocal.centerX, btn.boundsInLocal.centerY)
+                println(
+                    "UiShotTest: back arrow: visible=" + btn.isVisible + " disabled=" + btn.isDisabled +
+                        " centre on screen=" + centre,
+                )
+                val top = centre?.let { topmostAt(scene.root, it.x, it.y) }
+                println("UiShotTest: the node on top of that point is " + top)
+                if (top == null || !isInside(top, btn)) {
+                    println("UiShotTest: FAIL something is painted over the back arrow (topmost=" + top + ")")
+                    failures[0]++
+                }
+                if (centre == null || !onScreen(centre)) {
+                    println("UiShotTest: WARN the back arrow is off this display — no real click is possible here")
+                } else {
+                    val robot = runCatching { java.awt.Robot() }.getOrNull()
+                    if (robot == null) {
+                        println("UiShotTest: WARN java.awt.Robot is unavailable — no real click is possible here")
+                    } else {
+                        robot.mouseMove(centre.x.toInt(), centre.y.toInt())
+                        // Longer than Ui.tooltip's 900ms delay: if a tooltip is
+                        // what eats the click, it is up by now.
+                        Thread.sleep(1400L)
+                        robot.mousePress(java.awt.event.InputEvent.BUTTON1_DOWN_MASK)
+                        Thread.sleep(80L)
+                        robot.mouseRelease(java.awt.event.InputEvent.BUTTON1_DOWN_MASK)
+                        Thread.sleep(900L)
+                        println("UiShotTest: clicked the banner's back arrow with the real mouse")
+                    }
+                }
+            }
+        }
+        steps += 200L to {
+            val now = AppShell.current
+            if (now is Screen.Detail) {
+                println("UiShotTest: FAIL the detail screen's back arrow did nothing (still " + now + ")")
+                failures[0]++
+            } else {
+                println("UiShotTest: OK   the banner's back arrow navigates back (now " + now + ")")
+            }
+        }
+
+        // ── the Installed list's engine filter: All | CloudStream | Hikari | … ─
+        // The desktop twin of the Android picker's chips. With a hundred providers
+        // from several engines installed, "show me only the Hikari ones" has to be
+        // one click. Providers of three different engines are registered here (and
+        // removed again at the end) so the chips have something real to filter.
+        val chipProviders = listOf(
+            com.hikari.app.data.ProviderConfig(
+                id = "zztest|hiki1", name = "ZZ Test Hikari One",
+                type = com.hikari.app.data.ProviderType.HIKARI, url = "",
+            ),
+            com.hikari.app.data.ProviderConfig(
+                id = "zztest|hiki2", name = "ZZ Test Hikari Two",
+                type = com.hikari.app.data.ProviderType.HIKARI, url = "",
+            ),
+            com.hikari.app.data.ProviderConfig(
+                id = "zztest|cs3", name = "ZZ Test CloudStream",
+                type = com.hikari.app.data.ProviderType.CS3, url = "",
+            ),
+            com.hikari.app.data.ProviderConfig(
+                id = "zztest|nuvio", name = "ZZ Test Nuvio",
+                type = com.hikari.app.data.ProviderType.NUVIO, url = "",
+            ),
+        )
+        steps += 300L to {
+            chipProviders.forEach { AppShell.app.store.addProvider(it) }
+            AppShell.show(Screen.Home)
+            AppShell.show(Screen.Extensions)
+        }
+        steps += 1400L to {
+            val chips = engineChips(scene)
+            println("UiShotTest: engine chips = " + chips.joinToString(" | "))
+            if (chips.none { it == "All" } || chips.none { it == "Hikari" } || chips.none { it == "Nuvio" }) {
+                println("UiShotTest: FAIL the Installed list has no engine chips")
+                failures[0]++
+            } else {
+                println("UiShotTest: OK   the Installed list offers one chip per engine")
+            }
+        }
+        steps += 300L to {
+            scene.root.lookupAll(".kind-chips .seg").filterIsInstance<javafx.scene.control.Button>()
+                .firstOrNull { it.text == "Hikari" }?.fire()
+        }
+        steps += 700L to {
+            val mine = installedNames(scene).filter { it.startsWith("ZZ Test") }
+            println("UiShotTest: with the Hikari chip on, test rows = " + mine)
+            if (mine.size == 2 && mine.all { it.contains("Hikari") }) {
+                println("UiShotTest: OK   picking Hikari leaves only the Hikari extensions")
+            } else {
+                println("UiShotTest: FAIL the Hikari chip did not narrow the Installed list")
+                failures[0]++
+            }
+            save(
+                scene.snapshot(WritableImage(scene.width.toInt(), scene.height.toInt())),
+                File(out, "n-extensions-engine-filter.png"),
+            )
+        }
+        steps += 300L to {
+            scene.root.lookupAll(".kind-chips .seg").filterIsInstance<javafx.scene.control.Button>()
+                .firstOrNull { it.text == "All" }?.fire()
+            chipProviders.forEach { runCatching { AppShell.app.store.removeProvider(it.id) } }
+        }
 
         // ── a repo that will not load: the card the user acts on ─────────────
         // This is the screen the bug reports are about, so it is worth looking
@@ -450,6 +601,66 @@ class UiShotApp : Application() {
             pause.play()
         }
         pump()
+    }
+
+    /** The detail banner's own back arrow (see DetailScreen.buildHero). */
+    private fun detailBackButton(scene: Scene): javafx.scene.control.Button? =
+        (scene.root.lookup("#heroBackBtn") as? javafx.scene.control.Button)
+            ?: scene.root.lookupAll(".hero-back")
+                .filterIsInstance<javafx.scene.control.Button>().firstOrNull()
+
+    /** The engine chips of the Installed list ("All | CloudStream | Hikari | …"). */
+    private fun engineChips(scene: Scene): List<String> =
+        scene.root.lookupAll(".kind-chips .seg").filterIsInstance<javafx.scene.control.Button>()
+            .mapNotNull { it.text }.toList()
+
+    /** The names of every rendered installed/repo row. */
+    private fun installedNames(scene: Scene): List<String> =
+        scene.root.lookupAll(".src-name")
+            .filterIsInstance<javafx.scene.control.Label>().mapNotNull { it.text }.toList()
+
+    /**
+     * The node that would take a click at a scene point — the same question
+     * JavaFX's own picking answers, walked by hand so the test can ask it.
+     *
+     * A Region with no background and no border is not pickable (JavaFX skips
+     * it), and nor is a mouse-transparent node, so both are skipped here too —
+     * otherwise every transparent wrapper would look like an obstruction.
+     */
+    private fun topmostAt(root: javafx.scene.Parent, sceneX: Double, sceneY: Double): javafx.scene.Node? {
+        for (child in root.childrenUnmodifiable.reversed()) {
+            if (!pickable(child)) continue
+            val local = child.sceneToLocal(sceneX, sceneY)
+            if (!runCatching { child.contains(local.x, local.y) }.getOrDefault(false)) continue
+            val deeper = if (child is javafx.scene.Parent) topmostAt(child, sceneX, sceneY) else null
+            return deeper ?: child
+        }
+        return null
+    }
+
+    private fun pickable(node: javafx.scene.Node): Boolean {
+        if (!node.isVisible || node.isMouseTransparent || node.opacity <= 0.01) return false
+        return when (node) {
+            is javafx.scene.layout.Region ->
+                node.isPickOnBounds || node.background != null || node.border != null
+            else -> true
+        }
+    }
+
+    /** True when [node] (or a child of it) is [ancestor] itself. */
+    private fun isInside(node: javafx.scene.Node, ancestor: javafx.scene.Node): Boolean {
+        var n: javafx.scene.Node? = node
+        while (n != null) {
+            if (n === ancestor) return true
+            n = n.parent
+        }
+        return false
+    }
+
+    /** True when a screen point is on this display (a click there can land). */
+    private fun onScreen(p: javafx.geometry.Point2D): Boolean {
+        val b = javafx.stage.Screen.getPrimary().visualBounds
+        return p.x > b.minX + 2 && p.y > b.minY + 2 && p.x < b.maxX - 2 && p.y < b.maxY - 2
     }
 
     /** The episode numbers currently on screen — read off the real tiles. */

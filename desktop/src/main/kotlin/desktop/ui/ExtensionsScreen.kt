@@ -178,6 +178,14 @@ class ExtensionsScreenView {
     }
     private val composerButton = Ui.button("Add repo", primary = true) { submitComposer() }.apply { minWidth = 128.0 }
     private val fileRow = HBox(8.0).apply { alignment = Pos.CENTER_LEFT; isVisible = false; isManaged = false }
+    /** The engine the Installed list is narrowed to, or null for "All".
+     *
+     *  The desktop twin of the Android picker's filter chips ("All | Aniyomi |
+     *  CloudStream | Hikari …"): picking one shows only that engine's
+     *  extensions, which no amount of scrolling a hundred-provider list can do
+     *  by hand. */
+    private var kindFilter: ProviderType? = null
+
     private val installedFilter = Ui.field("Filter installed…").apply {
         prefWidth = 220.0
         minWidth = 160.0
@@ -2274,6 +2282,7 @@ class ExtensionsScreenView {
                 HBox(10.0, installedFilter).apply { alignment = Pos.CENTER_RIGHT },
             )
         )
+        content.children.add(kindChips(all))
         fillInstalled()
         content.children.add(installedBox)
     }
@@ -2284,17 +2293,61 @@ class ExtensionsScreenView {
         installedBox.children.clear()
         val all = runCatching { AppShell.app.store.providers() }.getOrDefault(emptyList()).sortedBy { it.name.lowercase() }
         val query = installedFilter.text.trim().lowercase()
-        val list = all.filter { query.isEmpty() || it.name.lowercase().contains(query) }
+        val kind = kindFilter
+        val list = all
+            .filter { kind == null || it.type == kind }
+            .filter { query.isEmpty() || it.name.lowercase().contains(query) }
         if (all.isEmpty()) {
             installedBox.children.add(
                 Ui.emptyState(Icons.EXTENSIONS, "Nothing installed yet", "Add a repo above and install the extensions you want.")
             )
         } else if (list.isEmpty()) {
-            installedBox.children.add(themed("No extension matches “$query”.", "tiny"))
+            val engine = kind?.let { kindLabel(it) }
+            val why = when {
+                query.isNotEmpty() && engine != null -> "No $engine extension matches “$query”."
+                query.isNotEmpty() -> "No extension matches “$query”."
+                engine != null -> "No $engine extension is installed."
+                else -> "Nothing matches that filter."
+            }
+            installedBox.children.add(themed(why, "tiny"))
         } else {
             list.forEach { installedBox.children.add(installedRow(it)) }
         }
     }
+
+    /**
+     * The engine filter, laid out exactly like the Android picker's: `All` first,
+     * then one chip per engine that is actually installed. Selecting one narrows
+     * the Installed list below to that engine — "only the Hikari extensions",
+     * "only the Nuvio ones".
+     */
+    private fun kindChips(all: List<ProviderConfig>): HBox {
+        val kinds = all.map { it.type }.distinct().sortedBy { kindLabel(it) }
+        val index = kinds.indexOfFirst { it == kindFilter }.let { if (it < 0) 0 else it + 1 }
+        if (index == 0) kindFilter = null
+        val labels = listOf("All") + kinds.map { kindLabel(it) }
+        return Ui.segmented(labels, index) { picked ->
+            kindFilter = if (picked <= 0) null else kinds.getOrNull(picked - 1)
+            // Only the list below changes, and only it is repainted — rebuilding
+            // the whole screen here would drop the chip row mid-click.
+            fillInstalled()
+        }.apply {
+            // Its own class so the UI test can tell these chips from the composer's
+            // ("Hikari repo | CloudStream repo | …"), which is a segmented control
+            // too.
+            styleClass.add("kind-chips")
+        }
+    }
+
+    /**
+     * How an engine is named on a chip and on an installed row: the same names
+     * the rest of the app uses (see ProviderType.groupLabel), except that a
+     * universal scraper says so — it is a different kind of thing from a Hikari
+     * extension, and two chips both called "Hikari" would be a worse filter than
+     * no filter at all.
+     */
+    private fun kindLabel(type: ProviderType): String =
+        if (type == ProviderType.UNIVERSAL) "Scraper" else type.groupLabel
 
     private fun installedRow(cfg: ProviderConfig): Node {
         val status = AppShell.app.providers.statuses.value.firstOrNull { it.id == cfg.id }
@@ -2320,7 +2373,7 @@ class ExtensionsScreenView {
 
         val badges = HBox(6.0).apply {
             alignment = Pos.CENTER_RIGHT
-            children.add(Ui.badge(cfg.type.name, if (cfg.type == ProviderType.HIKARI) "badge-accent" else "badge"))
+            children.add(Ui.badge(kindLabel(cfg.type), if (cfg.type == ProviderType.HIKARI) "badge-accent" else "badge"))
             children.add(
                 if (failing != null) Ui.badge("not loaded", "badge-danger") else Ui.badge("loaded", "badge-ok")
             )
@@ -2330,25 +2383,44 @@ class ExtensionsScreenView {
             isSelected = cfg.enabled
             setOnAction {
                 runCatching { AppShell.app.store.setEnabled(cfg.id, isSelected) }
-                AppShell.uiScope.launch { AppShell.app.providers.refresh() }
-                renderAll()
+                AppShell.uiScope.launch {
+                    AppShell.app.providers.refresh()
+                    Fx.run { refreshHeader() }
+                }
             }
         }
         val reload = Ui.iconButton(Icons.REFRESH, "Reload this extension", 15.0) {
             AppShell.uiScope.launch {
                 AppShell.app.providers.refresh()
-                Fx.run { renderAll() }
+                // Only what shows provider state is repainted. Rebuilding the
+                // whole screen (every plugin row, every repo card) made "reload
+                // this one extension" as slow as opening the page.
+                Fx.run {
+                    fillInstalled()
+                    refreshHeader()
+                }
             }
             AppShell.toast("Reloaded providers")
         }
         val remove = Ui.iconButton(Icons.TRASH, "Remove", 15.0) {
+            // Local work only — the store row and the file. The list is repainted
+            // from the store immediately, so the row is gone the moment it is
+            // clicked; the provider-list refresh (which re-instantiates what is
+            // left) runs behind it.
             runCatching { AppShell.app.store.removeProvider(cfg.id) }
             if (cfg.url.isNotBlank() && cfg.type in setOf(ProviderType.HIKARI, ProviderType.CS3)) {
                 runCatching { File(cfg.url).delete() }
             }
-            AppShell.uiScope.launch { AppShell.app.providers.refresh() }
             setStatus("Removed ${cfg.name}")
-            renderAll()
+            fillInstalled()
+            refreshHeader()
+            AppShell.uiScope.launch {
+                AppShell.app.providers.refresh()
+                Fx.run {
+                    fillInstalled()
+                    refreshHeader()
+                }
+            }
         }
 
         val row = HBox(12.0, icon, info, badges, toggle, reload, remove).apply {

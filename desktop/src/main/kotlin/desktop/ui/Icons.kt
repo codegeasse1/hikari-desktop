@@ -41,6 +41,7 @@ object Icons {
     const val FULLSCREEN = "fullscreen"
     const val FULLSCREEN_EXIT = "fullscreen-exit"
     const val SUBTITLES = "subtitles"
+    const val QUALITY = "quality"
     const val SPEED = "speed"
     const val PIP = "pip"
 
@@ -227,6 +228,18 @@ object Icons {
             SVGPath().apply { content = "M19.8 9.2 H14.8 V4.2" },
             SVGPath().apply { content = "M14.8 19.8 V14.8 H19.8" },
             SVGPath().apply { content = "M4.2 14.8 H9.2 V19.8" },
+        )
+
+        QUALITY -> mix(
+            listOf(
+                Rectangle(2.6, 3.6).apply { x = 5.4; y = 12.6; arcWidth = 1.0; arcHeight = 1.0 },
+                Rectangle(2.6, 6.8).apply { x = 10.5; y = 9.4; arcWidth = 1.0; arcHeight = 1.0 },
+                Rectangle(2.6, 10.0).apply { x = 15.6; y = 6.2; arcWidth = 1.0; arcHeight = 1.0 },
+            ),
+            listOf(
+                Rectangle(20.4, 14.0).apply { x = 1.8; y = 3.4; arcWidth = 3.0; arcHeight = 3.0 },
+                Line(8.4, 21.4, 15.6, 21.4),
+            ),
         )
 
         SUBTITLES -> mix(

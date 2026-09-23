@@ -372,6 +372,49 @@ private fun test(host: Stage, mpvPath: String): Int {
         Thread.sleep(500)
         check("the channel reads back the picture's pause state", onFx { PlayerWindow.mpvPaused() } == false)
 
+        // ── the Quality picker, through the same channel ────────────────────
+        // The picture publishes the tracks it has (two video renditions, one
+        // audio, one subtitle); the Quality pill must offer Auto plus exactly the
+        // two renditions, and picking one must reach the picture as a `vid`.
+        fake.publishTrackList()
+        Thread.sleep(700)
+        val qualityRows = onFx { PlayerWindow.qualityItems() }
+        println("  quality menu rows: " + qualityRows)
+        check(
+            "the Quality menu offers Auto (adaptive) first",
+            qualityRows?.firstOrNull() == "Auto (adaptive)",
+            "" + qualityRows,
+        )
+        check(
+            "the Quality menu lists every video track and nothing else",
+            qualityRows?.size == 3,
+            "" + qualityRows,
+        )
+        check(
+            "a quality row carries the resolution being chosen between",
+            qualityRows?.getOrNull(1)?.contains("1080p") == true &&
+                qualityRows?.getOrNull(2)?.contains("720p") == true,
+            "" + qualityRows,
+        )
+        check("nothing is pinned before a choice is made", onFx { PlayerWindow.qualityChoice() } == "auto")
+        check("picking a quality row is accepted", onFx { PlayerWindow.pickQuality(2) } == true)
+        Thread.sleep(600)
+        check(
+            "the picked row becomes the current quality",
+            onFx { PlayerWindow.qualityChoice() } == "2",
+            "" + onFx { PlayerWindow.qualityChoice() },
+        )
+        check(
+            "the choice reaches the picture as a vid command",
+            fake.commands.any { it.startsWith("set_property vid 2") },
+            fake.commands.joinToString(" | ").take(300),
+        )
+        check("the picture's own vid is the one that was picked", fake.vid.toString() == "2", "" + fake.vid)
+        onFx { PlayerWindow.pickQuality(0) }
+        Thread.sleep(500)
+        check("Auto hands the choice back to the stream", onFx { PlayerWindow.qualityChoice() } == "auto")
+        check("Auto reaches the picture too", fake.vid.toString() == "auto", "" + fake.vid)
+
         onFx { PlayerWindow.clickPlayPause() }
         val paused = waitForFake(fake, true, 5_000L)
         check("pressing play/pause PAUSES the picture", paused == true, "channel=" + paused)
@@ -477,6 +520,41 @@ private class FakeMpvChannel {
     /** Every command the player sent, in order, for the log. */
     val commands = java.util.Collections.synchronizedList(ArrayList<String>())
 
+    /** The picture's video quality state (mpv's `vid`). */
+    @Volatile var vid: Any = "auto"
+
+    /** What the picture says its video tracks are — two renditions, so the
+     *  Quality picker has something to choose between. */
+    private val tracks = org.json.JSONArray().apply {
+        put(JSONObject().put("type", "video").put("id", 1)
+            .put("demux-w", 1920).put("demux-h", 1080).put("demux-bitrate", 4_200_000))
+        put(JSONObject().put("type", "video").put("id", 2)
+            .put("demux-w", 1280).put("demux-h", 720).put("demux-bitrate", 1_800_000))
+        put(JSONObject().put("type", "audio").put("id", 1).put("lang", "eng"))
+        put(JSONObject().put("type", "sub").put("id", 2).put("lang", "eng"))
+    }
+
+    private val writeLock = Any()
+
+    @Volatile private var channel: SocketChannel? = null
+
+    /** Pushes a `track-list` property change, exactly as mpv does when the file's
+     *  tracks are known — the path the Quality/Audio/Subs menus are built from. */
+    fun publishTrackList() {
+        val ch = channel ?: return
+        val message = JSONObject()
+            .put("event", "property-change")
+            .put("name", "track-list")
+            .put("data", tracks)
+        send(ch, message)
+    }
+
+    private fun send(ch: SocketChannel, json: JSONObject) {
+        synchronized(writeLock) {
+            runCatching { ch.write(ByteBuffer.wrap((json.toString() + "\n").toByteArray(StandardCharsets.UTF_8))) }
+        }
+    }
+
     init {
         server.bind(UnixDomainSocketAddress.of(path.toPath()))
         Thread({ serve() }, "fake-mpv-channel").apply { isDaemon = true; start() }
@@ -485,6 +563,7 @@ private class FakeMpvChannel {
     private fun serve() {
         runCatching {
             val ch = server.accept()
+            channel = ch
             val buffer = ByteBuffer.allocate(8192)
             val line = StringBuilder()
             while (true) {
@@ -524,18 +603,22 @@ private class FakeMpvChannel {
             }
             "set_property" -> {
                 if (name == "pause") paused = args.optBoolean(2)
+                if (name == "vid") vid = args.opt(2) ?: "auto"
                 data = paused
             }
-            "get_property" -> data = if (name == "pause") paused else 0
+            "get_property" -> data = when (name) {
+                "pause" -> paused
+                "vid" -> vid
+                "track-list" -> tracks
+                else -> 0
+            }
             else -> data = 0
         }
         val out = JSONObject()
         out.put("request_id", json.optLong("request_id"))
         out.put("error", "success")
         out.put("data", data)
-        runCatching {
-            ch.write(ByteBuffer.wrap((out.toString() + "\n").toByteArray(StandardCharsets.UTF_8)))
-        }
+        send(ch, out)
     }
 
     fun close() {

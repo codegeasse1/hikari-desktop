@@ -342,9 +342,17 @@ class DetailScreenView(private val item: MediaItem) {
         Ui.fill(side)
         Ui.fill(content)
         root.center = content
-        hero.isVisible = false
-        hero.isManaged = false
-        leftColumn.children.add(Ui.loadingRow("Loading details…"))
+        // The screen is painted from the catalog item we were handed, BEFORE any
+        // network call: the banner, the title block and the Synopsis/Details
+        // panels are already on screen when the click's frame ends. The item a
+        // grid hands over carries the title, year, genres, overview and artwork,
+        // so `metaFor` only ever *enriches* what is already there. Opening a
+        // title used to show an empty banner and a spinner while that round-trip
+        // ran, which is what "loading takes a moment" looked like.
+        renderHero(item)
+        renderFacts(item)
+        // The sources panel shows its own "Fetching sources…" spinner (see
+        // loadStreams), and the Episodes section pops in when the season lands.
         renderPanel()
         load()
     }
@@ -431,6 +439,10 @@ class DetailScreenView(private val item: MediaItem) {
     private fun renderHero(m: MediaItem) {
         hero.isVisible = true
         hero.isManaged = true
+        // The title/meta/action block appears with the details; until then the
+        // banner is an empty surface with the back arrow on it (see init).
+        heroBody.isVisible = true
+        heroBody.isManaged = true
         val provider = runCatching {
             AppShell.app.store.providers().firstOrNull { it.id == m.providerId }?.name
         }.getOrNull()
@@ -571,8 +583,22 @@ class DetailScreenView(private val item: MediaItem) {
             isMouseTransparent = true
         }
 
-        val back = Ui.iconButton(Icons.CHEVRON_LEFT, "Back", 18.0) { AppShell.back() }.apply {
-            styleClass.add("round-btn")
+        // The banner's own back arrow. Two things about it are load-bearing:
+        //
+        //  - it carries NO tooltip. A JavaFX tooltip is a popup window of its
+        //    own, and a click that arrives while one is up is spent dismissing it
+        //    instead of pressing the button (see Ui.tooltip) — on a one-click
+        //    control that reads as "the back button does not work". The arrow
+        //    needs no label anyway: the shell's top bar spells "Back" out right
+        //    above it.
+        //  - it is added to the StackPane LAST (see the children.addAll at the
+        //    end of this function), so nothing painted over the banner — the
+        //    title block, the poster card, the scrims — can cover it or take its
+        //    clicks.
+        val back = Ui.iconButton(Icons.CHEVRON_LEFT, null, 18.0) { AppShell.back() }.apply {
+            styleClass.addAll("round-btn", "hero-back")
+            id = "heroBackBtn"
+            accessibleText = "Back"
         }
         StackPane.setAlignment(back, Pos.TOP_LEFT)
         StackPane.setMargin(back, Insets(16.0, 0.0, 0.0, 16.0))
@@ -587,7 +613,9 @@ class DetailScreenView(private val item: MediaItem) {
         StackPane.setAlignment(heroPosterFrame, Pos.BOTTOM_RIGHT)
         StackPane.setMargin(heroPosterFrame, Insets(0.0, 26.0, 24.0, 0.0))
 
-        hero.children.addAll(heroImage, scrim, scrimR, back, topRight, heroBody, heroPosterFrame)
+        // Paint order IS click priority in JavaFX: the back arrow goes in last so
+        // it is on top of everything the banner draws.
+        hero.children.addAll(heroImage, scrim, scrimR, heroBody, heroPosterFrame, topRight, back)
     }
 
     private fun toggleFavourite() {

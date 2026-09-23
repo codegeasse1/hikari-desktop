@@ -286,6 +286,13 @@ jobs:
           java -cp "jpackage-input/*" com.hikari.app.net.RepoFetchSelfTestKt
         shell: bash
 
+      - name: Extension install self-test (release assets, mirrors, the OS TLS stack)
+        if: always()
+        timeout-minutes: 8
+        run: |
+          set -e
+          java -cp "jpackage-input/*" com.hikari.app.net.ExtensionInstallSelfTestKt
+        shell: bash
       - name: Diagnose packaged runtime
         run: |
           set +e
