@@ -780,6 +780,168 @@ player looking like "close the player" and took the whole app (and the playback)
 down. The player now has its own two controls: minimise, and a close that closes
 the PLAYER (`requestClose`, the same thing the back arrow and Esc do).
 
+## Stage 11 — the install that could never work, the dead back arrow, and the player's Quality button (done)
+
+### 1. "ALL extensions fail to install" — one line of `mirrorVariants` was the whole cause
+
+This is the one that had been "fixed" for several builds, so the important part is
+what it actually was.
+
+The official Hikari repo (`codegeasse1/hikari-extensions`, 142 extensions)
+publishes **every extension as a GitHub RELEASE ASSET**:
+`https://github.com/codegeasse1/hikari-extensions/releases/download/continuous/<name>.jar`.
+`Http.mirrorVariants` only knew how to build mirrors for a **raw file path** — it
+parsed the URL with `parseGhTarget` (which matches
+`raw.githubusercontent.com/u/r/ref/p` and `github.com/u/r/raw|blob/ref/p` only),
+and when that parse failed it returned an **empty list**. A `/releases/download/`
+URL matches neither, so every extension in that repo had exactly ONE candidate URL
+and **no mirror at all**. On a network where github.com is blocked or TLS-filtered
+there was nothing else to try — which is precisely the two messages in the bug
+reports: *"Download failed for S1CG — no mirror served the file"* and *"the TLS
+handshake is being blocked by this network"*. Not a slow install, not a flaky
+mirror: a list of length one.
+
+The fix is that a GitHub URL the repo parser cannot decompose is now handed to the
+proxy frontdoors, which are the only mirrors a release asset can have:
+
+- `mirrorVariants` returns `githubFrontdoors(base)` whenever `isGithubUrl(base)`
+  (a new host test over `github.com`, `raw.githubusercontent.com`,
+  `objects.githubusercontent.com`, `release-assets.githubusercontent.com`,
+  `github-releases.githubusercontent.com`, `codeload.github.com`,
+  `gist.githubusercontent.com`) instead of the empty list it used to return;
+- `githubFrontdoors` is unchanged in shape — `ghfast.top`, `ghproxy.net`,
+  `gh-proxy.com`, `ghproxy.cc`, `gh.llkk.cc`, `github.moeyy.xyz`,
+  `hub.gitmirror.com`, each handed the **full** URL — but is now generated for
+  release assets as well as raw paths;
+- release assets are deliberately **not** offered the jsDelivr/githack mirrors
+  (those publish branch files only, so they can only ever 404 — offering them
+  would just lengthen every race);
+- and since a release asset's *authoritative* list is github.com on its own, it
+  gets `RELEASE_ORIGIN_FIRST_MS = 4_000` instead of the usual 12 s before the
+  frontdoors join the race. Waiting a full origin window on a host with no
+  alternative is a pure delay.
+
+Measured on CI, against the live repo (`ExtensionInstallSelfTest`, new):
+
+```
+— a release asset: …/hikari-extensions/releases/download/continuous/anime.jar
+    origins (1):  github.com/…/anime.jar
+    mirrors (7):  ghfast.top/https://github.com/…  ghproxy.net/…  gh-proxy.com/…
+                  ghproxy.cc/…  gh.llkk.cc/…  github.moeyy.xyz/…  hub.gitmirror.com/…
+  OK   a release asset is its own first candidate
+  OK   a release asset has at least 3 mirrors
+  OK   a release asset can go through a GitHub frontdoor
+  OK   a release asset is NOT offered a CDN mirror that cannot serve it
+— the live Hikari repo lists 142 extensions
+  OK   no extension in the live repo is left with a single candidate URL
+— downloading the Anime extension: ok=true in 402ms, 405736 bytes
+  OK   what landed is a real archive (PK header), not an error page
+  OK   a real extension arrives in seconds, not minutes
+— downloading a Nuvio scraper: 15572 bytes in 215ms
+```
+
+### 2. The last resort: the OS's own HTTP stack
+
+There is a class of Windows machine where **nothing** inside the JVM can fetch the
+file while the browser fetches it fine — a TLS-inspecting filter, a driver-level
+firewall, a certificate the JVM's stack refuses. Every in-JVM pass (`Conscrypt`,
+the pinned trust store, the TLS-1.2 rescue, the no-proxy rescue) presents the same
+chain to the same trust decision, so no amount of ladder-walking rescues it.
+
+`Http` now has a final phase that runs `curl.exe` (System32 first, then PATH) or
+`powershell.exe` — Schannel and the Windows certificate store, i.e. literally the
+stack the browser uses, in a **separate process**, so none of this JVM's TLS,
+trust store, proxy handling or DNS is involved. It races the same candidate list
+(`OS_PARALLELISM = 4`, `OS_WINDOW_MS = 25_000`), rejects an HTML error page the
+same way the in-JVM paths do (`looksLikeHtmlFile`), and is bounded by whatever is
+left of the 60 s install budget. It is only ever reached after every other pass has
+failed, so a healthy network pays nothing for it.
+
+It is also wired into `fetchStringRobust`/`fetchBytesRobust`/`fetchRepoJson`, so a
+**repo** that only the OS stack can reach loads too. The CI runner is Windows, so
+this is not a claim: `— the OS HTTP client on this machine: C:\Windows\System32\curl.exe`
+→ `— OS client fetch of the release asset: ok in 354ms, 405736 bytes`.
+
+### 3. The detail banner's back arrow did nothing
+
+The arrow had a tooltip. A JavaFX tooltip is its own popup window, and a click that
+arrives while one is up is spent dismissing the popup instead of pressing the
+button — a hazard this repo already documents on `Ui.tooltip`, and precisely a
+one-click control that reads as "the back button does not work". Two more things
+were load-bearing and are now explicit:
+
+- the arrow carries **no** tooltip (the shell's top bar already spells "Back" out
+  above it), has `accessibleText = "Back"`, and `id = "heroBackBtn"`;
+- it is added to the banner's `StackPane` **last**, so nothing the banner draws —
+  the title block, the poster card, the scrims — can cover it or take its clicks;
+- `AppShell.back()` no longer steps back **into** the screen already showing (a
+  Detail opened from a Detail made the arrow a visible no-op), and exposes
+  `AppShell.current` so a test can tell "it navigated" from "it did nothing".
+
+The UI-shot test now proves it with a **real mouse**: it finds the arrow, reports
+the topmost pickable node at its centre and fails if anything covers it, then
+dwells 1.4 s (longer than the 900 ms tooltip delay, so a tooltip would be up) and
+clicks it with `java.awt.Robot`:
+
+```
+UiShotTest: back arrow: visible=true disabled=false centre on screen=Point2D [x = 271.0, y = 95.5]
+UiShotTest: clicked the banner's back arrow with the real mouse
+UiShotTest: OK   the banner's back arrow navigates back (now desktop.ui.Screen$Home@…)
+```
+
+### 4. The player's Quality button
+
+The player had Source, Audio and Subs but no quality picker. It now has a
+**Quality** pill between Source and Audio, built from mpv's own `track-list`
+(`vid`) — not from the provider's source list, because the track list is what the
+file actually contains, which is also where the Android player reads it from. Rows
+read `Auto (adaptive)` first, then every video rendition as
+`1080p · 1920x1080 · 4.2 Mbps` (resolution first — that is what is being chosen
+between — with the bitrate only when the stream declares one). Choosing one sends
+`set_property vid <id>`; `Auto` sends `vid auto`. The pill greys out and empties
+when the stream publishes no video tracks (nothing to choose between), and it
+collapses with Audio/Subs on a narrow window like the rest of the pickers.
+
+`FloatingBarsSelfTest` drives this through the fake channel's real command loop:
+`FakeMpvChannel` now answers `track-list` and `vid`, and the test asserts the rows
+are `[Auto (adaptive), 1080p …, 720p …]`, that picking row 2 puts
+`set_property vid 2` on the wire and the picture's own `vid` becomes `2`, and that
+row 0 hands it back to `auto`.
+
+### 5. "Clicking Hikari shows only the Hikari extensions" — the engine filter
+
+The Android app's picker has a chip row (`All | Aniyomi | CloudStream | Hikari | …`).
+The desktop Installed list now has the same control, built from the engines that
+are actually **installed** (so the chips are exactly the engines in use), with
+`All` first. A universal scraper is labelled `Scraper` rather than `Hikari` — it is
+a different kind of thing, and two chips with the same name would be a worse filter
+than none. Selecting a chip narrows the list and only the list: rebuilding the
+whole page on every chip click is what would drop the chip row mid-click.
+
+The test registers four fake providers across three engines, asserts the chips, and
+fires the Hikari chip:
+
+```
+UiShotTest: engine chips = All | CloudStream | Hikari | Nuvio | Stremio
+UiShotTest: with the Hikari chip on, test rows = [ZZ Test Hikari One, ZZ Test Hikari Two]
+UiShotTest: OK   picking Hikari leaves only the Hikari extensions
+```
+
+### 6. "Everything instant" — the two that were still waiting on the network
+
+- **Uninstall / reload / toggle** no longer call `renderAll()`. Those actions
+  rewrite the store and the file on the spot and repaint *only* the installed list
+  and the header; the provider-list refresh (which re-instantiates the extensions
+  that are left) runs behind them. Removing a row used to rebuild the whole
+  screen — every plugin row, every repo card — before the row disappeared.
+- **Opening a title** no longer waits for `metaFor` before it paints. The catalog's
+  own `MediaItem` already carries the title, year, genres, overview and artwork, so
+  the banner, the title block and the Synopsis/Details panels are drawn **before any
+  network call**, in the same frame as the click; `metaFor` then only *enriches*
+  what is already on screen, and the Episodes section drops in when the season
+  lands. The sources panel shows its own `Fetching sources…` spinner, which is the
+  one thing that genuinely has to wait.
+
 ## Still to do
 
 ### i18n
