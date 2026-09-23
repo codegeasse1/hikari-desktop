@@ -1185,7 +1185,12 @@ class ExtensionsScreenView {
             }
             RepoKind.NUVIO -> {
                 val root = manifest.root ?: return emptyList()
-                val baseUrl = manifest.url.substringBeforeLast('/')
+                // The manifest is fetched from whichever mirror answers first, and
+                // these plugin paths are RELATIVE — so without this the plugin URLs
+                // inherit the winner's host (in practice a cdn.jsdelivr.net URL,
+                // which is then a single candidate everywhere: see
+                // Http.canonicalGithubFileUrl and mirrorVariants).
+                val baseUrl = Http.canonicalGithubFileUrl(manifest.url).substringBeforeLast('/')
                 val out = LinkedHashMap<String, PluginRef>()
                 val arr = root.optJSONArray("scrapers") ?: JSONArray()
                 for (i in 0 until arr.length()) {
@@ -1230,7 +1235,10 @@ class ExtensionsScreenView {
                 }
                 return out.values.toList()
             }
-            else -> return parseCloudStreamPlugins(manifest.root, manifest.url)
+            // Same reasoning as the Nuvio branch: relative plugin/list URLs are
+            // resolved against the CANONICAL form of the file that referenced
+            // them, never against whichever mirror happened to serve it.
+            else -> return parseCloudStreamPlugins(manifest.root, Http.canonicalGithubFileUrl(manifest.url))
         }
     }
 

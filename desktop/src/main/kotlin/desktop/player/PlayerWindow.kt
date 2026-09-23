@@ -1372,17 +1372,52 @@ object PlayerWindow {
         // on the row leave plenty of room, and on a narrow one the length is the
         // first thing to go. Its floor (90px) is what keeps it scrubbable when
         // the window is at its smallest.
-        seekBar?.let { it1 ->
-            val length = (width - 480.0).coerceIn(90.0, 620.0)
-            it1.minWidth = 90.0
-            it1.prefWidth = length
-            it1.maxWidth = length
+        // The seek bar gets whatever is LEFT of the row, and that budget is
+        // MEASURED from the controls that are actually there — never a constant.
+        // The old "controls need ≈480px" was written when the bar had three
+        // pickers; adding the fourth silently took ~90px of the row, so the
+        // pickers were squeezed below the width of their own labels and JavaFX
+        // ellipsized them ("Quality" → "Qua…", "00:00" → "0…") while the seek bar
+        // still had all of its length. Anything added to the bar is now accounted
+        // for automatically.
+        val row = bottomBar
+        if (row != null) {
+            var need = 0.0
+            var shown = 0
+            for (child in row.children) {
+                if (child === seekBar) continue
+                if (!child.isVisible || !child.isManaged) continue
+                shown++
+                val r = child as? Region
+                val w = r?.prefWidth(-1.0) ?: 0.0
+                need += if (w > 0.0) w else (r?.minWidth(-1.0) ?: 0.0).coerceAtLeast(0.0)
+            }
+            if (shown > 1) need += row.spacing * (shown - 1)
+            seekBar?.let { it1 ->
+                val length = (width - need - 10.0).coerceIn(90.0, 620.0)
+                it1.minWidth = 90.0
+                it1.prefWidth = length
+                it1.maxWidth = length
+            }
         }
+        // ...and the labels that must never be reduced to "Qua…" or "0…" say so.
+        // A pill whose text no longer fits is worse than a shorter seek bar: the
+        // picker is the control the user is reaching for, and a truncation is
+        // indistinguishable from a different label.
+        for (menu in listOf(sourceMenu, qualityMenu, audioMenu, subMenu)) {
+            menu ?: continue
+            menu.minWidth = javafx.scene.layout.Region.USE_PREF_SIZE
+        }
+        timeLabel?.minWidth = javafx.scene.layout.Region.USE_PREF_SIZE
         // Below 620px the row is carryable without the total-time label: the
         // elapsed time and the seek bar still say where playback is, and dropping
         // the label is what stops the remaining controls being squeezed into each
         // other (the seek bar keeps its own length either way).
-        totalLabel?.let { it.isVisible = width >= 620.0; it.isManaged = width >= 620.0 }
+        totalLabel?.let {
+            it.minWidth = javafx.scene.layout.Region.USE_PREF_SIZE
+            it.isVisible = width >= 620.0
+            it.isManaged = width >= 620.0
+        }
     }
 
     private fun roundButton(icon: String, tooltip: String, iconSize: Double, diameter: Double, onClick: () -> Unit): Button =

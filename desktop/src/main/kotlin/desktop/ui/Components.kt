@@ -35,6 +35,17 @@ import javafx.util.Duration
  */
 object Ui {
 
+    /**
+     * How an engine is named wherever the UI groups providers by it: the catalog
+     * picker's chips, the Extensions list's chips and its row badges. One place,
+     * so the two lists cannot end up calling the same engine two different
+     * things. A universal scraper says so rather than "Hikari" — it is a
+     * different kind of thing, and two chips with the same name would be a worse
+     * filter than no filter at all.
+     */
+    fun providerEngineLabel(type: com.hikari.app.data.ProviderType): String =
+        if (type == com.hikari.app.data.ProviderType.UNIVERSAL) "Scraper" else type.groupLabel
+
     // ---- buttons ------------------------------------------------------------
 
     fun button(

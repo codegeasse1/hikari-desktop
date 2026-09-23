@@ -57,13 +57,29 @@ fun main() {
         "a release asset" to releaseAsset,
         "a raw file" to rawFile,
         "a repo manifest" to repoFile,
+        "a jsDelivr-hosted file" to "https://cdn.jsdelivr.net/gh/tapframe/nuvio-providers@main/providers/4khdhub.js",
+        "a githack-hosted file" to "https://raw.githack.com/tapframe/nuvio-providers/main/providers/4khdhub.js",
+        "a frontdoor-wrapped URL" to "https://ghfast.top/https://raw.githubusercontent.com/tapframe/nuvio-providers/main/providers/4khdhub.js",
     )) {
         val origins = Http.originVariants(url)
         val mirrors = Http.mirrorVariants(url)
         println("— $label: $url")
         println("    origins (${origins.size}): " + origins.joinToString(" "))
         println("    mirrors (${mirrors.size}): " + mirrors.joinToString(" "))
-        check("$label is its own first candidate", origins.firstOrNull() == url, origins.firstOrNull() ?: "none")
+        // The caller's own URL is always a candidate (it is what the repo
+        // published, and the one a browser would use).
+        check("$label is one of its own candidates", origins.contains(url), origins.joinToString(" "))
+        // ...and for a CDN/frontdoor form the canonical RAW file comes first,
+        // because a CDN copy of a branch file can be days old.
+        if (label != "a raw file" && label != "a repo manifest" && label != "a release asset") {
+            check(
+                "$label is canonicalized to raw before anything else",
+                origins.firstOrNull()?.startsWith("https://raw.githubusercontent.com/tapframe/nuvio-providers/") == true,
+                origins.firstOrNull() ?: "none",
+            )
+        } else {
+            check("$label is its own first candidate", origins.firstOrNull() == url, origins.firstOrNull() ?: "none")
+        }
         check("$label has at least 3 mirrors", mirrors.size >= 3, "got ${mirrors.size}")
         // A frontdoor is handed the FULL GitHub URL — that is the only kind of
         // mirror a release asset can have, and what this fix is.
@@ -126,6 +142,70 @@ fun main() {
         head.joinToString(" ") { (it.toInt() and 0xFF).toString(16) },
     )
     check("a real extension arrives in seconds, not minutes", ms < 30_000L, "${ms}ms")
+
+    // ── 3b. the exact repo behind "Download failed — check the URL" ─────────
+    // All-in-One-Nuvio's manifest is fetched from whichever mirror answers
+    // first, and its plugin paths are RELATIVE ("providers/allanime.js"), so the
+    // URL that reaches the installer is built on top of that winner — a
+    // cdn.jsdelivr.net URL, on every machine where jsDelivr wins the race. With
+    // no way to mirror a jsDelivr URL that left ONE candidate for every plugin
+    // in the repo, so on a network that cannot reach jsDelivr every install
+    // failed with "Download failed — check the URL". This walks the app's own
+    // path end to end.
+    val allInOne = "https://raw.githubusercontent.com/D3adlyRocket/All-in-One-Nuvio/refs/heads/main/manifest.json"
+    val served = Http.fetchRepoJson(allInOne).getOrNull()?.first
+    println("— All-in-One-Nuvio manifest served by: $served")
+    // Relative plugin paths resolve against the manifest's DIRECTORY, exactly as
+    // ExtensionsScreen does it (`canonicalGithubFileUrl(manifest.url)
+    // .substringBeforeLast('/')`).
+    val canonicalBase = Http.canonicalGithubFileUrl(served ?: allInOne).substringBeforeLast('/')
+    println("— ...canonicalized for relative plugin paths to: $canonicalBase")
+    check(
+        "a mirror-served manifest still resolves its relative plugin paths to raw.github",
+        canonicalBase == "https://raw.githubusercontent.com/D3adlyRocket/All-in-One-Nuvio/main",
+        canonicalBase,
+    )
+    val allInOneJson = Http.fetchRepoJson(allInOne).getOrNull()?.second
+    val scrapers = allInOneJson?.let { runCatching { JSONObject(it).optJSONArray("scrapers") }.getOrNull() }
+    println("— its manifest lists ${scrapers?.length() ?: 0} scrapers")
+    check("the repo's manifest parses as a Nuvio repo", (scrapers?.length() ?: 0) > 10, "" + scrapers?.length())
+    // The plugin URL the All-in-One repo produces, both ways: canonical (raw) and
+    // the jsDelivr one a mirror-served manifest used to hand over.
+    val canonicalPlugin = "$canonicalBase/providers/allanime.js"
+    val jsdelivrPlugin = "https://cdn.jsdelivr.net/gh/D3adlyRocket/All-in-One-Nuvio@main/providers/allanime.js"
+    println("— plugin URL (canonical): $canonicalPlugin")
+    println("    origins (" + Http.originVariants(canonicalPlugin).size + "), mirrors (" +
+        Http.mirrorVariants(canonicalPlugin).size + ")")
+    println("— plugin URL (jsDelivr): $jsdelivrPlugin")
+    println("    origins (" + Http.originVariants(jsdelivrPlugin).size + "): " +
+        Http.originVariants(jsdelivrPlugin).joinToString(" "))
+    println("    mirrors (" + Http.mirrorVariants(jsdelivrPlugin).size + "): " +
+        Http.mirrorVariants(jsdelivrPlugin).joinToString(" "))
+    check(
+        "a jsDelivr plugin URL is offered the raw file AND the other CDN edges",
+        Http.mirrorVariants(jsdelivrPlugin).any { it.startsWith("https://fastly.jsdelivr.net/") } &&
+            Http.mirrorVariants(jsdelivrPlugin).any { it.contains("raw.githack.com/") },
+        Http.mirrorVariants(jsdelivrPlugin).joinToString(" "),
+    )
+    check(
+        "a jsDelivr plugin URL is offered a proxy frontdoor (what rescues a jsDelivr-blocked network)",
+        Http.mirrorVariants(jsdelivrPlugin).any { it.startsWith("https://ghfast.top/") },
+        Http.mirrorVariants(jsdelivrPlugin).joinToString(" "),
+    )
+    val canonicalBytes = Http.fetchBytesRobust(canonicalPlugin)
+    val jsdelivrBytes = Http.fetchBytesRobust(jsdelivrPlugin)
+    println("— the plugin downloads: canonical=${canonicalBytes?.size ?: 0} bytes, " +
+        "jsDelivr URL=${jsdelivrBytes?.size ?: 0} bytes")
+    check(
+        "the plugin downloads from the canonical raw URL",
+        canonicalBytes != null && canonicalBytes.size > 1000 && !Http.isWebPage(canonicalBytes),
+        "" + canonicalBytes?.size,
+    )
+    check(
+        "the plugin downloads when all the app has is the jsDelivr URL",
+        jsdelivrBytes != null && jsdelivrBytes.size > 1000 && !Http.isWebPage(jsdelivrBytes),
+        "" + jsdelivrBytes?.size,
+    )
 
     // ── 4. a real Nuvio scraper (raw file) downloads ────────────────────────
     val t1 = System.currentTimeMillis()

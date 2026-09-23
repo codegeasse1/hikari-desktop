@@ -956,6 +956,134 @@ the difference that made this invisible.
   lands. The sources panel shows its own `Fetching sources…` spinner, which is the
   one thing that genuinely has to wait.
 
+## Stage 12 — the second install failure, the provider sheet on Home, and the Play button that was never clickable (done)
+
+### 1. "Neither extension will install" — a jsDelivr URL still had a mirror list of one
+
+Stage 11 taught `mirrorVariants` about release assets. The same class of hole was
+left open one step over: an extension URL that is served **from a CDN**.
+
+The All-in-One-Nuvio repo (`D3adlyRocket/All-in-One-Nuvio`, since renamed to
+`NuvioPlugin/All-in-One-Nuvio`) serves its `manifest.json` from whichever mirror
+answers first, and its entries carry **relative** paths (`providers/allanime.js`).
+That is fine on paper — except the relative path was joined onto the *winning
+mirror's* base, so in practice the plugin URL came out as
+`cdn.jsdelivr.net/gh/…@main/providers/allanime.js`. `parseGhTarget` did not know a
+jsDelivr URL, so `mirrorVariants` again returned a list of exactly ONE candidate —
+and on a network where jsDelivr is blocked, "Download failed — check the URL".
+
+- `parseGhTarget` now decomposes **every published form of a GitHub file**: raw,
+  raw-path, `github.com/…/raw|blob/`, jsDelivr (`cdn.`, `fastly.`, `gcore.`,
+  `testingcf.jsdelivr.net`), jsDelivr's `bcdn` form, and githack. They all reduce
+  to `{owner, repo, ref, path}`, so they all yield the same family.
+- `Http.canonicalGithubFileUrl(url)` is the one public entry point for "what is the
+  authoritative URL for this file": it maps any of those forms to
+  `https://raw.githubusercontent.com/<owner>/<repo>/<ref>/<path>`.
+- `originVariants` puts the **canonical raw** URL first when the caller's URL was a
+  CDN/frontdoor form (the CDN copy is the one that can be stale or blocked on the
+  user's network), and keeps the caller's URL first otherwise, so nothing that
+  worked before changed order.
+- `mirrorVariants` returns the whole family (minus the base itself) instead of
+  whichever single form happened to be recognised.
+- `ExtensionsScreen` resolves a manifest entry's relative `filename` against
+  `Http.canonicalGithubFileUrl(manifest.url).substringBeforeLast('/')`, so the
+  plugin URL is built on raw.githubusercontent.com **no matter which mirror served
+  the manifest** — which is the actual bug the user was hitting.
+- `ExtensionInstallSelfTest` §1 now walks a jsDelivr URL, a githack URL and a
+  frontdoor-wrapped URL as well as the raw ones, and §3b walks the real
+  All-in-One-Nuvio repo end to end: manifest served → 65 scrapers → canonical raw
+  plugin URL → that plugin's bytes downloaded (19 281 B) → 12 mirrors for the
+  jsDelivr form.
+
+### 2. The provider picker on Home — the Android provider sheet, in the desktop toolbar
+
+The catalog's source used to be chosen from a plain combo box holding one flat,
+alphabetical list of every enabled provider. With six engines and a hundred
+providers that is a scroller you cannot search, and it decides which catalog the
+whole home page is built from.
+
+`desktop/ui/ProviderPicker.kt` is the Android sheet: a filter field, **one chip per
+engine that actually has providers** (`All | CloudStream | Hikari | Nuvio |
+Stremio | …`), and the list, with `All providers` as the first row and an engine
+badge on every row. It replaces the combo box in `HomeScreen`'s toolbar and calls
+back on every pick, so the page reloads from the new provider. Details that matter:
+
+- it is a `Popup` — a window with a scene of its own — so its stylesheets are
+  copied from the main scene at show time (the sheet is drawn entirely in
+  looked-up colours);
+- `setProviders` runs on every load, keeps the user's choice, and drops a selection
+  whose provider was just uninstalled;
+- chips are built for engines that have providers *right now*, so a chip can never
+  filter to an empty list.
+- `UiShotTest` drives it through the picker's own hooks (a `Popup` is not reachable
+  through the app's scene graph): it opens the sheet, requires `All` + one chip per
+  engine, requires `All providers` as the first row, presses the `Hikari` chip and
+  requires only Hikari rows, picks a row and requires the button text and the
+  **catalog source** to change, then requires that pick to survive its own reload.
+
+### 3. The Play button: an invisible, stretched box was lying over the whole banner
+
+Reported three times now ("the Play button is unclickable", and before that "the
+back arrow is dead"). Both are the same failure: in JavaFX **paint order is click
+priority**, and a container that draws nothing still takes the click.
+
+`buildHero` put the "Add to library" cluster in
+`topRight = VBox(8.0, favouriteButton)` with `StackPane.setAlignment(topRight,
+TOP_RIGHT)`. A StackPane resizes a child up to the child's **max** size, a VBox's
+max size is unbounded, and nothing said otherwise — so that little container was
+stretched over the **entire banner**. It was added after the title block, which put
+it above the Play button in the paint order, and it has no background, so it drew
+nothing at all: the screenshot looked perfect while every click landed on it instead
+of on Play, Download, or anything else under it. The test now names it:
+
+```
+UiShotTest: over the Play button, topmost first:
+UiShotTest:     Button[id=heroPlayBtn cls=button.btn-play] scene=(264,324 104x43) …
+```
+
+The fix, all of it defensive:
+
+- `topRight` is sized to its own content (`maxWidth`/`maxHeight =
+  `Region.USE_PREF_SIZE`) — a container is never allowed to be bigger than what it
+  holds;
+- the artwork (`heroImage`) and the poster card (`heroPosterFrame`) are
+  `isMouseTransparent` — decoration must never be a pick target on a banner with
+  buttons on it;
+- `heroBody` (the title/meta/chips/**Play + Download** block) is added LAST, just
+  before the back arrow, so nothing but the arrow can be painted over it.
+
+`UiShotTest` now prints **every node covering the button's centre, topmost first**
+(with class, id, style classes, scene bounds and the picking flags) so this can
+never be guessed at again; it fails if the topmost node is not the button or a
+child of it, then clicks it with a real `java.awt.Robot` press/release and requires
+`DetailScreenTestSeam.playPresses >= 1`. A screenshot cannot tell "the button is
+there" from "the button is there but dead" — this can.
+
+### 4. The player's bar: the seek bar's budget is measured, not assumed
+
+"the player button are not have full text also the time in player video time not
+showing full" — the pickers read `Qua…`, `Au…`, `Sub…`, the clock `0…`.
+
+`applyResponsive` sized the seek bar from a hard-coded `width - 480.0`, and that 480
+was written when the bar had **three** pickers. Adding the Quality pill silently
+took ~90 px out of the row, so the seek bar kept its full length and the *pickers*
+were laid out narrower than their own labels, which JavaFX draws with an ellipsis.
+
+- the budget is now **measured**: every visible, managed control on the bar (skipping
+  the seek bar) contributes its `prefWidth(-1)`, plus the row's spacing, and the seek
+  bar gets `width - need - 10` clamped to `[90, 620]`. Anything added to the bar from
+  now on is accounted for automatically;
+- the source/quality/audio/subtitle menus and the two time labels carry
+  `minWidth = Region.USE_PREF_SIZE`: a pill whose text no longer fits is worse than
+  a shorter seek bar, because "Qua…" is indistinguishable from a different label;
+- below 620 px the **total**-time label drops out (the elapsed time and the seek bar
+  still say where playback is) rather than squeezing everything else.
+
+`UiShotTest.squeezedBarControls` compares each control's laid-out width with its
+computed preferred width on the wide bar *and* on the 460 px one — a control's
+`text` is unchanged by truncation, so measuring is the only way to catch this from a
+test.
+
 ## Still to do
 
 ### i18n

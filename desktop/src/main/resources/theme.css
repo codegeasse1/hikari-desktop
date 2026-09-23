@@ -1029,6 +1029,48 @@
 .seg:hover { -fx-text-fill: -h-fg; }
 .seg-sel, .seg-sel:hover { -fx-background-color: -h-surface-4; -fx-text-fill: -h-fg; -fx-font-weight: bold; }
 
+/*
+ * The catalog provider picker (ProviderPicker): the button in the home toolbar
+ * and the sheet it opens. Every state is spelled out rather than inherited — the
+ * button wears `.combo-box`, and a rule that only sets the border would let the
+ * platform's own `.button:hover` background show through.
+ */
+.provider-picker {
+    -fx-background-color: -h-surface;
+    -fx-border-color: -h-border;
+    -fx-border-radius: 9;
+    -fx-background-radius: 9;
+    -fx-padding: 5 10 5 12;
+    -fx-text-fill: -h-fg;
+    -fx-font-size: 12.5px;
+    -fx-cursor: hand;
+}
+.provider-picker:hover { -fx-background-color: -h-surface; -fx-border-color: -h-border-2; }
+.provider-picker:pressed { -fx-background-color: -h-surface-3; }
+.provider-picker:focused { -fx-border-color: -h-accent-line; }
+.provider-picker .h-icon { -fx-fill: -h-fg-3; }
+
+.picker-pop {
+    -fx-background-color: -h-surface-2;
+    -fx-background-radius: 12;
+    -fx-border-color: -h-border-2;
+    -fx-border-width: 1;
+    -fx-border-radius: 12;
+    -fx-padding: 12;
+    -fx-effect: dropshadow(gaussian, -h-shadow-3, 22, 0, 0, 8);
+}
+.picker-list { -fx-padding: 2 0 2 0; }
+.picker-row {
+    -fx-background-color: transparent;
+    -fx-background-radius: 8;
+    -fx-padding: 7 10 7 10;
+    -fx-cursor: hand;
+}
+.picker-row:hover { -fx-background-color: -h-surface-3; }
+.picker-row-sel { -fx-background-color: -h-accent-soft; }
+.provider-chips { -fx-padding: 3; }
+.provider-search { -fx-font-size: 12.5px; }
+
 .repo-card {
     -fx-background-color: -h-surface-2;
     -fx-border-color: -h-border;

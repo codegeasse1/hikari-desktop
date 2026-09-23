@@ -470,6 +470,11 @@ object AppShell {
 
     val app get() = HikariApp.instance
 
+    /** The home screen, for the UI test: it has to drive the provider picker
+     *  (whose sheet lives in a `Popup`, i.e. a window of its own) the way a user
+     *  does. Nothing in the app itself reaches for this. */
+    val homeView get() = homeScreen
+
     // ── window / player-layer hooks ─────────────────────────────────────────
 
     /** The layer the player mounts itself into (see [desktop.player.PlayerWindow]). */

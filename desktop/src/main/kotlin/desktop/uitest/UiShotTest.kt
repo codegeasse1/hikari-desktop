@@ -192,6 +192,18 @@ class UiShotApp : Application() {
             } else {
                 println("UiShotTest: OK   seek track stays inside its slider")
             }
+            // Every control on the bar must fit its own label. This is the check
+            // for "the player's buttons are cut off: Quality shows as 'Qua…' and
+            // the time as '0…'", which happened as soon as the bar had one more
+            // picker than the old fixed-width budget allowed for.
+            val squeezed = squeezedBarControls(scene)
+            println("UiShotTest: bar controls narrower than their label: " + squeezed)
+            if (squeezed.isEmpty()) {
+                println("UiShotTest: OK   every control on the player bar fits its label")
+            } else {
+                println("UiShotTest: FAIL the player bar squeezes its own controls: " + squeezed)
+                failures[0]++
+            }
         }
 
         // ── the bars float over the picture ─────────────────────────────────
@@ -269,6 +281,19 @@ class UiShotApp : Application() {
             )
         }
         steps += 1000L to { }
+        steps += 200L to {
+            // On the narrow window the pickers drop their labels and, below
+            // 560px, drop out of the row entirely — whichever of those happened,
+            // what is still on the bar has to fit its label.
+            val squeezed = squeezedBarControls(scene)
+            println("UiShotTest: narrow bar, controls narrower than their label: " + squeezed)
+            if (squeezed.isEmpty()) {
+                println("UiShotTest: OK   the narrow player bar fits everything it shows")
+            } else {
+                println("UiShotTest: FAIL the narrow player bar squeezes its own controls: " + squeezed)
+                failures[0]++
+            }
+        }
         shot("f-player-narrow", "the bar on a 460px-wide window")
 
         steps += 200L to {
@@ -450,6 +475,70 @@ class UiShotApp : Application() {
             }
         }
 
+        // ── the banner's Play button: on top, and it really is pressed ───────
+        // The same test as the back arrow, for the same reason: this control has
+        // already been reported dead once (a full-size, backgroundless VBox was
+        // stacked over the banner and took the click), and "the button is there
+        // but nothing happens" is invisible to a screenshot.
+        steps += 300L to {
+            AppShell.show(Screen.Home)
+            AppShell.openDetail(detailItem)
+            DetailScreenTestSeam.playPresses.set(0)
+        }
+        steps += 1800L to { }
+        steps += 200L to {
+            stage.x = 0.0
+            stage.y = 0.0
+            val btn = scene.root.lookup("#heroPlayBtn") as? javafx.scene.control.Button
+            if (btn == null) {
+                println("UiShotTest: FAIL the detail banner has no Play button")
+                failures[0]++
+            } else {
+                val centre = btn.localToScreen(btn.boundsInLocal.centerX, btn.boundsInLocal.centerY)
+                val at = btn.localToScene(btn.boundsInLocal.centerX, btn.boundsInLocal.centerY)
+                // Everything lying over the button, topmost first: when a click
+                // does nothing, this names the node that ate it.
+                println("UiShotTest: over the Play button, topmost first:")
+                occludersAt(scene.root, at.x, at.y).take(8).forEach {
+                    println("UiShotTest:     " + it)
+                }
+                val top = topmostAt(scene.root, at.x, at.y)
+                println(
+                    "UiShotTest: Play button: visible=" + btn.isVisible + " disabled=" + btn.isDisabled +
+                        " centre=" + centre + " topmost=" + top,
+                )
+                if (top == null || !isInside(top, btn)) {
+                    println("UiShotTest: FAIL something is painted over the banner's Play button (topmost=" + top + ")")
+                    failures[0]++
+                }
+                if (centre == null || !onScreen(centre)) {
+                    println("UiShotTest: WARN the Play button is off this display — no real click is possible here")
+                } else {
+                    val robot = runCatching { java.awt.Robot() }.getOrNull()
+                    if (robot == null) {
+                        println("UiShotTest: WARN java.awt.Robot is unavailable — no real click is possible here")
+                    } else {
+                        robot.mouseMove(centre.x.toInt(), centre.y.toInt())
+                        Thread.sleep(300L)
+                        robot.mousePress(java.awt.event.InputEvent.BUTTON1_DOWN_MASK)
+                        Thread.sleep(80L)
+                        robot.mouseRelease(java.awt.event.InputEvent.BUTTON1_DOWN_MASK)
+                        Thread.sleep(600L)
+                        println("UiShotTest: clicked the banner's Play button with the real mouse")
+                    }
+                }
+            }
+        }
+        steps += 400L to {
+            val presses = DetailScreenTestSeam.playPresses.get()
+            if (presses >= 1) {
+                println("UiShotTest: OK   the banner's Play button runs the play path (" + presses + " press(es))")
+            } else {
+                println("UiShotTest: FAIL the banner's Play button never ran (presses=" + presses + ")")
+                failures[0]++
+            }
+        }
+
         // ── the Installed list's engine filter: All | CloudStream | Hikari | … ─
         // The desktop twin of the Android picker's chips. With a hundred providers
         // from several engines installed, "show me only the Hikari ones" has to be
@@ -521,6 +610,74 @@ class UiShotApp : Application() {
                 File(out, "n-extensions-engine-filter.png"),
             )
         }
+        // ── the home catalog's provider picker (the Android provider sheet) ──
+        // The control that decides which provider the whole home page is built
+        // from. It is a Popup (a window with a scene of its own), so it is driven
+        // through the picker's own hooks — the same paths its rows and chips use.
+        steps += 300L to {
+            AppShell.show(Screen.Home)
+            AppShell.homeView.load(force = true)
+        }
+        steps += 1400L to {
+            val picker = AppShell.homeView.pickerForTest
+            (scene.root.lookup(".provider-picker") as? javafx.scene.control.Button)?.fire()
+            val open = picker.isOpenForTest()
+            val chips = picker.chipLabelsForTest()
+            val rows = picker.rowNamesForTest()
+            println("UiShotTest: provider picker open=" + open + " chips=" + chips)
+            println("UiShotTest: provider picker rows (first 4) = " + rows.take(4))
+            if (!open) {
+                println("UiShotTest: FAIL the home provider picker did not open")
+                failures[0]++
+            } else if (chips.firstOrNull() != "All" || !chips.contains("Hikari") || !chips.contains("Nuvio")) {
+                println("UiShotTest: FAIL the provider picker has no All+engine chips (" + chips + ")")
+                failures[0]++
+            } else if (rows.firstOrNull() != "All providers") {
+                println("UiShotTest: FAIL the provider list does not start with \"All providers\" (" + rows.take(2) + ")")
+                failures[0]++
+            } else {
+                println("UiShotTest: OK   the provider picker opens with All + one chip per engine")
+            }
+        }
+        steps += 300L to {
+            val picker = AppShell.homeView.pickerForTest
+            picker.pressChipForTest("Hikari")
+            val rows = picker.rowNamesForTest()
+            println("UiShotTest: provider picker, Hikari chip on: " + rows)
+            if (rows.any { it.startsWith("ZZ Test Hikari") } &&
+                rows.none { it.contains("Nuvio") || it.contains("CloudStream") }
+            ) {
+                println("UiShotTest: OK   picking an engine chip leaves only that engine's providers")
+            } else {
+                println("UiShotTest: FAIL the engine chip did not narrow the provider list")
+                failures[0]++
+            }
+        }
+        steps += 300L to {
+            val picker = AppShell.homeView.pickerForTest
+            val picked = picker.selectForTest("ZZ Test Hikari One")
+            val label = (scene.root.lookup(".provider-picker") as? javafx.scene.control.Button)?.text
+            println("UiShotTest: picked a provider=" + picked + " button now says \"" + label + "\"")
+            if (picked && label == "ZZ Test Hikari One") {
+                println("UiShotTest: OK   picking a provider sets the catalog source")
+            } else {
+                println("UiShotTest: FAIL picking a provider did not take")
+                failures[0]++
+            }
+        }
+        steps += 900L to {
+            // ...and the selection SURVIVES the reload the pick triggers.
+            val picker = AppShell.homeView.pickerForTest
+            println("UiShotTest: after the reload the picker still says \"" + picker.selectedName() + "\"")
+            if (picker.selectedName() == "ZZ Test Hikari One") {
+                println("UiShotTest: OK   the picked provider survives its own reload")
+            } else {
+                println("UiShotTest: FAIL the picked provider was reset by the reload")
+                failures[0]++
+            }
+            picker.selectForTest("All providers")
+        }
+
         steps += 300L to {
             scene.root.lookupAll(".kind-chips .seg").filterIsInstance<javafx.scene.control.Button>()
                 .firstOrNull { it.text == "All" }?.fire()
@@ -616,6 +773,65 @@ class UiShotApp : Application() {
             pause.play()
         }
         pump()
+    }
+
+    /**
+     * Every node whose laid-out bounds contain a scene point, topmost first.
+     *
+     * Deliberately *geometric*: it ignores the background/bounds picking rules
+     * the app relies on, so when a click on a button does nothing it names the
+     * exact node lying over it (an invisible, stretched container included)
+     * instead of leaving the cause to a guess.
+     */
+    private fun occludersAt(root: javafx.scene.Parent, sceneX: Double, sceneY: Double): List<String> {
+        val out = ArrayList<String>()
+        fun walk(parent: javafx.scene.Parent) {
+            for (child in parent.childrenUnmodifiable.reversed()) {
+                if (!child.isVisible) continue
+                val local = child.sceneToLocal(sceneX, sceneY)
+                if (!runCatching { child.contains(local.x, local.y) }.getOrDefault(false)) continue
+                if (child is javafx.scene.Parent) walk(child)
+                out.add(describeNode(child))
+            }
+        }
+        walk(root)
+        return out
+    }
+
+    /** One node in the form a bug report can name: class, id, style classes,
+     *  scene bounds, and the flags that decide whether JavaFX picks it. */
+    private fun describeNode(n: javafx.scene.Node): String {
+        val b = runCatching { n.localToScene(n.boundsInLocal) }.getOrNull()
+        val region = n as? javafx.scene.layout.Region
+        return n.javaClass.simpleName +
+            "[id=" + n.id + " cls=" + n.styleClass.joinToString(".") + "]" +
+            " scene=" + (b?.let {
+                "(" + it.minX.toInt() + "," + it.minY.toInt() + " " + it.width.toInt() + "x" + it.height.toInt() + ")"
+            } ?: "?") +
+            " pickOnBounds=" + n.isPickOnBounds + " bg=" + (region?.background != null) +
+            " border=" + (region?.border != null) + " mouseTransparent=" + n.isMouseTransparent +
+            " opacity=" + n.opacity
+    }
+
+    /**
+     * The controls on the player's bar that have been squeezed narrower than the
+     * width they asked for — i.e. the ones JavaFX will have drawn with an
+     * ellipsis ("Qua…", "0…"). A control's `text` is unchanged by truncation, so
+     * the only way to see this from a test is to compare the laid-out width with
+     * the computed preferred width.
+     */
+    private fun squeezedBarControls(scene: Scene): List<String> {
+        val bar = scene.lookup(".player-bar") as? javafx.scene.layout.HBox ?: return emptyList()
+        val out = ArrayList<String>()
+        for (child in bar.children) {
+            if (!child.isVisible || !child.isManaged) continue
+            val r = child as? javafx.scene.layout.Region ?: continue
+            val want = r.prefWidth(-1.0)
+            if (want <= 0.0) continue
+            val got = child.layoutBounds.width
+            if (got + 1.0 < want) out.add((child as? javafx.scene.control.Labeled)?.text + " (" + got + "<" + want + ")")
+        }
+        return out
     }
 
     /** The detail banner's own back arrow (see DetailScreen.buildHero). */

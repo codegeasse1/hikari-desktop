@@ -10,7 +10,6 @@ import javafx.animation.Timeline
 import javafx.geometry.Insets
 import javafx.geometry.Pos
 import javafx.scene.Node
-import javafx.scene.control.ComboBox
 import javafx.scene.control.Label
 import javafx.scene.control.ScrollPane
 import javafx.scene.image.ImageView
@@ -116,7 +115,13 @@ class HomeScreenView {
     // ── page ────────────────────────────────────────────────────────────────
 
     private val rowsBox = VBox(Theme.S4)
-    private val providerBox = ComboBox<String>()
+    /** The catalog's provider picker: chips by engine + a filter field + the
+     *  list, and the only control that decides which provider the home page is
+     *  built from. It calls back on every pick, so the catalog reloads. */
+    private val providerPicker = ProviderPicker { load(force = true) }
+
+    /** The provider picker, for the UI test (see AppShell.homeView). */
+    val pickerForTest: ProviderPicker get() = providerPicker
     private val statusLabel = themed("", "tiny").apply {
         // A long status line (a dozen failed providers, "10 rows from 102
         // sources") must wrap: without this it declares a minimum width wider
@@ -152,20 +157,15 @@ class HomeScreenView {
     private var logsOpen = false
 
     init {
-        providerBox.run {
-            styleClass.add("combo-box")
-            prefWidth = 260.0
-            // Shrinkable: the combo + Refresh + Logs row must still fit a
-            // narrow window instead of pushing the page wider than the viewport.
-            minWidth = 150.0
-            maxWidth = 340.0
-            setOnAction { load(force = true) }
-        }
         logsScroll.isVisible = false
         logsScroll.isManaged = false
         buildHero()
         content.children.addAll(
-            HBox(8.0, providerBox, refreshBtn, logsBtn).apply {
+            // The provider picker (see ProviderPicker): a filter field, a chip
+            // per engine and the list, opened from the button that shows the
+            // current choice — the Android app's provider sheet, in the desktop
+            // toolbar.
+            HBox(8.0, providerPicker.button, refreshBtn, logsBtn).apply {
                 alignment = Pos.CENTER_RIGHT
                 padding = Insets(0.0, 0.0, 2.0, 0.0)
                 minWidth = 0.0
@@ -350,7 +350,6 @@ class HomeScreenView {
 
     fun load(force: Boolean = false) {
         loadJob?.cancel()
-        val selected = providerBox.value ?: ""
         val myGen = ++gen
         loadJob = AppShell.uiScope.launch {
             try {
@@ -372,24 +371,17 @@ class HomeScreenView {
                     // the user scans to find one, and the order they were added
                     // is meaningless to them.
                     .sortedBy { it.name.lowercase() }
-                val providerNames = enabled.map { it.name }
                 providerNamesById = enabled.associate { it.id to it.name }
-                // Resolve the ACTIVE choice on the FX thread from the ComboBox's
-                // LIVE value. JavaFX can deliver a popup's action event before
-                // the chosen item is committed to `value`, so a value captured at
-                // load() start can be stale ("All providers") and would clobber
-                // the user's pick back to "All providers".
+                // The picker holds the user's choice, so it is read on the FX
+                // thread from its LIVE state — there is no stale copy to
+                // reconcile (the old combo box needed that dance because JavaFX
+                // can deliver a popup's action event before the chosen item is
+                // committed to `value`, which clobbered the user's pick back to
+                // "All providers").
                 val (chosen, filterId) = Fx.runBlock {
-                    val items = providerBox.items
-                    val all = listOf("All providers") + providerNames
-                    for (n in all) if (!items.contains(n)) items.add(n)
-                    val current = providerBox.value
-                    val c = when {
-                        current != null && current in items -> current
-                        selected in items -> selected
-                        else -> "All providers"
-                    }
-                    providerBox.value = c
+                    providerPicker.setProviders(enabled)
+                    val cfg = providerPicker.selection
+                    val c = providerPicker.selectedName()
                     // Re-seed the banner whenever the source filter changes, so
                     // the hero features the provider the user picked. Without
                     // this it kept showing whichever provider answered first and
@@ -403,8 +395,7 @@ class HomeScreenView {
                         heroBox.isVisible = false
                         heroBox.isManaged = false
                     }
-                    val cfg = enabled.firstOrNull { it.name == c }
-                    c to cfg?.id?.takeIf { c != "All providers" }
+                    c to cfg?.id
                 }
                 val firstRow = booleanArrayOf(false)
                 val rows = AppShell.app.repository.homeRows(filterId, force = force) { row ->

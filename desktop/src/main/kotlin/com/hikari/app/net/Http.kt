@@ -2012,37 +2012,148 @@ object Http {
         }
     }
 
-    private val GITHUB_RAW =
-        Regex("^https://raw\\.githubusercontent\\.com/([^/]+)/([^/]+)/([^/]+)/(.+)$")
-    private val GITHUB_ALT =
-        Regex("^https?://(?:www\\.)?github\\.com/([^/]+)/([^/]+)/(?:raw|blob)/([^/]+)/(.+)$")
+    // ── GitHub file URLs, in EVERY published form ───────────────────────────
+    //
+    // One repository file has several URLs that serve identical bytes: raw's
+    // canonical form, github.com's own `/raw/` path, the jsDelivr edges, githack
+    // and the proxy frontdoors. A repo may hand out ANY of them as a plugin's
+    // URL — and usually does: whichever mirror answered the manifest fetch
+    // becomes the base that the manifest's RELATIVE plugin paths are joined onto.
+    // So the URL that reaches the installer is very often a `cdn.jsdelivr.net`
+    // one (see the All-in-One-Nuvio repo, whose manifest is a jsDelivr/raw race).
+    //
+    // Before this, only raw.githubusercontent.com and github.com counted as
+    // "GitHub", so a jsDelivr plugin URL got ONE candidate and NO fallback at
+    // all: on a network that cannot reach jsDelivr (a very common case — it is
+    // blocked or throttled in whole regions) every extension of such a repo
+    // failed with "Download failed — check the URL", while the same file was one
+    // URL rewrite away on raw or through a frontdoor. That is the same
+    // structural hole as the release-asset one, for a different set of hosts.
 
-    /** A GitHub raw URL split into user/repo/ref/path. */
+    private val RE_GH_RAW_HOST =
+        Regex("^https://raw\\.githubusercontent\\.com/([^/]+)/([^/]+)/(.+)$")
+    private val RE_GH_RAW_PATH =
+        Regex("^https?://(?:www\\.)?github\\.com/([^/]+)/([^/]+)/(?:raw|blob)/(.+)$")
+    private val RE_GH_JSDELIVR =
+        Regex("^https://(?:cdn|fastly|gcore|testingcf)\\.jsdelivr\\.net/gh/([^/]+)/([^/@]+)@([^/]+)(?:/(.*))?$")
+    private val RE_GH_JSDELIVR_BCDN =
+        Regex("^https://jsdelivr\\.b-cdn\\.net/gh/([^/]+)/([^/@]+)@([^/]+)(?:/(.*))?$")
+    private val RE_GH_GITHACK =
+        Regex("^https://(?:rawcdn\\.|raw\\.)?githack\\.com/([^/]+)/([^/]+)/([^/]+)(?:/(.*))?$")
+
+    /** A GitHub file URL split into user/repo/ref/path, whatever form it wore. */
     private data class GhTarget(val user: String, val repo: String, val ref: String, val path: String)
 
-    /**
-     * Parses a GitHub raw URL (`raw.githubusercontent.com/u/r/b/p` or
-     * `github.com/u/r/raw|blob/b/p`). Modern CloudStream repos hand out the
-     * fully-qualified form `…/u/r/refs/heads/<branch>/p`, which the naive
-     * regex splits as ref="refs" + path="heads/<branch>/p" — every mirror URL
-     * built from that 404s. The ref is normalized here ("refs/heads/builds"
-     * → "builds") so the CDN mirrors, which expect a bare branch, work.
-     */
-    private fun parseGhTarget(url: String): GhTarget? {
-        val m = GITHUB_RAW.matchEntire(url) ?: GITHUB_ALT.matchEntire(url) ?: return null
-        val (user, repo, ref0, path0) = m.destructured
-        var ref = ref0
-        var path = path0
-        if (ref == "refs" && (path.startsWith("heads/") || path.startsWith("tags/"))) {
-            val rest = path.substringAfter('/')
-            val cut = rest.indexOf('/')
-            if (cut > 0) {
-                ref = rest.substring(0, cut)
-                path = rest.substring(cut + 1)
+    /** Strips a proxy frontdoor prefix (`ghfast.top/https://github.com/…`) so what
+     *  it wraps can be recognized for what it is. */
+    private fun stripFrontdoor(url: String): String {
+        for (h in FRONTDOOR_HOSTS) {
+            val p = "https://$h/"
+            if (url.startsWith(p)) {
+                val rest = url.substring(p.length)
+                if (rest.startsWith("http://") || rest.startsWith("https://")) return rest
             }
         }
-        if (path.isBlank()) return null
+        return url
+    }
+
+    /**
+     * Parses any published form of a GitHub file URL. Modern repos hand out the
+     * fully-qualified form `…/u/r/refs/heads/<branch>/p`, which the naive split
+     * reads as ref="refs" + path="heads/<branch>/p" — every mirror URL built
+     * from that 404s — so the ref is normalized ("refs/heads/builds" →
+     * "builds"). jsDelivr/githack forms put the ref after `@` or in its own
+     * segment; all of them end up as the same (user, repo, ref, path).
+     */
+    private fun parseGhTarget(url0: String): GhTarget? {
+        val url = stripFrontdoor(url0.trim())
+        // groupValues (not destructured): the CDN forms end in an OPTIONAL path
+        // group ("a bare base URL"), and a non-participating group is a null
+        // String in the destructured form — an NPE waiting for the one repo that
+        // publishes a base URL instead of a file URL.
+        RE_GH_RAW_HOST.matchEntire(url)?.let { m ->
+            return splitRefPath(m.groupValues[1], m.groupValues[2], m.groupValues[3])
+        }
+        RE_GH_RAW_PATH.matchEntire(url)?.let { m ->
+            return splitRefPath(m.groupValues[1], m.groupValues[2], m.groupValues[3])
+        }
+        RE_GH_JSDELIVR.matchEntire(url)?.let { m ->
+            return GhTarget(m.groupValues[1], m.groupValues[2], m.groupValues[3], m.groupValues[4].substringBefore('?'))
+        }
+        RE_GH_JSDELIVR_BCDN.matchEntire(url)?.let { m ->
+            return GhTarget(m.groupValues[1], m.groupValues[2], m.groupValues[3], m.groupValues[4].substringBefore('?'))
+        }
+        RE_GH_GITHACK.matchEntire(url)?.let { m ->
+            return GhTarget(m.groupValues[1], m.groupValues[2], m.groupValues[3], m.groupValues[4].substringBefore('?'))
+        }
+        return null
+    }
+
+    /** `ref/path…` → (ref, path), with a fully-qualified ref normalized to the
+     *  bare branch/tag the CDN and frontdoor forms expect. */
+    private fun splitRefPath(user: String, repo: String, rest0: String): GhTarget {
+        val rest = rest0.substringBefore('?')
+        var ref = rest.substringBefore('/')
+        var path = rest.substringAfter('/', "")
+        if (ref == "refs" && (path.startsWith("heads/") || path.startsWith("tags/"))) {
+            val tail = path.substringAfter('/')
+            val cut = tail.indexOf('/')
+            if (cut > 0) {
+                ref = tail.substring(0, cut)
+                path = tail.substring(cut + 1)
+            } else {
+                ref = tail
+                path = ""
+            }
+        }
         return GhTarget(user, repo, ref, path)
+    }
+
+    /** raw.githubusercontent's canonical form for [g] — the freshest URL there is,
+     *  and the one every other form can be rewritten to. */
+    private fun ghRawUrl(g: GhTarget): String =
+        "https://raw.githubusercontent.com/${g.user}/${g.repo}/${g.ref}" +
+            (if (g.path.isBlank()) "" else "/${g.path}")
+
+    /** github.com's own raw path for [g] — it follows the repo's canonical case
+     *  and answers for a renamed owner, so it is the more forgiving twin. */
+    private fun ghRawPathUrl(g: GhTarget): String =
+        "https://github.com/${g.user}/${g.repo}/raw/${g.ref}" +
+            (if (g.path.isBlank()) "" else "/${g.path}")
+
+    /** The CDN copies of [g] — the jsDelivr edges (different hostnames, which is
+     *  what is needed when one is SNI-blocked) and githack. */
+    private fun ghCdnUrls(g: GhTarget): List<String> {
+        if (g.path.isBlank()) return emptyList()
+        val q = "gh/${g.user}/${g.repo}@${g.ref}/${g.path}"
+        return listOf(
+            "https://cdn.jsdelivr.net/$q",
+            "https://fastly.jsdelivr.net/$q",
+            "https://gcore.jsdelivr.net/$q",
+            "https://testingcf.jsdelivr.net/$q",
+            "https://jsdelivr.b-cdn.net/$q",
+            "https://raw.githack.com/${g.user}/${g.repo}/${g.ref}/${g.path}",
+        )
+    }
+
+    /** True when [url] already IS the canonical raw form (so it needs no
+     *  canonicalization and can be tried first). */
+    private fun isCanonicalRawForm(url: String): Boolean =
+        url.startsWith("https://raw.githubusercontent.com/") ||
+            RE_GH_RAW_PATH.matches(url)
+
+    /**
+     * Rewrites any published form of a GitHub file (or a repo base) URL to
+     * raw.githubusercontent. Used before resolving a manifest's RELATIVE plugin
+     * paths: joining them onto whichever CDN won the manifest race is how a
+     * plugin URL ends up pinned to one host with no alternatives, and the raw
+     * form is both canonical and the one every mirror can be derived from.
+     * Anything unrecognized is returned untouched.
+     */
+    fun canonicalGithubFileUrl(url: String): String {
+        val base = normalizeDriveUrl(url.trim())
+        val gh = parseGhTarget(base) ?: return base
+        return ghRawUrl(gh)
     }
 
 
@@ -2059,6 +2170,11 @@ object Http {
      * path. These cannot be a stale CDN copy of a branch file, so they are
      * always tried before any mirror.
      *
+     * When the caller's URL is itself a CDN/frontdoor form (a jsDelivr plugin
+     * URL is the common case — see the note above [parseGhTarget]) the canonical
+     * raw file comes FIRST: a CDN caches a branch file for days, so it is the
+     * one thing that must not decide what gets installed.
+     *
      * A RELEASE ASSET has no such family — the bytes live on github.com alone —
      * so this list is the single URL the caller gave, and [mirrorVariants] is
      * what supplies its alternatives (see [githubFrontdoors]).
@@ -2066,11 +2182,16 @@ object Http {
     internal fun originVariants(url: String): List<String> {
         val base = normalizeDriveUrl(url.trim())
         val gh = parseGhTarget(base) ?: return listOf(base)
-        val p = gh.path.substringBefore('?')
         val out = linkedSetOf<String>()
-        out.add(base)
-        out.add("https://raw.githubusercontent.com/${gh.user}/${gh.repo}/${gh.ref}/$p")
-        out.add("https://github.com/${gh.user}/${gh.repo}/raw/${gh.ref}/$p")
+        if (isCanonicalRawForm(base)) {
+            out.add(base)
+            out.add(ghRawUrl(gh))
+            out.add(ghRawPathUrl(gh))
+        } else {
+            out.add(ghRawUrl(gh))
+            out.add(base)
+            out.add(ghRawPathUrl(gh))
+        }
         return out.toList()
     }
 
@@ -2091,26 +2212,15 @@ object Http {
         val gh = parseGhTarget(base)
         val out = linkedSetOf<String>()
         if (gh != null) {
-            // Mirror URLs are built from the bare path — a query string that is
-            // fine on raw.githubusercontent ("…?token=x") makes CDN/proxy
-            // mirrors answer HTTP 400, so it never leaks into generated
-            // variants.
-            val p = gh.path.substringBefore('?')
-            // jsDelivr's edges: the same files on several different hostnames,
-            // which is exactly what is needed when ONE of them is SNI-blocked by
-            // the local network. (cdn.statically.io, raw.gitmirror.com and
-            // github.moeyy.xyz were removed: all three stopped answering, and a
-            // host that only ever fails makes the race shorter for the ones that
-            // work.)
-            out.add("https://cdn.jsdelivr.net/gh/${gh.user}/${gh.repo}@${gh.ref}/$p")
-            out.add("https://fastly.jsdelivr.net/gh/${gh.user}/${gh.repo}@${gh.ref}/$p")
-            out.add("https://gcore.jsdelivr.net/gh/${gh.user}/${gh.repo}@${gh.ref}/$p")
-            out.add("https://testingcf.jsdelivr.net/gh/${gh.user}/${gh.repo}@${gh.ref}/$p")
-            out.add("https://jsdelivr.b-cdn.net/gh/${gh.user}/${gh.repo}@${gh.ref}/$p")
-            out.add("https://raw.githack.com/${gh.user}/${gh.repo}/${gh.ref}/$p")
-            out.addAll(
-                githubFrontdoors("https://raw.githubusercontent.com/${gh.user}/${gh.repo}/${gh.ref}/$p"),
-            )
+            // Every CDN copy of the file, whichever of them the caller's URL
+            // happened to be — a jsDelivr plugin URL now gets the raw form, the
+            // other jsDelivr edges, githack AND the frontdoors, instead of the
+            // empty list it used to get for being "not GitHub".
+            out.addAll(ghCdnUrls(gh))
+            out.addAll(githubFrontdoors(ghRawUrl(gh)))
+            // The URL the caller gave is already in [originVariants]; a mirror
+            // list that repeats it would spend a socket racing itself.
+            out.remove(base)
             return out.toList()
         }
         // NOT a raw file path — and this is the case this branch exists for: a
@@ -2156,14 +2266,19 @@ object Http {
      * nothing because they are all raced at once. (gh-proxy.net was removed: it
      * answers 200 with a 122-byte stub, and being tiny it won every race.)
      */
-    private fun githubFrontdoors(url: String): List<String> = listOf(
-        "https://ghfast.top/$url",
-        "https://ghproxy.net/$url",
-        "https://gh-proxy.com/$url",
-        "https://ghproxy.cc/$url",
-        "https://gh.llkk.cc/$url",
-        "https://github.moeyy.xyz/$url",
-        "https://hub.gitmirror.com/$url",
+    private fun githubFrontdoors(url: String): List<String> =
+        FRONTDOOR_HOSTS.map { "https://$it/$url" }
+
+    /** The proxy frontdoors, in one place: [githubFrontdoors] builds the URLs and
+     *  [stripFrontdoor] unwraps them, so the two can never drift apart. */
+    private val FRONTDOOR_HOSTS = listOf(
+        "ghfast.top",
+        "ghproxy.net",
+        "gh-proxy.com",
+        "ghproxy.cc",
+        "gh.llkk.cc",
+        "github.moeyy.xyz",
+        "hub.gitmirror.com",
     )
 
     /** Every candidate URL for a file: authoritative first, mirrors after. */

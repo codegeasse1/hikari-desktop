@@ -68,6 +68,12 @@ import kotlinx.coroutines.withContext
 internal object DetailScreenTestSeam {
     @Volatile
     var season: ((MediaItem) -> Pair<MediaItem, List<Episode>>)? = null
+
+    /** How many times the banner's Play button has actually been pressed.
+     *  The UI test clicks it with a real mouse, so this is what tells "the click
+     *  reached the button" apart from "something invisible covers it" — the
+     *  failure mode this screen has already had twice. */
+    val playPresses = java.util.concurrent.atomic.AtomicInteger()
 }
 
 class DetailScreenView(private val item: MediaItem) {
@@ -195,7 +201,11 @@ class DetailScreenView(private val item: MediaItem) {
     }
     private val heroChips = HBox(8.0).apply { alignment = Pos.CENTER_LEFT }
     private val heroActions = HBox(10.0,
-        Ui.playButton("Play") { playFirst() },
+        // The banner's Play button. It is the primary action on this screen and
+        // it has to be reachable by a plain click, so it carries an id for the
+        // UI test to find, measure and click (see UiShotTest's detail-back section
+        // — the same wiring the back arrow uses).
+        Ui.playButton("Play") { playFirst() }.apply { id = "heroPlayBtn" },
         Ui.button("Download", icon = Icons.DOWNLOAD, ghost = true) { downloadFirst() },
     ).apply { alignment = Pos.CENTER_LEFT }
     private val heroBody = VBox(10.0, heroOver, heroTitle, heroMeta, heroChips, heroActions).apply {
@@ -603,7 +613,23 @@ class DetailScreenView(private val item: MediaItem) {
         StackPane.setAlignment(back, Pos.TOP_LEFT)
         StackPane.setMargin(back, Insets(16.0, 0.0, 0.0, 16.0))
 
-        val topRight = VBox(8.0, favouriteButton).apply { alignment = Pos.TOP_RIGHT }
+        // Nothing decorative may be a pick target on a banner that carries
+        // buttons: the artwork and the poster card are pictures, so a click that
+        // lands on them is a click the user meant for Play or Download.
+        heroImage.isMouseTransparent = true
+        heroPosterFrame.isMouseTransparent = true
+
+        // Sized to its own content. A StackPane stretches a child out to the
+        // child's max size, and a VBox's max size is unbounded — so, left alone,
+        // this little container became an invisible full-banner box lying OVER the
+        // whole hero, added after the title block and therefore above the Play
+        // button in the paint order, and it swallowed every click meant for it.
+        // Its own bounds are all it needs.
+        val topRight = VBox(8.0, favouriteButton).apply {
+            alignment = Pos.TOP_RIGHT
+            maxWidth = javafx.scene.layout.Region.USE_PREF_SIZE
+            maxHeight = javafx.scene.layout.Region.USE_PREF_SIZE
+        }
         StackPane.setAlignment(topRight, Pos.TOP_RIGHT)
         StackPane.setMargin(topRight, Insets(16.0, 16.0, 0.0, 0.0))
 
@@ -614,8 +640,10 @@ class DetailScreenView(private val item: MediaItem) {
         StackPane.setMargin(heroPosterFrame, Insets(0.0, 26.0, 24.0, 0.0))
 
         // Paint order IS click priority in JavaFX: the back arrow goes in last so
-        // it is on top of everything the banner draws.
-        hero.children.addAll(heroImage, scrim, scrimR, heroBody, heroPosterFrame, topRight, back)
+        // it is on top of everything the banner draws, and the title/action block
+        // sits directly under it. The Play button is the point of this screen, so
+        // nothing but the arrow may ever be painted over it.
+        hero.children.addAll(heroImage, scrim, scrimR, heroPosterFrame, topRight, heroBody, back)
     }
 
     private fun toggleFavourite() {
@@ -896,6 +924,7 @@ class DetailScreenView(private val item: MediaItem) {
     }
 
     private fun playFirst() {
+        DetailScreenTestSeam.playPresses.incrementAndGet()
         val list = streams
         if (list.isNotEmpty()) {
             playBest(list)
