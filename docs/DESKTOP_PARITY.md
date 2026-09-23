@@ -555,6 +555,39 @@ connection and never answers** and asserts the window exists and can be restyled
 placed while the stream is still loading (on CI: window at 32,90 960x540, ~0.2 s
 after launch). That assertion fails under `--force-window=yes`, which is the point.
 
+### Adopting the WRONG window: mpv owns more than one
+
+`--force-window=immediate` found a second, older bug that `--force-window=yes` had
+been hiding. mpv owns **several windows in one process**, and the one the app was
+picking was not always the video window. The embed test's own diagnostic printed it:
+
+    windows of mpv's pid: 1. hwnd=0x40072 visible 960x540 class=mpv  title="HikariEmbedTest"
+                          2. hwnd=0x2016a hidden  768x519 class=mpv-smtc title="mpv smtc"
+                          3. hwnd=0x501e0 hidden  0x0     class=MSCTFIME UI
+                          4. hwnd=0x2017c hidden  0x0     class=IME
+
+`mpv-smtc` is mpv's System-Media-Transport-Controls window. It belongs to the same
+process, it is visible (timing-dependently), and it can be larger than the video
+window — so "the largest visible window of that process" dressed up the helper and
+left the app showing a placed window with **nothing drawn in it**, while mpv painted
+the picture in the window nobody had adopted. That is exactly the symptom the pixel
+check had been reporting as `NO VIDEO`, and it was there long before this change: the
+old, narrower test image (a gradient with a big white centre) made it look like a
+flat sampled area instead.
+
+The fix is to stop guessing by size alone. `WinShell.findWindowOf` now takes a
+class preference, and the player asks for mpv's **video** window: `MPV_VIDEO_CLASS =
+"mpv"`. `HELPER_CLASSES` (`mpv-smtc`, `IME`, `MSCTFIME UI`) are never candidates, at
+any step of the search. The full order is: exact title match (mpv's `--title`), then
+a window of the preferred class, then the largest visible window, then any window at
+all. The process id is always part of the search — a window that merely shares the
+episode's title is somebody else's.
+
+`EmbedSelfTest` asserts both halves: that mpv exposes a window of class `mpv`, and
+that `findWindowOf` returns *that* window rather than a helper, with the window list
+printed either way. With it, the pixel check confirms the picture inside the adopted
+window again (`spread=152`, `vo-configured=true`).
+
 - The player layer also refuses to call a window adopted when the **app's own** window
   could not be identified: with no owner there is nothing to glue the video to, and
   "adopted" would only have stripped mpv's chrome and left the picture wherever mpv

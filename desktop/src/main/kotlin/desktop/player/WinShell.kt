@@ -140,35 +140,76 @@ object WinShell {
     }
 
     /**
-     * The visible top-level window of [pid] — mpv's window, once mpv has created
-     * it, or the app's own window when called with our own pid.
-     *
-     * When [titleHint] is given, a window whose title matches it exactly wins
-     * outright: that is how the app's own window is identified when the process
-     * happens to own a second, larger one (a WebView surface, a popup) whose
-     * area would otherwise make it the "biggest window". Otherwise the largest
-     * visible window wins.
+     * mpv's VIDEO window class on Windows. mpv owns more than one window in the
+     * same process — this one, and helpers such as the
+     * System-Media-Transport-Controls window (`mpv-smtc`) it creates alongside
+     * it. A helper is visible and can even be larger than the video window, so
+     * "the largest visible window of the process" is not good enough on its own:
+     * this is the class that makes the player's window unmistakable.
      */
-    fun findWindowOf(pid: Long, titleHint: String? = null): Long? = call(null) {
+    const val MPV_VIDEO_CLASS = "mpv"
+
+    /** Window classes that are never the player's video surface: mpv's SMTC
+     *  helper, and the IME windows Windows attaches to any window. They belong
+     *  to the same process, they are visible, and they would otherwise be
+     *  candidates — the observed failure was the app dressing up `mpv-smtc` as
+     *  the video surface while mpv drew the picture in its real window. */
+    private val HELPER_CLASSES = setOf("mpv-smtc", "IME", "MSCTFIME UI")
+
+    /** A window's class name, or null when it cannot be read. */
+    private fun classNameOf(h: WinDef.HWND, buffer: CharArray): String? {
+        val fn = extra ?: return null
+        val len = runCatching { fn.GetClassName(h, buffer, buffer.size) }.getOrNull() ?: return null
+        return if (len > 0) String(buffer, 0, len) else null
+    }
+
+    /**
+     * The window of [pid] to use as a surface — mpv's window, once mpv has
+     * created it, or the app's own window when called with our own pid.
+     *
+     * Chosen in this order:
+     *
+     *  1. a window whose title is exactly [titleHint] — how the app's own window
+     *     is identified when the process also owns a bigger one (a WebView
+     *     surface, a popup), and how mpv's window is identified by the title it
+     *     was launched with;
+     *  2. otherwise a window whose class is [preferClass] (`mpv` for the player:
+     *     the class is the only thing that tells mpv's video window apart from
+     *     the helpers it creates beside it);
+     *  3. otherwise the largest visible window;
+     *  4. and only then any window at all, which covers the case where Windows
+     *     does not call the video window "visible" yet.
+     *
+     * Helper windows ([HELPER_CLASSES]) are never candidates, at any step.
+     */
+    fun findWindowOf(pid: Long, titleHint: String? = null, preferClass: String? = null): Long? = call(null) {
         if (pid <= 0L) return@call null
-        val best = longArrayOf(0L)
-        val bestArea = longArrayOf(-1L)
-        val anyHwnd = longArrayOf(0L)
-        val anyArea = longArrayOf(-1L)
-        val hinted = longArrayOf(0L)
+        var hinted = 0L
+        var bestVisible = 0L
+        var bestVisibleArea = -1L
+        var bestAny = 0L
+        var bestAnyArea = -1L
+        var classVisible = 0L
+        var classVisibleArea = -1L
+        var classAny = 0L
+        var classAnyArea = -1L
         val buffer = CharArray(512)
+        val classBuffer = CharArray(256)
         val callback = object : WinUser.WNDENUMPROC {
             override fun callback(hwnd: WinDef.HWND?, data: Pointer?): Boolean {
                 val h = hwnd ?: return true
                 val owner = IntByReference()
                 User32.INSTANCE.GetWindowThreadProcessId(h, owner)
                 if (owner.value.toLong() != pid) return true
+                val cls = classNameOf(h, classBuffer)
+                if (cls != null && HELPER_CLASSES.contains(cls)) return true
+                val address = Pointer.nativeValue(h.pointer)
                 // The hint is checked before the visibility test on purpose: a
                 // window that Windows does not call visible yet is still the
                 // window we are looking for.
-                if (!titleHint.isNullOrBlank() && hinted[0] == 0L) {
+                if (!titleHint.isNullOrBlank() && hinted == 0L) {
                     val len = User32.INSTANCE.GetWindowText(h, buffer, buffer.size)
-                    if (len > 0 && String(buffer, 0, len) == titleHint) hinted[0] = Pointer.nativeValue(h.pointer)
+                    if (len > 0 && String(buffer, 0, len) == titleHint) hinted = address
                 }
                 val rect = WinDef.RECT()
                 if (!User32.INSTANCE.GetWindowRect(h, rect)) return true
@@ -176,23 +217,36 @@ object WinShell {
                 val hh = rect.bottom - rect.top
                 if (w <= 0 || hh <= 0) return true
                 val area = w.toLong() * hh.toLong()
-                // A window the player has not shown yet is the LAST resort, not
-                // a candidate the moment one is visible: mpv's video output is
-                // visible as soon as it exists, so anything invisible here is
-                // either not the player's window or not ready.
-                if (User32.INSTANCE.IsWindowVisible(h) && area > bestArea[0]) {
-                    bestArea[0] = area
-                    best[0] = Pointer.nativeValue(h.pointer)
+                val visible = User32.INSTANCE.IsWindowVisible(h)
+                // A window the player has not shown yet is the LAST resort, not a
+                // candidate the moment one is visible.
+                if (visible && area > bestVisibleArea) {
+                    bestVisibleArea = area
+                    bestVisible = address
                 }
-                if (area > anyArea[0]) {
-                    anyArea[0] = area
-                    anyHwnd[0] = Pointer.nativeValue(h.pointer)
+                if (area > bestAnyArea) {
+                    bestAnyArea = area
+                    bestAny = address
+                }
+                if (preferClass != null && preferClass == cls) {
+                    if (visible && area > classVisibleArea) {
+                        classVisibleArea = area
+                        classVisible = address
+                    }
+                    if (area > classAnyArea) {
+                        classAnyArea = area
+                        classAny = address
+                    }
                 }
                 return true
             }
         }
         User32.INSTANCE.EnumWindows(callback, null)
-        hinted[0].takeIf { it != 0L } ?: best[0].takeIf { it != 0L } ?: anyHwnd[0].takeIf { it != 0L }
+        return@call hinted.takeIf { it != 0L }
+            ?: classVisible.takeIf { it != 0L }
+            ?: bestVisible.takeIf { it != 0L }
+            ?: classAny.takeIf { it != 0L }
+            ?: bestAny.takeIf { it != 0L }
     }
 
     /**
@@ -234,15 +288,14 @@ object WinShell {
                 User32.INSTANCE.GetWindowThreadProcessId(h, owner)
                 if (owner.value.toLong() != pid) return true
                 val titleLen = User32.INSTANCE.GetWindowText(h, buffer, buffer.size)
-                val classLen = runCatching { extra?.GetClassName(h, classBuffer, classBuffer.size) }
-                    .getOrNull() ?: 0
+                val cls = classNameOf(h, classBuffer)
                 val rect = WinDef.RECT()
                 User32.INSTANCE.GetWindowRect(h, rect)
                 found += WinInfo(
                     hwnd = Pointer.nativeValue(h.pointer),
                     visible = User32.INSTANCE.IsWindowVisible(h),
                     title = if (titleLen > 0) String(buffer, 0, titleLen) else "",
-                    className = if (classLen > 0) String(classBuffer, 0, classLen) else "",
+                    className = cls ?: "",
                     width = rect.right - rect.left,
                     height = rect.bottom - rect.top,
                 )

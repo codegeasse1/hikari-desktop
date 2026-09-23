@@ -572,16 +572,22 @@ object PlayerWindow {
     private fun playerAlive(pid: Long): Boolean =
         runCatching { ProcessHandle.of(pid).map { it.isAlive }.orElse(true) }.getOrDefault(true)
 
-    /** The player's own window: the largest visible window of mpv's process, with
-     *  mpv's own title (`--title=…`) winning outright when one of its windows
-     *  carries it.
+    /** The player's own window: mpv's VIDEO window (its class is the one thing
+     *  that tells it apart from the helper windows mpv creates beside it — the
+     *  observed failure was the app adopting `mpv-smtc` while mpv drew the
+     *  picture in its real window), with mpv's own title (`--title=…`) winning
+     *  outright when one of its windows carries it.
      *
      *  The process id is never dropped from the search: a window that merely
      *  happens to share the episode's title is somebody else's window, and
      *  dressing THAT up as the video surface would wreck it. */
     private fun findPlayerWindow(pid: Long): Long? {
         val title = mpvTitle
-        return WinShell.findWindowOf(pid, title.takeIf { it.isNotBlank() })
+        return WinShell.findWindowOf(
+            pid,
+            titleHint = title.takeIf { it.isNotBlank() },
+            preferClass = WinShell.MPV_VIDEO_CLASS,
+        )
     }
 
     /**

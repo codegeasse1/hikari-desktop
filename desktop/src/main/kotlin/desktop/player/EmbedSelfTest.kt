@@ -16,8 +16,9 @@ import javax.swing.SwingUtilities
  *     no JavaFX display) proves the Win32 lookups work — [WinShell.findWindowOf]
  *     finds it by process id, [WinShell.restyleAsVideoSurface] strips its chrome,
  *     [WinShell.placeWindow] moves it and [WinShell.windowRect] reads it back;
- *  2. the bundled mpv is launched on a generated still image and its own window
- *     is adopted exactly the way the app adopts it, then driven over mpv's JSON
+ *  2. the bundled mpv is launched on a generated still image — with the app's own
+ *     launch flags, `--force-window=immediate` included — and its own window is
+ *     adopted exactly the way the app adopts it, then driven over mpv's JSON
  *     IPC to ask whether a video output actually came up (`vo-configured`,
  *     `video-format`) — the difference between "the picture is in the app" and
  *     "the app is showing a black rectangle while mpv plays somewhere else";
@@ -131,11 +132,25 @@ fun main() {
     var mpvHwnd: Long? = null
     val mpvDeadline = System.currentTimeMillis() + 20_000
     while (mpvHwnd == null && System.currentTimeMillis() < mpvDeadline && proc.isAlive) {
-        mpvHwnd = WinShell.findWindowOf(proc.pid())
+        // The same call the app makes, hint and class preference included.
+        mpvHwnd = WinShell.findWindowOf(proc.pid(), "HikariEmbedTest", WinShell.MPV_VIDEO_CLASS)
         if (mpvHwnd == null) Thread.sleep(200)
     }
     val window = mpvHwnd
-    check("findWindowOf(mpv pid) finds mpv's window", window != null)
+    check("findWindowOf(mpv pid) finds mpv's video window", window != null)
+    // mpv owns several windows in one process, and the helper ones are visible
+    // and can be bigger: the app must adopt the `mpv`-class window. This is not
+    // hypothetical — the adoption was observed taking `mpv-smtc` (mpv's
+    // System-Media-Transport-Controls window) while mpv drew the picture in its
+    // real window, which left the app showing a placed window with nothing in it.
+    val videoWindows = WinShell.windowsOf(proc.pid()).filter { it.className == WinShell.MPV_VIDEO_CLASS }
+    println("  windows of mpv's pid: " + WinShell.describeWindows(proc.pid()).joinToString(" | "))
+    check("mpv exposes a window of class " + WinShell.MPV_VIDEO_CLASS, videoWindows.isNotEmpty())
+    check(
+        "findWindowOf picks mpv's VIDEO window, not a helper (mpv-smtc/IME)",
+        videoWindows.any { it.hwnd == window },
+        "picked " + (window?.let { "0x" + java.lang.Long.toHexString(it) } ?: "none"),
+    )
     if (window != null) {
         println("  mpv hwnd=" + window + " rect=" + WinShell.windowRect(window)?.joinToString(","))
         // Exactly what the app does: strip the chrome, own it, glue it over the
@@ -198,9 +213,11 @@ fun main() {
         var stallHwnd: Long? = null
         val stallUntil = System.currentTimeMillis() + 12_000
         while (stallHwnd == null && System.currentTimeMillis() < stallUntil && stallProc.isAlive) {
-            stallHwnd = WinShell.findWindowOf(stallProc.pid())
+            stallHwnd = WinShell.findWindowOf(stallProc.pid(), "HikariEmbedStall", WinShell.MPV_VIDEO_CLASS)
             if (stallHwnd == null) Thread.sleep(150)
         }
+        println("  windows of the stalled player's pid:")
+        WinShell.describeWindows(stallProc.pid()).forEach { println("    " + it) }
         val elapsed = 12_000 - (stallUntil - System.currentTimeMillis())
         check(
             "mpv's window EXISTS while the stream is still loading (--force-window=immediate)",
@@ -247,10 +264,18 @@ fun main() {
         println("  vo-configured=$voConfigured video-format=$videoFormat")
         if (shot.isEmpty()) shot = sample(140, 110, 720, 405)
         println("  pixels over the video area: $shot")
+        // Which window is the picture in NOW? mpv creating a SECOND window for
+        // its video output would mean the handle the app adopted went stale — the
+        // one thing a "the window was adopted but nothing is drawn in it" report
+        // needs to rule out.
+        println("  windows of the picture's pid now:")
+        WinShell.describeWindows(proc.pid()).forEach { println("    " + it) }
         if (picture(shot)) {
             println("EmbedSelfTest: video CONFIRMED by the pixels inside the adopted window")
         } else if (voConfigured != true && videoFormat == null) {
             println("EmbedSelfTest: NO VIDEO (the window was adopted, but nothing is being drawn in it)")
+        } else {
+            println("EmbedSelfTest: NO VIDEO (mpv reports the output is configured, but the pixels are flat)")
         }
     } else {
         println("  (mpv's IPC pipe never appeared)")
@@ -299,15 +324,32 @@ private fun cleanup(frame: JFrame?, proc: Process?, picture: File?) {
     frame?.let { f -> runCatching { SwingUtilities.invokeAndWait { f.dispose() } } }
 }
 
-/** A strongly coloured test pattern, so a sampled frame can tell "picture" from
- *  "black window". */
+/** A strongly patterned test image, so a sampled frame can tell "picture" from
+ *  "black window" (or from "another window is covering this one").
+ *
+ *  A CHECKERBOARD, not a gradient with a big white centre: a pixel sample has to
+ *  be able to tell a picture from a blank area, and a large flat-coloured region
+ *  can fill a sample rectangle exactly — observed for real: the old image's
+ *  white centre, scaled to the player's window, made a picture that WAS on
+ *  screen read as "nothing is being drawn here". */
 private fun testImage(w: Int, h: Int): BufferedImage {
     val img = BufferedImage(w, h, BufferedImage.TYPE_INT_RGB)
     val g = img.createGraphics()
-    g.paint = java.awt.GradientPaint(0f, 0f, java.awt.Color(230, 60, 90), w.toFloat(), h.toFloat(), java.awt.Color(40, 180, 240))
-    g.fillRect(0, 0, w, h)
+    val cell = 20
+    var y = 0
+    while (y < h) {
+        var x = 0
+        while (x < w) {
+            val light = ((x / cell) + (y / cell)) % 2 == 0
+            g.color = if (light) java.awt.Color(230, 60, 90) else java.awt.Color(40, 180, 240)
+            g.fillRect(x, y, cell, cell)
+            x += cell
+        }
+        y += cell
+    }
     g.color = java.awt.Color.WHITE
-    g.fillOval(w / 4, h / 4, w / 2, h / 2)
+    g.fillRect(0, 0, w, 8)
+    g.fillRect(0, h - 8, w, 8)
     g.dispose()
     return img
 }
@@ -318,13 +360,15 @@ private fun picture(sample: String): Boolean {
     return spread >= 40
 }
 
-/** Samples the middle of a screen rectangle: a flat result means nothing (or
- *  only black) is being drawn there. */
+/** Samples a screen rectangle: a flat result means nothing (or only one colour)
+ *  is being drawn there. The WHOLE rectangle is sampled, not just its centre —
+ *  a centre-only sample can sit entirely inside one flat-coloured part of a
+ *  picture and report "no picture" for a picture that is right there. */
 private fun sample(x: Int, y: Int, w: Int, h: Int): String = runCatching {
-    val img = Robot().createScreenCapture(Rectangle(x + w / 4, y + h / 4, w / 2, h / 2))
+    val img = Robot().createScreenCapture(Rectangle(x, y, w, h))
     var min = 255
     var max = 0
-    var step = 4
+    var step = 6
     var i = 0
     while (i < img.width) {
         var j = 0
