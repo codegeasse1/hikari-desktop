@@ -487,6 +487,21 @@ class UiShotApp : Application() {
             } else {
                 println("UiShotTest: OK   the Installed list offers one chip per engine")
             }
+            // ...and the chips have to be VISIBLE, not merely present: the whole
+            // Installed section used to be below the fold (composer + every repo
+            // card above it), so the filter could not be found by looking.
+            val row = scene.root.lookup(".kind-chips")
+            if (row != null && inScrollViewport(row)) {
+                println("UiShotTest: OK   the engine chips are on screen without scrolling")
+            } else {
+                println("UiShotTest: FAIL the engine chips are not in the visible page area (node=" + row + ")")
+                failures[0]++
+            }
+            // The shot that follows is of the top of the page, so make sure that
+            // is where the page is.
+            var up: javafx.scene.Node? = row?.parent
+            while (up != null && up !is javafx.scene.control.ScrollPane) up = up.parent
+            (up as? javafx.scene.control.ScrollPane)?.vvalue = 0.0
         }
         steps += 300L to {
             scene.root.lookupAll(".kind-chips .seg").filterIsInstance<javafx.scene.control.Button>()
@@ -655,6 +670,30 @@ class UiShotApp : Application() {
             n = n.parent
         }
         return false
+    }
+
+    /**
+     * True when [node] is inside the viewport of the [ScrollPane] it lives in —
+     * i.e. the user can SEE it without scrolling.
+     *
+     * This is not pedantry: the Installed list (and its engine chips) sat at the
+     * bottom of the Extensions page, below the composer and every repo card, so
+     * the control existed, worked when fired programmatically, and could not be
+     * found by anyone looking at the screen. A test that only asks "is it in the
+     * scene graph?" cannot tell those two apart.
+     */
+    private fun inScrollViewport(node: javafx.scene.Node): Boolean {
+        var p: javafx.scene.Node? = node
+        var sp: javafx.scene.control.ScrollPane? = null
+        while (p != null) {
+            if (p is javafx.scene.control.ScrollPane) { sp = p; break }
+            p = p.parent
+        }
+        val pane = sp ?: return true
+        val vp = pane.viewportBounds
+        if (vp.height <= 0.0) return false
+        val inPane = pane.sceneToLocal(node.localToScene(node.boundsInLocal))
+        return inPane.minY >= -0.5 && inPane.maxY <= vp.height + 0.5
     }
 
     /** True when a screen point is on this display (a click there can land). */

@@ -923,9 +923,23 @@ fires the Hikari chip:
 
 ```
 UiShotTest: engine chips = All | CloudStream | Hikari | Nuvio | Stremio
+UiShotTest: OK   the engine chips are on screen without scrolling
 UiShotTest: with the Hikari chip on, test rows = [ZZ Test Hikari One, ZZ Test Hikari Two]
 UiShotTest: OK   picking Hikari leaves only the Hikari extensions
 ```
+
+**And the Installed list moved to the top of the page.** The chips worked from the
+first build of them, passed their test, and were still unfindable: the Installed
+section sat at the *bottom* of the Extensions page, below the composer and every
+repo card, so on a machine with a handful of repos the whole feature was below the
+fold. The screenshot taken for the CI run showed the composer's repo-kind chips
+(`Hikari repo | CloudStream repo | …`) and no sign of the new row — which is what
+"it works but nobody can find it" looks like. The Installed section (heading,
+filter field, engine chips, rows) now comes directly under the page header, above
+the composer and the repo list, exactly as the Android picker has the chips above
+the list. The test asserts the chips are inside their `ScrollPane`'s own viewport
+(`inScrollViewport`) rather than merely present in the scene graph, because that is
+the difference that made this invisible.
 
 ### 6. "Everything instant" — the two that were still waiting on the network
 

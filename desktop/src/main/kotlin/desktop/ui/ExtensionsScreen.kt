@@ -230,9 +230,16 @@ class ExtensionsScreenView {
         if (repo != null) {
             renderRepoDetail(repo)
         } else {
+            // What is INSTALLED comes first, directly under the header: it is the
+            // list whose state the user manages (enable, reload, remove) and the
+            // one the engine chips narrow. At the bottom of the page it sat below
+            // the composer and every repo card, so on a machine with a handful of
+            // repos the chips were not on screen at all — the feature existed and
+            // could not be found, which is how the Android picker (chips directly
+            // above the list) does it. The composer and the repo list follow it.
+            renderInstalled()
             renderComposer()
             renderRepos()
-            renderInstalled()
         }
     }
 
