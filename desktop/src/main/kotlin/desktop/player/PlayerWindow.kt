@@ -183,6 +183,12 @@ object PlayerWindow {
     private var nextButton: Button? = null
     private var sourceMenu: MenuButton? = null
 
+    /** Whether the bar is currently laid out for a narrow window. Kept as state
+     *  (rather than a local in [applyResponsive]) because the Source pill's label
+     *  depends on it and is re-applied when the SOURCE changes too — see
+     *  [applySourceLabel]. */
+    private var barsNarrow = false
+
     /**
      * The Quality picker — the desktop twin of the Android player's "Video
      * quality" button (Auto (adaptive) + one row per video track). Its rows come
@@ -1297,10 +1303,24 @@ object PlayerWindow {
         // on one line (the seek bar used to be squeezed to a dot and the
         // fullscreen button pushed off the edge) — see [applyResponsive].
         applyResponsive()
+        // Re-run once the first layout pass has given the bar its real width: the
+        // width read above can still be the window's PREVIOUS size, and a player
+        // opened just after the window was made narrower would then lay its bar
+        // out for the old one.
+        javafx.application.Platform.runLater { applyResponsive() }
         root?.widthProperty()?.addListener { _, _, _ -> applyResponsive() }
         // The floating control bar is sized by [positionOverlays], not by the
         // window's layout, so its own width is the trigger there.
         bottomBar?.widthProperty()?.addListener { _, _, _ -> applyResponsive() }
+        // ...and the WINDOW is the final authority on how much room there is,
+        // whether or not the player layer has been re-laid-out yet. A window that
+        // shrinks while a stream plays used to leave the bar at the old width:
+        // the seek bar stayed long and the right-hand controls were pushed past
+        // the window edge (the "Vid…"/"Qua…" pills and the cut-off clock).
+        root?.sceneProperty()?.addListener { _, _, sceneValue ->
+            sceneValue?.widthProperty()?.addListener { _, _, _ -> applyResponsive() }
+            applyResponsive()
+        }
 
         // Anything that moves or resizes the video area has to move the window
         // glued to it.
@@ -1336,16 +1356,50 @@ object PlayerWindow {
      * The labels go first, then the pickers that are only occasionally needed,
      * so the transport controls and a USABLE seek bar always survive.
      */
+    /**
+     * The Source pill's label — the ONE place that decides it.
+     *
+     * It names the server that is playing when the bar has room for a name (the
+     * Android player's pill does the same, and "what am I watching this on" is
+     * worth a button), and is the film icon on its own when the window is narrow.
+     * Called from [applyResponsive] and [renderSources] both, so a width change
+     * and a source change can never leave the pill disagreeing with the layout it
+     * has to fit into.
+     */
+    private fun applySourceLabel() {
+        val menu = sourceMenu ?: return
+        val name = currentSource?.name?.takeIf { it.isNotBlank() }
+        menu.text = if (barsNarrow) "" else (name?.let { shorten(it, 18) } ?: "Source")
+    }
+
     private fun applyResponsive() {
         // Whichever container the bars are actually in decides how much room
-        // they have: the window's own layout, or the floating bar window.
-        val width = runCatching {
+        // they have: the window's own layout, or the floating bar window. The
+        // SCENE's width is consulted as well and the SMALLER of the two is used:
+        // a bar that was built for the window size the player had a moment ago
+        // must never be laid out wider than the window it is now in — that is how
+        // the Source pill (and the fullscreen button before it) ended up past the
+        // right edge of a window that had just been made narrower.
+        val sceneW = runCatching { root?.scene?.width ?: 0.0 }.getOrDefault(0.0)
+        val barW = runCatching {
             (if (overlaysOn) bottomBar?.width else root?.width) ?: 0.0
         }.getOrDefault(0.0)
+        val width = when {
+            barW <= 0.0 -> sceneW
+            sceneW <= 0.0 -> barW
+            else -> minOf(barW, sceneW)
+        }
         if (width <= 0.0) return
         val narrow = width < 780.0
         val tiny = width < 560.0
-        sourceMenu?.let { it.text = if (narrow) "" else "Source" }
+        barsNarrow = narrow
+        // The Source pill's label is decided in ONE place (see applySourceLabel):
+        // it names the server that is playing when there is room, and is the icon
+        // alone when there is not. Setting the text here as well as in
+        // renderSources() meant whichever ran last won — and on a 460px window
+        // that was the source NAME, which pushed the pill (and its text) off the
+        // right edge of the bar.
+        applySourceLabel()
         qualityMenu?.let { it.text = if (narrow) "" else "Quality" }
         audioMenu?.let { it.text = if (narrow) "" else "Audio" }
         subMenu?.let { it.text = if (narrow) "" else "Subs" }
@@ -1394,8 +1448,9 @@ object PlayerWindow {
             }
             if (shown > 1) need += row.spacing * (shown - 1)
             seekBar?.let { it1 ->
-                val length = (width - need - 10.0).coerceIn(90.0, 620.0)
-                it1.minWidth = 90.0
+                val floor = if (tiny) 48.0 else 90.0
+                val length = (width - need - 10.0).coerceIn(floor, 620.0)
+                it1.minWidth = floor
                 it1.prefWidth = length
                 it1.maxWidth = length
             }
@@ -1769,7 +1824,7 @@ object PlayerWindow {
         currentSource = sources.firstOrNull { it.name == current } ?: sources.firstOrNull()
         val menu = sourceMenu ?: return
         val active = currentSource
-        menu.text = active?.name?.takeIf { it.isNotBlank() }?.let { shorten(it, 18) } ?: "Source"
+        applySourceLabel()
         javafx.scene.control.Tooltip.install(
             menu,
             Ui.tooltip(active?.name?.takeIf { it.isNotBlank() } ?: "Pick another source / server"),

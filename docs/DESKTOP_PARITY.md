@@ -1084,6 +1084,33 @@ computed preferred width on the wide bar *and* on the 460 px one — a control's
 `text` is unchanged by truncation, so measuring is the only way to catch this from a
 test.
 
+Two things that check could not see, and a second pass fixed:
+
+- **The bar was laid out for the window's PREVIOUS size.** `applyResponsive` read
+  the player layer's own width, and a bar built a moment after the window was made
+  narrower read the old width — so on a 460 px window the seek bar stayed 620 px
+  long and the right-hand controls were laid out past the window edge. Every
+  control was exactly as wide as it asked for (`squeezedBarControls` saw nothing
+  wrong) while the last ones were off the screen: the Source pill read "Vi", and
+  the fullscreen button had gone the same way before it. `applyResponsive` now
+  takes the **smaller** of the bar's width and the scene's width, is re-run once
+  after the first layout pass, and listens to the *scene* width as well as the
+  layer's — so shrinking the window re-lays the bar out however the layer is
+  being sized.
+- **The Source pill's label had two authors.** `renderSources` wrote the current
+  server's name into the pill and `applyResponsive` wrote `""`/`"Source"` — so
+  whichever ran last won, and on a narrow window that was the name, which is what
+  pushed the pill off the edge. The label is now decided in exactly one place
+  (`applySourceLabel`): the server's name when there is room for it (shortened to
+  18 characters), the film icon alone when there is not.
+
+`UiShotTest` also fails when the bar's row is wider than the bar
+(`barOverflow` — the case a per-control width check is blind to), when the bar's
+laid-out width is wider than the **window**, and prints the geometry of the whole
+row (`barLayout`, `text(laidOut/pref)` per control) on both the wide and the 460 px
+bar, so the next regression of this kind is legible in the log rather than only on
+a screenshot.
+
 ## Still to do
 
 ### i18n
