@@ -198,6 +198,12 @@ class UiShotApp : Application() {
             // picker than the old fixed-width budget allowed for.
             val squeezed = squeezedBarControls(scene)
             println("UiShotTest: bar controls narrower than their label: " + squeezed)
+            println("UiShotTest: bar geometry: " + barLayout(scene))
+            val overflow = barOverflow(scene)
+            if (overflow != null) {
+                println("UiShotTest: FAIL the player bar overflows its own row: " + overflow)
+                failures[0]++
+            }
             if (squeezed.isEmpty()) {
                 println("UiShotTest: OK   every control on the player bar fits its label")
             } else {
@@ -280,14 +286,41 @@ class UiShotApp : Application() {
                 onPickSource = { },
             )
         }
-        steps += 1000L to { }
-        steps += 200L to {
+        // The picture "comes up", exactly as in the wide-window section above:
+        // without this the shot below captures the loading state, where the
+        // transport controls are not drawn at all — which says nothing about the
+        // bar a user actually sees while a stream plays.
+        steps += 1000L to { PlayerWindow.previewPlaying() }
+        steps += 600L to {
             // On the narrow window the pickers drop their labels and, below
             // 560px, drop out of the row entirely — whichever of those happened,
-            // what is still on the bar has to fit its label.
+            // what is still on the bar has to fit its label, and the row as a
+            // whole has to fit the window.
             val squeezed = squeezedBarControls(scene)
             println("UiShotTest: narrow bar, controls narrower than their label: " + squeezed)
-            if (squeezed.isEmpty()) {
+            println("UiShotTest: narrow bar geometry: " + barLayout(scene))
+            val overflow = barOverflow(scene)
+            if (overflow != null) {
+                println("UiShotTest: FAIL the narrow player bar overflows its own row: " + overflow)
+                failures[0]++
+            }
+            // ...and the bar itself must fit the WINDOW. A bar laid out for the
+            // window's previous size is how the Source pill and, before it, the
+            // fullscreen button ended up past the right edge — every control
+            // perfect, and the right-hand ones off the screen.
+            val bar = scene.lookup(".player-bar") as? javafx.scene.layout.HBox
+            println(
+                "UiShotTest: narrow bar width=" + (bar?.width ?: 0.0) +
+                    " window width=" + scene.width,
+            )
+            if (bar != null && bar.width > scene.width + 4.0) {
+                println(
+                    "UiShotTest: FAIL the player bar is laid out wider than the window (" +
+                        bar.width.toInt() + " > " + scene.width.toInt() + ")",
+                )
+                failures[0]++
+            }
+            if (squeezed.isEmpty() && overflow == null) {
                 println("UiShotTest: OK   the narrow player bar fits everything it shows")
             } else {
                 println("UiShotTest: FAIL the narrow player bar squeezes its own controls: " + squeezed)
@@ -811,6 +844,40 @@ class UiShotApp : Application() {
             " pickOnBounds=" + n.isPickOnBounds + " bg=" + (region?.background != null) +
             " border=" + (region?.border != null) + " mouseTransparent=" + n.isMouseTransparent +
             " opacity=" + n.opacity
+    }
+
+    /**
+     * The bar's row pushed past the edge of its own container. An HBox whose
+     * children cannot shrink below their minimum does not squeeze them — it
+     * OVERFLOWS, so the rightmost control is clipped by the window edge. A
+     * per-control width check cannot see that (every control is exactly as wide
+     * as it asked for, while the last one is half off the screen), which is how
+     * the Source pill ended up reading "Vi" on a 460px window.
+     *
+     * Returns null when the row fits.
+     */
+    private fun barOverflow(scene: Scene): String? {
+        val bar = scene.lookup(".player-bar") as? javafx.scene.layout.HBox ?: return null
+        var total = 0.0
+        var shown = 0
+        for (child in bar.children) {
+            if (!child.isVisible || !child.isManaged) continue
+            total += child.layoutBounds.width
+            shown++
+        }
+        if (shown > 1) total += bar.spacing * (shown - 1)
+        return if (total > bar.width + 1.0) "row wants " + total.toInt() + "px in " + bar.width.toInt() + "px" else null
+    }
+
+    /** "text(laidOut/pref)" for every control on the bar, so a layout change is
+     *  visible in the log and not only in a screenshot. */
+    private fun barLayout(scene: Scene): String {
+        val bar = scene.lookup(".player-bar") as? javafx.scene.layout.HBox ?: return "(no bar)"
+        return bar.children.filter { it.isVisible && it.isManaged }.joinToString(" | ") { c ->
+            val label = (c as? javafx.scene.control.Labeled)?.text?.take(14) ?: c.javaClass.simpleName
+            val r = c as? javafx.scene.layout.Region
+            label + "(" + c.layoutBounds.width.toInt() + "/" + ((r?.prefWidth(-1.0) ?: 0.0).toInt()) + ")"
+        }
     }
 
     /**

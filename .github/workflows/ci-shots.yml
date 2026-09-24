@@ -1,0 +1,121 @@
+name: CI shots
+
+# Throwaway compile + UI-shot workflow used while a batch is being iterated on.
+# It NEVER packages, signs or publishes anything (unlike build.yml, which
+# uploads to the "continuous" release on every run). Dispatch it against a
+# temporary branch.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shots:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: "8.11.1"
+          cache-disabled: true
+
+      - name: Compile and stage the app
+        run: |
+          set +e
+          FAILED=0
+          for attempt in 1 2 3 4; do
+            gradle desktop:jpackageInput --no-daemon --stacktrace > build.log 2>&1
+            code=$?
+            if [ $code -eq 0 ]; then
+              echo "==== BUILD OK (attempt $attempt) ===="
+              exit 0
+            fi
+            FAILED=$code
+            if ! grep -qE "Received status code 429|Could not GET|Could not resolve|Connection reset|Read timed out|Temporary failure in name resolution" build.log; then
+              echo "==== BUILD FAILED (attempt $attempt, exit $code) - a real build error, not a network one; not retrying ===="
+              break
+            fi
+            echo "==== BUILD FAILED (attempt $attempt) - network problem, retrying in 20s ===="
+            sleep 20
+          done
+          {
+            echo "==== KOTLIN ERRORS ===="
+            grep -E "^e: " build.log | head -n 80 || true
+            echo "==== GRADLE FAILURE LINES ===="
+            grep -E "FAILURE|What went wrong|Execution failed|error: |Caused by" build.log | head -n 40 || true
+            echo "==== TAIL OF build.log ===="
+            tail -n 120 build.log
+          }
+          exit 1
+        shell: bash
+
+      - name: Stage jpackage input for the self-tests
+        run: |
+          set -e
+          rm -rf jpackage-input
+          mkdir -p jpackage-input
+          cp -r desktop/build/jpackage-input/* jpackage-input/
+          ls jpackage-input | head -5
+        shell: bash
+
+      - name: Extension install self-test (release assets, mirrors, the OS TLS stack)
+        if: always()
+        timeout-minutes: 8
+        run: |
+          set -e
+          java -cp "jpackage-input/*" com.hikari.app.net.ExtensionInstallSelfTestKt
+        shell: bash
+
+      - name: UI shots (render the app and the player layer to PNGs)
+        if: always()
+        timeout-minutes: 8
+        run: |
+          set +e
+          java -cp "jpackage-input/*" desktop.uitest.UiShotTestKt ui-shots
+          echo "ui shots exit: $?"
+          ls -la ui-shots || true
+        shell: bash
+
+      - name: App boot smoke test
+        if: always()
+        timeout-minutes: 8
+        run: |
+          set +e
+          java -cp "jpackage-input/*" desktop.MainKt > app-boot.log 2>&1 &
+          APP=$!
+          sleep 30
+          kill $APP 2>/dev/null
+          wait $APP 2>/dev/null
+          echo "==== app boot log ===="
+          cat app-boot.log
+          if grep -qE "^[[:space:]]+at desktop\.(ui|player)\." app-boot.log; then
+            echo "APP BOOT FAILED: an exception in our UI code"
+            exit 1
+          fi
+          echo "APP BOOT OK"
+        shell: bash
+
+      - name: Upload UI shots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-shots
+          path: ui-shots/*.png
+          if-no-files-found: ignore
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
