@@ -1086,17 +1086,25 @@ test.
 
 Two things that check could not see, and a second pass fixed:
 
+- **A bar left carrying the floating layout's size pin.** When the bars float over
+  the picture they live in windows of their own, so `placeOverlay` pins their size
+  to the app window's at that moment (`min = pref = max = logicalWidth`). Going
+  back to the in-window layout (a machine that cannot embed the video, or the
+  layout being restored for any reason) never removed that pin — so the bar stayed
+  exactly as wide as the window *used to be*. In a window that had since been made
+  narrower, the row was laid out for the old size and everything on the right (the
+  Source pill, the window buttons) was pushed past the window edge and clipped:
+  the pill read "Vi", and the fullscreen button had gone the same way before it.
+  The pin is now removed with the floating state, and the release re-runs
+  `applyResponsive()`.
 - **The bar was laid out for the window's PREVIOUS size.** `applyResponsive` read
-  the player layer's own width, and a bar built a moment after the window was made
-  narrower read the old width — so on a 460 px window the seek bar stayed 620 px
-  long and the right-hand controls were laid out past the window edge. Every
-  control was exactly as wide as it asked for (`squeezedBarControls` saw nothing
-  wrong) while the last ones were off the screen: the Source pill read "Vi", and
-  the fullscreen button had gone the same way before it. `applyResponsive` now
-  takes the **smaller** of the bar's width and the scene's width, is re-run once
-  after the first layout pass, and listens to the *scene* width as well as the
-  layer's — so shrinking the window re-lays the bar out however the layer is
-  being sized.
+  the bar's own width only, so a bar that was not re-measured yet kept the old
+  budget: on a 460 px window the seek bar stayed 620 px long — every control
+  exactly the width it asked for (`squeezedBarControls` saw nothing wrong) while
+  the last ones were off the screen. It now takes the **smaller** of the bar's
+  width and the scene's width, is re-run once after the first layout pass, and
+  listens to the *scene* width as well as the bar's — so shrinking the window
+  re-lays the bar out however the layer is being sized.
 - **The Source pill's label had two authors.** `renderSources` wrote the current
   server's name into the pill and `applyResponsive` wrote `""`/`"Source"` — so
   whichever ran last won, and on a narrow window that was the name, which is what

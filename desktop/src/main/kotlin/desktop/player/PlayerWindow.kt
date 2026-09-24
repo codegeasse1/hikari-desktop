@@ -882,6 +882,22 @@ object PlayerWindow {
             val ui = root ?: return@run
             val strip = topStrip
             val bar = bottomBar
+            // [placeOverlay] PINS a floating bar's width/height to the app
+            // window's size at the moment it was placed (`min = pref = max =
+            // logicalWidth`). A bar that goes back into the window's layout still
+            // carrying that pin is a bar of the OLD window's width: shrink the
+            // window and the row is laid out for the size the window used to be,
+            // so everything on the right (the Source pill, the window buttons) is
+            // pushed past the window edge and clipped. The pin belongs to the
+            // floating state, so it is removed with it.
+            for (n in listOfNotNull(strip, bar)) {
+                n.minWidth = javafx.scene.layout.Region.USE_COMPUTED_SIZE
+                n.prefWidth = javafx.scene.layout.Region.USE_COMPUTED_SIZE
+                n.maxWidth = Double.MAX_VALUE
+                n.minHeight = javafx.scene.layout.Region.USE_COMPUTED_SIZE
+                n.prefHeight = javafx.scene.layout.Region.USE_COMPUTED_SIZE
+                n.maxHeight = javafx.scene.layout.Region.USE_COMPUTED_SIZE
+            }
             // A node belongs to exactly ONE scene, so each floating stage is
             // given an empty scene of its own before its bar goes back into the
             // window's layout — that detaches the bar from the floating scene,
@@ -892,6 +908,7 @@ object PlayerWindow {
             runCatching { barStage?.scene = Scene(StackPane(), Color.TRANSPARENT) }
             strip?.let { runCatching { if (ui.top == null) ui.top = it } }
             bar?.let { runCatching { if (ui.bottom == null) ui.bottom = it } }
+            applyResponsive()
         }
     }
 
