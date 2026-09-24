@@ -889,8 +889,14 @@ class UiShotApp : Application() {
      */
     private fun squeezedBarControls(scene: Scene): List<String> {
         val bar = scene.lookup(".player-bar") as? javafx.scene.layout.HBox ?: return emptyList()
+        // The seek bar is the ONE control that is meant to give way: it is what
+        // absorbs the shortfall when the row is tight, and it has a floor of its
+        // own (see PlayerWindow.applyResponsive). Every other control on the bar
+        // has to fit its own label.
+        val seek = scene.lookup(".player-seek")
         val out = ArrayList<String>()
         for (child in bar.children) {
+            if (child === seek) continue
             if (!child.isVisible || !child.isManaged) continue
             val r = child as? javafx.scene.layout.Region ?: continue
             val want = r.prefWidth(-1.0)

@@ -1117,7 +1117,9 @@ Two things that check could not see, and a second pass fixed:
 laid-out width is wider than the **window**, and prints the geometry of the whole
 row (`barLayout`, `text(laidOut/pref)` per control) on both the wide and the 460 px
 bar, so the next regression of this kind is legible in the log rather than only on
-a screenshot.
+a screenshot. The one control exempt from the "fits its own label" rule is the seek
+bar itself: it is the control that is supposed to give way, down to its own floor,
+while every pill beside it keeps its full text.
 
 ## Still to do
 
