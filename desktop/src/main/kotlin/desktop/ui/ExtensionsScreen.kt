@@ -2041,6 +2041,14 @@ class ExtensionsScreenView {
                 }
             }
             Fx.run {
+                // Everything from here on runs AFTER the extension is installed,
+                // and an exception anywhere in it used to leave the top bar's
+                // activity chip up forever — the "Installed X" that never goes
+                // away. The `finally` guarantees the busy bookkeeping is torn
+                // down whatever happens, so a finished install can never hang on
+                // screen again; the catch says what went wrong on the status line
+                // instead of dying silently (this runs inside a coroutine).
+                try {
                 settingUpPlugins.remove(url)
                 busySince.remove(url)
                 busy.isVisible = busyPlugins.isNotEmpty() || settingUpPlugins.isNotEmpty()
@@ -2075,6 +2083,20 @@ class ExtensionsScreenView {
                     "install: " + name + " ready in " +
                         (System.currentTimeMillis() - startedAt) + "ms (" + names.size + " provider(s))",
                 )
+                } catch (t: Throwable) {
+                    installErrors[url] = "Couldn't finish $name: ${t.message?.take(300)}"
+                    setStatus(
+                        "Installed $name, but finishing the setup failed: ${t.message?.take(200)}",
+                        isError = true,
+                    )
+                } finally {
+                    // The chip is only ever "busy" while something is actually
+                    // running: no install in flight means no chip, whatever
+                    // happened above.
+                    settingUpPlugins.remove(url)
+                    busySince.remove(url)
+                    busy.isVisible = busyPlugins.isNotEmpty() || settingUpPlugins.isNotEmpty()
+                }
             }
             reloadProvidersQuietly()
         }

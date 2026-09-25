@@ -1171,6 +1171,18 @@ prints one line per extension saying *why* it had nothing (`lastStreamError()` o
 meta → "this addon has no streams" (it must explain itself, not return a blank
 list), and Torrentio's streams must parse into `StreamSource` rows.
 
+The third engine the report named, **SkyStream**, had no test at all, which is a
+hole a "no playable source" report cannot survive: a `.sky` is a whole site in a
+box and its runtime is a different JS environment from nuvio's.
+`SkyStreamSelfTest` (CI) now walks the app's own path against the live repo:
+fetch the plugin list → download a real `.sky` →
+`SkyStreamPluginManager.install` (unzip → `plugin.json`/`plugin.js` →
+`SkyStreamRuntime.validate`, i.e. a real engine boot that checks the four
+exported callbacks) → `catalogs()` (`getHome`) → `getCatalog` → `getMeta` /
+`getEpisodes` / `loadStreams`. A runtime failure (the plugin will not install,
+the engine cannot load it, a call answers with no JSON at all) fails the build; a
+site that has nothing to show is a WARN with the reason the provider recorded.
+
 ### 3. "Some names show completely like '…' only dot dots"
 
 A JavaFX `HBox` that cannot fit its children does not overflow — it **squeezes**
