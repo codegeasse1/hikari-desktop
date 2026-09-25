@@ -514,17 +514,19 @@ class ExtensionsScreenView {
             val now = System.currentTimeMillis()
             repos.forEach { repo ->
                 reposBox.children.add(repoCard(repo))
-                // A repo that already has contents is NOT fetched again just
-                // because the screen was opened. It used to be (on a six-hour
-                // TTL), which is why a repo added days ago — every one of its
-                // extensions already installed — could still put "Fetching repo…
-                // (racing 16 mirrors)" across the screen for no reason the user
-                // could see. Contents are refreshed when the user asks for it:
-                // "Reload this repo", "Reload all", or "Try again" on a failure.
-                // The background pass is left to repos that have NEVER loaded.
-                val known = repoData.containsKey(repo.url) || repoErrors.containsKey(repo.url)
-                val waited = now - (repoFetchedAt[repo.url] ?: 0L) >= FAILED_RETRY_MS
-                if (!known && waited && repoLoading.add(repo.url)) loadRepoData(repo.url, silent = true)
+                // Contents are painted from disk above, but a cache that is
+                // never revisited is a lie: a repo whose index dropped a plugin
+                // (or added one) would show its first-ever snapshot forever, and
+                // every Install for a dropped plugin could only fail. So a copy
+                // older than REPO_TTL_MS is refreshed in the BACKGROUND, with the
+                // current contents left on screen while that happens. A repo
+                // that has NEVER loaded is retried after FAILED_RETRY_MS instead
+                // (that failure is what the user sees, so it is checked sooner).
+                val known = repoData.containsKey(repo.url)
+                val age = now - (repoFetchedAt[repo.url] ?: 0L)
+                val due = if (known) age >= REPO_TTL_MS
+                          else age >= FAILED_RETRY_MS && !repoErrors.containsKey(repo.url)
+                if (due && repoLoading.add(repo.url)) loadRepoData(repo.url, silent = true)
             }
         }
         page.add(reposBox)
@@ -1554,9 +1556,11 @@ class ExtensionsScreenView {
         refreshRow(url)
         startBusyTicker()
         AppShell.uiScope.launch {
+            var note: String? = null
             val result = runCatching {
-                val bytes = Http.fetchBytesRobust(url)
-                    ?: throw Exception("Download failed — check the URL")
+                val dl = Http.downloadPluginFile(url)
+                val bytes = dl.bytes ?: throw Exception(dl.error ?: "Download failed — check the URL")
+                note = dl.takeIf { it.usedUrl != url }?.error
                 checkHash(bytes, plugin.fileHash)?.let { throw Exception(it) }
                 val fileName = plugin.name.substringBeforeLast('.').ifBlank { "provider" } + ".js"
                 com.hikari.app.nuvio.NuvioPluginManager.installScraper(
@@ -1567,7 +1571,7 @@ class ExtensionsScreenView {
                     iconUrl = plugin.iconUrl,
                 ).getOrThrow()
             }
-            finishInstall(plugin.name, url, result)
+            finishInstall(plugin.name, url, result, note)
         }
     }
 
@@ -1584,9 +1588,14 @@ class ExtensionsScreenView {
         refreshRow(url)
         startBusyTicker()
         AppShell.uiScope.launch {
+            var note: String? = null
             val result = runCatching {
-                val bytes = Http.fetchBytesRobust(url)
-                    ?: throw Exception("Download failed — check the URL")
+                val dl = Http.downloadPluginFile(url)
+                val bytes = dl.bytes ?: throw Exception(
+                    (dl.error ?: "Download failed — check the URL") +
+                        " (${url.substringAfterLast('/')} from ${repoLabelFor(url)})"
+                )
+                note = dl.takeIf { it.usedUrl != url }?.error
                 com.hikari.app.skystream.SkyStreamPluginManager.install(
                     HikariApp.instance,
                     bytes,
@@ -1594,7 +1603,7 @@ class ExtensionsScreenView {
                     iconUrl = plugin.iconUrl,
                 ).getOrThrow()
             }
-            finishInstall(plugin.name, url, result)
+            finishInstall(plugin.name, url, result, note)
         }
     }
 
@@ -1611,9 +1620,14 @@ class ExtensionsScreenView {
         refreshRow(url)
         startBusyTicker()
         AppShell.uiScope.launch {
+            var note: String? = null
             val result = runCatching {
-                val bytes = Http.fetchBytesRobust(url)
-                    ?: throw Exception("Download failed — check the URL")
+                val dl = Http.downloadPluginFile(url)
+                val bytes = dl.bytes ?: throw Exception(
+                    (dl.error ?: "Download failed — check the URL") +
+                        " (${url.substringAfterLast('/')} from ${repoLabelFor(url)})"
+                )
+                note = dl.takeIf { it.usedUrl != url }?.error
                 checkHash(bytes, plugin.fileHash)?.let { throw Exception(it) }
                 com.hikari.app.aniyomi.AniyomiExtensionManager.install(
                     HikariApp.instance,
@@ -1622,8 +1636,24 @@ class ExtensionsScreenView {
                     iconUrl = plugin.iconUrl,
                 ).getOrThrow()
             }
-            finishInstall(plugin.name, url, result)
+            finishInstall(plugin.name, url, result, note)
         }
+    }
+
+    /**
+     * The repo a source URL came from, named the way the user sees it.
+     *
+     * An install failure has to say WHERE the file was supposed to come from —
+     * "Download failed — check the URL" left the user checking a URL that was
+     * never wrong, when the repo had simply stopped publishing the file.
+     */
+    private fun repoLabelFor(url: String): String {
+        val repos = runCatching { AppShell.app.store.repos() }.getOrDefault(emptyList())
+        for (r in repos) {
+            val data = repoData[r.url] ?: repoData[r.url.trimEnd('/')] ?: continue
+            if (data.plugins.any { it.url == url }) return "repo “${Http.repoDisplayName(r)}”"
+        }
+        return "its repo"
     }
 
     /** A repo row's Install, routed to the manager for the open repo's kind. */
@@ -1676,8 +1706,9 @@ class ExtensionsScreenView {
     }
 
     /** Shared tail of every non-dex install: one busy-state cleanup, one row
-     *  message, one status line, one toast. */
-    private fun finishInstall(name: String, url: String, result: Result<Int>) {
+     *  message, one status line, one toast. [note] is an extra sentence for a
+     *  success that came with a caveat (a URL that had to be repaired). */
+    private fun finishInstall(name: String, url: String, result: Result<Int>, note: String? = null) {
         Fx.run {
             busyPlugins.remove(url)
             settingUpPlugins.remove(url)
@@ -1690,7 +1721,8 @@ class ExtensionsScreenView {
                     (result.exceptionOrNull()?.message ?: "unknown error").take(300)
             } else {
                 val n = if (count!! > 0) count else 1
-                "Installed $name ($n provider${if (n == 1) "" else "s"})."
+                "Installed $name ($n provider${if (n == 1) "" else "s"})" +
+                    (if (note != null) " — $note" else "") + "."
             }
             if (isErr) installErrors[url] = message.take(700) else installErrors.remove(url)
             setStatus(message, isErr)
@@ -1902,7 +1934,33 @@ class ExtensionsScreenView {
                 val attempts = StringBuilder()
                 var registered: String? = null
                 var loadFailure: String? = null
-                for (c in candidates) {
+                // A repo's index can name a file the repository no longer serves
+                // under that name — a renamed build (`-v14.28` vs
+                // `-v14.28-release`), a folder that moved, a family prefix the
+                // index dropped (`aniyomi-` vs `anime-`). Those all resolve to
+                // "Download failed — check the URL" even though the extension is
+                // right there under another name. So when every candidate above
+                // has failed, ask the repository what it actually holds and try
+                // the match too (Http.repairGithubFileUrl). It is queued LAZILY
+                // so a working install never pays for the extra api.github.com
+                // call, and only when the repo really holds something else — a
+                // file genuinely deleted upstream stays a clear error.
+                val queue = ArrayList(candidates)
+                var qi = 0
+                var repairQueued = false
+                while (true) {
+                    if (qi >= queue.size) {
+                        if (repairQueued) break
+                        repairQueued = true
+                        val fixed = runCatching { Http.repairGithubFileUrl(dl) }.getOrNull()
+                        if (fixed == null || fixed == dl || candidates.contains(fixed)) break
+                        attempts.append(
+                            "the repo does not serve ${dl.substringAfterLast('/')} — " +
+                                "trying ${fixed.substringAfterLast('/')}\n"
+                        )
+                        queue.add(fixed)
+                    }
+                    val c = queue[qi++]
                     val why = StringBuilder()
                     val ok = if (reused && c == dl) true else Http.downloadToRobust(c, dest) { tried, success, reason ->
                         if (!success) {
@@ -2711,6 +2769,22 @@ class ExtensionsScreenView {
          *  sees. Explicit reloads ("Reload this repo", "Reload all", "Try
          *  again") always fetch, so nothing is ever stuck. */
         const val FAILED_RETRY_MS = 15 * 60 * 1000L
+
+        /** How long a repo's cached contents are trusted before they are quietly
+         *  refreshed in the background.
+         *
+         *  Without this, a repo whose index is served from the on-disk cache is
+         *  frozen at the moment it was first fetched — forever. Plugins that the
+         *  repo later DELETED keep appearing in the list, with a working-looking
+         *  Install button that can only ever fail ("the repository no longer
+         *  holds this file"), and plugins the repo later ADDED never appear at
+         *  all. That is exactly what the 11-entry SkyStream list was: a snapshot
+         *  of a repo that has since dropped six of them.
+         *
+         *  The refresh is silent (see loadRepoData) and paints from the cache
+         *  first, so the user never sees a "Fetching repo…" stall for it; the
+         *  list simply corrects itself a moment after the screen opens. */
+        const val REPO_TTL_MS = 6 * 60 * 60 * 1000L
 
         const val MODE_HIKARI = 0
         const val MODE_CS3 = 1

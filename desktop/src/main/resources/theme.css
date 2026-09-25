@@ -1278,6 +1278,16 @@
 }
 .player-seek:disabled { -fx-opacity: 0.45; }
 
+/* The seek bar's CLICK TARGET (the wrapper the slider sits in).
+   A Region with no background is not picked up by the mouse at all, which is why
+   a click a few pixels off the hairline track used to do nothing; a fully
+   transparent background keeps the panel invisible while making the whole row
+   (22px tall) scrubbable. */
+.player-seek-hit {
+    -fx-background-color: transparent;
+    -fx-cursor: hand;
+}
+
 .player-pill {
     -fx-background-color: rgba(255, 255, 255, 0.07);
     -fx-border-color: rgba(255, 255, 255, 0.11);

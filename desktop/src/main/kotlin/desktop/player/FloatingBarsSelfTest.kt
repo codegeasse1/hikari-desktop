@@ -246,6 +246,11 @@ private fun test(host: Stage, mpvPath: String): Int {
     onFx { PlayerWindow.previewPlaying() }
     check("the bars float over the picture", onFx { PlayerWindow.barsFloating() } == true)
     Thread.sleep(800)
+    check(
+        "the picture's window is stacked above the app window (a raised app window must not hide the video)",
+        onFx { PlayerWindow.videoAboveApp() } == true,
+        "videoAboveApp=" + onFx { PlayerWindow.videoAboveApp() },
+    )
 
     val barHwnd = onFx { PlayerWindow.floatingBarHwnd() }
     val stripHwnd = onFx { PlayerWindow.floatingStripHwnd() }
@@ -525,11 +530,210 @@ private fun test(host: Stage, mpvPath: String): Int {
         val recovered = waitForFake(fake, true, 8_000L)
         check("a DROPPED pause command is noticed and recovered from", recovered == true, "channel=" + recovered)
 
+        // ── the SEEK BAR: a real click on a real pixel ──────────────────────
+        // The reported bug is in the CLICK, not in the maths: "clicking anywhere
+        // on the time bar to skip does not work, the point on the bar reverts back
+        // to where it was". So this clicks the bar with a real mouse, at a real
+        // screen position, and then checks what the player and the picture did —
+        // including the case that caused the snap-back: the picture reporting the
+        // PRE-seek position for a moment after the seek.
+        fake.publishProperty("duration", 100.0)
+        fake.publishProperty("time-pos", 10.0)
+        Thread.sleep(500)
+        check("the bar takes the picture's duration", onFx { PlayerWindow.durationSecs() } == 100.0, "" + onFx { PlayerWindow.durationSecs() })
+        val beforeSeek = onFx { PlayerWindow.seekFraction() }
+        println("  seek fraction before the click = " + beforeSeek)
+        val seekRect = onFx { PlayerWindow.seekBarScreenRect() }
+        println("  seek rect on screen = " + seekRect?.joinToString(",") + "  bar=" + barRect?.joinToString(","))
+        check("the seek bar has a rectangle on screen", seekRect != null && seekRect[2] > 60 && seekRect[3] > 0, "" + seekRect?.joinToString(","))
+        check(
+            "the seek bar's rectangle is inside the control bar",
+            seekRect != null && barRect != null &&
+                seekRect[0] >= barRect[0] - 4 &&
+                seekRect[0] + seekRect[2] <= barRect[0] + barRect[2] + 4,
+            "seek=" + seekRect?.joinToString(",") + " bar=" + barRect?.joinToString(","),
+        )
+        if (robot == null || seekRect == null) {
+            println("  (skipping the seek-bar click checks: no usable Robot / no seek rect)")
+        } else {
+            // The click is placed 6px ABOVE the row's vertical centre: well inside
+            // the 22px the bar offers, and well outside the few pixels the slider's
+            // own track occupies — the click a user makes when they aim at the bar
+            // rather than at the line.
+            val clickX = seekRect[0] + (seekRect[2] * 0.70).toInt()
+            val clickY = seekRect[1] + (seekRect[3] / 2) - 6
+            robot.mouseMove(clickX, clickY)
+            Thread.sleep(120)
+            robot.mousePress(java.awt.event.InputEvent.BUTTON1_DOWN_MASK)
+            Thread.sleep(90)
+            robot.mouseRelease(java.awt.event.InputEvent.BUTTON1_DOWN_MASK)
+            Thread.sleep(700)
+            val afterSeek = onFx { PlayerWindow.seekFraction() }
+            val shownAfter = onFx { PlayerWindow.shownSeconds() }
+            println("  after clicking at 70% of the bar: fraction=" + afterSeek + " readout=" + shownAfter + "s")
+            check(
+                "clicking the bar MOVES the bar to where it was clicked",
+                afterSeek != null && kotlin.math.abs(afterSeek - 0.70) <= 0.06,
+                "" + afterSeek,
+            )
+            check(
+                "the readout follows the click (70% of a 100s file ≈ 70s)",
+                shownAfter != null && kotlin.math.abs(shownAfter - 70.0) <= 6.0,
+                "" + shownAfter,
+            )
+            check(
+                "the click reaches the picture as an absolute seek",
+                fake.commands.any {
+                    val parts = it.split(" ")
+                    parts.getOrNull(0) == "seek" && parts.getOrNull(2) == "absolute" &&
+                        (parts.getOrNull(1)?.toDoubleOrNull()?.let { v -> kotlin.math.abs(v - 70.0) <= 6.0 } == true)
+                },
+                fake.commands.joinToString(" | ").take(400),
+            )
+
+            // …and now the exact cause of "the point reverts back": the picture
+            // keeps reporting the OLD position for a moment (which is what a real
+            // mpv does while the demuxer moves). The bar must not follow it.
+            fake.publishProperty("time-pos", 10.0)
+            Thread.sleep(500)
+            val afterEcho = onFx { PlayerWindow.seekFraction() }
+            val shownEcho = onFx { PlayerWindow.shownSeconds() }
+            println("  after a stale pre-seek report (10s): fraction=" + afterEcho + " readout=" + shownEcho + "s")
+            check(
+                "a stale pre-seek position report does NOT drag the bar back (the reported snap-back)",
+                afterEcho != null && kotlin.math.abs(afterEcho - 0.70) <= 0.08,
+                "" + afterEcho,
+            )
+            check(
+                "…and it does not drag the clock back either",
+                shownEcho != null && shownEcho >= 60.0,
+                "" + shownEcho,
+            )
+            // The seek lands: the bar follows the picture again from there.
+            fake.publishProperty("time-pos", 71.0)
+            Thread.sleep(400)
+            val landed = onFx { PlayerWindow.seekFraction() }
+            println("  once the picture catches up (71s): fraction=" + landed)
+            check(
+                "the bar follows the picture again once the seek lands",
+                landed != null && kotlin.math.abs(landed - 0.71) <= 0.05,
+                "" + landed,
+            )
+            // A seek that never lands must not leave the bar lying: after the
+            // echo window closes the reports win again.
+            onFx { PlayerWindow.seekToFraction(0.30) }
+            fake.publishProperty("time-pos", 5.0)
+            Thread.sleep(3_200)
+            val honest = onFx { PlayerWindow.seekFraction() }
+            println("  a seek that never lands, 3.2s later: fraction=" + honest)
+            check(
+                "a seek that never lands does not leave the bar lying about the position",
+                honest != null && kotlin.math.abs(honest - 0.05) <= 0.06,
+                "" + honest,
+            )
+        }
+
         println("  channel commands the player sent: " + fake.commands.joinToString(" | "))
         runCatching { client.close() }
     }
     fake.close()
     probePipe(ipcName)
+
+    // ── the FULLSCREEN button ───────────────────────────────────────────────
+    // The reported "the player's fullscreen button does not work". From the
+    // user's side that is any of three things, and all three are measured here:
+    // the platform refusing the transition (the window never changes), the
+    // picture ending up BEHIND the raised full-screen window (a black player with
+    // working controls), and the window not coming back when full screen is left.
+    fun clickRect(r: IntArray?) {
+        if (robot == null || r == null || r[2] <= 0 || r[3] <= 0) return
+        robot.mouseMove(r[0] + r[2] / 2, r[1] + r[3] / 2)
+        Thread.sleep(150)
+        robot.mousePress(java.awt.event.InputEvent.BUTTON1_DOWN_MASK)
+        Thread.sleep(90)
+        robot.mouseRelease(java.awt.event.InputEvent.BUTTON1_DOWN_MASK)
+    }
+    onFx { PlayerWindow.previewChrome(true) }
+    Thread.sleep(400)
+    val windowBefore = WinShell.windowRect(appHwnd)
+    val fullButtonBefore = onFx { PlayerWindow.fullscreenButtonScreenRect() }
+    println(
+        "  fullscreen button = " + fullButtonBefore?.joinToString(",") +
+            "  window=" + windowBefore?.joinToString(","),
+    )
+    check(
+        "the fullscreen button has a rectangle on screen",
+        fullButtonBefore != null && fullButtonBefore[2] > 0 && fullButtonBefore[3] > 0,
+        "" + fullButtonBefore?.joinToString(","),
+    )
+    if (robot == null || fullButtonBefore == null || windowBefore == null ||
+        barHwnd == null || videoHwnd == null
+    ) {
+        println("  (skipping the fullscreen checks: no usable Robot / no window rects)")
+    } else {
+        clickRect(fullButtonBefore)
+        Thread.sleep(1_600)
+        val active = onFx { PlayerWindow.fullscreenActive() }
+        val covers = onFx { PlayerWindow.windowCoversScreen() }
+        val fullRect = WinShell.windowRect(appHwnd)
+        println(
+            "  after clicking it: active=" + active + " coversScreen=" + covers +
+                "  window=" + fullRect?.joinToString(","),
+        )
+        check("clicking the fullscreen button puts the player in full screen", active == true, "active=" + active)
+        check(
+            "the window really covers the screen in full screen (the user-visible result)",
+            covers == true,
+            "rect=" + fullRect?.joinToString(","),
+        )
+        check(
+            "the window CHANGED, so the button did something visible",
+            fullRect != null && !fullRect.contentEquals(windowBefore),
+            "was=" + windowBefore.joinToString(",") + " now=" + fullRect?.joinToString(","),
+        )
+        val videoInFull = onFx { PlayerWindow.videoSurfaceHwnd() }?.let { WinShell.windowRect(it) }
+        check(
+            "the picture fills the full-screen window",
+            videoInFull != null && fullRect != null &&
+                kotlin.math.abs(videoInFull[2] - fullRect[2]) <= 10 &&
+                kotlin.math.abs(videoInFull[3] - fullRect[3]) <= 10,
+            "video=" + videoInFull?.joinToString(",") + " window=" + fullRect?.joinToString(","),
+        )
+        check(
+            "the picture's window is stacked ABOVE the app window in full screen (not hidden behind it)",
+            onFx { PlayerWindow.videoAboveApp() } == true,
+            "videoAboveApp=" + onFx { PlayerWindow.videoAboveApp() },
+        )
+        val barInFull = onFx { PlayerWindow.barScreenRect() }
+        check(
+            "the control bar is still on screen in full screen",
+            barInFull != null && fullRect != null &&
+                barInFull[1] >= fullRect[1] - 6 &&
+                barInFull[1] + barInFull[3] <= fullRect[1] + fullRect[3] + 6,
+            "bar=" + barInFull?.joinToString(",") + " window=" + fullRect?.joinToString(","),
+        )
+        check(
+            "the control bar is still above the picture in full screen",
+            WinShell.isAbove(barHwnd, videoHwnd) == true,
+            "isAbove=" + WinShell.isAbove(barHwnd, videoHwnd),
+        )
+        // …and out again, from the same button: the window has to come BACK.
+        onFx { PlayerWindow.previewChrome(true) }
+        Thread.sleep(400)
+        clickRect(onFx { PlayerWindow.fullscreenButtonScreenRect() })
+        Thread.sleep(1_600)
+        val left = onFx { PlayerWindow.fullscreenActive() }
+        val restored = WinShell.windowRect(appHwnd)
+        println("  after clicking it again: active=" + left + "  window=" + restored?.joinToString(","))
+        check("clicking it again leaves full screen", left != true, "active=" + left)
+        check(
+            "the window comes back the size it had before",
+            restored != null &&
+                kotlin.math.abs(restored[2] - windowBefore[2]) <= 10 &&
+                kotlin.math.abs(restored[3] - windowBefore[3]) <= 10,
+            "was=" + windowBefore.joinToString(",") + " now=" + restored?.joinToString(","),
+        )
+    }
 
     println("  ---- mpv log (ipc lines, and the tail) ----")
     runCatching {
@@ -606,6 +810,13 @@ private class FakeMpvChannel {
     @Volatile
     var dropNextCycle = false
 
+    /** The picture's play position, in seconds — mpv's `time-pos`. Kept here so
+     *  a seek the player sends is visible from the channel's side too. */
+    @Volatile var timePos = 0.0
+
+    /** The picture's duration, in seconds — mpv's `duration`. */
+    @Volatile var duration = 0.0
+
     /** Every command the player sent, in order, for the log. */
     val commands = java.util.Collections.synchronizedList(ArrayList<String>())
 
@@ -635,6 +846,18 @@ private class FakeMpvChannel {
             .put("event", "property-change")
             .put("name", "track-list")
             .put("data", tracks)
+        send(ch, message)
+    }
+
+    /** Pushes a `property-change` the way mpv does — a `duration` once the file
+     *  is open, a `time-pos` move, and (what the seek test needs) the STALE
+     *  pre-seek position mpv keeps reporting for a moment after a seek. */
+    fun publishProperty(name: String, value: Any?) {
+        val ch = channel ?: return
+        val message = JSONObject()
+            .put("event", "property-change")
+            .put("name", name)
+            .put("data", value)
         send(ch, message)
     }
 
@@ -695,10 +918,23 @@ private class FakeMpvChannel {
                 if (name == "vid") vid = args.opt(2) ?: "auto"
                 data = paused
             }
+            "seek" -> {
+                // Accepted immediately, like mpv: the position is what the player
+                // asked for. What mpv goes on REPORTING for a moment (the stale
+                // pre-seek position) is published by the test itself, so the
+                // snap-back case can be reproduced exactly.
+                when (val target = args.opt(1)) {
+                    is Number -> timePos = target.toDouble()
+                    is String -> target.toDoubleOrNull()?.let { timePos = it }
+                }
+                data = timePos
+            }
             "get_property" -> data = when (name) {
                 "pause" -> paused
                 "vid" -> vid
                 "track-list" -> tracks
+                "time-pos" -> timePos
+                "duration" -> duration
                 else -> 0
             }
             else -> data = 0

@@ -79,8 +79,11 @@ fun main() {
         return
     }
 
-    // Two plugins, preferring well-established ones (they are the ones a user
-    // actually installs); anything that declares a `.sky` URL will do.
+    // EVERY plugin the repo currently lists, "well-established first" so the
+    // deepest checks (the full getHome → catalog → streams walk) run against a
+    // site that is likely to answer. The old version tried two: a repo that has
+    // lost plugins one by one is exactly the report this test exists for, and a
+    // sample of two cannot see that.
     val preferred = listOf("dev.akash.stars.4khd", "dev.akash.stars.hdhub4u", "dev.akash.stars.moviesdrive")
     val picks = ArrayList<Pair<String, String>>()
     for (name in preferred) {
@@ -91,28 +94,37 @@ fun main() {
             if (url.isNotBlank()) picks.add(name to url)
             break
         }
-        if (picks.size >= 2) break
     }
-    if (picks.isEmpty()) {
-        for (i in 0 until listed.length()) {
-            if (picks.size >= 2) break
-            val o = listed.optJSONObject(i) ?: continue
-            val url = o.optString("url")
-            if (url.endsWith(".sky")) picks.add(o.optString("packageName") to url)
-        }
+    for (i in 0 until listed.length()) {
+        val o = listed.optJSONObject(i) ?: continue
+        val pkg = o.optString("packageName")
+        val url = o.optString("url")
+        if (url.endsWith(".sky") && picks.none { it.first == pkg }) picks.add(pkg to url)
     }
     println("— plugins to try: " + picks.joinToString(", ") { it.first })
+    if (picks.size < listed.length()) {
+        println("  (the repo lists ${listed.length()}; ${picks.size} carry a .sky URL)")
+    }
 
     var installedOk = 0
     var calledOk = 0
     var streamOk = 0
 
-    for ((packageName, url) in picks) {
-        val bytes = Http.fetchBytesRobust(url)
+    for ((index, pick) in picks.withIndex()) {
+        val (packageName, url) = pick
+        // The installer's own fetch path (index-drift repair included), not a
+        // bare fetch — that is the code the Install button runs.
+        val dl = Http.downloadPluginFile(url)
+        val bytes = dl.bytes
         if (bytes == null || bytes.isEmpty()) {
-            warn("$packageName downloads", "no bytes from $url")
+            check(
+                "$packageName downloads",
+                false,
+                (dl.error ?: "no bytes from $url"),
+            )
             continue
         }
+        if (dl.usedUrl != url) println("      (index drift repaired: fetched ${dl.usedUrl})")
         println("— $packageName (${bytes.size} bytes)")
 
         // ── install: unzip, read the manifest, boot a real engine, and require
@@ -123,9 +135,12 @@ fun main() {
             Result.failure(t)
         }
         if (installed.isFailure) {
-            check(
+            // A `.sky` whose plugin.js no longer boots is the plugin's own
+            // outcome (these are third-party files that change without notice),
+            // so one of them must not fail the build — but ALL of them failing
+            // is an engine regression, which is gated below.
+            warn(
                 "$packageName installs and its plugin loads in the JS runtime",
-                false,
                 installed.exceptionOrNull()?.message?.take(300).orEmpty(),
             )
             continue
@@ -140,6 +155,12 @@ fun main() {
             continue
         }
         val provider = SkyStreamProvider(config)
+
+        // Only the first two run the FULL walk (catalog → meta → episodes →
+        // streams): each is a real site request and the point of the walk is
+        // covered twice; the rest stop after getHome so the whole matrix fits
+        // the step's budget.
+        val deep = index < 2
 
         // ── getHome ─────────────────────────────────────────────────────────
         val t0 = System.currentTimeMillis()
@@ -169,6 +190,7 @@ fun main() {
             warn("$packageName's getHome returned rows", (homeWhy ?: "the site answered no rows this run").take(220))
             continue
         }
+        if (!deep) continue
 
         // ── the first row's items ───────────────────────────────────────────
         val t1 = System.currentTimeMillis()
@@ -224,6 +246,13 @@ fun main() {
     }
 
     check("at least one real SkyStream plugin installs and loads", installedOk > 0, "installed=$installedOk")
+    // One plugin that will not boot is the third-party file's business; MOST of
+    // them not booting is the engine's, and that is what this gate catches.
+    check(
+        "the engine boots most of the repo's plugins (${installedOk}/${picks.size})",
+        installedOk > 0 && installedOk * 2 >= picks.size,
+        "installed=$installedOk of ${picks.size}",
+    )
     check("at least one real SkyStream plugin answers a plugin call", calledOk > 0, "answered=$calledOk")
     if (streamOk == 0) {
         println(
@@ -231,6 +260,58 @@ fun main() {
                 "third-party and change daily), but a build where NONE of ${picks.size} works is the " +
                 "report this test exists for."
         )
+    }
+
+    // ── a plugin the repo REMOVED must say so, not "check the URL" ──────────
+    //
+    // The reported failure behind this test: the SkyStream "Stars" repo cleaned
+    // up six of its plugins in one commit and left its listings alone, so every
+    // install of them ended in "⚠ Couldn't install Anichi: Download failed —
+    // check the URL". The extension is gone; the URL was never wrong. These are
+    // the six, measured from the repo's own history (baa3043 "clean up").
+    val removed = listOf(
+        "dev.akash.stars.anichi",
+        "dev.akash.stars.animedekho",
+        "dev.akash.stars.animesalt",
+        "dev.akash.stars.bollyflix",
+        "dev.akash.stars.ringz",
+        "dev.akash.stars.streamflix",
+    )
+    val base = "https://raw.githubusercontent.com/akashdh11/skystream-plugins/main/dist"
+    var driftOk = 0
+    var driftChecked = 0
+    for (pkg in removed) {
+        val url = "$base/$pkg.sky"
+        val files = Http.repoFileList(url)
+        if (files == null) {
+            warn("GitHub could not be asked what the SkyStream repo holds", "the drift checks are unverified this run")
+            break
+        }
+        driftChecked++
+        // It must not have come back upstream while we were not looking: if the
+        // repo publishes it again, the honest answer is that it DOES download.
+        val gone = Http.fileGoneFromRepo(url)
+        val dl = Http.downloadPluginFile(url)
+        if (gone) {
+            check(
+                "$pkg is reported as removed upstream, not as \"check the URL\"",
+                dl.bytes == null && dl.error?.contains("no longer holds this file") == true,
+                "said: ${dl.error}",
+            )
+            driftOk++
+        } else {
+            warn("$pkg is published by the repo again", "so it is not a drift case any more")
+            check("$pkg downloads when the repo does publish it", dl.bytes != null, "" + dl.error)
+            driftOk++
+        }
+    }
+    if (driftChecked > 0) {
+        check(
+            "every removed plugin is reported honestly ($driftOk/$driftChecked)",
+            driftOk == driftChecked,
+            "$driftOk of $driftChecked",
+        )
+        println("  (also listed, still live: " + listed.length().toString() + " plugins — a stale cached list would still show " + (listed.length() + removed.size) + ")")
     }
 
     println(

@@ -111,6 +111,19 @@ class JsRuntime private constructor(private val v8: V8Runtime) {
         evaluate<Any?>("$js\n;void 0;\n", name, false)
     }
 
+    /**
+     * Binds a plain value (a string, a number, a boolean) as a global, before (or
+     * between) [evaluate] calls.
+     *
+     * Used by the `app.cash.quickjs` stand-in, whose `set(name, type, value)`
+     * hands a value to the script it is about to run — a page's payload, usually.
+     */
+    fun setGlobal(name: String, value: Any?) {
+        val v8Value = runCatching { toV8Value(value) }.getOrNull() ?: return
+        runCatching { v8.globalObject.set(name, v8Value) }
+        runCatching { v8Value.close() }
+    }
+
     fun close() {
         runCatching { v8.close() }
         if (watchdogsInitialized) runCatching { watchdogs.shutdownNow() }

@@ -97,6 +97,21 @@ object PlayerWindow {
     private const val BAR_MIN_H = 24.0
     private const val BAR_MAX_H = 96.0
 
+    /**
+     * How long the reports of the PRE-seek position are ignored after a seek.
+     *
+     * mpv accepts a seek immediately but keeps reporting the old `time-pos` for a
+     * moment while the demuxer moves, and a bar that obeys those echoes snaps
+     * straight back to where it was — which is exactly the reported "tapping a
+     * spot on the time bar does nothing, the point reverts back". A report within
+     * [SEEK_ECHO_TOLERANCE_SECS] of the target is taken as "the seek landed" and
+     * normal updates resume; the timeout is the backstop for a seek that never
+     * lands (a refused seek must not leave the bar lying about where playback
+     * is).
+     */
+    private const val SEEK_ECHO_TOLERANCE_SECS = 1.5
+    private const val SEEK_ECHO_MS = 2_500L
+
     private var root: BorderPane? = null
     private var mounted = false
 
@@ -184,6 +199,41 @@ object PlayerWindow {
     private var timeLabel: Label? = null
     private var totalLabel: Label? = null
     private var seekBar: Slider? = null
+
+    /**
+     * The row the seek bar lives in — the click target.
+     *
+     * A Slider's own hit area is the thin track plus the thumb, and its skin
+     * swallows drags: click a couple of pixels above the line and nothing
+     * happens. This wrapper is as tall as the bar and turns the pointer's x into
+     * a position itself (see [scrubTo]), so a click anywhere on the bar seeks.
+     */
+    private var seekHit: StackPane? = null
+
+    /**
+     * The position (seconds) a seek asked for, while the picture catches up.
+     *
+     * mpv keeps reporting the OLD position for a moment after a seek; letting
+     * those echoes drive the bar is what made a clicked position snap back.
+     * While this is set, a report far from the target is ignored and the bar and
+     * readout stay on the target — see [displayedPosition].
+     */
+    @Volatile private var seekPendingSecs: Double? = null
+
+    /** When [seekPendingSecs] stops being believed (monotonic-ish wall clock). */
+    @Volatile private var seekPendingUntil = 0L
+
+    /** Whether the PLAYER asked for full screen. Compared against the stage's own
+     *  `isFullScreen`, so a machine that refuses the OS-level transition still
+     *  gets a full-screen window — see [setFullscreen]. */
+    private var fullscreenOn = false
+
+    /** True when the window was filled to the screen by hand, because the
+     *  platform did not honour `isFullScreen` (see [fillIfNotFullscreen]). */
+    private var fullscreenFill = false
+
+    /** The window geometry to put back when full screen is left: x, y, w, h. */
+    private var fullscreenSaved: DoubleArray? = null
     private var playButton: Button? = null
     private var nextButton: Button? = null
     private var sourceMenu: MenuButton? = null
@@ -1058,24 +1108,24 @@ object PlayerWindow {
         val w = (area.width * scale).roundToInt()
         val h = (area.height * scale).roundToInt()
         if (w < 16 || h < 16) return
-        val target = if (overlayUp) {
-            intArrayOf(WinShell.PARKED_X, WinShell.PARKED_Y, w, h)
-        } else {
-            val owner = ownerHwnd ?: return
-            // The app's window is undecorated, so its window rectangle IS its
-            // client rectangle: the video area's offset inside the client area
-            // plus that origin is where the video belongs on screen. JavaFX
-            // reports the offset in logical pixels, Win32 wants physical ones,
-            // which is what [scale] is for.
-            val appRect = WinShell.windowRect(owner) ?: return
-            val local = area.localToScene(0.0, 0.0)
-            intArrayOf(
-                appRect[0] + (local.x * scale).roundToInt(),
-                appRect[1] + (local.y * scale).roundToInt(),
-                w,
-                h,
-            )
+        if (overlayUp) {
+            WinShell.placeWindow(hwnd, WinShell.PARKED_X, WinShell.PARKED_Y, w, h)
+            return
         }
+        val owner = ownerHwnd ?: return
+        // The app's window is undecorated, so its window rectangle IS its client
+        // rectangle: the video area's offset inside the client area plus that
+        // origin is where the video belongs on screen. JavaFX reports the offset
+        // in logical pixels, Win32 wants physical ones, which is what [scale] is
+        // for.
+        val appRect = WinShell.windowRect(owner) ?: return
+        val local = area.localToScene(0.0, 0.0)
+        val target = intArrayOf(
+            appRect[0] + (local.x * scale).roundToInt(),
+            appRect[1] + (local.y * scale).roundToInt(),
+            w,
+            h,
+        )
         // Windows itself, and mpv, move windows behind the app's back (mpv
         // resizes its own window when a file's dimensions become known), so the
         // LIVE rectangle is what this compares against: a window that drifted
@@ -1083,8 +1133,15 @@ object PlayerWindow {
         // GetWindowRect per tick. Caching the last placement would leave the
         // video at whatever size mpv decided on.
         val live = WinShell.windowRect(hwnd)
-        if (live != null && live.contentEquals(target)) return
-        WinShell.placeWindow(hwnd, target[0], target[1], target[2], target[3])
+        // The picture's window is also kept directly ABOVE the app window. It is
+        // mpv's own top-level window, so Windows raises the app window over it
+        // whenever the app is activated — a click on the app's controls, a
+        // restore, and above all GOING FULL SCREEN — and the player then shows a
+        // black rectangle with working controls while the picture sits
+        // underneath. One SetWindowPos on a tick that already read the rectangle.
+        val stacked = runCatching { WinShell.isAbove(hwnd, owner) }.getOrNull()
+        if (live != null && live.contentEquals(target) && stacked == true) return
+        WinShell.placeAbove(hwnd, owner, target[0], target[1], target[2], target[3])
     }
 
     private fun screenScale(): Double = runCatching {
@@ -1202,22 +1259,46 @@ object PlayerWindow {
         val seek = Slider(0.0, 1.0, 0.0).apply {
             styleClass.add("player-seek")
             isDisable = true
-            cursor = Cursor.HAND
-            // Clicking anywhere on the bar scrubs there, and the readout follows
-            // the pointer while it is dragged; the seek itself is posted once the
-            // button is released, so a drag costs ONE seek instead of one per
-            // pixel.
-            setOnMousePressed {
-                scrubbing = true
-                previewScrub()
-            }
-            setOnMouseDragged { previewScrub() }
-            setOnMouseReleased {
-                scrubbing = false
-                seekTo(value)
-            }
+            // The wrapper below owns the pointer. A Slider's skin only reacts
+            // inside its own thin track, consumes the drag, and leaves the rest of
+            // the row inert — so "click the bar to skip" landed on nothing unless
+            // the click happened to be exactly on the line. Out of the pointer's
+            // way, every click on the row is turned into a position here.
+            isMouseTransparent = true
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
         }
         seekBar = seek
+
+        val seekRow = StackPane(seek).apply {
+            styleClass.add("player-seek-hit")
+            cursor = Cursor.HAND
+            alignment = Pos.CENTER_LEFT
+            // A bar you can hit without aiming: the track is a hairline, the click
+            // target is not.
+            minHeight = 22.0
+            prefHeight = 22.0
+            maxHeight = 22.0
+            minWidth = 0.0
+            // Press and drag move the bar and the readout to the pointer; the seek
+            // itself is posted once, on release, so a drag costs ONE seek instead
+            // of one per pixel.
+            setOnMousePressed { e ->
+                if (seek.isDisable) return@setOnMousePressed
+                scrubbing = true
+                scrubTo(e.x)
+            }
+            setOnMouseDragged { e ->
+                if (!scrubbing) return@setOnMouseDragged
+                scrubTo(e.x)
+            }
+            setOnMouseReleased {
+                if (!scrubbing) return@setOnMouseReleased
+                scrubbing = false
+                seekTo(seek.value)
+            }
+        }
+        seekHit = seekRow
 
         // The Source picker: EVERY server the title offered, switchable without
         // leaving the player. This is the button the Android player has and the
@@ -1296,7 +1377,7 @@ object PlayerWindow {
             minWidth = 0.0
             maxWidth = Double.MAX_VALUE
             children.addAll(
-                play, time, seek, total,
+                play, time, seekRow, total,
                 barGap,
                 sepA,
                 source, quality, audio, subs,
@@ -1368,7 +1449,20 @@ object PlayerWindow {
             stage.yProperty().addListener { _, _, _ -> safeSync() }
             stage.widthProperty().addListener { _, _, _ -> safeSync() }
             stage.heightProperty().addListener { _, _, _ -> safeSync() }
-            stage.fullScreenProperty().addListener { _, _, _ -> refreshFullscreenButton(); pokeChrome() }
+            stage.fullScreenProperty().addListener { _, _, fs ->
+                // Full screen can also be left from OUTSIDE the button (the
+                // platform's own shortcut, a window manager), and the player's
+                // own state has to follow or the next click on the button would
+                // do the opposite of what it says.
+                if (!fs && fullscreenOn) {
+                    fullscreenOn = false
+                    fullscreenFill = false
+                }
+                refreshFullscreenButton()
+                pokeChrome()
+                safeSync()
+                positionOverlays()
+            }
         }
         syncTimer = Timeline(
             KeyFrame(Duration.millis(SYNC_MS), EventHandler<ActionEvent> {
@@ -1476,7 +1570,7 @@ object PlayerWindow {
             var need = 0.0
             var shown = 0
             for (child in row.children) {
-                if (child === seekBar) continue
+                if (child === seekBar || child === seekHit) continue
                 if (!child.isVisible || !child.isManaged) continue
                 shown++
                 val r = child as? Region
@@ -1484,12 +1578,19 @@ object PlayerWindow {
                 need += if (w > 0.0) w else (r?.minWidth(-1.0) ?: 0.0).coerceAtLeast(0.0)
             }
             if (shown > 1) need += row.spacing * (shown - 1)
-            seekBar?.let { it1 ->
-                val floor = if (tiny) 48.0 else 90.0
-                val length = (width - need - 10.0).coerceIn(floor, 620.0)
-                it1.minWidth = floor
-                it1.prefWidth = length
-                it1.maxWidth = length
+            val floor = if (tiny) 48.0 else 90.0
+            val length = (width - need - 10.0).coerceIn(floor, 620.0)
+            // The length belongs to the ROW (it is the row's child and the click
+            // target); the slider inside simply fills it.
+            seekHit?.let {
+                it.minWidth = floor
+                it.prefWidth = length
+                it.maxWidth = length
+            }
+            seekBar?.let {
+                it.minWidth = floor
+                it.prefWidth = length
+                it.maxWidth = length
             }
         }
         // ...and the labels that must never be reduced to "Qua…" or "0…" say so.
@@ -1558,9 +1659,7 @@ object PlayerWindow {
         runCatching { hideOverlay(barStage) }
         // Leaving the app fullscreen with no player in it would strand the user
         // on a screen with no controls.
-        runCatching {
-            if (AppShell.stage.isFullScreen) AppShell.stage.isFullScreen = false
-        }
+        runCatching { AppShell.stage }.getOrNull()?.let { leaveFullscreen(it) }
         overlayUp = true
         duration = 0.0
         scrubbing = false
@@ -1576,7 +1675,8 @@ object PlayerWindow {
      *  fullscreen is no longer a place with no controls at all: moving the
      *  pointer there brings them back, exactly as it does in a window. */
     private fun refreshFullscreenButton() {
-        val fs = runCatching { AppShell.stage.isFullScreen }.getOrDefault(false)
+        val stage = runCatching { AppShell.stage }.getOrNull()
+        val fs = stage != null && inFullscreen(stage)
         fullscreenButton?.graphic = Icons.of(if (fs) Icons.FULLSCREEN_EXIT else Icons.FULLSCREEN, 16.0)
     }
 
@@ -1824,6 +1924,69 @@ object PlayerWindow {
         if (overlaysOn) overlayHwnd(barStage)?.let { WinShell.windowRect(it) }
         else nodeScreenRect(bottomBar)
 
+    // ── harness hooks for the two reported-broken controls ──────────────────
+
+    /** The seek bar's rectangle on screen, so a test can click the bar with a
+     *  REAL mouse (which is the whole point: the click path is what was broken,
+     *  not the maths behind it). */
+    fun seekBarScreenRect(): IntArray? = nodeScreenRect(seekHit ?: seekBar)
+
+    /** The fullscreen button's rectangle on screen. */
+    fun fullscreenButtonScreenRect(): IntArray? = nodeScreenRect(fullscreenButton)
+
+    /** Where the bar's thumb is (0..1) — read after a click to prove it did not
+     *  snap back to where playback was. */
+    fun seekFraction(): Double? = Fx.runBlock { seekBar?.value }
+
+    /** What the readout says playback is at, in seconds. */
+    fun shownSeconds(): Double? = Fx.runBlock { lastPosition / 1000.0 }
+
+    /** The duration the layer is working with, in seconds. */
+    fun durationSecs(): Double? = Fx.runBlock { duration }
+
+    /** Presses the fullscreen button as a click does — for the same reason the
+     *  pointer-rests-on-the-bar check drives real clicks. */
+    fun clickFullscreen(): Boolean = runCatching {
+        Fx.runBlock {
+            val b = fullscreenButton ?: return@runBlock false
+            b.fire()
+            true
+        }
+    }.getOrDefault(false)
+
+    /** True while the player believes it is showing the picture full screen
+     *  (whether the platform made that happen or the window was filled by hand). */
+    fun fullscreenActive(): Boolean = Fx.runBlock {
+        val stage = runCatching { AppShell.stage }.getOrNull() ?: return@runBlock false
+        fullscreenOn && inFullscreen(stage)
+    }
+
+    /** Whether the app window really covers the screen it is on: the
+     *  user-visible meaning of "full screen", checked without trusting a flag. */
+    fun windowCoversScreen(): Boolean = Fx.runBlock {
+        val stage = runCatching { AppShell.stage }.getOrNull() ?: return@runBlock false
+        coversScreen(stage)
+    }
+
+    /** True when the picture's window is stacked directly above the app window —
+     *  what keeps the video visible when the app window is raised (a click on the
+     *  app, a restore, going full screen). */
+    fun videoAboveApp(): Boolean? = runCatching {
+        val video = surfaceHwnd ?: return@runCatching null
+        val owner = ownerHwnd ?: return@runCatching null
+        WinShell.isAbove(video, owner)
+    }.getOrNull()
+
+    /** A seek through the same path the bar uses, for a runner whose pointer
+     *  cannot be aimed at a 22px row. */
+    fun seekToFraction(fraction: Double): Boolean = Fx.runBlock {
+        if (duration <= 0.0) return@runBlock false
+        scrubbing = false
+        seekTo(fraction)
+        true
+    }
+
+
     private fun nodeScreenRect(n: javafx.scene.Node?): IntArray? {
         val node = n ?: return null
         if (node.scene == null) return null
@@ -1997,10 +2160,117 @@ object PlayerWindow {
 
     private fun toggleFullscreen() {
         val stage = runCatching { AppShell.stage }.getOrNull() ?: return
-        stage.isFullScreen = !stage.isFullScreen
+        setFullscreen(stage, !fullscreenOn)
+    }
+
+    /**
+     * Enters or leaves full screen, and makes sure it actually HAPPENED.
+     *
+     * The reported "the fullscreen button does nothing" is not a click that was
+     * lost — the stage's own `isFullScreen` is what everything downstream
+     * (the video surface's rectangle, the floating bars' placement) is measured
+     * from, so a platform that quietly refuses the transition leaves the player
+     * looking exactly as it did. Two things fix that:
+     *
+     *  1. the window is filled to the screen by hand when the transition did not
+     *     take (an UNDECORATED window sized to the screen is a full-screen
+     *     window — [fillIfNotFullscreen]);
+     *  2. the picture's z-order is re-asserted ([syncSurface] does it on its
+     *     next tick): a full-screen app window is raised over mpv's separate
+     *     top-level window, which is how a working picture turns into a black
+     *     rectangle the moment the user goes full screen.
+     *
+     * The geometry the window had before is kept so leaving full screen always
+     * gives the user their window back, whatever the platform did in between.
+     */
+    private fun setFullscreen(stage: javafx.stage.Stage, on: Boolean) {
+        if (on == fullscreenOn && on == inFullscreen(stage)) {
+            refreshFullscreenButton()
+            return
+        }
+        if (on) {
+            if (!inFullscreen(stage)) {
+                fullscreenSaved = doubleArrayOf(stage.x, stage.y, stage.width, stage.height)
+            }
+            fullscreenOn = true
+            runCatching { stage.isFullScreen = true }
+            // The platform gets its chance first; if it did not take, the window
+            // is filled on the next pulse, when the transition would have shown.
+            javafx.application.Platform.runLater { fillIfNotFullscreen(stage) }
+        } else {
+            leaveFullscreen(stage)
+        }
         refreshFullscreenButton()
         pokeChrome()
         settleSurface()
+        // …and at once, rather than up to one tick later, so the picture is
+        // already in the right place (and in the right z-order) on the frame the
+        // window changes size.
+        safeSync()
+        positionOverlays()
+    }
+
+    /** Leaves full screen, restoring the window the user had. Safe to call when
+     *  the player is not full screen. */
+    private fun leaveFullscreen(stage: javafx.stage.Stage) {
+        val wasOn = fullscreenOn || inFullscreen(stage)
+        fullscreenOn = false
+        fullscreenFill = false
+        runCatching { if (stage.isFullScreen) stage.isFullScreen = false }
+        fullscreenSaved?.let { r ->
+            fullscreenSaved = null
+            if (wasOn) {
+                runCatching {
+                    stage.width = r[2]
+                    stage.height = r[3]
+                    stage.x = r[0]
+                    stage.y = r[1]
+                }
+            }
+        }
+        refreshFullscreenButton()
+    }
+
+    /** True while the player is showing the picture full screen — whether the
+     *  platform did it or [fillIfNotFullscreen] had to. */
+    private fun inFullscreen(stage: javafx.stage.Stage): Boolean =
+        fullscreenFill || runCatching { stage.isFullScreen }.getOrDefault(false)
+
+    /** Fills the screen by hand when `isFullScreen` did not take: an undecorated
+     *  window at the screen's bounds IS a full-screen window, and everything that
+     *  measures the window (the video surface, the bars) then behaves exactly as
+     *  it does in a real full screen. */
+    private fun fillIfNotFullscreen(stage: javafx.stage.Stage) {
+        if (!fullscreenOn) return
+        if (runCatching { stage.isFullScreen }.getOrDefault(false)) return
+        val bounds = screenBoundsOf(stage) ?: return
+        fullscreenFill = true
+        runCatching {
+            stage.x = bounds[0]
+            stage.y = bounds[1]
+            stage.width = bounds[2]
+            stage.height = bounds[3]
+        }
+    }
+
+    /** The bounds of the screen the window is on (x, y, w, h), or null. */
+    private fun screenBoundsOf(stage: javafx.stage.Stage): DoubleArray? = runCatching {
+        val screen = Screen.getScreensForRectangle(stage.x, stage.y, 1.0, 1.0).firstOrNull()
+            ?: Screen.getPrimary()
+        val b = screen.bounds
+        doubleArrayOf(b.minX, b.minY, b.width, b.height)
+    }.getOrNull()
+
+    /** Whether the window really covers the screen it is on — the user-visible
+     *  meaning of "full screen", and what a test can check without trusting any
+     *  flag. */
+    private fun coversScreen(stage: javafx.stage.Stage): Boolean {
+        val bounds = screenBoundsOf(stage) ?: return false
+        val tol = 2.0
+        return stage.x <= bounds[0] + tol &&
+            stage.y <= bounds[1] + tol &&
+            stage.width >= bounds[2] - tol * 2 &&
+            stage.height >= bounds[3] - tol * 2
     }
 
     /**
@@ -2096,8 +2366,34 @@ object PlayerWindow {
 
     // ── seeking ─────────────────────────────────────────────────────────────
 
-    /** Moves the readout to where the pointer is dragging, without telling mpv
-     *  yet — the picture jumps once, on release. */
+    /**
+     * The fraction of the bar the pointer at [x] (local to the seek row) is over.
+     *
+     * The skin's own track is measured when it has been laid out, so the value
+     * matches where the thumb actually sits (the track is inset by the thumb's
+     * radius); the slider's box is the fallback for the first frame, before CSS
+     * has run.
+     */
+    private fun fractionAt(x: Double): Double {
+        val slider = seekBar ?: return 0.0
+        val track = runCatching { slider.lookup(".track") as? Region }.getOrNull()
+        val inSlider = x - (seekHit?.let { slider.layoutX } ?: 0.0)
+        val x0 = track?.layoutX ?: 0.0
+        val w = (track?.width ?: 0.0).takeIf { it > 1.0 } ?: slider.width
+        if (w <= 1.0) return 0.0
+        return ((inSlider - x0) / w).coerceIn(0.0, 1.0)
+    }
+
+    /** Moves the bar and the readout to the pointer while it drags, without
+     *  telling mpv yet — the picture jumps once, on release. */
+    private fun scrubTo(x: Double) {
+        val slider = seekBar ?: return
+        if (duration <= 0.0) return
+        slider.value = fractionAt(x)
+        previewScrub()
+    }
+
+    /** Moves the readout to where the bar is, without telling mpv yet. */
     private fun previewScrub() {
         val d = duration
         if (d <= 0) return
@@ -2105,14 +2401,68 @@ object PlayerWindow {
         renderTime()
     }
 
-    /** Seeks to a 0..1 position and moves the readout there immediately. */
+    /**
+     * Seeks to a 0..1 position: the bar and the readout move there at once, and
+     * the reports of the OLD position that follow are held off until the picture
+     * really is where it was asked to go (see [seekPendingSecs]).
+     */
     private fun seekTo(fraction: Double) {
         val d = duration
         if (d <= 0) return
-        val pos = fraction.coerceIn(0.0, 1.0)
-        lastPosition = (pos * d * 1000).toLong()
+        val f = fraction.coerceIn(0.0, 1.0)
+        val pos = f * d
+        seekBar?.let { it.value = f }
+        lastPosition = (pos * 1000).toLong()
         renderTime()
-        runCatching { ipc?.post("seek", pos * d, "absolute") }
+        armSeekEcho(pos)
+        runCatching { ipc?.post("seek", pos, "absolute") }
+    }
+
+    /**
+     * Skips [delta] seconds from where playback is SHOWN to be, through the same
+     * echo-suppressing path as a click on the bar — an arrow-key skip used to
+     * flick the bar back for a frame for exactly the same reason.
+     */
+    private fun seekBy(delta: Double) {
+        val d = duration
+        if (d <= 0) return
+        val pos = (lastPosition / 1000.0 + delta).coerceIn(0.0, d)
+        lastPosition = (pos * 1000).toLong()
+        renderTime()
+        seekBar?.let { it.value = (pos / d).coerceIn(0.0, 1.0) }
+        armSeekEcho(pos)
+        runCatching { ipc?.post("seek", pos, "absolute") }
+    }
+
+    /** Starts the window in which reports of the pre-seek position are ignored. */
+    private fun armSeekEcho(targetSecs: Double) {
+        seekPendingSecs = targetSecs
+        seekPendingUntil = System.currentTimeMillis() + SEEK_ECHO_MS
+    }
+
+    /**
+     * The position to SHOW right now, given what the picture just reported: the
+     * seek target while the seek is still settling, else the report itself.
+     * Pure arithmetic (no FX), because the caller is the IPC reader thread.
+     *
+     * Returns the readout's milliseconds and the bar's 0..1 fraction. Clearing
+     * the pending target happens here, once, so the readout and the bar can never
+     * disagree.
+     */
+    private fun displayedPosition(reportedSecs: Double): Pair<Long, Double> {
+        val d = duration
+        val target = seekPendingSecs
+        if (target != null) {
+            val landed = kotlin.math.abs(reportedSecs - target) <= SEEK_ECHO_TOLERANCE_SECS
+            if (landed || System.currentTimeMillis() > seekPendingUntil) {
+                seekPendingSecs = null
+            } else {
+                val frac = if (d > 0) (target / d).coerceIn(0.0, 1.0) else 0.0
+                return (target * 1000).toLong() to frac
+            }
+        }
+        val frac = if (d > 0) (reportedSecs / d).coerceIn(0.0, 1.0) else 0.0
+        return (reportedSecs * 1000).toLong() to frac
     }
 
     // ── keyboard ────────────────────────────────────────────────────────────
@@ -2140,8 +2490,8 @@ object PlayerWindow {
         pokeChrome()
         when (e.code) {
             KeyCode.SPACE -> togglePause()
-            KeyCode.LEFT -> runCatching { ipc?.post("seek", -10, "relative") }
-            KeyCode.RIGHT -> runCatching { ipc?.post("seek", 10, "relative") }
+            KeyCode.LEFT -> seekBy(-10.0)
+            KeyCode.RIGHT -> seekBy(10.0)
             KeyCode.UP -> setVolume(volume + 5)
             KeyCode.DOWN -> setVolume(volume - 5)
             KeyCode.F, KeyCode.F11 -> toggleFullscreen()
@@ -2196,13 +2546,17 @@ object PlayerWindow {
                 }
             }
             "time-pos" -> {
-                val pos = (value as? Number)?.toDouble() ?: 0.0
-                lastPosition = (pos * 1000).toLong()
+                val reported = (value as? Number)?.toDouble() ?: 0.0
+                // A report of the position BEFORE a seek (mpv keeps sending those
+                // for a moment) must not drag the bar or the clock back to where
+                // the user just left. See [displayedPosition].
+                val (shownMs, shownFraction) = displayedPosition(reported)
                 Fx.run {
-                    if (!scrubbing && duration > 0) seekBar?.value = (pos / duration).coerceIn(0.0, 1.0)
+                    lastPosition = shownMs
+                    if (!scrubbing && duration > 0) seekBar?.value = shownFraction
                     renderTime()
                 }
-                onPosition?.invoke(lastPosition, (duration * 1000).toLong())
+                onPosition?.invoke(shownMs, (duration * 1000).toLong())
             }
             "pause" -> {
                 paused = value == true
