@@ -2,9 +2,9 @@ package android.webkit
 
 import java.util.concurrent.ConcurrentHashMap
 
-/** Minimal `android.webkit.ValueCallback`, which some of the shimmed APIs take. */
+/** `android.webkit.ValueCallback`, which some of the shimmed APIs take. */
 fun interface ValueCallback<T> {
-    fun onReceiveValue(value: T)
+    fun onReceiveValue(value: T?)
 }
 
 /**

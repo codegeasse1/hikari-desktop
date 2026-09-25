@@ -1651,7 +1651,7 @@ class ExtensionsScreenView {
         val repos = runCatching { AppShell.app.store.repos() }.getOrDefault(emptyList())
         for (r in repos) {
             val data = repoData[r.url] ?: repoData[r.url.trimEnd('/')] ?: continue
-            if (data.plugins.any { it.url == url }) return "repo “${Http.repoDisplayName(r)}”"
+            if (data.plugins.any { it.url == url }) return "repo “${Http.repoDisplayName(r.url)}”"
         }
         return "its repo"
     }

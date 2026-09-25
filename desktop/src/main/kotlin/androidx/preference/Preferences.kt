@@ -324,7 +324,7 @@ open class Preference @JvmOverloads constructor(
      *  use). */
     open fun isStored(): Boolean {
         val key = keyValue ?: return false
-        return runCatching { store()?.contains(key) }.getOrDefault(false)
+        return runCatching { store()?.contains(key) }.getOrNull() == true
     }
 
     /** The value to start from: what was stored, else the declared default. */

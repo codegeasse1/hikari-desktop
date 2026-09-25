@@ -64,6 +64,10 @@ interface Editable : Spannable {
 
     fun append(text: CharSequence?): Editable
 
+    fun append(text: CharSequence?, start: Int, end: Int): Editable
+
+    fun append(text: Char): Editable
+
     fun clear()
 
     fun clearSpans()
@@ -112,7 +116,11 @@ open class SpannableString(text: CharSequence?) : Spannable {
             if (range[1] <= start || range[0] >= end) continue
             if (type.isInstance(span)) out.add(span as T)
         }
-        return out.toTypedArray()
+        // `toTypedArray()` needs a reified T, which an override of a generic
+        // method cannot have — the array is built from the Class instead.
+        val arr = java.lang.reflect.Array.newInstance(type, out.size) as Array<T>
+        for (i in out.indices) arr[i] = out[i]
+        return arr
     }
 
     override fun getSpanStart(tag: Any?): Int = spans[tag]?.get(0) ?: -1

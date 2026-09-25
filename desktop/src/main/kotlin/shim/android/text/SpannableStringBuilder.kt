@@ -43,7 +43,11 @@ open class SpannableStringBuilder(text: CharSequence? = "") : Editable {
             if (range[1] <= start || range[0] >= end) continue
             if (type.isInstance(span)) out.add(span as T)
         }
-        return out.toTypedArray()
+        // `toTypedArray()` needs a reified T, which an override of a generic
+        // method cannot have — the array is built from the Class instead.
+        val arr = java.lang.reflect.Array.newInstance(type, out.size) as Array<T>
+        for (i in out.indices) arr[i] = out[i]
+        return arr
     }
 
     override fun getSpanStart(tag: Any?): Int = spans[tag]?.get(0) ?: -1
@@ -71,6 +75,11 @@ open class SpannableStringBuilder(text: CharSequence? = "") : Editable {
 
     override fun append(text: CharSequence?, start: Int, end: Int): SpannableStringBuilder {
         content.append((text ?: "").subSequence(start, end).toString())
+        return this
+    }
+
+    override fun append(text: Char): SpannableStringBuilder {
+        content.append(text)
         return this
     }
 

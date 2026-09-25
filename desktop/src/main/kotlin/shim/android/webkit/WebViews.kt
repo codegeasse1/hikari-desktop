@@ -295,8 +295,3 @@ open class WebResourceResponse {
         this.data = data
     }
 }
-
-/** Android's `android.webkit.ValueCallback` — a one-shot result callback. */
-fun interface ValueCallback<T> {
-    fun onReceiveValue(value: T?)
-}
