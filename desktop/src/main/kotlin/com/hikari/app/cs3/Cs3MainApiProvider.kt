@@ -435,6 +435,10 @@ class Cs3MainApiProvider(override val config: ProviderConfig) : ContentProvider 
         }
     }
 
+    /** Why the last lookup came back empty — see [ContentProvider.lastStreamError].
+     *  The detail screen prints these under an empty server list. */
+    override fun lastStreamError(): String? = streamErrors[config.id]
+
     override suspend fun getStreams(item: MediaItem, episode: Episode?): List<StreamSource> =
         withContext(Dispatchers.IO) {
             val a = api ?: return@withContext emptyList()

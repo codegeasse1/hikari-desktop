@@ -1,5 +1,6 @@
 package com.hikari.app.data
 
+import com.hikari.app.providers.ContentProvider
 import com.hikari.app.providers.ProviderManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -12,6 +13,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
@@ -35,6 +37,31 @@ class ContentRepository(private val manager: ProviderManager) {
     private data class CachedRow(val row: CatalogRow, val at: Long)
     private val rowCache = HashMap<String, CachedRow>()
     private val ROW_CACHE_TTL_MS = 5 * 60_000L
+
+    private companion object {
+        /** How long [streamsFor] waits for the FIRST playable source before
+         *  handing back what it has. Playback starts on the first server, not on
+         *  the slowest extension; the rest of the sweep keeps running. */
+        const val FIRST_SOURCE_WAIT_MS = 14_000L
+
+        /** How long one provider gets to answer a stream lookup before it is
+         *  left behind by the rest of the family. */
+        const val SOURCE_BUDGET_MS = 40_000L
+
+        /** The same, for the title-search wave (search + episodes + streams). */
+        const val TITLE_BUDGET_MS = 55_000L
+
+        /** Providers asked at the same time in a wave. More than this starves
+         *  the shared HTTP pools for no visible gain. */
+        const val SOURCES_CONCURRENCY = 4
+
+        /** How many OTHER-engine providers the third wave asks. */
+        const val CROSS_SWEEP_MAX = 12
+
+        /** How long a finished sweep stays in memory (so re-opening a title is
+         *  instant) before it is dropped. */
+        const val SWEEP_KEEP_MS = 10 * 60_000L
+    }
 
     /**
      * Loads Home rows. Catalogs inside a provider are fetched IN PARALLEL but
@@ -195,69 +222,271 @@ class ContentRepository(private val manager: ProviderManager) {
         }
     }
 
+    // ── server lookup: the cross-extension sweep ────────────────────────────
+    //
+    // What the user asks of this app (and what the Android app does): a title's
+    // servers come from EVERY installed extension that can serve it, not only
+    // from the one whose catalog the title was opened in. Five nuvio scrapers
+    // installed = five scrapers asked; four Stremio addons = four addons asked,
+    // exactly like the real Stremio client; and an extension of another engine
+    // can still rescue a title by name.
+
+    /** One running sweep, for one title/episode of one provider. */
+    private class Sweep(val startedAt: Long) {
+        val sources = java.util.Collections.synchronizedList(mutableListOf<StreamSource>())
+        /** providerId → why that provider gave nothing (for the empty state). */
+        val errors = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+        @Volatile
+        var done = false
+
+        fun snapshot(): List<StreamSource> = synchronized(sources) { ArrayList(sources) }
+
+        fun add(list: List<StreamSource>): Boolean {
+            if (list.isEmpty()) return false
+            var added = false
+            synchronized(sources) {
+                val known = sources.mapTo(HashSet()) { it.infoHash ?: it.url }
+                for (s in list) {
+                    val key = s.infoHash ?: s.url
+                    if (key.isBlank() || known.add(key)) {
+                        sources.add(s)
+                        added = true
+                    }
+                }
+            }
+            return added
+        }
+    }
+
+    private val sweeps = java.util.concurrent.ConcurrentHashMap<String, Sweep>()
+    private val sweepScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    private fun sweepKey(item: MediaItem, episode: Episode?): String =
+        item.uniqueId + "|" + (episode?.id ?: "")
+
     /**
-     * Fetches streams the way the real Stremio client does: every installed
-     * Stremio addon is asked in parallel — a catalog-only addon contributes
-     * nothing, while playback addons (Torrentio, Comet…) contribute their
-     * sources. The origin provider is always included too, so CS3 plugins /
-     * universal scrapers keep their own single-provider pipeline.
+     * The servers found so far for a title/episode, without waiting for
+     * anything: a sweep keeps running after [streamsFor] has already returned
+     * (playback starts on the first server, not on the slowest extension), and
+     * this is how the detail screen and the player pick up the later ones.
+     */
+    fun sweepSnapshot(item: MediaItem, episode: Episode?): List<StreamSource> =
+        sweeps[sweepKey(item, episode)]?.snapshot().orEmpty()
+
+    /** `providerId → reason` for every provider in the sweep for this
+     *  title/episode that came back with nothing playable. */
+    fun sweepErrors(item: MediaItem, episode: Episode?): Map<String, String> =
+        sweeps[sweepKey(item, episode)]?.errors?.toMap().orEmpty()
+
+    /** The configured name of a provider id — what the "nothing found" list
+     *  prints next to a reason. */
+    fun providerName(id: String): String =
+        manager.providers.value.firstOrNull { it.config.id == id }?.config?.name ?: id
+
+    /** True while the sweep for this title/episode is still asking providers. */
+    fun sweepRunning(item: MediaItem, episode: Episode?): Boolean =
+        sweeps[sweepKey(item, episode)]?.done == false
+
+    /**
+     * Asks every provider that can serve this title, and returns as soon as
+     * there is something playable.
      *
-     * Two speed rules (this is why CloudStream starts in seconds while a
-     * multi-addon Stremio lookup used to take 25-45s):
-     *  - a CS3/universal origin is queried ALONE — the other addons don't know
-     *    its ids and only waste time timing out;
-     *  - Stremio results use FIRST-NON-EMPTY-WINS: as soon as any addon
-     *    returns sources, the rest are cancelled and playback starts. Only if
-     *    every addon comes up empty do we wait for all of them.
+     * The sweep itself is three waves, because coverage and speed pull in
+     * opposite directions:
+     *  1. the origin's own engine family, in parallel, with the same id — nuvio
+     *     providers all speak TMDB ids, Stremio addons all speak the id in the
+     *     manifest, so this wave is exact and it is usually enough;
+     *  2. a title search on the same family — a scraper can index the same film
+     *     under a different id (or a localized title);
+     *  3. a title sweep over the OTHER engines, so a CloudStream plugin can be
+     *     rescued by a nuvio scraper the user also has installed.
      */
     suspend fun streamsFor(item: MediaItem, episode: Episode?): List<StreamSource> =
         withContext(Dispatchers.IO) {
-            val all = manager.providers.value.filter { it.config.enabled }
-            val origin = manager.byId(item.providerId)
-            val targets = if (origin?.config?.type == ProviderType.STREMIO) {
-                // Like the real client: ask every Stremio addon plus the origin.
-                all.filter { p ->
-                    p.config.id == item.providerId || p.config.type == ProviderType.STREMIO
-                }
-            } else {
-                // CS3 plugin / universal scraper: only the origin can resolve
-                // its own ids, so asking the Stremio addons just adds latency.
-                listOfNotNull(origin)
-            }
-            if (targets.isEmpty()) return@withContext emptyList()
-
-            val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-            try {
-                val jobs = targets.map { p ->
-                    scope.async {
-                        cancellableCatching {
-                            withTimeoutOrNull(45_000) { p.getStreams(item, episode) }.orEmpty()
-                        }.getOrDefault(emptyList())
-                    }
-                }
-                var result: List<StreamSource> = emptyList()
-                val started = System.currentTimeMillis()
-                while (true) {
-                    for (j in jobs) {
-                        if (j.isCompleted) {
-                            val r = runCatching { j.getCompleted() }.getOrDefault(emptyList())
-                            if (r.isNotEmpty()) {
-                                result = r
-                                break
-                            }
+            val key = sweepKey(item, episode)
+            val existing = sweeps[key]
+            val sweep = if (existing != null && !existing.done) existing else {
+                Sweep(System.currentTimeMillis()).also {
+                    sweeps[key] = it
+                    sweepScope.launch {
+                        runCatching { runSweep(item, episode, it) }
+                        it.done = true
+                        // A finished sweep is kept for a while so re-opening the
+                        // title is instant, then dropped (it can be hundreds of
+                        // sources and it is stale anyway).
+                        sweepScope.launch {
+                            delay(SWEEP_KEEP_MS)
+                            sweeps.remove(key, it)
                         }
                     }
-                    if (result.isNotEmpty() || jobs.all { it.isCompleted }) break
-                    if (System.currentTimeMillis() - started > 45_000) break
-                    kotlinx.coroutines.delay(80)
                 }
-                jobs.forEach { it.cancel() }
-                // Same torrent/video surfaced by several addons = one entry.
-                result.distinctBy { it.infoHash ?: it.url }
-            } finally {
-                scope.cancel()
             }
+            val deadline = System.currentTimeMillis() + FIRST_SOURCE_WAIT_MS
+            while (System.currentTimeMillis() < deadline) {
+                val now = sweep.snapshot()
+                if (now.isNotEmpty()) return@withContext now
+                if (sweep.done) break
+                delay(90)
+            }
+            sweep.snapshot()
         }
+
+    private suspend fun runSweep(item: MediaItem, episode: Episode?, sweep: Sweep) {
+        val enabled = manager.providers.value.filter { it.config.enabled }
+        if (enabled.isEmpty()) return
+        val origin = manager.byId(item.providerId)
+        val originType = origin?.config?.type
+
+        // ── wave 1: the origin's engine family, same id ─────────────────────
+        val family = enabled.filter { originType != null && it.config.type == originType }
+        askAll(family, item, episode, sweep)
+
+        // ── wave 2: the same family, by TITLE ───────────────────────────────
+        if (sweep.snapshot().isEmpty()) {
+            askAllByTitle(family, item, episode, sweep)
+        }
+
+        // ── wave 3: every other engine, by TITLE ────────────────────────────
+        if (sweep.snapshot().isEmpty()) {
+            val others = enabled
+                .filter { it.config.type != originType }
+                .sortedByDescending { it.config.id == item.providerId }
+                .take(CROSS_SWEEP_MAX)
+            askAllByTitle(others, item, episode, sweep)
+        }
+    }
+
+    /** Asks [providers] for the item itself, in parallel, bounded by
+     *  [ProviderGate] (one call per provider at a time) and a per-provider
+     *  budget. */
+    private suspend fun askAll(
+        providers: List<ContentProvider>,
+        item: MediaItem,
+        episode: Episode?,
+        sweep: Sweep,
+    ) {
+        coroutineScope {
+            val gate = Semaphore(SOURCES_CONCURRENCY)
+            providers.map { p ->
+                async {
+                    gate.withPermit {
+                        val found = cancellableCatching {
+                            withTimeoutOrNull(SOURCE_BUDGET_MS) {
+                                com.hikari.app.providers.ProviderGate.withProvider(p.config.id) {
+                                    p.getStreams(item, episode)
+                                }
+                            }.orEmpty()
+                        }.getOrDefault(emptyList())
+                        if (found.isEmpty()) recordStreamError(p, sweep)
+                        else sweep.add(found.map { tag(it, p, item) })
+                    }
+                }
+            }.awaitAll()
+        }
+    }
+
+    /**
+     * The same, for the engines that cannot resolve the origin's id: search
+     * them by title, take the best match, and ask that for its streams.
+     *
+     * This is the cross-repo pass the Android app runs for every title, and it
+     * is what turns "no playable source" into a list: a nuvio scraper knows the
+     * film by TMDB id, a CloudStream plugin by its own slug, and neither can be
+     * asked with the other's id.
+     */
+    private suspend fun askAllByTitle(
+        providers: List<ContentProvider>,
+        item: MediaItem,
+        episode: Episode?,
+        sweep: Sweep,
+    ) {
+        val query = item.searchTitle
+        if (query.isBlank() || providers.isEmpty()) return
+        coroutineScope {
+            val gate = Semaphore(SOURCES_CONCURRENCY)
+            providers.map { p ->
+                async {
+                    gate.withPermit {
+                        val found = cancellableCatching {
+                            withTimeoutOrNull(TITLE_BUDGET_MS) {
+                                com.hikari.app.providers.ProviderGate.withProvider(p.config.id) {
+                                    // No match on this engine = this engine cannot
+                                    // serve the title by name either.
+                                    val hit = bestMatch(item, p.search(query, 1))
+                                        ?: return@withProvider emptyList()
+                                    // A series needs the SAME episode at the other
+                                    // end, not episode 1.
+                                    if (episode != null) {
+                                        val ep = matchEpisode(p, hit, episode)
+                                            ?: return@withProvider emptyList()
+                                        p.getStreams(hit, ep)
+                                    } else {
+                                        p.getStreams(hit, null)
+                                    }
+                                }
+                            }.orEmpty()
+                        }.getOrDefault(emptyList())
+                        if (found.isEmpty()) recordStreamError(p, sweep)
+                        else sweep.add(found.map { tag(it, p, item) })
+                    }
+                }
+            }.awaitAll()
+        }
+    }
+
+    /** The candidate whose title (and year, when both know one) matches the
+     *  item best — the same "is this the same film?" test the Android sweep
+     *  uses, on normalized titles. */
+    private fun bestMatch(item: MediaItem, candidates: List<MediaItem>): MediaItem? {
+        if (candidates.isEmpty()) return null
+        val want = normalizeTitle(item.searchTitle)
+        if (want.isBlank()) return null
+        fun score(c: MediaItem): Int {
+            val got = normalizeTitle(c.title)
+            var s = when {
+                got == want -> 100
+                got.startsWith(want) || want.startsWith(got) -> 80
+                got.contains(want) || want.contains(got) -> 60
+                else -> 0
+            }
+            if (s > 0 && item.year != null && c.year != null) {
+                s += if (item.year == c.year) 20 else if (kotlin.math.abs(item.year - c.year) <= 1) 5 else -30
+            }
+            if (s > 0 && item.type != MediaType.UNKNOWN && c.type == item.type) s += 10
+            return s
+        }
+        return candidates.map { it to score(it) }.filter { it.second >= 60 }
+            .maxByOrNull { it.second }?.first
+    }
+
+    /** The episode of [hit] that corresponds to [want] (same season+number when
+     *  the provider numbers seasons, same number otherwise). Null when the
+     *  provider has no such episode — better than playing episode 1 of the
+     *  wrong season. */
+    private suspend fun matchEpisode(
+        p: ContentProvider,
+        hit: MediaItem,
+        want: Episode,
+    ): Episode? {
+        val eps = cancellableCatching { p.getEpisodes(hit) }.getOrNull().orEmpty()
+        if (eps.isEmpty()) return null
+        return eps.firstOrNull { it.number == want.number && it.season == want.season }
+            ?: eps.firstOrNull { it.number == want.number && it.season == 1 }
+            ?: eps.firstOrNull { it.number == want.number }
+    }
+
+    private fun tag(source: StreamSource, p: ContentProvider, item: MediaItem): StreamSource =
+        if (p.config.id == item.providerId) source
+        else source.copy(name = p.config.name.trim().ifBlank { "Extension" } + " · " + source.name)
+
+    private fun recordStreamError(p: ContentProvider, sweep: Sweep) {
+        val why = runCatching { p.lastStreamError() }.getOrNull()
+        if (!why.isNullOrBlank()) sweep.errors[p.config.id] = why
+    }
+
+    private fun normalizeTitle(s: String): String =
+        s.lowercase().replace(Regex("[^a-z0-9]+"), "").trim()
 
     /** Enriches an item with the origin addon's full meta (backdrop, overview,
      *  genres, year). If that addon's meta is thin, the next addon that knows

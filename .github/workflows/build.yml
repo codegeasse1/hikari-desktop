@@ -232,6 +232,22 @@ jobs:
           java -cp "jpackage-input/*" desktop.player.FloatingBarsSelfTestKt
         shell: bash
 
+      - name: Nuvio stream self-test (a real scraper, end to end)
+        if: always()
+        timeout-minutes: 10
+        run: |
+          set -e
+          java -cp "jpackage-input/*" com.hikari.app.nuvio.NuvioStreamSelfTestKt
+        shell: bash
+
+      - name: Stremio self-test (manifest, catalogs, streams)
+        if: always()
+        timeout-minutes: 8
+        run: |
+          set -e
+          java -cp "jpackage-input/*" com.hikari.app.providers.StremioSelfTestKt
+        shell: bash
+
       - name: UI shots (render the app and the player layer to PNGs)
         if: always()
         timeout-minutes: 8

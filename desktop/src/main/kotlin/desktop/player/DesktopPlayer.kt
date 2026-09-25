@@ -154,6 +154,22 @@ object DesktopPlayer {
      * to make, the path is ours, and routing a local playlist through the relay
      * would hand OkHttp a `file:` URL it cannot fetch.
      */
+    /**
+     * Hands the player's Source menu a longer server list for the playback that
+     * is already running.
+     *
+     * The sweep that finds a title's servers returns as soon as the first one is
+     * playable (playback starts in seconds) and keeps asking the remaining
+     * extensions in the background, so the extra servers arrive while the user is
+     * already watching. Without this, "another server" would mean going back to
+     * the title and reloading it.
+     */
+    fun updateSources(sources: List<StreamSource>) {
+        if (sources.isEmpty()) return
+        sourceList = sources
+        runCatching { PlayerWindow.setSources(sources) }
+    }
+
     fun playFile(title: String, path: String) {
         onEnded = null
         onPosition = null

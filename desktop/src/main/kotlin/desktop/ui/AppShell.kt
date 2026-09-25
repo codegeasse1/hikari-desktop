@@ -475,6 +475,11 @@ object AppShell {
      *  does. Nothing in the app itself reaches for this. */
     val homeView get() = homeScreen
 
+    /** The Extensions screen, for the UI test: it has to check that a repaint
+     *  (which is what every install ends with) leaves the page scrolled where the
+     *  user left it. Nothing in the app itself reaches for this. */
+    val extensionsView get() = extensionsScreen
+
     // ── window / player-layer hooks ─────────────────────────────────────────
 
     /** The layer the player mounts itself into (see [desktop.player.PlayerWindow]). */

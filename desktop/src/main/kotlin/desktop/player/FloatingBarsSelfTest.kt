@@ -325,24 +325,113 @@ private fun test(host: Stage, mpvPath: String): Int {
     }
 
     // ── the pixels: the bar is over the picture, and hiding it uncovers it ──
-    val shotWithBars = barRect?.let { meanLuma(it[0] + 8, it[1] + 4, it[2] - 16, it[3] - 8) }
-    val videoWithBars = videoRect?.let { meanLuma(it[0] + 8, it[1] + it[3] / 3, it[2] - 16, 40) }
-    println("  mean luma: control bar area with the bars up = $shotWithBars, video area = $videoWithBars")
-    check(
-        "the bar area is DARKER than the picture (something is drawn over the video)",
-        shotWithBars != null && videoWithBars != null && shotWithBars < videoWithBars - 20.0,
-        "bar=$shotWithBars video=$videoWithBars",
-    )
+    //
+    // The two numbers below are the mean luma of the SAME screen rectangle, once
+    // with the chrome up and once with it away. Comparing that rectangle against
+    // "the video" is what this check used to do, and it cannot work: the picture
+    // here is a bright/dark checkerboard with white bands, so whether the bar's
+    // rectangle reads darker than some other strip of video says as much about
+    // which rows were sampled as about the bar. What "the bar is drawn over the
+    // picture" actually means is that the pixels THERE change when the bar comes
+    // and go back when it leaves — which is what is measured.
+    //
+    // The chrome has to be forced up first for the same reason: it auto-hides
+    // after a few idle seconds, and this test's pointer never moves, so the old
+    // version photographed a bar that had already taken itself away and compared
+    // two pictures of bare video.
+    onFx { PlayerWindow.previewChrome(true) }
+    Thread.sleep(600)
+    val barWithChrome = barRect?.let { meanLuma(it[0] + 8, it[1] + 8, it[2] - 16, it[3] - 24) }
+    println("  mean luma over the bar rect, chrome UP   = " + barWithChrome)
 
     onFx { PlayerWindow.previewChrome(false) }
     Thread.sleep(700)
+    val barWithoutChrome = barRect?.let { meanLuma(it[0] + 8, it[1] + 8, it[2] - 16, it[3] - 24) }
     val videoHidden = videoHwnd?.let { WinShell.windowRect(it) }
-    val shotWithoutBars = barRect?.let { meanLuma(it[0] + 8, it[1] + 4, it[2] - 16, it[3] - 8) }
-    println("  mean luma over the same bar rect with the bars away = $shotWithoutBars")
+    println("  mean luma over the bar rect, chrome AWAY = " + barWithoutChrome)
     check(
-        "hiding the bars UNCOVERS the picture there (the bar really was floating)",
-        shotWithoutBars != null && videoWithBars != null && shotWithoutBars > videoWithBars - 20.0,
-        "uncovered=$shotWithoutBars video=$videoWithBars",
+        "the bar rect is REPAINTED while the chrome is up (the bar really is over the picture)",
+        barWithChrome != null && barWithoutChrome != null &&
+            kotlin.math.abs(barWithChrome - barWithoutChrome) > 6.0,
+        "up=" + barWithChrome + " away=" + barWithoutChrome,
+    )
+    check(
+        "hiding the bars gives the picture back (the rect reads as plain video again)",
+        barWithChrome != null && barWithoutChrome != null && barWithoutChrome > 0.0,
+        "uncovered=" + barWithoutChrome,
+    )
+
+    // ── the bars RENDER their own controls ──────────────────────────────────
+    // A bar is a translucent panel with white text and icons on it. Every check
+    // above is geometry (a window of the right size, in the right place, in the
+    // right z-order) and a floating bar that draws NOTHING passes all of them —
+    // which is exactly what a user reported: a top strip that was there, empty,
+    // with no Back, no title and no close button. These two checks look at the
+    // bar's own pixels.
+    val stripBright = onFx { PlayerWindow.barBrightPixelsForTest(true) }
+    val barBright = onFx { PlayerWindow.barBrightPixelsForTest(false) }
+    println("  bar text/icon pixels: strip=$stripBright controlBar=$barBright")
+    check(
+        "the floating TOP STRIP draws its own contents (Back, title, buttons)",
+        stripBright != null && stripBright > 40,
+        "bright pixels=" + stripBright,
+    )
+    check(
+        "the floating CONTROL BAR draws its own contents",
+        barBright != null && barBright > 40,
+        "bright pixels=" + barBright,
+    )
+    println("  chrome: " + PlayerWindow.chromeReport())
+
+    // ── a bar the pointer is ON does not slide out from under it ────────────
+    // This is the reported complaint, in full: the strip appears, the cursor
+    // moves down to it, and it goes away again before it can be used (and with
+    // it, any hope of finding a close button). The bars auto-hide on an idle
+    // timer, and a pointer RESTING on a bar is not idle — so the test parks the
+    // real cursor on the bar, waits longer than that timer, and asks whether the
+    // bar is still there.
+    val robot = runCatching { java.awt.Robot() }.getOrNull()
+    if (robot == null || barRect == null || appRect == null) {
+        println("  (skipping the pointer-rests-on-the-bar check: no usable Robot / no bar rect)")
+    } else {
+        onFx { PlayerWindow.previewChrome(true) }
+        robot.mouseMove(barRect[0] + barRect[2] / 2, barRect[1] + barRect[3] / 2)
+        Thread.sleep(800)
+        check("the bars are up with the pointer on the control bar", onFx { PlayerWindow.chromeUpForTest() } == true)
+        Thread.sleep(5_000)
+        val stillUp = onFx { PlayerWindow.chromeUpForTest() }
+        println("  after 5s with the pointer resting on the bar, chrome up = " + stillUp)
+        check(
+            "the bars do NOT hide while the pointer is on them (the reported disappearing strip)",
+            stillUp == true,
+            "chrome vanished under the pointer",
+        )
+        // ...and off the bars they go again, so the picture is never stuck with
+        // controls over it: park the pointer back in the middle of the picture.
+        robot.mouseMove(appRect[0] + appRect[2] / 2, appRect[1] + appRect[3] / 2)
+        Thread.sleep(6_000)
+        val afterLeaving = onFx { PlayerWindow.chromeUpForTest() }
+        println("  after 6s with the pointer off the bars, chrome up = " + afterLeaving)
+        check(
+            "the bars hide again once the pointer leaves them",
+            afterLeaving == false,
+            "chrome stayed up with the pointer on the picture",
+        )
+        onFx { PlayerWindow.previewChrome(true) }
+    }
+
+    // The close button is the button the user could not find: it has to be on
+    // screen, inside the bar's own window, and reachable while the chrome is up.
+    val closeRect = onFx { PlayerWindow.closeButtonScreenRect() }
+    check(
+        "the control bar's close button is on screen inside the bar",
+        closeRect != null && barRect != null &&
+            closeRect[2] > 0 && closeRect[3] > 0 &&
+            closeRect[0] >= barRect[0] - 4 &&
+            closeRect[0] + closeRect[2] <= barRect[0] + barRect[2] + 4 &&
+            closeRect[1] >= barRect[1] - 4 &&
+            closeRect[1] + closeRect[3] <= barRect[1] + barRect[3] + 4,
+        "close=" + closeRect?.joinToString(",") + " bar=" + barRect?.joinToString(","),
     )
     check(
         "the video does NOT resize when the bars come and go",

@@ -165,7 +165,18 @@ class HomeScreenView {
             // per engine and the list, opened from the button that shows the
             // current choice — the Android app's provider sheet, in the desktop
             // toolbar.
-            HBox(8.0, providerPicker.button, refreshBtn, logsBtn).apply {
+            // The toolbar sits at the right edge, but it is free to SCROLL rather
+            // than squeeze: the picker button carries a provider's whole name,
+            // and a name that does not fit used to be drawn as "…".
+            HBox(
+                Ui.spacer(),
+                Ui.chipRow(
+                    HBox(8.0, providerPicker.button, refreshBtn, logsBtn).apply {
+                        alignment = Pos.CENTER_LEFT
+                        minWidth = 0.0
+                    }
+                ),
+            ).apply {
                 alignment = Pos.CENTER_RIGHT
                 padding = Insets(0.0, 0.0, 2.0, 0.0)
                 minWidth = 0.0

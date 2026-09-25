@@ -32,4 +32,9 @@ are exercised on every run.
 - **Iterating**: dispatch `build.yml` against a temporary branch (it publishes from
   any ref, so a throwaway compile-only workflow or branch is worth it for a big
   batch). `ci-compile.yml` is a compile-only check that never publishes anything.
+  `ci-shots.yml` is the middle rung: it compiles, bundles mpv, runs every
+  self-test and the UI shots, and **never signs, packages or publishes** — it is
+  the one to dispatch while iterating, so a broken batch cannot become a release.
+  (`workflow_dispatch` only exists for workflows present on `main`, so adding a
+  new workflow file to `main` is what makes it dispatchable against a branch.)
 

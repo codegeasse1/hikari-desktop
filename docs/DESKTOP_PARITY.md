@@ -1121,6 +1121,108 @@ a screenshot. The one control exempt from the "fits its own label" rule is the s
 bar itself: it is the control that is supposed to give way, down to its own floor,
 while every pill beside it keeps its full text.
 
+## Stage 13 — every extension's servers, chips that show their names, and bars that stay put (done)
+
+Five reported things, one batch. All of them are covered by a CI check, because
+four of the five are "present in the code, absent on screen":
+
+### 1. "Not showing any playable source in any nuvio extension"
+
+The nuvio JS engine had **no `setTimeout`/`setInterval`**. V8 (`javet`) has no
+event loop, so nothing supplied them — and real scrapers use them: `4khdhub`
+backs off between retries with `new Promise(r => setTimeout(r, delay))`,
+`streamflix` arms a socket timeout with `setTimeout` and cancels it with
+`clearTimeout`. On the reference client (a WebView) both exist. Here the Promise
+executor threw a ReferenceError, the provider returned nothing, and the app said
+"no sources" — a missing timer does not degrade a scraper, it deletes its
+results.
+
+`NuvioRuntime` now installs a timer queue as the FIRST script in every engine and
+the HOST drains it (`pumpTimers`): after the call is injected, the engine thread
+sleeps until the next deadline and runs whatever is due. `Thread.sleep` rather
+than a coroutine delay, because every call into a V8 runtime must come from the
+thread that created it; the call also moved to `Dispatchers.IO` so a sleeping
+provider cannot occupy the compute pool. The next deadline is read back as a
+**String** (`String(__nuvioNextTimerDelayMs())`) — `evaluate` hands back javet's
+own conversion of the raw V8 value, and an unchecked `as Double` on an integral
+number throws.
+
+`NuvioStreamSelfTest` (CI) downloads two real scrapers and runs them end to end:
+`NuvioStreamSelfTest: OK (scrapers loaded=2, produced sources=2, warnings=0)`.
+A *runtime* failure (unreadable payload, no export, TMDB resolve, timeout) fails
+the build; a *provider* failure (site 403/down) is a WARN, because a third-party
+scraper breaking is not a reason to fail a build.
+
+### 2. "nuvio and stremio extensions should all work as a group"
+
+`ContentRepository.streamsFor` used to ask only the addon the title was opened
+in. Now it runs a **sweep** over every enabled provider in three waves: the
+origin's engine family by id (exact, usually enough), then that family by title,
+then every other engine by title (`bestMatch` scores normalized titles + year +
+type; `matchEpisode` requires the same season+number). The first playable server
+is returned after at most `FIRST_SOURCE_WAIT_MS` (14 s) — playback starts on the
+first server, not on the slowest extension — and the sweep keeps running in the
+background for the sources that land later. The detail screen and the (already
+open) player pick those up through `sweepSnapshot`, and the empty state now
+prints one line per extension saying *why* it had nothing (`lastStreamError()` on
+`ContentProvider`, implemented by every engine).
+
+`StremioSelfTest` (CI) proves the Stremio half on the runner: Cinemeta catalogs →
+meta → "this addon has no streams" (it must explain itself, not return a blank
+list), and Torrentio's streams must parse into `StreamSource` rows.
+
+### 3. "Some names show completely like '…' only dot dots"
+
+A JavaFX `HBox` that cannot fit its children does not overflow — it **squeezes**
+them, and a squeezed `Button` draws `CloudStream re…`. Every row of chips in the
+app was doing exactly that. `Ui.chipRow(row)` wraps a chip row in an invisible
+horizontal scroller and `Ui.keepChipLabels(row)` pins each chip to
+`USE_PREF_SIZE`, so the row scrolls instead of the labels collapsing; it is now
+used by the provider sheet (which also grew its popup to 380 px), the Installed
+list's engine filter, the Home toolbar, and the **Add a source** mode row (nine
+modes: `Hikari repo` … `Universal scraper`, which was the worst offender).
+`UiShotTest` measures `width` against `prefWidth(-1)` for all four rows — the
+only check that catches this, since a squeezed button still reports its full
+`text` — and asserts the provider chip row really scrolls.
+
+### 4. The Installed list belongs BELOW the repo box, and the page must not jump
+
+`renderAll` drew Installed first. It now draws the composer, then Repos, then
+Installed, and builds the whole page into a list that is swapped in with ONE
+`children.setAll(page)`. The old two-step (clear, then add) collapsed the page to
+zero height for a frame, and a `ScrollPane` whose content is momentarily empty
+clamps back to the top — that is what threw a scrolled-down user to the top of
+the page on every finished install, and what left the wheel with nothing to
+scroll. The position is restored from an anchor (the child at the top of the
+viewport plus its offset, not a raw `vvalue` fraction, because a fraction of a
+different total height is a different place), and the per-list repaints
+(`fillInstalled`, `fillPlugins`) hold it the same way.
+
+### 5. The strip that disappeared while the cursor was reaching for it, and no close button
+
+Two separate causes:
+
+- The bars auto-hid 2 s after the last mouse move, **including while the pointer
+  was resting on them** — a control that slides out from under the cursor cannot
+  be clicked. The idle window is now 3.5 s and `chromeUnderPointer()` (the bars'
+  screen rectangles against `GetCursorPos`) cancels the hide while the pointer is
+  on either bar; the next move off them re-arms it.
+- The only close button lived on the auto-hiding strip. The control bar now has
+  its own close (X) at the right end, so "get me out of here" is available
+  whenever the controls are.
+
+`FloatingBarsSelfTest` gained two checks that would have caught both: it parks
+the **real cursor** on the control bar and waits 5 s (the bars must still be
+there), then moves it back onto the picture and waits 6 s (they must go), and it
+compares the mean luma of the bar's own screen rectangle with the chrome up
+(38.7 — a dark panel) and away (115.4 — bare checkerboard). The old version of
+that check asked whether the bar's rectangle was *darker than some other strip of
+video*, which photographs bare video when the chrome has already auto-hidden;
+comparing the same rectangle against itself is the question that means something.
+Both bars are also required to draw their own contents (`barBrightPixelsForTest`:
+a bar that is on screen, correctly sized, and completely empty passes every
+geometry check).
+
 ## Still to do
 
 ### i18n

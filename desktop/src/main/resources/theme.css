@@ -1071,6 +1071,11 @@
 .provider-chips { -fx-padding: 3; }
 .provider-search { -fx-font-size: 12.5px; }
 
+/* A chip row that scrolls instead of squeezing its chips (see Ui.chipRow): the
+   scroller itself is invisible — the row of chips is the control. */
+.chip-scroll { -fx-background-color: transparent; -fx-padding: 0; }
+.chip-scroll > .viewport { -fx-background-color: transparent; }
+
 .repo-card {
     -fx-background-color: -h-surface-2;
     -fx-border-color: -h-border;

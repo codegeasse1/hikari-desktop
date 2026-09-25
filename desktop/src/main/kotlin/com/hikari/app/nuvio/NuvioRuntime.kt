@@ -89,6 +89,81 @@ object NuvioRuntime {
     private val cheerioJs: String by lazy { readAsset("nuvio/cheerio.js") }
     private val harnessJs: String by lazy { readAsset("nuvio/harness.js") }
 
+    /**
+     * `setTimeout`/`setInterval`, which V8 does not have and the nuvio
+     * environment does.
+     *
+     * This is not a nicety. Real scrapers use timers: 4khdhub backs off between
+     * retries with `new Promise(r => setTimeout(r, delay))`, streamflix arms a
+     * WebSocket timeout with `setTimeout` and disarms it with `clearTimeout`.
+     * On the reference client (a WebView) both exist, so the code is correct
+     * there — here, `setTimeout` was simply undefined, the Promise executor
+     * threw a ReferenceError, and the provider produced NO sources at all. A
+     * missing timer does not degrade a scraper, it deletes its results.
+     *
+     * The queue is drained by the HOST (see [runProvider] and
+     * [pumpTimers]): V8 in javet has no event loop, so a timer only fires when
+     * the host asks for the due ones — which it does after every evaluation and
+     * while a call is waiting.
+     */
+    private val TIMER_GLUE: String =
+        "globalThis.__nuvioTimers = [];" +
+            "globalThis.__nuvioTimerSeq = 1;" +
+            "globalThis.setTimeout = function (fn, delay) {" +
+            "  if (typeof fn !== 'function') return 0;" +
+            "  var id = globalThis.__nuvioTimerSeq++;" +
+            "  var args = Array.prototype.slice.call(arguments, 2);" +
+            "  globalThis.__nuvioTimers.push({ id: id, fn: fn, args: args," +
+            "    due: Date.now() + (Number(delay) || 0), period: 0 });" +
+            "  return id;" +
+            "};" +
+            "globalThis.setInterval = function (fn, delay) {" +
+            "  if (typeof fn !== 'function') return 0;" +
+            "  var id = globalThis.__nuvioTimerSeq++;" +
+            "  var args = Array.prototype.slice.call(arguments, 2);" +
+            "  var period = Math.max(1, Number(delay) || 0);" +
+            "  globalThis.__nuvioTimers.push({ id: id, fn: fn, args: args," +
+            "    due: Date.now() + period, period: period });" +
+            "  return id;" +
+            "};" +
+            "globalThis.clearTimeout = function (id) {" +
+            "  globalThis.__nuvioTimers = globalThis.__nuvioTimers.filter(function (t) { return t.id !== id; });" +
+            "};" +
+            "globalThis.clearInterval = globalThis.clearTimeout;" +
+            // Milliseconds until the next timer is due, or -1 when none is
+            // pending — what the host waits for (see pumpTimers).
+            "globalThis.__nuvioNextTimerDelayMs = function () {" +
+            "  var best = -1;" +
+            "  var now = Date.now();" +
+            "  for (var i = 0; i < globalThis.__nuvioTimers.length; i++) {" +
+            "    var d = globalThis.__nuvioTimers[i].due - now;" +
+            "    if (d < 0) d = 0;" +
+            "    if (best < 0 || d < best) best = d;" +
+            "  }" +
+            "  return best;" +
+            "};" +
+            // Runs every timer that is due (or all of them, when forced), so a
+            // scraper's `await new Promise(r => setTimeout(r, 200))` resumes.
+            "globalThis.__nuvioRunDueTimers = function (force) {" +
+            "  var now = Date.now();" +
+            "  var due = [];" +
+            "  var keep = [];" +
+            "  var list = globalThis.__nuvioTimers;" +
+            "  for (var i = 0; i < list.length; i++) {" +
+            "    var t = list[i];" +
+            "    if (force || t.due <= now) due.push(t); else keep.push(t);" +
+            "  }" +
+            "  globalThis.__nuvioTimers = keep;" +
+            "  for (var j = 0; j < due.length; j++) {" +
+            "    var timer = due[j];" +
+            "    if (timer.period > 0) { timer.due = Date.now() + timer.period; globalThis.__nuvioTimers.push(timer); }" +
+            "    try { timer.fn.apply(null, timer.args); } catch (e) {" +
+            "      if (typeof console !== 'undefined' && console.warn) console.warn('nuvio timer: ' + e);" +
+            "    }" +
+            "  }" +
+            "  return due.length;" +
+            "};"
+
     private fun readAsset(path: String): String =
         this.javaClass.getResourceAsStream("/" + path)?.bufferedReader()?.readText()
             ?: throw IllegalStateException("missing bundled asset: " + path)
@@ -187,6 +262,9 @@ object NuvioRuntime {
         }
         NuvioCryptoBridge.bindAll(qjs)
 
+        // 0. Timers — before anything else, because the polyfills and the
+        //    scrapers both reach for setTimeout (see [TIMER_GLUE]).
+        qjs.evaluate<Any?>(TIMER_GLUE, "timers.js", false)
         // 1. Polyfills (console, TextEncoder/Decoder, Blob, URL, AbortController,
         //    crypto/CryptoJS backed by NuvioCryptoBridge, array/object/string).
         qjs.evaluate<Any?>(bootJs, "boot.js", false)
@@ -296,16 +374,28 @@ object NuvioRuntime {
     ): String {
         return concurrency.withPermit {
             withTimeoutOrNull(CALL_TIMEOUT_MS) {
-                withContext(Dispatchers.Default) {
+                // IO, not Default: the call blocks the thread it runs on (see
+                // [pumpTimers], which sleeps between timer deadlines because V8
+                // must be entered from the thread that created it). Blocking a
+                // handful of IO threads is free; blocking the whole compute pool
+                // would starve every other coroutine in the app.
+                withContext(Dispatchers.IO) {
                     val cid = java.util.UUID.randomUUID().toString()
                     val deferred = CompletableDeferred<String>()
                     val qjs = createEngine(deferred)
                     providerRunStart[providerId] = System.currentTimeMillis()
                     try {
                         qjs.evaluate<Any?>(buildCall(cid), "call.js", false)
-                        // evaluate() returns once the async IIFE settles, which
-                        // happens when onGetStreamsDone/onSettingsDone completed
-                        // the deferred above — so await() returns immediately.
+                        // The call is an async IIFE: evaluate() returns with it
+                        // still running, and it finishes when the bridge reports
+                        // through `deferred`. Between those two moments the host
+                        // is the only thing that can advance a pending TIMER —
+                        // V8 has no event loop — so the due ones are run here
+                        // until the provider is done. (`Thread.sleep` rather than
+                        // a coroutine delay: every call into a V8 engine must be
+                        // made from the thread that created it, and this keeps
+                        // the whole call on one.)
+                        pumpTimers(qjs, deferred, CALL_TIMEOUT_MS)
                         deferred.await()
                     } catch (e: Throwable) {
                         // Engine-level failure (boot error, native interrupt after
@@ -318,6 +408,40 @@ object NuvioRuntime {
                     }
                 }
             } ?: "{\"ok\":false,\"error\":\"provider timed out after ${CALL_TIMEOUT_MS / 1000}s\"}"
+        }
+    }
+
+    /**
+     * Runs pending JS timers until the provider is done (or [budgetMs] is up).
+     *
+     * V8 in javet has no event loop of its own: `await new Promise(r =>
+     * setTimeout(r, 200))` — which real nuvio scrapers use for retry backoff and
+     * for socket timeouts — can only resume when the HOST runs the due timers.
+     * Each round runs whatever is due and then waits for the next deadline, so a
+     * provider that is merely sleeping finishes as soon as its timer is due
+     * instead of sitting until the call times out.
+     */
+    private fun pumpTimers(qjs: JsRuntime, done: CompletableDeferred<String>, budgetMs: Long) {
+        val deadline = System.currentTimeMillis() + budgetMs
+        while (!done.isCompleted && System.currentTimeMillis() < deadline) {
+            // Due timers first (never the future ones: a scraper's `setTimeout`
+            // delay is real — a poll must wait its 500ms rather than spin), then
+            // the wait for the next deadline, in short slices so a provider that
+            // finishes in the middle of one is not held up by it.
+            // The delay comes back as a string on purpose: evaluate() hands back
+            // whatever javet's converter produced for the raw V8 value (an int
+            // when the number is integral), and a hard cast of that to Double
+            // throws — the cast is unchecked, so this is the one place it would
+            // blow up at runtime with nothing to show for it.
+            val next = runCatching {
+                qjs.evaluate<String?>(
+                    "globalThis.__nuvioRunDueTimers(false); String(globalThis.__nuvioNextTimerDelayMs());",
+                    "timers.js",
+                    false,
+                )
+            }.getOrNull()?.trim()?.toDoubleOrNull() ?: return
+            if (next < 0) return // nothing pending: the provider is waiting on the network
+            if (next > 0) Thread.sleep(next.coerceAtMost(60.0).toLong().coerceAtLeast(1L))
         }
     }
 

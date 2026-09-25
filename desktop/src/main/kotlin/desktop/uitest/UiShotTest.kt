@@ -609,21 +609,62 @@ class UiShotApp : Application() {
             } else {
                 println("UiShotTest: OK   the Installed list offers one chip per engine")
             }
-            // ...and the chips have to be VISIBLE, not merely present: the whole
-            // Installed section used to be below the fold (composer + every repo
-            // card above it), so the filter could not be found by looking.
+            // ...and the chips have to be REACHABLE, not merely present. The
+            // Installed section sits BELOW the repo box — that is the order the
+            // page is meant to have (add a repo, then install from it, then see
+            // what is installed) — so the check scrolls the page down to the
+            // Installed list and then asks whether the row is really inside the
+            // viewport. A filter that exists but can never be brought on screen
+            // is not a filter.
+            val row = scene.root.lookup(".kind-chips")
+            if (row == null) {
+                println("UiShotTest: FAIL the Installed list has no engine chip row")
+                failures[0]++
+            } else {
+                scrollIntoViewport(row)
+            }
+        }
+        steps += 400L to {
             val row = scene.root.lookup(".kind-chips")
             if (row != null && inScrollViewport(row)) {
-                println("UiShotTest: OK   the engine chips are on screen without scrolling")
+                println("UiShotTest: OK   the engine chips can be scrolled into view")
             } else {
                 println("UiShotTest: FAIL the engine chips are not in the visible page area (node=" + row + ")")
                 failures[0]++
             }
-            // The shot that follows is of the top of the page, so make sure that
-            // is where the page is.
-            var up: javafx.scene.Node? = row?.parent
-            while (up != null && up !is javafx.scene.control.ScrollPane) up = up.parent
-            (up as? javafx.scene.control.ScrollPane)?.vvalue = 0.0
+            // Every chip has to show its WHOLE label: a chip laid out narrower
+            // than its own text is drawn as "…", and an unreadable filter is
+            // worse than a filter you have to scroll to.
+            val kind = scene.root.lookupAll(".kind-chips .seg").filterIsInstance<javafx.scene.control.Button>()
+            val squeezed = kind.filter { it.width + 0.5 < it.prefWidth(-1.0) }
+            println(
+                "UiShotTest: engine chip widths = " +
+                    kind.joinToString(" | ") { it.text + "=" + it.width.toInt() + "/" + it.prefWidth(-1.0).toInt() },
+            )
+            if (squeezed.isNotEmpty()) {
+                println("UiShotTest: FAIL these engine chips are squeezed: " + squeezed.map { it.text })
+                failures[0]++
+            } else {
+                println("UiShotTest: OK   every engine chip is wide enough for its label")
+            }
+            // The composer's own chip row ("Hikari repo | CloudStream repo | …")
+            // follows the same rule, and broke it the same way: nine modes never
+            // fit one panel width, so the labels came out as "CloudStream re…".
+            val modeChips = scene.root.lookupAll(".composer-chips .seg").filterIsInstance<javafx.scene.control.Button>()
+            val squeezedModes = modeChips.filter { it.width + 0.5 < it.prefWidth(-1.0) }
+            println("UiShotTest: composer chip widths = " + modeChips.joinToString(" | ") { it.text })
+            if (modeChips.isEmpty()) {
+                println("UiShotTest: FAIL the composer has no mode chips to measure")
+                failures[0]++
+            } else if (squeezedModes.isNotEmpty()) {
+                println("UiShotTest: FAIL these composer chips are squeezed: " + squeezedModes.map { it.text })
+                failures[0]++
+            } else {
+                println("UiShotTest: OK   every composer chip is wide enough for its label")
+            }
+            // The shot that follows is of the FILTERED Installed list, so the
+            // page is left scrolled to it — that is the state a user looking for
+            // "show me only the Nuvio ones" is actually in.
         }
         steps += 300L to {
             scene.root.lookupAll(".kind-chips .seg").filterIsInstance<javafx.scene.control.Button>()
@@ -672,6 +713,51 @@ class UiShotApp : Application() {
                 println("UiShotTest: OK   the provider picker opens with All + one chip per engine")
             }
         }
+        steps += 400L to {
+            // The chips have to SHOW their engine names. A chip that cannot fit
+            // its label is drawn as "…" — which is exactly what the picker did
+            // with six engines installed — and the chip's own `text` still reads
+            // "CloudStream", so only a width comparison catches it.
+            val picker = AppShell.homeView.pickerForTest
+            val widths = picker.chipWidthsForTest()
+            println(
+                "UiShotTest: picker chip widths = " +
+                    widths.joinToString(" | ") { it.first + "=" + it.second.toInt() + "/" + it.third.toInt() },
+            )
+            val squeezed = widths.filter { it.second + 0.5 < it.third }
+            if (widths.isEmpty()) {
+                println("UiShotTest: FAIL the provider picker has no chips to measure")
+                failures[0]++
+            } else if (squeezed.isNotEmpty()) {
+                println("UiShotTest: FAIL these provider chips are squeezed: " + squeezed.map { it.first })
+                failures[0]++
+            } else {
+                println("UiShotTest: OK   every provider chip is wide enough for its name")
+            }
+            // ...and the row is a scroller, so the chips that do not fit the
+            // popup are reachable instead of clipped.
+            val scroller = picker.chipRowForTest()
+            val content = scroller.content
+            val contentW = (content as? javafx.scene.layout.Region)?.width ?: 0.0
+            println(
+                "UiShotTest: picker chip row content=" + contentW.toInt() +
+                    " viewport=" + scroller.viewportBounds.width.toInt(),
+            )
+            if (contentW > scroller.viewportBounds.width + 1.0) {
+                val before = scroller.hvalue
+                scroller.hvalue = 1.0
+                val moved = scroller.hvalue > before
+                scroller.hvalue = before
+                if (moved) {
+                    println("UiShotTest: OK   the provider chip row scrolls horizontally")
+                } else {
+                    println("UiShotTest: FAIL the provider chip row cannot scroll")
+                    failures[0]++
+                }
+            } else {
+                println("UiShotTest: OK   the provider chip row fits the popup")
+            }
+        }
         steps += 300L to {
             val picker = AppShell.homeView.pickerForTest
             picker.pressChipForTest("Hikari")
@@ -711,6 +797,41 @@ class UiShotApp : Application() {
             picker.selectForTest("All providers")
         }
 
+        // ── the page keeps its place while it repaints ───────────────────────
+        // A finished install ends with a repaint of the Installed list and the
+        // header, and the page used to jump back to the top for it: the children
+        // were cleared, the page was momentarily empty, and a ScrollPane clamps an
+        // empty content back to the top (the wheel then had nothing to scroll
+        // until the new rows had been laid out).
+        steps += 400L to {
+            val page = AppShell.extensionsView.pageForTest()
+            page.vvalue = 0.65
+            println("UiShotTest: extensions page scrolled to " + page.vvalue)
+        }
+        steps += 300L to { AppShell.extensionsView.repaintAfterInstallForTest() }
+        steps += 700L to {
+            val page = AppShell.extensionsView.pageForTest()
+            val v = page.vvalue
+            println("UiShotTest: extensions page vvalue after the repaint = " + v)
+            if (kotlin.math.abs(v - 0.65) < 0.05) {
+                println("UiShotTest: OK   the page stays where the user left it while it repaints")
+            } else {
+                println("UiShotTest: FAIL the repaint moved the page (0.65 -> " + v + ")")
+                failures[0]++
+            }
+            // ...and the repos are above the installed list, in that order.
+            val order = AppShell.extensionsView.sectionOrderForTest()
+            println("UiShotTest: extensions sections top to bottom = " + order)
+            val repos = order.indexOf("Repos")
+            val installed = order.indexOf("Installed")
+            if (repos >= 0 && installed > repos) {
+                println("UiShotTest: OK   the repo box is above the installed list")
+            } else {
+                println("UiShotTest: FAIL the section order is wrong (" + order + ")")
+                failures[0]++
+            }
+            page.vvalue = 0.0
+        }
         steps += 300L to {
             scene.root.lookupAll(".kind-chips .seg").filterIsInstance<javafx.scene.control.Button>()
                 .firstOrNull { it.text == "All" }?.fire()
@@ -972,17 +1093,51 @@ class UiShotApp : Application() {
      * scene graph?" cannot tell those two apart.
      */
     private fun inScrollViewport(node: javafx.scene.Node): Boolean {
-        var p: javafx.scene.Node? = node
-        var sp: javafx.scene.control.ScrollPane? = null
-        while (p != null) {
-            if (p is javafx.scene.control.ScrollPane) { sp = p; break }
-            p = p.parent
-        }
-        val pane = sp ?: return true
+        val pane = outerScrollPane(node) ?: return true
         val vp = pane.viewportBounds
         if (vp.height <= 0.0) return false
         val inPane = pane.sceneToLocal(node.localToScene(node.boundsInLocal))
         return inPane.minY >= -0.5 && inPane.maxY <= vp.height + 0.5
+    }
+
+    /**
+     * The OUTERMOST [ScrollPane] that holds [node].
+     *
+     * Outermost, not nearest: a control can sit inside a horizontal chip rail
+     * which itself sits inside the page's vertical scroller, and "can the user
+     * see it" is a question about the PAGE. The nearest scroller (the rail) is
+     * fit-to-height, so it answers "yes" about a row that is two screens down.
+     */
+    private fun outerScrollPane(node: javafx.scene.Node): javafx.scene.control.ScrollPane? {
+        var p: javafx.scene.Node? = node.parent
+        var found: javafx.scene.control.ScrollPane? = null
+        while (p != null) {
+            if (p is javafx.scene.control.ScrollPane) found = p
+            p = p.parent
+        }
+        return found
+    }
+
+    /**
+     * Scrolls the [ScrollPane] that holds [node] until the node is inside its
+     * viewport (its top aligned just below the viewport's top edge).
+     *
+     * Used by the layout checks: the Installed list sits below the repo box, so
+     * a test that wants to look at the Installed section has to scroll the page
+     * to it first — exactly as a user does. Nothing here is automatic: the page
+     * is a plain ScrollPane, and a control that cannot be scrolled to is a
+     * control nobody can use.
+     */
+    private fun scrollIntoViewport(node: javafx.scene.Node) {
+        val pane = outerScrollPane(node) ?: return
+        val vp = pane.viewportBounds
+        if (vp.height <= 0.0) return
+        val contentH = (pane.content as? javafx.scene.layout.Region)?.height ?: 0.0
+        val max = (contentH - vp.height).coerceAtLeast(0.0)
+        if (max <= 0.0) return
+        val inPane = pane.sceneToLocal(node.localToScene(node.boundsInLocal))
+        val now = pane.vvalue * max
+        pane.vvalue = ((now + inPane.minY - 8.0) / max).coerceIn(0.0, 1.0)
     }
 
     /** True when a screen point is on this display (a click there can land). */

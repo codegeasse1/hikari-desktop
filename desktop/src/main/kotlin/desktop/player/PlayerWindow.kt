@@ -76,7 +76,7 @@ object PlayerWindow {
      *  seconds is what players on every platform do, and it is the difference
      *  between "the picture, with controls when you reach for them" and "a
      *  control bar with a picture behind it". */
-    private const val CHROME_IDLE_MS = 2000.0
+    private const val CHROME_IDLE_MS = 3500.0
 
     /**
      * How long the player's window is waited for before the user is told the
@@ -172,6 +172,11 @@ object PlayerWindow {
     private var topStrip: HBox? = null
     private var bottomBar: HBox? = null
     private var closePlayerButton: Button? = null
+
+    /** The control bar's own close button. Two ways out (the strip's and this
+     *  one), because the strip is hidden whenever the chrome is idle — see
+     *  [playerWindowControls] and the bar's own construction. */
+    private var barCloseButton: Button? = null
     private var titleLabel: Label? = null
     private var statusLabel: Label? = null
     private var statusChip: HBox? = null
@@ -1264,6 +1269,14 @@ object PlayerWindow {
         val full = roundButton(Icons.FULLSCREEN, "Fullscreen (F)", 16.0, 34.0) { toggleFullscreen() }
         fullscreenButton = full
 
+        // Closing the player belongs on the CONTROL BAR, not only on the title
+        // strip. The strip auto-hides while a video plays, so a user looking for
+        // "get me out of here" had a button that was usually not on screen; the
+        // bar's close button is there whenever the controls are, and it does the
+        // same thing as the strip's (leave the player, keep the app).
+        val barClose = roundButton(Icons.CLOSE, "Close the player (Esc)", 15.0, 34.0) { requestClose() }
+        barCloseButton = barClose
+
         val sepA = separator()
         val sepB = separator()
         barSeparators = listOf(sepA, sepB)
@@ -1288,7 +1301,7 @@ object PlayerWindow {
                 sepA,
                 source, quality, audio, subs,
                 sepB,
-                next, full,
+                next, full, barClose,
             )
         }
         bottomBar = bar
@@ -1308,7 +1321,14 @@ object PlayerWindow {
         root?.addEventFilter(MouseEvent.MOUSE_MOVED) { pokeChrome() }
         root?.addEventFilter(MouseEvent.MOUSE_PRESSED) { pokeChrome() }
         hideChrome = PauseTransition(Duration.millis(CHROME_IDLE_MS)).apply {
-            setOnFinished { setChromeVisible(false) }
+            setOnFinished {
+                // A pointer resting on one of the bars is the user USING it: a
+                // control that slides out from under the cursor is unusable, and
+                // that is exactly how the player's close button came to feel
+                // missing. The bars stay up while the pointer is on them, and the
+                // next mouse move (off them) restarts the countdown.
+                if (!paused && !overlayUp && !chromeUnderPointer()) setChromeVisible(false)
+            }
         }
 
         messageLabel = msgLabel
@@ -1582,6 +1602,10 @@ object PlayerWindow {
      *  failure), in which case they stay. */
     private fun scheduleChromeHide() {
         if (!mounted || paused || overlayUp) return
+        // ...and not while the pointer is ON a bar: the user is reading it, or
+        // reaching for a button on it (see the countdown's own handler). The next
+        // mouse move off the bars arms the countdown again.
+        if (chromeUnderPointer()) return
         hideChrome?.playFromStart()
     }
 
@@ -1733,6 +1757,90 @@ object PlayerWindow {
         }
     }.getOrDefault(false)
 
+    /** Presses the CONTROL BAR's close button (the always-visible way out). */
+    fun clickBarClose(): Boolean = runCatching {
+        Fx.runBlock {
+            val b = barCloseButton ?: return@runBlock false
+            b.fire()
+            true
+        }
+    }.getOrDefault(false)
+
+    /**
+     * How many near-white pixels the bar's OWN rendering contains.
+     *
+     * A bar is a translucent panel with white text and white icons on it, so a
+     * bar that renders its contents always has some — and a bar that renders
+     * nothing (the failure this catches: a floating strip window that was on
+     * screen, sized correctly, placed correctly, and completely empty) has none.
+     * Geometry checks cannot see the difference; pixels can.
+     */
+    fun barBrightPixelsForTest(strip: Boolean): Int? = Fx.runBlock {
+        val node = (if (strip) topStrip else bottomBar) ?: return@runBlock null
+        if (node.scene == null) return@runBlock null
+        val img = runCatching { node.snapshot(null, null) }.getOrNull() ?: return@runBlock null
+        val reader = img.pixelReader ?: return@runBlock null
+        val w = img.width.toInt()
+        val h = img.height.toInt()
+        var bright = 0
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val argb = runCatching { reader.getArgb(x, y) }.getOrDefault(0)
+                val alpha = argb ushr 24 and 0xff
+                if (alpha < 128) continue
+                val lum = ((argb shr 16 and 0xff) + (argb shr 8 and 0xff) + (argb and 0xff)) / 3
+                if (lum >= 185) bright++
+            }
+        }
+        bright
+    }
+
+    /** True while the two bars are on screen (see [chromeVisible]). The
+     *  self-test parks the real cursor on a bar and then asks this, which is how
+     *  "the strip disappears while I am reaching for it" is verified. */
+    fun chromeUpForTest(): Boolean = Fx.runBlock { chromeVisible }
+
+    /** Where the two bars' controls actually are on screen, and whether the
+     *  chrome is up — the numbers a test needs to check that the close button is
+     *  on screen and clickable while the bars are showing. */
+    fun chromeReport(): String = Fx.runBlock {        val strip = stripScreenRect()?.joinToString(",")
+        val bar = barScreenRect()?.joinToString(",")
+        val close = closeButtonScreenRect()?.joinToString(",")
+        "bars floating=" + overlaysOn + " visible=" + chromeVisible +
+            " strip=" + strip + " bar=" + bar + " close=" + close +
+            " idle=" + CHROME_IDLE_MS.toInt() + "ms"
+    }
+
+    /** The control-bar close button's screen rectangle. */
+    fun closeButtonScreenRect(): IntArray? = nodeScreenRect(barCloseButton ?: closePlayerButton)
+
+    /** The top strip's screen rectangle (floating window or in-layout node). */
+    fun stripScreenRect(): IntArray? =
+        if (overlaysOn) overlayHwnd(stripStage)?.let { WinShell.windowRect(it) }
+        else nodeScreenRect(topStrip)
+
+    /** The control bar's screen rectangle (floating window or in-layout node). */
+    fun barScreenRect(): IntArray? =
+        if (overlaysOn) overlayHwnd(barStage)?.let { WinShell.windowRect(it) }
+        else nodeScreenRect(bottomBar)
+
+    private fun nodeScreenRect(n: javafx.scene.Node?): IntArray? {
+        val node = n ?: return null
+        if (node.scene == null) return null
+        val b = runCatching { node.localToScreen(node.boundsInLocal) }.getOrNull() ?: return null
+        if (b.width <= 0.0 || b.height <= 0.0) return null
+        return intArrayOf(b.minX.toInt(), b.minY.toInt(), b.width.toInt(), b.height.toInt())
+    }
+
+    /** True while the pointer is over one of the two bars, i.e. while the user
+     *  is working the controls — see [scheduleChromeHide]. */
+    private fun chromeUnderPointer(): Boolean {
+        val p = WinShell.cursorPos() ?: return false
+        return listOfNotNull(stripScreenRect(), barScreenRect()).any {
+            p[0] >= it[0] && p[0] < it[0] + it[2] && p[1] >= it[1] && p[1] < it[1] + it[3]
+        }
+    }
+
     /** mpv's current `pause` value, straight from the control channel — the
      *  outside view of whether a click on play/pause did anything. */
     fun mpvPaused(): Boolean? = runCatching {
@@ -1836,6 +1944,16 @@ object PlayerWindow {
 
     /** Fills the Source menu with every stream the title/episode offered, and
      *  labels the button with the one that is playing. */
+    /** Swaps in a longer server list without touching playback — see
+     *  [desktop.player.DesktopPlayer.updateSources]. */
+    fun setSources(list: List<StreamSource>) {
+        if (list.isEmpty()) return
+        Fx.run {
+            sources = list
+            renderSources(currentSourceName)
+        }
+    }
+
     private fun renderSources(current: String) {
         currentSourceName = current
         currentSource = sources.firstOrNull { it.name == current } ?: sources.firstOrNull()

@@ -211,35 +211,105 @@ class ExtensionsScreenView {
         renderAll()
     }
 
+    // ── test hooks ──────────────────────────────────────────────────────────
+
+    /** The page's own scroller, so a UI test can scroll it and check where it
+     *  landed. */
+    fun pageForTest(): javafx.scene.control.ScrollPane = root
+
+    /** What every finished install does to the page: rebuild the installed list
+     *  and the header's counts. Used to check the scroll position survives it. */
+    fun repaintAfterInstallForTest() {
+        fillInstalled()
+        refreshHeader()
+    }
+
+    /** The page's section titles in the order they are drawn, top to bottom
+     *  ("Repos", "Installed", …) — the UI test checks the repos come first. */
+    fun sectionOrderForTest(): List<String> =
+        content.children
+            .mapNotNull { (it as? javafx.scene.Parent)?.lookup(".section-title") }
+            .filterIsInstance<javafx.scene.control.Label>()
+            .map { it.text }
+
     // ── rendering ───────────────────────────────────────────────────────────
 
     private fun renderAll() {
-        content.children.clear()
+        // The page is rebuilt into a LIST and swapped in with ONE `setAll`.
+        //
+        // Clearing the children first collapses the page to zero height for a
+        // frame, and a ScrollPane whose content is momentarily empty clamps its
+        // position back to the top — which is why installing an extension yanked
+        // a scrolled-down user up to the top of the screen, and why the page then
+        // felt stuck (the wheel had nothing to scroll until the new rows had been
+        // laid out).
+        val anchor = scrollAnchor()
         // The rows that are about to be rebuilt are gone; the parts map has to
         // forget them or a repaint would touch detached nodes.
         rowParts.clear()
-        content.children.add(header())
+        val page = ArrayList<Node>(content.children.size + 12)
+        page.add(header())
         // The live status line sits directly under the header: an install that
         // finishes while the user is looking at the top of the page must not
         // report itself at the bottom of a long list (that is where the old
         // layout put it, and why installs looked like they did nothing).
-        content.children.add(
-            HBox(10.0, busy, statusLabel).apply { alignment = Pos.CENTER_LEFT },
-        )
+        page.add(HBox(10.0, busy, statusLabel).apply { alignment = Pos.CENTER_LEFT })
         val repo = openRepo
         if (repo != null) {
-            renderRepoDetail(repo)
+            renderRepoDetail(repo, page)
         } else {
-            // What is INSTALLED comes first, directly under the header: it is the
-            // list whose state the user manages (enable, reload, remove) and the
-            // one the engine chips narrow. At the bottom of the page it sat below
-            // the composer and every repo card, so on a machine with a handful of
-            // repos the chips were not on screen at all — the feature existed and
-            // could not be found, which is how the Android picker (chips directly
-            // above the list) does it. The composer and the repo list follow it.
-            renderInstalled()
-            renderComposer()
-            renderRepos()
+            // Repos FIRST, the installed list LAST. Adding a repo and installing
+            // from it is what this page is for, so the composer and the repo
+            // cards are the first thing under the header, and the extensions this
+            // machine already holds sit underneath them.
+            renderComposer(page)
+            renderRepos(page)
+            renderInstalled(page)
+        }
+        content.children.setAll(page)
+        restoreScroll(anchor)
+    }
+
+    /**
+     * Where the page was scrolled to, as a NODE plus its offset from the top of
+     * the viewport.
+     *
+     * A raw `vvalue` (a 0..1 fraction) is not enough: repainting changes the
+     * height of everything above the point the user is reading (an install adds
+     * rows, a repo re-render can change every card), and a fraction of a
+     * different total is a different place. Anchoring on the child that was at
+     * the top of the viewport keeps that child exactly where it was.
+     */
+    private class ScrollAnchor(val node: Node, val offset: Double)
+
+    private fun scrollAnchor(): ScrollAnchor? {
+        val vp = root.viewportBounds.height
+        if (vp <= 0.0 || content.children.isEmpty()) return null
+        val top = root.vvalue * (content.height - vp).coerceAtLeast(0.0)
+        for (child in content.children) {
+            val b = child.boundsInParent
+            if (b.minY + b.height > top) return ScrollAnchor(child, b.minY - top)
+        }
+        return null
+    }
+
+    /** Puts the page back where [scrollAnchor] found it, once the new layout has
+     *  been measured (hence the `runLater`: heights are only known after the next
+     *  pulse). */
+    private fun restoreScroll(anchor: ScrollAnchor?) {
+        val a = anchor ?: return
+        javafx.application.Platform.runLater {
+            runCatching {
+                val vp = root.viewportBounds.height
+                if (vp <= 0.0) return@runCatching
+                val max = (content.height - vp).coerceAtLeast(0.0)
+                if (max <= 0.0) {
+                    root.vvalue = 0.0
+                    return@runCatching
+                }
+                val y = a.node.boundsInParent.minY
+                root.vvalue = ((y - a.offset) / max).coerceIn(0.0, 1.0)
+            }
         }
     }
 
@@ -262,14 +332,23 @@ class ExtensionsScreenView {
 
     // ── composer ────────────────────────────────────────────────────────────
 
-    private fun renderComposer() {
+    private fun renderComposer(page: MutableList<Node>) {
         val segmented = Ui.segmented(COMPOSER_MODES, mode) { index ->
             mode = index
             composerInput.promptText = COMPOSER_PROMPTS[index]
             composerButton.text = COMPOSER_LABELS[index]
             fileRow.isVisible = index == MODE_FILE
             fileRow.isManaged = index == MODE_FILE
+        }.apply {
+            // Its own class so a test can measure these chips (see UiShotTest).
+            styleClass.add("composer-chips")
         }
+        // "CloudStream repo", "Universal scraper", "IPTV playlist" — nine modes do
+        // not fit one panel width, and an HBox that cannot fit its children
+        // SQUEEZES them: every label came out as "CloudStream re…". The labels are
+        // kept whole and the row scrolls instead (see [Ui.chipRow]), which is the
+        // same rule the provider picker and the Installed filter follow.
+        Ui.keepChipLabels(segmented)
         val row = HBox(10.0, composerInput, composerButton).apply {
             alignment = Pos.CENTER_LEFT
             composerInput.promptText = COMPOSER_PROMPTS[mode]
@@ -277,10 +356,10 @@ class ExtensionsScreenView {
             fileRow.isVisible = mode == MODE_FILE
             fileRow.isManaged = mode == MODE_FILE
         }
-        content.children.add(
+        page.add(
             Ui.panel(
                 Ui.sectionHeader("Add a source", "Repos, addons, scrapers and single files"),
-                HBox(12.0, segmented).apply { alignment = Pos.CENTER_LEFT },
+                Ui.chipRow(segmented),
                 row,
                 fileRow,
                 Ui.divider(),
@@ -413,10 +492,10 @@ class ExtensionsScreenView {
         return Http.repoDisplayName(repo.url).takeIf { it.isNotBlank() } ?: repo.name
     }
 
-    private fun renderRepos() {
+    private fun renderRepos(page: MutableList<Node>) {
         reposBox.children.clear()
         val repos = runCatching { AppShell.app.store.repos() }.getOrDefault(emptyList())
-        content.children.add(Ui.sectionHeader("Repos", "${repos.size}"))
+        page.add(Ui.sectionHeader("Repos", "${repos.size}"))
         if (repos.isEmpty()) {
             reposBox.children.add(
                 Ui.emptyState(
@@ -448,7 +527,7 @@ class ExtensionsScreenView {
                 if (!known && waited && repoLoading.add(repo.url)) loadRepoData(repo.url, silent = true)
             }
         }
-        content.children.add(reposBox)
+        page.add(reposBox)
     }
 
     /** Loads every stored repo's cached manifest into [repoData] (disk only —
@@ -592,7 +671,7 @@ class ExtensionsScreenView {
     }
 
     /** Drills into a repo: its plugins, each with its own install state. */
-    private fun renderRepoDetail(repo: Cs3Repo) {
+    private fun renderRepoDetail(repo: Cs3Repo, page: MutableList<Node>) {
         val data = repoData[repo.url]
         val back = Ui.button("All extensions", icon = Icons.CHEVRON_LEFT, ghost = true) {
             openRepo = null
@@ -622,7 +701,7 @@ class ExtensionsScreenView {
             minWidth = 0.0
             maxWidth = Double.MAX_VALUE
         }
-        content.children.add(
+        page.add(
             VBox(Theme.S2,
                 heading,
                 sub,
@@ -636,8 +715,8 @@ class ExtensionsScreenView {
         val filterRow = HBox(10.0, pluginFilter, pluginCount).apply { alignment = Pos.CENTER_LEFT }
         filterRow.isVisible = data != null && data.plugins.isNotEmpty()
         filterRow.isManaged = filterRow.isVisible
-        content.children.add(filterRow)
-        content.children.add(pluginsBox)
+        page.add(filterRow)
+        page.add(pluginsBox)
         fillPlugins()
     }
 
@@ -736,7 +815,21 @@ class ExtensionsScreenView {
     }
 
     /** Rebuilds only the plugin list (keeps focus in the filter field). */
-    private fun fillPlugins() {
+    /** Runs [block] without moving the page: whatever the user was looking at
+     *  stays where it is, even when the block changes the height of everything
+     *  above it. */
+    private fun <T> keepingScroll(block: () -> T): T {
+        val anchor = scrollAnchor()
+        return try {
+            block()
+        } finally {
+            restoreScroll(anchor)
+        }
+    }
+
+    private fun fillPlugins() = keepingScroll { fillPluginRows() }
+
+    private fun fillPluginRows() {
         pluginsBox.children.clear()
         rowParts.clear()
         val repo = openRepo ?: return
@@ -1963,6 +2056,17 @@ class ExtensionsScreenView {
                 } else {
                     installErrors.remove(url)
                     syncProviders(name, safeName, url, dest, sourceUrl, names)
+                    // The optimistic half of the install put "Installed X (N …)"
+                    // on the status line and, because the real load was still
+                    // running, left the same text in the top bar's activity chip
+                    // — and nothing ever took it down again, so a finished
+                    // install sat in the top bar for the rest of the session.
+                    // The extension is fully installed now: the message becomes
+                    // the real count and is no longer "busy", which clears the
+                    // chip.
+                    setStatus(
+                        "Installed $name (${names.size} extension${if (names.size == 1) "" else "s"}).",
+                    )
                 }
                 refreshRow(url)
                 fillInstalled()
@@ -2286,25 +2390,29 @@ class ExtensionsScreenView {
 
     // ── installed providers ─────────────────────────────────────────────────
 
-    private fun renderInstalled() {
+    private fun renderInstalled(page: MutableList<Node>) {
         val all = runCatching { AppShell.app.store.providers() }.getOrDefault(emptyList())
         val statuses = AppShell.app.providers.statuses.value
         val failed = statuses.count { !it.loaded }
-        content.children.add(
+        page.add(
             Ui.sectionHeader(
                 "Installed",
                 "${all.size} extensions" + if (failed > 0) " · $failed failed to load" else "",
                 HBox(10.0, installedFilter).apply { alignment = Pos.CENTER_RIGHT },
             )
         )
-        content.children.add(kindChips(all))
+        page.add(kindChips(all))
         fillInstalled()
-        content.children.add(installedBox)
+        page.add(installedBox)
     }
 
     /** Rebuilds only the installed list, so typing in the filter never
-     *  re-parents the field (which would steal focus on every keystroke). */
-    private fun fillInstalled() {
+     *  re-parents the field (which would steal focus on every keystroke). The
+     *  scroll position is held across it: an install adds a row to a list that
+     *  can be several screens tall. */
+    private fun fillInstalled() = keepingScroll { fillInstalledRows() }
+
+    private fun fillInstalledRows() {
         installedBox.children.clear()
         val all = runCatching { AppShell.app.store.providers() }.getOrDefault(emptyList()).sortedBy { it.name.lowercase() }
         val query = installedFilter.text.trim().lowercase()
@@ -2336,12 +2444,12 @@ class ExtensionsScreenView {
      * the Installed list below to that engine — "only the Hikari extensions",
      * "only the Nuvio ones".
      */
-    private fun kindChips(all: List<ProviderConfig>): HBox {
+    private fun kindChips(all: List<ProviderConfig>): Node {
         val kinds = all.map { it.type }.distinct().sortedBy { kindLabel(it) }
         val index = kinds.indexOfFirst { it == kindFilter }.let { if (it < 0) 0 else it + 1 }
         if (index == 0) kindFilter = null
         val labels = listOf("All") + kinds.map { kindLabel(it) }
-        return Ui.segmented(labels, index) { picked ->
+        val row = Ui.segmented(labels, index) { picked ->
             kindFilter = if (picked <= 0) null else kinds.getOrNull(picked - 1)
             // Only the list below changes, and only it is repainted — rebuilding
             // the whole screen here would drop the chip row mid-click.
@@ -2352,6 +2460,11 @@ class ExtensionsScreenView {
             // too.
             styleClass.add("kind-chips")
         }
+        // One chip per installed engine outgrows a 108-extension list's width, and
+        // a squeezed chip says "…" instead of the engine's name: the labels are
+        // kept whole and the row scrolls (see [Ui.chipRow]).
+        Ui.keepChipLabels(row)
+        return Ui.chipRow(row)
     }
 
     /**

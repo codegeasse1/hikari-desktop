@@ -403,6 +403,45 @@ object Ui {
     }
 
     /**
+     * Wraps a row of chips in a horizontal scroller.
+     *
+     * A row of engine chips grows with what is installed, and an HBox that runs
+     * out of room SQUEEZES its children: every chip's label came out as "…",
+     * which is the one outcome worse than a chip you have to scroll to. The row
+     * therefore scrolls (wheel and two-finger motion included) and the chips
+     * themselves keep their full name — see [keepChipLabels].
+     */
+    fun chipRow(row: Node): ScrollPane = ScrollPane(row).apply {
+        styleClass.addAll("scroll-pane", "chip-scroll")
+        isFitToHeight = true
+        hbarPolicy = ScrollPane.ScrollBarPolicy.NEVER
+        vbarPolicy = ScrollPane.ScrollBarPolicy.NEVER
+        minWidth = 0.0
+        maxWidth = Double.MAX_VALUE
+        // The wheel pages the row ONLY while the row has somewhere to go: a chip
+        // row that fits must not eat the page's own scroll gesture (the pointer
+        // rests over the toolbar far more often than it scrolls the chips).
+        addEventFilter(javafx.scene.input.ScrollEvent.SCROLL) { e ->
+            val delta = if (e.deltaX != 0.0) e.deltaX else e.deltaY
+            if (delta == 0.0) return@addEventFilter
+            val next = (hvalue + delta / 320.0).coerceIn(0.0, 1.0)
+            if (next == hvalue) return@addEventFilter
+            hvalue = next
+            e.consume()
+        }
+    }
+
+    /** Stops a chip row from shrinking its buttons (`USE_PREF_SIZE`): each chip
+     *  is at least as wide as its own label needs, so [chipRow] scrolls instead
+     *  of JavaFX ellipsizing the names. */
+    fun keepChipLabels(row: HBox) {
+        row.children.filterIsInstance<Button>().forEach {
+            it.minWidth = Region.USE_PREF_SIZE
+            it.maxWidth = Region.USE_PREF_SIZE
+        }
+    }
+
+    /**
      * Wraps a rail in a hover-reactive overlay with circular left/right arrows.
      * The arrows fade in only while the pointer is over the row, so the artwork
      * stays clean but paging is always one click away.

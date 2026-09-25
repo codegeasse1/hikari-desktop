@@ -59,11 +59,13 @@ class ProviderPicker(private val onPick: () -> Unit) {
         contentDisplay = ContentDisplay.RIGHT
         graphicTextGap = 10.0
         isFocusTraversable = false
-        prefWidth = 260.0
-        // Shrinkable: the picker + Refresh + Logs row must still fit a narrow
-        // window instead of pushing the page wider than the viewport.
-        minWidth = 150.0
-        maxWidth = 340.0
+        prefWidth = 300.0
+        // The chosen provider's name is the button's whole point, so the button
+        // is never shrunk below what that name needs: the toolbar it lives in
+        // scrolls instead (see HomeScreen), which is what keeps "Anime · Animeko"
+        // from being drawn as "Anim…".
+        minWidth = javafx.scene.layout.Region.USE_PREF_SIZE
+        maxWidth = 420.0
         setOnAction { toggle() }
     }
 
@@ -73,6 +75,19 @@ class ProviderPicker(private val onPick: () -> Unit) {
         textProperty().addListener { _, _, _ -> rebuildList() }
     }
     private val chips = HBox(4.0).apply { styleClass.addAll("segmented", "provider-chips") }
+
+    /**
+     * The chip row, horizontally scrollable.
+     *
+     * One chip per engine is a row that grows past any reasonable popup width
+     * once six or seven engines have providers installed — and an HBox that
+     * cannot fit its children squeezes them instead of overflowing, which
+     * ellipsized every label into "…" (the chips were on screen and unreadable,
+     * the worst of both). The chips now keep their full name
+     * (`minWidth = USE_PREF_SIZE`, see [rebuildChips]) and the row scrolls, so
+     * every engine is reachable whatever is installed.
+     */
+    private val chipsScroll = Ui.chipRow(chips)
     private val listBox = VBox(2.0).apply { styleClass.add("picker-list") }
     private val listScroll = ScrollPane(listBox).apply {
         styleClass.add("scroll-pane")
@@ -88,11 +103,11 @@ class ProviderPicker(private val onPick: () -> Unit) {
     }
 
     init {
-        val body = VBox(Theme.S2, search, chips, listScroll).apply {
+        val body = VBox(Theme.S2, search, chipsScroll, listScroll).apply {
             styleClass.add("picker-pop")
-            prefWidth = 360.0
-            maxWidth = 420.0
-            minWidth = 300.0
+            prefWidth = 380.0
+            maxWidth = 460.0
+            minWidth = 320.0
         }
         VBox.setVgrow(listScroll, Priority.ALWAYS)
         pop.content.add(body)
@@ -160,7 +175,9 @@ class ProviderPicker(private val onPick: () -> Unit) {
             kindFilter = if (picked <= 0) null else kinds.getOrNull(picked - 1)
             rebuildList()
         }
+        Ui.keepChipLabels(seg)
         chips.children.setAll(ArrayList<javafx.scene.Node>(seg.children))
+        chipsScroll.hvalue = 0.0
     }
 
     private fun rebuildList() {
@@ -179,7 +196,10 @@ class ProviderPicker(private val onPick: () -> Unit) {
             styleClass.add("src-name")
             isWrapText = false
             minWidth = 0.0
-            maxWidth = 240.0
+            maxWidth = 300.0
+            // The full name is always reachable even when a very long one has to
+            // be ellipsized to fit the row.
+            tooltip = Ui.tooltip(cfg?.name ?: ALL)
         }
         val right = if (cfg == null) {
             Label("every enabled provider").apply { styleClass.add("tiny") }
@@ -208,6 +228,21 @@ class ProviderPicker(private val onPick: () -> Unit) {
     fun chipLabelsForTest(): List<String> =
         chips.children.filterIsInstance<Button>().mapNotNull { it.text }
 
+    /**
+     * `(label, laid-out width, width its text needs)` for every chip.
+     *
+     * A squeezed chip still reports its full `text` — the ellipsis is a drawing
+     * decision — so the UI test needs these three numbers to tell a readable
+     * chip row from one that has been crushed into "…".
+     */
+    fun chipWidthsForTest(): List<Triple<String, Double, Double>> =
+        chips.children.filterIsInstance<Button>().map {
+            Triple(it.text ?: "", it.width, it.prefWidth(-1.0))
+        }
+
+    /** The horizontally scrollable chip row (see [chipsScroll]). */
+    fun chipRowForTest(): ScrollPane = chipsScroll
+
     /** Fires the chip with this label, as a click would. */
     fun pressChipForTest(label: String): Boolean {
         val b = chips.children.filterIsInstance<Button>().firstOrNull { it.text == label } ?: return false
@@ -233,7 +268,12 @@ class ProviderPicker(private val onPick: () -> Unit) {
 
     private fun pick(cfg: ProviderConfig?) {
         selection = cfg
+        // The button carries the WHOLE name; a provider with a long name gets a
+        // tooltip rather than a truncated label (see the button's own width
+        // rules: it may shrink on a narrow window, but it never ellipsizes the
+        // engine name into "…" while there is room).
         button.text = cfg?.name ?: ALL
+        button.tooltip = Ui.tooltip(cfg?.name ?: ALL)
         pop.hide()
         rebuildList()
         onPick()

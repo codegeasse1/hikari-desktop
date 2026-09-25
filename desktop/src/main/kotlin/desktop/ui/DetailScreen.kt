@@ -34,7 +34,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -84,6 +86,11 @@ class DetailScreenView(private val item: MediaItem) {
     private var episodes: List<Episode> = emptyList()
     private var selectedEpisode: Episode? = null
     private var streams: List<StreamSource> = emptyList()
+
+    /** The job that keeps picking up servers found after the first one (see
+     *  [pollSweep]). */
+    private var sweepPoll: Job? = null
+
     private var pendingPlay = false
     private var pendingDownload = false
     private var favourite = false
@@ -808,12 +815,26 @@ class DetailScreenView(private val item: MediaItem) {
 
     // ── sources ─────────────────────────────────────────────────────────────
 
+    /**
+     * Fetches this title's servers and then KEEPS WATCHING.
+     *
+     * Sources are collected across every installed extension of the title's
+     * engine (see [com.hikari.app.data.ContentRepository.streamsFor]), and that
+     * sweep returns as soon as the first server is playable — so the list on
+     * screen keeps growing for a few seconds after it appears. A second server
+     * that arrives late is exactly the one the user needs when the first one is
+     * dead, so the panel (and the player's Source menu, when it is open) is
+     * updated as they land instead of freezing the list at "whatever answered
+     * first".
+     */
     private fun loadStreams() {
         sourcesBox.children.setAll(Ui.loadingRow("Fetching sources…"))
         sourcesHeader.text = "Sources"
         sourcesCount.text = ""
+        sweepPoll?.cancel()
+        val ep = selectedEpisode
         scope.launch {
-            val list = runCatching { AppShell.app.repository.streamsFor(meta, selectedEpisode) }
+            val list = runCatching { AppShell.app.repository.streamsFor(meta, ep) }
                 .getOrElse { t ->
                     Fx.run {
                         sourcesBox.children.setAll(
@@ -838,23 +859,64 @@ class DetailScreenView(private val item: MediaItem) {
                     downloadFirst()
                 }
             }
+            pollSweep(ep)
         }
+    }
+
+    /** Polls the running sweep for servers that landed after the first one, and
+     *  shows them. Stops when the sweep is done (or the screen goes away). */
+    private fun pollSweep(ep: Episode?) {
+        val repo = AppShell.app.repository
+        val job = scope.launch {
+            while (true) {
+                delay(1200L)
+                val all = repo.sweepSnapshot(meta, ep)
+                val running = repo.sweepRunning(meta, ep)
+                if (all.size > streams.size) {
+                    Fx.run {
+                        streams = all
+                        renderStreams()
+                        renderPanel()
+                        // The player is open on this title: give it the new
+                        // servers too, so its Source menu can move to one of them
+                        // without a trip back here.
+                        DesktopPlayer.updateSources(all)
+                    }
+                }
+                if (!running) break
+            }
+            Fx.run { renderStreams() }
+        }
+        sweepPoll = job
     }
 
     private fun renderStreams() {
         if (streams.isEmpty()) {
-            sourcesBox.children.setAll(
-                Ui.emptyState(
-                    Icons.INFO,
-                    "No playable source found",
+            // An empty list says WHAT happened, per extension. "No playable
+            // source found" with nothing under it is the answer that tells a
+            // user nothing at all — the sweep knows which extensions it asked
+            // and what each of them said (see ContentRepository.sweepErrors).
+            val errors = AppShell.app.repository.sweepErrors(meta, selectedEpisode)
+            val running = AppShell.app.repository.sweepRunning(meta, selectedEpisode)
+            val body = buildString {
+                append(
                     if (selectedEpisode == null) {
-                        "This provider returned no streams for the title itself."
+                        "No installed extension returned a stream for this title."
                     } else {
-                        "No source answered for this episode. Try another episode, or reload after installing more extensions."
-                    },
+                        "No installed extension returned a stream for this episode."
+                    }
                 )
-            )
-            sourcesCount.text = "0 found"
+                if (running) append(" Still asking…")
+                if (errors.isNotEmpty()) {
+                    append("\n\n")
+                    errors.entries.take(6).forEach { (id, why) ->
+                        val name = AppShell.app.repository.providerName(id)
+                        append("• $name — ${why.take(180)}\n")
+                    }
+                }
+            }.trim()
+            sourcesBox.children.setAll(Ui.emptyState(Icons.INFO, "No playable source found", body))
+            sourcesCount.text = if (running) "searching…" else "0 found"
             return
         }
         sourcesCount.text = "${streams.size} found"
