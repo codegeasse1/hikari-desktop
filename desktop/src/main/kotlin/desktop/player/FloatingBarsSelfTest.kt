@@ -260,6 +260,7 @@ private fun test(host: Stage, mpvPath: String): Int {
 
     val videoRect = videoHwnd?.let { WinShell.windowRect(it) }
     val appRect = WinShell.windowRect(appHwnd)
+    println("  surface: " + onFx { PlayerWindow.surfaceDebug() })
     check(
         "the video window covers the WHOLE app window (the bars take no layout space)",
         videoRect != null && appRect != null &&
@@ -712,10 +713,16 @@ private fun test(host: Stage, mpvPath: String): Int {
                 barInFull[1] + barInFull[3] <= fullRect[1] + fullRect[3] + 6,
             "bar=" + barInFull?.joinToString(",") + " window=" + fullRect?.joinToString(","),
         )
+        val videoNow = onFx { PlayerWindow.videoSurfaceHwnd() } ?: videoHwnd
+        println(
+            "  in full screen: " + onFx { PlayerWindow.surfaceDebug() } +
+                " barExists=" + barHwnd?.let { WinShell.windowExists(it) } +
+                " videoExists=" + videoNow?.let { WinShell.windowExists(it) },
+        )
         check(
             "the control bar is still above the picture in full screen",
-            WinShell.isAbove(barHwnd, videoHwnd) == true,
-            "isAbove=" + WinShell.isAbove(barHwnd, videoHwnd),
+            barHwnd != null && videoNow != null && WinShell.isAbove(barHwnd, videoNow) == true,
+            "isAbove=" + (if (barHwnd != null && videoNow != null) WinShell.isAbove(barHwnd, videoNow) else null),
         )
         // …and out again, from the same button: the window has to come BACK.
         onFx { PlayerWindow.previewChrome(true) }

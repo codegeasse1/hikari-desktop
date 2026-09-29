@@ -1018,8 +1018,12 @@ class UiShotApp : Application() {
         val out = ArrayList<String>()
         for (child in bar.children) {
             if (child === seek) continue
+            if (seek != null && child is javafx.scene.Parent &&
+                runCatching { child.lookup(".player-seek") }.getOrNull() === seek
+            ) continue
             if (!child.isVisible || !child.isManaged) continue
             val r = child as? javafx.scene.layout.Region ?: continue
+            if (r.styleClass.contains("player-seek-hit")) continue
             val want = r.prefWidth(-1.0)
             if (want <= 0.0) continue
             val got = child.layoutBounds.width

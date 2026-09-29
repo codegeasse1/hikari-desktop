@@ -223,6 +223,16 @@ object PlayerWindow {
     /** When [seekPendingSecs] stops being believed (monotonic-ish wall clock). */
     @Volatile private var seekPendingUntil = 0L
 
+    /** The last position the picture reported, so a seek that never lands can
+     *  stop showing its target once the echo window closes. */
+    @Volatile private var lastReportedSecs = 0.0
+
+    /** Invalidates stale seek-echo expiry callbacks; see [armSeekEcho]. */
+    @Volatile private var seekEchoGen = 0
+
+    /** What [syncSurface] last did, for the harness to report. */
+    @Volatile private var lastSyncNote = ""
+
     /** Whether the PLAYER asked for full screen. Compared against the stage's own
      *  `isFullScreen`, so a machine that refuses the OS-level transition still
      *  gets a full-screen window — see [setFullscreen]. */
@@ -1089,7 +1099,9 @@ object PlayerWindow {
     }
 
     private fun safeSync() {
-        runCatching { syncSurface() }
+        runCatching { syncSurface() }.onFailure {
+            lastSyncNote = "sync threw: " + (it.message ?: it.javaClass.simpleName)
+        }
     }
 
     /**
@@ -1099,6 +1111,7 @@ object PlayerWindow {
     private fun syncSurface() {
         val hwnd = surfaceHwnd ?: return
         if (!WinShell.windowExists(hwnd)) {
+            lastSyncNote = "surface window gone; released"
             releaseSurface()
             return
         }
@@ -1110,6 +1123,7 @@ object PlayerWindow {
         if (w < 16 || h < 16) return
         if (overlayUp) {
             WinShell.placeWindow(hwnd, WinShell.PARKED_X, WinShell.PARKED_Y, w, h)
+            lastSyncNote = "parked(overlayUp) " + w + "x" + h
             return
         }
         val owner = ownerHwnd ?: return
@@ -1140,8 +1154,13 @@ object PlayerWindow {
         // black rectangle with working controls while the picture sits
         // underneath. One SetWindowPos on a tick that already read the rectangle.
         val stacked = runCatching { WinShell.isAbove(hwnd, owner) }.getOrNull()
-        if (live != null && live.contentEquals(target) && stacked == true) return
-        WinShell.placeAbove(hwnd, owner, target[0], target[1], target[2], target[3])
+        if (live != null && live.contentEquals(target) && stacked == true) {
+            lastSyncNote = "already placed " + target.joinToString(",")
+            return
+        }
+        val moved = WinShell.placeAbove(hwnd, owner, target[0], target[1], target[2], target[3])
+        lastSyncNote = "placeAbove " + target.joinToString(",") + " -> " + moved +
+            " live=" + (live?.joinToString(",") ?: "?") + " stacked=" + stacked
     }
 
     private fun screenScale(): Double = runCatching {
@@ -1643,6 +1662,7 @@ object PlayerWindow {
 
     private fun closeInternal() {
         teardown = true
+        seekEchoGen++
         runCatching { syncTimer?.stop() }
         syncTimer = null
         runCatching { hideChrome?.stop() }
@@ -1836,6 +1856,18 @@ object PlayerWindow {
     /** The adopted video window (mpv's), for a test that measures where the
      *  picture actually is. */
     fun videoSurfaceHwnd(): Long? = surfaceHwnd
+
+    /** One line on where the picture is and why, for a test that measures it. */
+    fun surfaceDebug(): String = Fx.runBlock {
+        val area = videoArea
+        "overlayUp=" + overlayUp +
+            " loading=" + (loadingBox?.isVisible) + " msg=" + (messageBox?.isVisible) +
+            " area=" + area.width.roundToInt() + "x" + area.height.roundToInt() +
+            " scene=" + (area.scene != null) +
+            " owner=" + (ownerHwnd?.let { WinShell.windowRect(it)?.joinToString(",") }) +
+            " surface=" + (surfaceHwnd?.let { WinShell.windowRect(it)?.joinToString(",") }) +
+            " embedded=" + embedded + " note=" + lastSyncNote
+    }.orEmpty()
 
     /** Presses the control bar's play/pause button, exactly as a click does, so
      *  a test can check that pausing and RESUMING both reach mpv. */
@@ -2438,6 +2470,23 @@ object PlayerWindow {
     private fun armSeekEcho(targetSecs: Double) {
         seekPendingSecs = targetSecs
         seekPendingUntil = System.currentTimeMillis() + SEEK_ECHO_MS
+        val gen = ++seekEchoGen
+        Thread(
+            {
+                runCatching { Thread.sleep(SEEK_ECHO_MS) }
+                Fx.run {
+                    if (seekEchoGen == gen && seekPendingSecs != null) {
+                        seekPendingSecs = null
+                        val d = duration
+                        val frac = if (d > 0) (lastReportedSecs / d).coerceIn(0.0, 1.0) else 0.0
+                        lastPosition = (lastReportedSecs * 1000).toLong()
+                        if (!scrubbing) seekBar?.value = frac
+                        renderTime()
+                    }
+                }
+            },
+            "hikari-seek-echo",
+        ).apply { isDaemon = true; start() }
     }
 
     /**
@@ -2547,6 +2596,7 @@ object PlayerWindow {
             }
             "time-pos" -> {
                 val reported = (value as? Number)?.toDouble() ?: 0.0
+                lastReportedSecs = reported
                 // A report of the position BEFORE a seek (mpv keeps sending those
                 // for a moment) must not drag the bar or the clock back to where
                 // the user just left. See [displayedPosition].

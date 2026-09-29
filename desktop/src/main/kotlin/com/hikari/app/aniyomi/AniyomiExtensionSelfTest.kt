@@ -117,6 +117,14 @@ fun main() {
         "android.webkit.WebResourceRequest",
         "android.webkit.WebResourceResponse",
         "android.webkit.ValueCallback",
+        "uy.kohesive.injekt.api.InjektScope",
+        "uy.kohesive.injekt.api.InjektFactory",
+        "uy.kohesive.injekt.api.InjektRegistrar",
+        "uy.kohesive.injekt.api.InjektRegistry",
+        "uy.kohesive.injekt.api.InjektModule",
+        "uy.kohesive.injekt.api.TypeReference",
+        "uy.kohesive.injekt.api.FullTypeReference",
+        "uy.kohesive.injekt.api.InjektionException",
     )
     val missingTypes = types.filter { runCatching { Class.forName(it, false, loader) }.isFailure }
     check(
@@ -162,6 +170,9 @@ fun main() {
         // The JS engine twelve extensions run their own scripts on.
         "app.cash.quickjs.QuickJs#evaluate(java.lang.String):java.lang.Object|12",
         "app.cash.quickjs.QuickJs#set(java.lang.String,java.lang.Class,java.lang.Object):void|3",
+        "uy.kohesive.injekt.InjektKt#getInjekt():uy.kohesive.injekt.api.InjektScope",
+        "uy.kohesive.injekt.api.InjektFactory#getInstance(java.lang.reflect.Type):java.lang.Object",
+        "uy.kohesive.injekt.api.InjektFactory#getInstanceOrNull(java.lang.reflect.Type):java.lang.Object",
         // The text types a source's own helpers are built on.
         "android.text.Editable#replace(int,int,java.lang.CharSequence):android.text.Editable",
         "android.text.Editable#insert(int,java.lang.CharSequence):android.text.Editable",
