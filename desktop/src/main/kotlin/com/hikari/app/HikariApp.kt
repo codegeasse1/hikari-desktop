@@ -18,6 +18,8 @@ import kotlinx.coroutines.launch
 import okhttp3.Cache
 import okhttp3.OkHttpClient
 import org.conscrypt.Conscrypt
+import uy.kohesive.injekt.api.addSingleton
+import uy.kohesive.injekt.api.addSingletonFactory
 import java.io.File
 import java.security.Security
 import java.util.concurrent.TimeUnit
