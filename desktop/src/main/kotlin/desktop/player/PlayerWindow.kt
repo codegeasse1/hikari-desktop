@@ -233,6 +233,12 @@ object PlayerWindow {
     /** What [syncSurface] last did, for the harness to report. */
     @Volatile private var lastSyncNote = ""
 
+    /** Placement accounting, for the harness to report. */
+    @Volatile private var parkCount = 0
+
+    /** Placement accounting, for the harness to report. */
+    @Volatile private var placeCount = 0
+
     /** Whether the PLAYER asked for full screen. Compared against the stage's own
      *  `isFullScreen`, so a machine that refuses the OS-level transition still
      *  gets a full-screen window — see [setFullscreen]. */
@@ -1127,7 +1133,8 @@ object PlayerWindow {
         if (w < 16 || h < 16) return
         if (overlayUp) {
             WinShell.placeWindow(hwnd, WinShell.PARKED_X, WinShell.PARKED_Y, w, h)
-            lastSyncNote = "parked(overlayUp) " + w + "x" + h
+            parkCount++
+            lastSyncNote = "parked(overlayUp) " + w + "x" + h + " parks=" + parkCount
             return
         }
         val owner = ownerHwnd ?: return
@@ -1162,9 +1169,23 @@ object PlayerWindow {
             lastSyncNote = "already placed " + target.joinToString(",")
             return
         }
+        placeCount++
         val moved = WinShell.placeAbove(hwnd, owner, target[0], target[1], target[2], target[3])
-        lastSyncNote = "placeAbove " + target.joinToString(",") + " -> " + moved +
-            " live=" + (live?.joinToString(",") ?: "?") + " stacked=" + stacked
+        val liveAfter = WinShell.windowRect(hwnd)
+        val took = liveAfter != null && liveAfter[0] == target[0] && liveAfter[1] == target[1]
+        if (!took) {
+            val movedFallback = WinShell.moveWindow(hwnd, target[0], target[1], target[2], target[3])
+            val liveAfterFallback = WinShell.windowRect(hwnd)
+            lastSyncNote = "placeAbove " + target.joinToString(",") + " -> " + moved +
+                " liveAfter=" + (liveAfter?.joinToString(",") ?: "?") +
+                " fallback=" + movedFallback +
+                " liveAfterFallback=" + (liveAfterFallback?.joinToString(",") ?: "?") +
+                " places=" + placeCount
+        } else {
+            lastSyncNote = "placeAbove " + target.joinToString(",") + " -> " + moved +
+                " live=" + (live?.joinToString(",") ?: "?") + " stacked=" + stacked +
+                " places=" + placeCount
+        }
     }
 
     private fun screenScale(): Double = runCatching {
@@ -1872,6 +1893,7 @@ object PlayerWindow {
             " surface=" + (surfaceHwnd?.let { WinShell.windowRect(it)?.joinToString(",") }) +
             " iconic=" + surfaceHwnd?.let { WinShell.isIconified(it) } +
             " shown=" + surfaceHwnd?.let { WinShell.isVisible(it) } +
+            " parks=" + parkCount + " places=" + placeCount +
             " embedded=" + embedded + " note=" + lastSyncNote
     }.orEmpty()
 

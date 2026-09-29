@@ -451,6 +451,18 @@ object WinShell {
         )
     }
 
+    /**
+     * Moves and sizes a window the `SetWindowPos` way's older sibling: some
+     * windows (observed: mpv's, once dressed as an owned popup) acknowledge a
+     * `SetWindowPos` with success and never move, while `MoveWindow` lands. The
+     * fallback for a placement that did not take — see `PlayerWindow`.
+     */
+    fun moveWindow(hwnd: Long, x: Int, y: Int, w: Int, h: Int): Boolean = call(false) {
+        if (w <= 0 || h <= 0) return@call false
+        if (!windowExists(hwnd)) return@call false
+        User32.INSTANCE.MoveWindow(toHwnd(hwnd), x, y, w, h, true)
+    }
+
     /** Kept for the CI smoke test: resizes a child window to fill its parent. */
     fun fillWindow(hwnd: Long, w: Int, h: Int): Boolean = call(false) {
         User32.INSTANCE.MoveWindow(toHwnd(hwnd), 0, 0, w, h, true)
