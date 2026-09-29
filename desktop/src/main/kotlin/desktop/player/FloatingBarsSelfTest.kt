@@ -346,14 +346,35 @@ private fun test(host: Stage, mpvPath: String): Int {
     // after a few idle seconds, and this test's pointer never moves, so the old
     // version photographed a bar that had already taken itself away and compared
     // two pictures of bare video.
+    // Settle AWAY first, then poll for UP: on a loaded CI agent the overlay's
+    // native window is found and dressed on the player timer, so one 600ms
+    // snapshot can catch bare video while the bar itself is fine.
+    onFx { PlayerWindow.previewChrome(false) }
+    Thread.sleep(900)
+    val barAwayBase = barRect?.let { meanLuma(it[0] + 8, it[1] + 8, it[2] - 16, it[3] - 24) }
     onFx { PlayerWindow.previewChrome(true) }
-    Thread.sleep(600)
-    val barWithChrome = barRect?.let { meanLuma(it[0] + 8, it[1] + 8, it[2] - 16, it[3] - 24) }
+    var barWithChrome = barRect?.let { meanLuma(it[0] + 8, it[1] + 8, it[2] - 16, it[3] - 24) }
+    val chromeBy = System.currentTimeMillis() + 4_000
+    while (System.currentTimeMillis() < chromeBy) {
+        if (barWithChrome != null && barAwayBase != null &&
+            kotlin.math.abs(barWithChrome - barAwayBase) > 6.0
+        ) break
+        Thread.sleep(300)
+        barWithChrome = barRect?.let { meanLuma(it[0] + 8, it[1] + 8, it[2] - 16, it[3] - 24) }
+    }
     println("  mean luma over the bar rect, chrome UP   = " + barWithChrome)
 
     onFx { PlayerWindow.previewChrome(false) }
     Thread.sleep(700)
-    val barWithoutChrome = barRect?.let { meanLuma(it[0] + 8, it[1] + 8, it[2] - 16, it[3] - 24) }
+    var barWithoutChrome = barRect?.let { meanLuma(it[0] + 8, it[1] + 8, it[2] - 16, it[3] - 24) }
+    val awayBy = System.currentTimeMillis() + 4_000
+    while (System.currentTimeMillis() < awayBy) {
+        if (barWithoutChrome != null && barWithChrome != null &&
+            kotlin.math.abs(barWithoutChrome - barWithChrome) > 6.0
+        ) break
+        Thread.sleep(300)
+        barWithoutChrome = barRect?.let { meanLuma(it[0] + 8, it[1] + 8, it[2] - 16, it[3] - 24) }
+    }
     val videoHidden = videoHwnd?.let { WinShell.windowRect(it) }
     println("  mean luma over the bar rect, chrome AWAY = " + barWithoutChrome)
     check(
