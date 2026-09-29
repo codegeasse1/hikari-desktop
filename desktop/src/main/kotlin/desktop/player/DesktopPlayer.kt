@@ -233,6 +233,7 @@ object DesktopPlayer {
                 // space/arrows/q once its window has been clicked.
                 add("--no-border")
                 add("--auto-window-resize=no")
+                add("--keepaspect-window=no")
                 add("--no-input-default-bindings")
                 add("--title=" + title.take(200).replace('\n', ' '))
                 ipcArg()?.let { add(it) }
@@ -370,6 +371,7 @@ object DesktopPlayer {
                 // mpv must never resize its own window when a file's dimensions
                 // become known: the app owns the window's geometry ([WinShell]).
                 add("--auto-window-resize=no")
+                add("--keepaspect-window=no")
                 add("--no-input-default-bindings")
                 // No youtube-dl hook: for direct HLS/MP4 URLs it fires a SECOND,
                 // header-less probe (no Referer/Cookie) that 403s on protected

@@ -175,6 +175,7 @@ private fun test(host: Stage, mpvPath: String): Int {
         "--no-config",
         "--no-border",
         "--auto-window-resize=no",
+        "--keepaspect-window=no",
         "--no-osc",
         "--no-input-default-bindings",
         "--force-window=immediate",
@@ -692,7 +693,17 @@ private fun test(host: Stage, mpvPath: String): Int {
             fullRect != null && !fullRect.contentEquals(windowBefore),
             "was=" + windowBefore.joinToString(",") + " now=" + fullRect?.joinToString(","),
         )
-        val videoInFull = onFx { PlayerWindow.videoSurfaceHwnd() }?.let { WinShell.windowRect(it) }
+        var videoInFull: IntArray? = null
+        val fullBy = System.currentTimeMillis() + 3_000
+        while (System.currentTimeMillis() < fullBy) {
+            videoInFull = onFx { PlayerWindow.videoSurfaceHwnd() }?.let { WinShell.windowRect(it) }
+            if (videoInFull != null && fullRect != null &&
+                kotlin.math.abs(videoInFull[2] - fullRect[2]) <= 10 &&
+                kotlin.math.abs(videoInFull[3] - fullRect[3]) <= 10
+            ) break
+            Thread.sleep(200)
+        }
+        println("  fullscreen picture settle: video=" + videoInFull?.joinToString(",") + " window=" + fullRect?.joinToString(","))
         check(
             "the picture fills the full-screen window",
             videoInFull != null && fullRect != null &&

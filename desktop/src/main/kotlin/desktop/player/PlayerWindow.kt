@@ -1172,7 +1172,8 @@ object PlayerWindow {
         placeCount++
         val moved = WinShell.placeAbove(hwnd, owner, target[0], target[1], target[2], target[3])
         val liveAfter = WinShell.windowRect(hwnd)
-        val took = liveAfter != null && liveAfter[0] == target[0] && liveAfter[1] == target[1]
+        val took = liveAfter != null && liveAfter[0] == target[0] && liveAfter[1] == target[1] &&
+            kotlin.math.abs(liveAfter[2] - target[2]) <= 2 && kotlin.math.abs(liveAfter[3] - target[3]) <= 2
         if (!took) {
             val movedFallback = WinShell.moveWindow(hwnd, target[0], target[1], target[2], target[3])
             val liveAfterFallback = WinShell.windowRect(hwnd)
@@ -2670,7 +2671,10 @@ object PlayerWindow {
         if (event != "ipc-closed") ipcAnswered = true
         when (event) {
             // mpv has the file open and is about to render: the wait is over.
-            "file-loaded", "playback-restart" -> Fx.run { playbackStarted() }
+            "file-loaded", "playback-restart" -> Fx.run {
+                playbackStarted()
+                safeSync()
+            }
             "end-file", "ipc-closed" -> {
                 val fatalPipe = event == "ipc-closed"
                 val reason = data.optString("reason").ifBlank { data.optString("error") }
@@ -2706,7 +2710,10 @@ object PlayerWindow {
         nextButton?.isDisable = !(nextButton?.isVisible ?: false)
         if (sawVideo) return
         sawVideo = true
-        Fx.run { playbackStarted() }
+        Fx.run {
+            playbackStarted()
+            safeSync()
+        }
     }
 
     /** Called the moment playback is actually up: drops the loading overlay and
