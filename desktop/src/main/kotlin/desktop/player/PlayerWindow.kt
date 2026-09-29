@@ -1115,6 +1115,10 @@ object PlayerWindow {
             releaseSurface()
             return
         }
+        if (WinShell.isIconified(hwnd)) {
+            lastSyncNote = "surface minimised; restoring"
+            WinShell.restoreWindow(hwnd)
+        }
         val area = videoArea
         if (area.scene == null || area.width < 16.0 || area.height < 16.0) return
         val scale = screenScale()
@@ -1866,6 +1870,8 @@ object PlayerWindow {
             " scene=" + (area.scene != null) +
             " owner=" + (ownerHwnd?.let { WinShell.windowRect(it)?.joinToString(",") }) +
             " surface=" + (surfaceHwnd?.let { WinShell.windowRect(it)?.joinToString(",") }) +
+            " iconic=" + surfaceHwnd?.let { WinShell.isIconified(it) } +
+            " shown=" + surfaceHwnd?.let { WinShell.isVisible(it) } +
             " embedded=" + embedded + " note=" + lastSyncNote
     }.orEmpty()
 

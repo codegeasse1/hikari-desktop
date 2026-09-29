@@ -2,6 +2,7 @@ package androidx.preference
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.content.DesktopSharedPreferences
 
 /**
  * Desktop stand-ins for AndroidX's preference library.
@@ -779,7 +780,7 @@ open class PreferenceManager(private val context: Context?) {
         /** Used only when there is no context at all (never in the app's own
          *  path) so a settings read can never NPE. */
         private val FALLBACK: SharedPreferences =
-            SharedPreferences(SharedPreferences.fileFor(java.io.File(System.getProperty("user.home"), ".hikari"), "hikari"))
+            DesktopSharedPreferences(DesktopSharedPreferences.fileFor(java.io.File(System.getProperty("user.home"), ".hikari"), "hikari"))
 
         private fun defaultName(context: Context): String =
             context.packageName + "_preferences"
@@ -795,18 +796,18 @@ open class PreferenceManager(private val context: Context?) {
 /** AndroidX's `PreferenceDataStore` (a preference store that is not
  *  SharedPreferences). Sources rarely install one; the type exists so a source
  *  that does still links. */
-interface PreferenceDataStore {
-    fun putString(key: String?, value: String?) = Unit
-    fun getString(key: String?, defValue: String?): String? = defValue
-    fun putStringSet(key: String?, values: Set<String>?) = Unit
-    fun getStringSet(key: String?, defValues: Set<String>?): Set<String>? = defValues
-    fun putInt(key: String?, value: Int) = Unit
-    fun getInt(key: String?, defValue: Int): Int = defValue
-    fun putLong(key: String?, value: Long) = Unit
-    fun getLong(key: String?, defValue: Long): Long = defValue
-    fun putFloat(key: String?, value: Float) = Unit
-    fun getFloat(key: String?, defValue: Float): Float = defValue
-    fun putBoolean(key: String?, value: Boolean) = Unit
-    fun getBoolean(key: String?, defValue: Boolean): Boolean = defValue
-    fun isDataStoreEnabled(): Boolean = true
+abstract class PreferenceDataStore {
+    open fun putString(key: String?, value: String?) = Unit
+    open fun getString(key: String?, defValue: String?): String? = defValue
+    open fun putStringSet(key: String?, values: Set<String>?) = Unit
+    open fun getStringSet(key: String?, defValues: Set<String>?): Set<String>? = defValues
+    open fun putInt(key: String?, value: Int) = Unit
+    open fun getInt(key: String?, defValue: Int): Int = defValue
+    open fun putLong(key: String?, value: Long) = Unit
+    open fun getLong(key: String?, defValue: Long): Long = defValue
+    open fun putFloat(key: String?, value: Float) = Unit
+    open fun getFloat(key: String?, defValue: Float): Float = defValue
+    open fun putBoolean(key: String?, value: Boolean) = Unit
+    open fun getBoolean(key: String?, defValue: Boolean): Boolean = defValue
+    open fun isDataStoreEnabled(): Boolean = true
 }

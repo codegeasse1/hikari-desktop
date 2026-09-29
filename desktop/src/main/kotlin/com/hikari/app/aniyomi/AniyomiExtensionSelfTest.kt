@@ -132,6 +132,36 @@ fun main() {
         missingTypes.isEmpty(),
         "missing: " + missingTypes.joinToString(", "),
     )
+    val kinds = listOf(
+        "android.content.SharedPreferences" to true,
+        "android.content.SharedPreferences\$Editor" to true,
+        "android.content.SharedPreferences\$OnSharedPreferenceChangeListener" to true,
+        "androidx.preference.PreferenceDataStore" to false,
+        "androidx.preference.Preference\$OnPreferenceChangeListener" to true,
+        "androidx.preference.Preference\$OnPreferenceClickListener" to true,
+        "androidx.preference.EditTextPreference\$OnBindEditTextListener" to true,
+        "android.util.AttributeSet" to true,
+        "android.text.Spanned" to true,
+        "android.text.Spannable" to true,
+        "android.text.Editable" to true,
+        "android.text.TextWatcher" to true,
+        "android.webkit.ValueCallback" to true,
+        "android.webkit.WebResourceRequest" to true,
+        "uy.kohesive.injekt.api.InjektFactory" to true,
+        "uy.kohesive.injekt.api.InjektScope" to false,
+    )
+    val badKinds = kinds.mapNotNull { (name, wantInterface) ->
+        val cls = runCatching { Class.forName(name, false, loader) }.getOrNull()
+            ?: return@mapNotNull "$name (missing)"
+        if (cls.isInterface != wantInterface) {
+            name + " should be " + (if (wantInterface) "an interface" else "a class")
+        } else null
+    }
+    check(
+        "every shim type has the class/interface kind Android declares",
+        badKinds.isEmpty(),
+        badKinds.joinToString(", "),
+    )
 
     // Each entry is `ownerClass#method(paramTypes):returnType`, in JVM names,
     // exactly as the descriptor appears in the extensions' bytecode, with the

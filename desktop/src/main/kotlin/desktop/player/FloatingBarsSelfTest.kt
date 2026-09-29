@@ -714,15 +714,16 @@ private fun test(host: Stage, mpvPath: String): Int {
             "bar=" + barInFull?.joinToString(",") + " window=" + fullRect?.joinToString(","),
         )
         val videoNow = onFx { PlayerWindow.videoSurfaceHwnd() } ?: videoHwnd
+        val barNow = onFx { PlayerWindow.floatingBarHwnd() } ?: barHwnd
         println(
             "  in full screen: " + onFx { PlayerWindow.surfaceDebug() } +
-                " barExists=" + barHwnd?.let { WinShell.windowExists(it) } +
+                " barExists=" + barNow?.let { WinShell.windowExists(it) } +
                 " videoExists=" + videoNow?.let { WinShell.windowExists(it) },
         )
         check(
             "the control bar is still above the picture in full screen",
-            barHwnd != null && videoNow != null && WinShell.isAbove(barHwnd, videoNow) == true,
-            "isAbove=" + (if (barHwnd != null && videoNow != null) WinShell.isAbove(barHwnd, videoNow) else null),
+            barNow != null && videoNow != null && WinShell.isAbove(barNow, videoNow) == true,
+            "isAbove=" + (if (barNow != null && videoNow != null) WinShell.isAbove(barNow, videoNow) else null),
         )
         // …and out again, from the same button: the window has to come BACK.
         onFx { PlayerWindow.previewChrome(true) }
