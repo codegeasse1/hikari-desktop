@@ -256,6 +256,14 @@ jobs:
           java -cp "jpackage-input/*" com.hikari.app.skystream.SkyStreamSelfTestKt
         shell: bash
 
+      - name: Aniyomi extension self-test (real extensions, the android/JS shims, repo drift)
+        if: always()
+        timeout-minutes: 12
+        run: |
+          set -e
+          java -cp "jpackage-input/*" com.hikari.app.aniyomi.AniyomiExtensionSelfTestKt
+        shell: bash
+
       - name: UI shots (render the app and the player layer to PNGs)
         if: always()
         timeout-minutes: 8

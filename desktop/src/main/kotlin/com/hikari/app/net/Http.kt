@@ -3056,6 +3056,187 @@ object Http {
             "https://drive.usercontent.google.com/download?id=$id&export=download&confirm=t"
         } else u
     }
+    // ── the file a repo's index names but the repository does not serve ─────
+    //
+    // A repo publishes two things written by two different jobs: the index
+    // (`index.min.json`, `dist/plugins.json`, a `plugins` array) and the files
+    // themselves. They drift apart constantly, and every drift shows up as an
+    // install that cannot work:
+    //
+    //  * an index that keeps an entry after its build stopped publishing it —
+    //    the SkyStream "Stars" repo cleaned up six of its eleven plugins
+    //    (`dev.akash.stars.anichi` and friends) and left the listings alone, so
+    //    every install of them ended in "Download failed — check the URL";
+    //  * a build that changed a file name without the index following —
+    //    `aniyomiorg/aniyomi-extensions` publishes `apk/aniyomi-all.jellyfin-
+    //    v14.17.apk` while its own index says `apk/anime-all.jellyfin-v14.17
+    //    .apk`, and the OsmerGalarragaTKD repo lists `-v14.28-release.apk` for
+    //    files that are published as `-v14.28.apk`;
+    //  * a file that moved folder (dist/ → build/, apk/ → repo/apk/).
+    //
+    // GitHub can be asked what a repository ACTUALLY contains, so the fix is to
+    // ask, match what was asked for against what is there, and use the file
+    // that exists. The alternative — reporting every one of those as "check the
+    // URL" — sends users hunting for a mistake that is not theirs.
+
+    /** Repository file lists already fetched, per `user/repo@ref`. */
+    private val repoTreeCache = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
+
+    /**
+     * Every blob path in [user]/[repo] at [ref], or null when the repository
+     * could not be asked (no network to api.github.com, a rate limit, a private
+     * repo). Cached for the process, because an install walks one repo's files
+     * repeatedly.
+     */
+    private fun repoTree(user: String, repo: String, ref: String): List<String>? {
+        val key = "$user/$repo@$ref"
+        repoTreeCache[key]?.let { return it }
+        val api = "https://api.github.com/repos/$user/$repo/git/trees/$ref?recursive=1"
+        val text = runCatching { getStringStrict(api).getOrNull() }.getOrNull() ?: return null
+        val arr = runCatching { org.json.JSONObject(text).optJSONArray("tree") }.getOrNull() ?: return null
+        val out = ArrayList<String>(arr.length())
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            if (o.optString("type") != "blob") continue
+            val path = o.optString("path")
+            if (path.isNotBlank()) out.add(path)
+        }
+        if (out.isEmpty()) return null
+        repoTreeCache[key] = out
+        return out
+    }
+
+    /**
+     * A file name reduced to what identifies the extension it belongs to: no
+     * folder, no extension, no version/build suffix, no `aniyomi-`/`anime-`
+     * family prefix, no separators.
+     *
+     * `aniyomi-all.jellyfin-v14.17.apk`, `anime-all.jellyfin-v14.17.apk` and
+     * `aniyomi-all.jellyfin-v14.17-release.apk` all reduce to `alljellyfin`,
+     * which is exactly the tolerance a repo index needs.
+     */
+    private fun fileKey(name: String): String {
+        var n = name.substringAfterLast('/')
+        n = n.replace(Regex("(?i)\\.(apk|sky|js|mjs|json|zip|jar|hiki)$"), "")
+        n = n.replace(Regex("(?i)^(aniyomi|anime|aniyomix|animetv|mihon|tachiyomi)[-_.]"), "")
+        n = n.replace(Regex("(?i)[-_]v?\\d+([.\\d]*).*$"), "")
+        return n.lowercase().replace(Regex("[^a-z0-9]"), "")
+    }
+
+    /** The file's extension, lowercased (`apk`, `sky`, `js`…). */
+    private fun fileExt(name: String): String =
+        name.substringAfterLast('.', "").lowercase()
+
+    /** Roughly the version a file name carries, so the newest of several
+     *  matching builds is the one chosen. */
+    private fun versionRank(name: String): Long {
+        val m = Regex("(\\d+)(?:\\.(\\d+))?(?:\\.(\\d+))?").find(name) ?: return 0L
+        val a = m.groupValues.getOrNull(1)?.toLongOrNull() ?: 0L
+        val b = m.groupValues.getOrNull(2)?.toLongOrNull() ?: 0L
+        val c = m.groupValues.getOrNull(3)?.toLongOrNull() ?: 0L
+        return a * 1_000_000L + b * 1_000L + c
+    }
+
+    /**
+     * What [want] (a path from a repo's index) is called in [paths] (what the
+     * repo actually holds), or null when nothing matches.
+     *
+     * Four tries, most exact first: the same path, the same file name anywhere,
+     * the same file key with the same extension (the renamed-build case), and
+     * the same file key in the SAME folder (a repo that keeps two builds of one
+     * extension side by side). When several files still match — a repo that
+     * keeps `-v14.27.apk` next to `-v14.28.apk` — the newest wins.
+     */
+    private fun matchRepoPath(paths: List<String>, want: String): String? {
+        val wanted = want.trimStart('/')
+        val wantedLower = wanted.lowercase()
+        paths.firstOrNull { it.lowercase() == wantedLower }?.let { return it }
+        val wantedName = wanted.substringAfterLast('/').lowercase()
+        val wantedDir = wanted.substringBeforeLast('/', "")
+        val sameName = paths.filter { it.substringAfterLast('/').lowercase() == wantedName }
+        if (sameName.size == 1) return sameName.first()
+        val key = fileKey(wanted)
+        if (key.isBlank()) return null
+        val ext = fileExt(wanted)
+        val sameKey = paths.filter { fileKey(it) == key && fileExt(it) == ext }
+        if (sameKey.isEmpty()) return null
+        val sameDir = sameKey.filter { it.substringBeforeLast('/', "").lowercase() == wantedDir.lowercase() }
+        val pool = if (sameDir.isNotEmpty()) sameDir else sameKey
+        if (pool.size == 1) return pool.first()
+        return pool.maxByOrNull { versionRank(it.substringAfterLast('/')) }
+    }
+
+    /**
+     * The URL to fetch a GitHub file from when the URL a repo's index gave does
+     * not serve it: the repository is asked what it holds, the requested name is
+     * matched against that, and the matching file's canonical raw URL comes
+     * back. Null when the file is not in the repository at all (it was removed
+     * upstream — the caller says so), or when GitHub could not be asked.
+     */
+    fun repairGithubFileUrl(url: String): String? {
+        val gh = parseGhTarget(normalizeDriveUrl(url.trim())) ?: return null
+        if (gh.path.isBlank()) return null
+        val paths = repoTree(gh.user, gh.repo, gh.ref) ?: return null
+        val hit = matchRepoPath(paths, gh.path) ?: return null
+        if (hit == gh.path) return null
+        System.err.println("net: repaired $url -> $hit")
+        return ghRawUrl(gh.copy(path = hit))
+    }
+
+    /** True when the repository really does not hold the file [url] names (as
+     *  opposed to GitHub not answering). */
+    fun fileGoneFromRepo(url: String): Boolean {
+        val gh = parseGhTarget(normalizeDriveUrl(url.trim())) ?: return false
+        if (gh.path.isBlank()) return false
+        val paths = repoTree(gh.user, gh.repo, gh.ref) ?: return false
+        return matchRepoPath(paths, gh.path) == null
+    }
+
+    /**
+     * Every file the repository holding [url] publishes, or null when GitHub
+     * could not be asked (no network to api.github.com, a rate limit, a private
+     * repo).
+     *
+     * Exists so a self-test can tell "the repair did not work" from "GitHub
+     * would not tell us": the two both end in a null from [repairGithubFileUrl],
+     * and only one of them is a bug in this app.
+     */
+    fun repoFileList(url: String): List<String>? {
+        val gh = parseGhTarget(normalizeDriveUrl(url.trim())) ?: return null
+        if (gh.path.isBlank()) return null
+        return repoTree(gh.user, gh.repo, gh.ref)
+    }
+
+    /**
+     * A plugin file's bytes, with the repairs above applied, plus the reason
+     * there are none when there are none.
+     *
+     * [usedUrl] is where the bytes actually came from (a repaired URL when the
+     * index was stale), so a caller can say so; [error] is a sentence the UI can
+     * show as-is. The old behaviour — `fetchBytesRobust(url) ?: "Download
+     * failed — check the URL"` — is what made a deleted-upstream plugin and an
+     * unreachable host look identical.
+     */
+    class PluginDownload(val bytes: ByteArray?, val usedUrl: String, val error: String?)
+
+    fun downloadPluginFile(url: String, headers: Map<String, String> = emptyMap()): PluginDownload {
+        val direct = runCatching { fetchBytesRobust(url, headers) }.getOrNull()
+        if (direct != null && direct.isNotEmpty()) return PluginDownload(direct, url, null)
+        val repaired = runCatching { repairGithubFileUrl(url) }.getOrNull()
+        if (repaired != null) {
+            val bytes = runCatching { fetchBytesRobust(repaired, headers) }.getOrNull()
+            if (bytes != null && bytes.isNotEmpty()) {
+                return PluginDownload(bytes, repaired, "the file had moved in its repository — fetched from $repaired")
+            }
+        }
+        val error = when {
+            fileGoneFromRepo(url) ->
+                "the repository no longer holds this file (its index still lists it) — the extension was removed upstream"
+            else -> "Download failed — check the URL"
+        }
+        System.err.println("net-plugin: gave up on $url ($error)")
+        return PluginDownload(null, url, error)
+    }
 }
 
 /**
@@ -3171,6 +3352,7 @@ object DoH {
             return ips
         }
     }
+
 }
 
 /**

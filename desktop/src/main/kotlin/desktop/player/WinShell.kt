@@ -127,6 +127,9 @@ object WinShell {
     /** `ShowWindow` command: hide the window (see [parkAndHide]). */
     private const val SW_HIDE = 0
 
+    /** `ShowWindow` command: take a minimised window back (see [restoreWindow]). */
+    private const val SW_RESTORE = 9
+
     /** Virtual-key code for the left mouse button (see [leftButtonDown]). */
     private const val VK_LBUTTON = 0x01
 
@@ -374,6 +377,24 @@ object WinShell {
         fn.IsIconic(toHwnd(hwnd))
     }
 
+    /**
+     * Takes a minimised window back, so a move actually moves it: a `SetWindowPos`
+     * on a minimised window reports success and changes nothing on screen (the
+     * window keeps its `-32000` park rect until it is restored), which reads as
+     * "the picture never fills the window" with every placement call claiming it
+     * worked.
+     */
+    fun restoreWindow(hwnd: Long): Boolean = call(false) {
+        if (!windowExists(hwnd)) return@call false
+        if (!isIconified(hwnd)) return@call true
+        User32.INSTANCE.ShowWindow(toHwnd(hwnd), SW_RESTORE)
+    }
+
+    /** Whether the window is currently shown (as opposed to hidden). */
+    fun isVisible(hwnd: Long): Boolean = call(false) {
+        hwnd != 0L && User32.INSTANCE.IsWindowVisible(toHwnd(hwnd))
+    }
+
     /** A window's screen rectangle as [x, y, width, height], or null.
      *
      *  For an undecorated window this is also its CLIENT rectangle, which is
@@ -428,6 +449,18 @@ object WinShell {
             toHwnd(hwnd), WinDef.HWND(Pointer.createConstant(0)), x, y, w, h,
             SWP_NOACTIVATE,
         )
+    }
+
+    /**
+     * Moves and sizes a window the `SetWindowPos` way's older sibling: some
+     * windows (observed: mpv's, once dressed as an owned popup) acknowledge a
+     * `SetWindowPos` with success and never move, while `MoveWindow` lands. The
+     * fallback for a placement that did not take — see `PlayerWindow`.
+     */
+    fun moveWindow(hwnd: Long, x: Int, y: Int, w: Int, h: Int): Boolean = call(false) {
+        if (w <= 0 || h <= 0) return@call false
+        if (!windowExists(hwnd)) return@call false
+        User32.INSTANCE.MoveWindow(toHwnd(hwnd), x, y, w, h, true)
     }
 
     /** Kept for the CI smoke test: resizes a child window to fill its parent. */

@@ -1,42 +1,48 @@
+@file:Suppress("NOTHING_TO_INLINE")
+
 package uy.kohesive.injekt
 
-import java.util.concurrent.ConcurrentHashMap
+import uy.kohesive.injekt.api.InjektScope
+import uy.kohesive.injekt.api.InjektScopedMain
+import uy.kohesive.injekt.api.SimpleRegistrar
+import uy.kohesive.injekt.api.fullType
+import uy.kohesive.injekt.api.get
+import uy.kohesive.injekt.api.logger
+import kotlin.reflect.KClass
 
-/**
- * A tiny stand-in for Mihon's Injekt container.
- *
- * Aniyomi extensions reach the host through it: `ConfigurableAnimeSource` asks
- * for the `Application` to get its SharedPreferences, `AnimeHttpSource` injects
- * a `NetworkHelper`, and the JSON helpers ask for a `Json`. Desktop has no
- * reflection-based DI to intercept, so this is a plain registry keyed by type —
- * the same registrations the Android app makes in `HikariApp` are made in the
- * desktop `HikariApp.init()`.
- */
-object Injekt {
+@Volatile
+var Injekt: InjektScope = InjektScope(SimpleRegistrar())
 
-    @PublishedApi
-    internal val factories = ConcurrentHashMap<String, () -> Any>()
+abstract class InjektMain : InjektScopedMain(Injekt)
 
-    @PublishedApi
-    internal fun keyOf(clazz: Class<*>): String = clazz.name
-
-    inline fun <reified T : Any> addSingleton(instance: T) {
-        factories[keyOf(T::class.java)] = { instance }
-    }
-
-    inline fun <reified T : Any> addSingletonFactory(noinline factory: () -> T) {
-        factories[keyOf(T::class.java)] = factory
-    }
-
-    inline fun <reified T : Any> get(): T = getOrNull<T>()
-        ?: throw IllegalStateException("Injekt: nothing registered for ${T::class.java.name}")
-
-    inline fun <reified T : Any> getOrNull(): T? {
-        val factory = factories[keyOf(T::class.java)] ?: return null
-        @Suppress("UNCHECKED_CAST")
-        return factory() as T
-    }
+inline fun <reified T : Any> injectLazy(): Lazy<T> {
+    return lazy { Injekt.get(fullType<T>()) }
 }
 
-/** Lazily resolves [T] on first use, like Injekt's `injectLazy()`. */
-inline fun <reified T : Any> injectLazy(): Lazy<T> = lazy { Injekt.get<T>() }
+inline fun <reified T : Any> injectValue(): Lazy<T> {
+    return lazyOf(Injekt.get(fullType<T>()))
+}
+
+inline fun <reified T : Any> injectLazy(key: Any): Lazy<T> {
+    return lazy { Injekt.get(fullType<T>(), key) }
+}
+
+inline fun <reified T : Any> injectValue(key: Any): Lazy<T> {
+    return lazyOf(Injekt.get(fullType<T>(), key))
+}
+
+inline fun <reified R : Any, reified T : Any> R.injectLogger(): Lazy<T> {
+    return lazy { Injekt.logger(fullType<T>(), R::class.java) }
+}
+
+inline fun <reified T : Any, O : Any> injectLogger(forClass: KClass<O>): Lazy<T> {
+    return lazy { Injekt.logger(fullType<T>(), forClass.java) }
+}
+
+inline fun <reified T : Any, O : Any> injectLogger(forClass: Class<O>): Lazy<T> {
+    return lazy { Injekt.logger(fullType<T>(), forClass) }
+}
+
+inline fun <reified T : Any> injectLogger(byName: String): Lazy<T> {
+    return lazy { Injekt.logger(fullType<T>(), byName) }
+}

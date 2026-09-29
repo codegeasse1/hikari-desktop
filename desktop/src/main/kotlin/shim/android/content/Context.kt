@@ -38,7 +38,7 @@ open class Context {
     private val prefs = java.util.concurrent.ConcurrentHashMap<String, SharedPreferences>()
 
     open fun getSharedPreferences(name: String, mode: Int): SharedPreferences =
-        prefs.computeIfAbsent(name) { SharedPreferences(SharedPreferences.fileFor(filesDir, it)) }
+        prefs.computeIfAbsent(name) { DesktopSharedPreferences(DesktopSharedPreferences.fileFor(filesDir, it)) }
 
     open fun startActivity(intent: Intent) {
         val url = intent.data?.toString()

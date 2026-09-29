@@ -5,7 +5,15 @@ import android.content.Intent
 import android.view.View
 import android.view.Window
 
-open class Application : Context()
+/**
+ * The desktop's application context.
+ *
+ * It is a [android.content.ContextWrapper], exactly as Android's Application is:
+ * extensions unwrap the context they are handed (`(context as ContextWrapper)
+ * .baseContext`) often enough that a context which is not one would throw a
+ * ClassCastException where the real platform succeeds.
+ */
+open class Application : android.content.ContextWrapper(null)
 
 /**
  * Minimal Activity shim.
@@ -17,7 +25,7 @@ open class Application : Context()
  * pieces are here so the plugin's own code keeps running instead of dying on a
  * NoSuchMethodError; nothing is ever displayed.
  */
-open class Activity : Context() {
+open class Activity : android.content.ContextWrapper(null) {
 
     private val activityWindow = Window()
 
