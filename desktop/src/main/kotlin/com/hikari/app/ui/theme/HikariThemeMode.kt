@@ -4,6 +4,7 @@ package com.hikari.app.ui.theme
 enum class HikariThemeMode(val key: String) {
     DARK("dark"),
     LIGHT("light"),
+    AMOLED("amoled"),
     ;
 
     companion object {

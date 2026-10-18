@@ -27,6 +27,7 @@ object Icons {
     const val SEARCH = "search"
     const val LIBRARY = "library"
     const val DOWNLOAD = "download"
+    const val EXPLORE = "explore"
     const val HISTORY = "history"
     const val EXTENSIONS = "extensions"
     const val SETTINGS = "settings"
@@ -143,6 +144,12 @@ object Icons {
                 Line(12.0, 3.6, 12.0, 14.2),
                 Line(4.4, 20.0, 19.6, 20.0),
             ),
+        )
+
+        EXPLORE -> outline(
+            Circle(12.0, 12.0, 8.3),
+            Polygon(3.0, 12.0, 6.0, 5.5, 18.0, 5.5, 21.0, 12.0),
+            Line(3.0, 12.0, 21.0, 12.0),
         )
 
         HISTORY -> outline(

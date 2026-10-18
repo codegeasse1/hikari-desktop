@@ -1331,3 +1331,14 @@
     -fx-effect: dropshadow(gaussian, rgba(0, 0, 0, 0.55), 24, 0.2, 0, 8);
 }
 .player-msg { -fx-text-fill: #eef0f7; -fx-font-size: 13px; }
+
+/* ---- amoled theme (CS3 parity: pure-black canvas) ------------------------- */
+.amoled {
+    -h-bg: #000000;
+    -h-bg-2: #000000;
+    -h-surface: #0a0a0c;
+    -h-surface-2: #101014;
+    -h-surface-3: #16161c;
+    -h-surface-4: #1e1e26;
+    -h-scrim: rgba(0, 0, 0, 0.78);
+}
