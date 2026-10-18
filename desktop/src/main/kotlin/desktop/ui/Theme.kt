@@ -115,7 +115,7 @@ object Theme {
             ?: HikariThemeMode.DARK
         accent = prefs.get("accent", ACCENTS.first()).takeIf { it in ACCENTS } ?: ACCENTS.first()
         applyClasses()
-        fill = javafx.scene.paint.Color.web(if (mode == HikariThemeMode.LIGHT) "#eff1f7" else BG)
+        fill = javafx.scene.paint.Color.web(if (mode == HikariThemeMode.LIGHT) "#eff1f7" else if (mode == HikariThemeMode.AMOLED) "#000000" else BG)
     }
 
     fun scene(root: javafx.scene.Parent): Scene = style(Scene(root))
@@ -127,14 +127,14 @@ object Theme {
             ?.let { HikariThemeMode.fromKey(it) }
             ?: mode
         applyClasses()
-        currentScene?.fill = javafx.scene.paint.Color.web(if (mode == HikariThemeMode.LIGHT) "#eff1f7" else BG)
+        currentScene?.fill = javafx.scene.paint.Color.web(if (mode == HikariThemeMode.LIGHT) "#eff1f7" else if (mode == HikariThemeMode.AMOLED) "#000000" else BG)
     }
 
     fun setMode(next: HikariThemeMode) {
         mode = next
         runCatching { HikariApp.instance.store.setTheme(next.key) }
         applyClasses()
-        currentScene?.fill = javafx.scene.paint.Color.web(if (next == HikariThemeMode.LIGHT) "#eff1f7" else BG)
+        currentScene?.fill = javafx.scene.paint.Color.web(if (next == HikariThemeMode.LIGHT) "#eff1f7" else if (next == HikariThemeMode.AMOLED) "#000000" else BG)
     }
 
     fun setAccent(key: String) {
@@ -149,8 +149,9 @@ object Theme {
 
     private fun applyClasses() {
         val root = currentScene?.root ?: return
-        root.styleClass.removeAll("light")
+        root.styleClass.removeAll("light", "amoled")
         if (mode == HikariThemeMode.LIGHT) root.styleClass.add("light")
+        if (mode == HikariThemeMode.AMOLED) root.styleClass.add("amoled")
         ACCENTS.forEach { root.styleClass.remove("accent-$it") }
         root.styleClass.add("accent-$accent")
     }

@@ -49,6 +49,16 @@ import java.util.zip.ZipFile
  */
 object DexJar {
 
+    /** Bump when [convert] output changes: stale cached jars are reconverted. */
+    const val TRANSFORMER_VERSION = 3
+
+    private const val VERSION_ENTRY = "META-INF/hikari-transformer.version"
+
+    /** Content digests that permanently failed conversion: never retry in a loop. */
+    private val failedDexCache: java.util.concurrent.ConcurrentHashMap.KeySetView<String, Boolean> =
+        java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+
     /**
      * Where converted jars are kept between runs.
      *
@@ -115,8 +125,12 @@ object DexJar {
         val lock = locks.computeIfAbsent(stamp) { Any() }
         synchronized(lock) {
             cache[key]?.let { if (it.stamp == stamp && it.jar.isFile && it.jar.length() > 0L) return it.jar }
+            if (failedDexCache.contains(stamp)) {
+                lastError = "dex conversion failed before for ${file.name}: not retrying"
+                return null
+            }
             val out = File(cacheDir, "dex-" + stamp.take(24) + ".jar")
-            if (out.isFile && out.length() > 0L) {
+            if (out.isFile && out.length() > 0L && checkJarHasTransformerVersion(out)) {
                 cache[key] = Entry(out, stamp)
                 return out
             }
@@ -142,6 +156,8 @@ object DexJar {
                 out
             }.getOrElse { e ->
                 lastError = "dex conversion failed for ${file.name}: ${e.javaClass.simpleName}: ${e.message}"
+                failedDexCache.add(stamp)
+                runCatching { File(cacheDir, file.nameWithoutExtension + ".d2j_failed").createNewFile() }
                 null
             }
         }
@@ -157,6 +173,27 @@ object DexJar {
      * in place. There is no intermediate directory of `.class` files, no second
      * walk over it, and no ASM round trip per class.
      */
+    fun checkJarHasTransformerVersion(jar: File): Boolean = runCatching {
+        java.util.zip.ZipFile(jar).use { z ->
+            val e = z.getEntry(VERSION_ENTRY) ?: return false
+            z.getInputStream(e).use { it.readBytes().toString(Charsets.UTF_8).trim() } == TRANSFORMER_VERSION.toString()
+        }
+    }.getOrDefault(false)
+
+    fun checkJarHasClass(jar: File, className: String): Boolean = runCatching {
+        java.util.zip.ZipFile(jar).use { z ->
+            z.getEntry(className.replace('.', '/') + ".class") != null
+        }
+    }.getOrDefault(false)
+
+    fun clearFailedMarker(file: File) {
+        runCatching {
+            val marker = java.io.File(file.parentFile, file.nameWithoutExtension + ".d2j_failed")
+            if (marker.exists()) marker.delete()
+        }
+        failedDexCache.remove(contentDigest(file) ?: file.absolutePath)
+    }
+
     private fun convert(archive: File, out: File) {
         val work = File(cacheDir, "work-" + System.nanoTime() + ".zip")
         val dex = File(cacheDir, "work-" + System.nanoTime() + ".dex")
@@ -189,7 +226,11 @@ object DexJar {
                         jos.closeEntry()
                     }
                 }
-                // 2. manifest.json + bundled resources (the extracted cs3 assets
+                // 2. transformer version marker (cache validation).
+                jos.putNextEntry(JarEntry(VERSION_ENTRY))
+                jos.write(TRANSFORMER_VERSION.toString().toByteArray(Charsets.UTF_8))
+                jos.closeEntry()
+                // 3. manifest.json + bundled resources (the extracted cs3 assets
                 //    live under cs3/…; they're only needed by bridge wrappers,
                 //    but keep the archive faithful anyway).
                 ZipFile(archive).use { z ->

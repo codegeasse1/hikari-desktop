@@ -40,6 +40,21 @@ import java.util.concurrent.ConcurrentHashMap
  */
 object Cs3PluginManager {
 
+    /** Loaded plugin instances by absolute path (CS3 ExtensionLoader parity). */
+    val plugins: java.util.concurrent.ConcurrentHashMap<String, BasePlugin> = java.util.concurrent.ConcurrentHashMap()
+
+    /** One lock per plugin path, so two screens cannot load the same file twice. */
+    private val pluginLoadLocks: java.util.concurrent.ConcurrentHashMap<String, Any> = java.util.concurrent.ConcurrentHashMap()
+
+    /** Class loader -> plugin display name, for cross-plugin class resolution. */
+    val classLoaders: java.util.concurrent.ConcurrentHashMap<ClassLoader, String> = java.util.concurrent.ConcurrentHashMap()
+
+    /** Class loader -> jar file it was loaded from. */
+    val classLoaderToJar: java.util.concurrent.ConcurrentHashMap<ClassLoader, java.io.File> = java.util.concurrent.ConcurrentHashMap()
+
+    /** Class loader -> class names inside its jar (for getCallingPluginName). */
+    val classLoaderToClassNames: java.util.concurrent.ConcurrentHashMap<ClassLoader, Set<String>> = java.util.concurrent.ConcurrentHashMap()
+
     private val cache = ConcurrentHashMap<String, List<MainAPI>>()
 
     private val loading = ConcurrentHashMap.newKeySet<String>()
@@ -72,6 +87,75 @@ object Cs3PluginManager {
         }
 
     private const val LOAD_TIMEOUT_S = 45L
+
+    /**
+     * A class loader that searches every loaded plugin before the app loader:
+     * Jackson/kotlin-reflect deserializing a plugin-defined inner class across
+     * a class-loader boundary is what made whole catalogs come back empty.
+     */
+    fun createCompositeClassLoader(fallback: ClassLoader): ClassLoader {
+        val pluginLoaders = classLoaders.keys.toList()
+        return object : ClassLoader(fallback) {
+            override fun loadClass(name: String, resolve: Boolean): Class<*> {
+                for (loader in pluginLoaders) {
+                    try {
+                        return loader.loadClass(name)
+                    } catch (_: ClassNotFoundException) {
+                    }
+                }
+                return super.loadClass(name, resolve)
+            }
+        }
+    }
+
+    /** Which loaded plugin is calling us, via its class loader first. */
+    fun getCallingPluginName(): String? {
+        runCatching {
+            val walker = StackWalker.getInstance(StackWalker.Option.RETAIN_CLASS_REFERENCE)
+            val name = walker.walk { stream ->
+                stream.map { it.declaringClass }
+                    .filter { clazz ->
+                        val loader = clazz.classLoader
+                        loader != null && classLoaders.containsKey(loader)
+                    }
+                    .map { clazz -> classLoaders[clazz.classLoader] }
+                    .findFirst()
+                    .orElse(null)
+            }
+            if (name != null) return name
+        }
+        val trace = Thread.currentThread().stackTrace
+        for (element in trace) {
+            val className = element.className
+            if (className.startsWith("com.hikari.") || className.startsWith("com.lagradost.") ||
+                className.startsWith("java.") || className.startsWith("kotlin.")
+            ) continue
+            for ((loader, name) in classLoaders) {
+                if (classLoaderToClassNames[loader]?.contains(className) == true) return name
+            }
+        }
+        return null
+    }
+
+    /** Forgets a plugin so the next use reloads it from disk. */
+    fun unloadPlugin(absolutePath: String) {
+        cache.remove(absolutePath)
+        plugins.remove(absolutePath)
+        lastFail.remove(absolutePath)
+    }
+
+    private fun recordLoader(classLoader: ClassLoader, name: String, jar: java.io.File) {
+        classLoaders[classLoader] = name
+        classLoaderToJar[classLoader] = jar
+        runCatching {
+            java.util.jar.JarFile(jar).use { jf ->
+                classLoaderToClassNames[classLoader] = jf.entries().asSequence()
+                    .filter { it.name.endsWith(".class") }
+                    .map { it.name.removeSuffix(".class").replace('/', '.') }
+                    .toSet()
+            }
+        }
+    }
 
     private fun record(what: String, e: Throwable) {
         val line = "$what: ${e.javaClass.simpleName}: ${e.message}"
@@ -135,10 +219,16 @@ object Cs3PluginManager {
         loadFailure = null
         val path = file.absolutePath
 
-        val classLoader = try {
+        val jvmJar = try {
             val url = DexJar.toJvmJarUrlOrNull(file)
                 ?: throw IllegalStateException(DexJar.lastError ?: "this extension's dex payload couldn't be converted to JVM bytecode")
-            URLClassLoader(arrayOf(url), context.classLoader)
+            java.io.File(url.toURI())
+        } catch (e: Throwable) {
+            record("URLClassLoader failed", e)
+            return fail()
+        }
+        val classLoader = try {
+            URLClassLoader(arrayOf(jvmJar.toURI().toURL()), createCompositeClassLoader(context.classLoader))
         } catch (e: Throwable) {
             record("URLClassLoader failed", e)
             return fail()
@@ -185,6 +275,8 @@ object Cs3PluginManager {
             record("loadClass/instantiate ${manifest.pluginClassName} failed", e)
             return fail()
         }
+        plugins[path] = instance
+        recordLoader(classLoader, file.nameWithoutExtension, jvmJar)
 
         try {
             APIHolder.allProviders.removeAll { it.sourcePlugin == path }

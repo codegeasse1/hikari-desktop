@@ -26,7 +26,9 @@ import kotlinx.coroutines.launch
 
 sealed class Screen {
     object Home : Screen()
+    object Explore : Screen()
     object Search : Screen()
+    object History : Screen()
     object Library : Screen()
     object Downloads : Screen()
     object Extensions : Screen()
@@ -64,7 +66,9 @@ object AppShell {
     private val backStack = java.util.ArrayDeque<Screen>()
 
     private val homeScreen = HomeScreenView()
+    private val exploreScreen = ExploreScreenView()
     private val searchScreen = SearchScreenView()
+    private val historyScreen = HistoryScreenView()
     private val libraryScreen = LibraryScreenView()
     private val downloadsScreen = DownloadsScreenView()
     private val extensionsScreen = ExtensionsScreenView()
@@ -182,9 +186,11 @@ object AppShell {
 
         box.children.add(Theme.overline("Watch").apply { styleClass.add("sidebar-section") })
         nav(Screen.Home, Icons.HOME, "Home")
+        nav(Screen.Explore, Icons.EXPLORE, "Explore")
         nav(Screen.Search, Icons.SEARCH, "Search")
         nav(Screen.Library, Icons.LIBRARY, "Library")
         nav(Screen.Downloads, Icons.DOWNLOAD, "Downloads")
+        nav(Screen.History, Icons.HISTORY, "History")
 
         box.children.add(Theme.overline("Sources").apply { styleClass.add("sidebar-section") })
         nav(Screen.Extensions, Icons.EXTENSIONS, "Extensions")
@@ -358,7 +364,9 @@ object AppShell {
         subtitleLabel.text = subtitleFor(screen)
         when (screen) {
             is Screen.Home -> homeScreen.onShown()
+            is Screen.Explore -> exploreScreen.onShown()
             is Screen.Search -> searchScreen.onShown()
+            is Screen.History -> historyScreen.onShown()
             is Screen.Library -> libraryScreen.onShown()
             is Screen.Downloads -> downloadsScreen.onShown()
             is Screen.Extensions -> extensionsScreen.onShown()
@@ -405,7 +413,9 @@ object AppShell {
 
     private fun viewFor(screen: Screen): Node = when (screen) {
         is Screen.Home -> homeScreen.root
+        is Screen.Explore -> exploreScreen.root
         is Screen.Search -> searchScreen.root
+        is Screen.History -> historyScreen.root
         is Screen.Library -> libraryScreen.root
         is Screen.Downloads -> downloadsScreen.root
         is Screen.Extensions -> extensionsScreen.root
@@ -416,7 +426,9 @@ object AppShell {
 
     private fun titleFor(screen: Screen): String = when (screen) {
         is Screen.Home -> "Home"
+        is Screen.Explore -> "Explore"
         is Screen.Search -> "Search"
+        is Screen.History -> "History"
         is Screen.Library -> "Library"
         is Screen.Downloads -> "Downloads"
         is Screen.Extensions -> "Extensions"
@@ -429,7 +441,9 @@ object AppShell {
 
     private fun subtitleFor(screen: Screen): String = when (screen) {
         is Screen.Home -> "Catalogs from every enabled source"
+        is Screen.Explore -> "Browse catalogs across providers"
         is Screen.Search -> "Search every installed provider at once"
+        is Screen.History -> "Everything you have watched"
         is Screen.Library -> "Favourites and continue watching"
         is Screen.Downloads -> "Offline copies and exports"
         is Screen.Extensions -> "Addons, scrapers and plugin repositories"
@@ -450,7 +464,9 @@ object AppShell {
         navButtons.forEach { (screen, button) ->
             val selected = when (screen) {
                 is Screen.Home -> currentScreen is Screen.Home
+                is Screen.Explore -> currentScreen is Screen.Explore
                 is Screen.Search -> currentScreen is Screen.Search
+                is Screen.History -> currentScreen is Screen.History
                 is Screen.Library -> currentScreen is Screen.Library
                 is Screen.Downloads -> currentScreen is Screen.Downloads
                 is Screen.Extensions -> currentScreen is Screen.Extensions
