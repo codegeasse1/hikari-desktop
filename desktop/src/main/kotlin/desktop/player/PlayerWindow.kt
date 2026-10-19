@@ -1103,6 +1103,21 @@ object PlayerWindow {
                 "  placed=" + w + "x" + h + " at the " + (if (atBottom) "bottom" else "top") +
                 "  scale=" + scale
             if (w < 40 || h < 16) return@runCatching
+            // The JavaFX-side position is written outright, BEFORE the native
+            // window is even looked up: `WinShell.placeAbove` moves the native
+            // window behind Glass's back, and Glass only learns the new
+            // position when the OS event loops back (or never, when the window
+            // was just re-shown and its events have not arrived yet). Anything
+            // read off the scene graph in the meantime — `localToScreen`, and
+            // with it the close button's reported rectangle — would use the
+            // stage's STALE position. The stage properties are the synchronous
+            // truth; the native move below keeps the pixels with them.
+            val lx = x / scale
+            val ly = y / scale
+            if (kotlin.math.abs(st.x - lx) > 0.5 || kotlin.math.abs(st.y - ly) > 0.5) {
+                st.x = lx
+                st.y = ly
+            }
             val hwnd = overlayHwnd(st) ?: return@runCatching
             // Dressed once per native window: see [dressOverlay].
             val dressed = if (st === stripStage) stripDressed else barDressed
