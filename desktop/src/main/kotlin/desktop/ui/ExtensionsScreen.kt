@@ -1138,7 +1138,7 @@ class ExtensionsScreenView {
             // activity chip with "Fetching repo… (racing 8 mirrors)".
             val onStep: ((String) -> Unit)? =
                 if (silent) null else ({ step -> Fx.run { setStatus(step, busy = true) } })
-            val result = fetchManifest(url, kind, onStep)
+            val result = fetchManifest(url, kind, onStep = onStep)
             val manifest = result.getOrNull()
             if (manifest == null) {
                 Fx.run {
@@ -1284,8 +1284,8 @@ class ExtensionsScreenView {
     private fun fetchManifest(
         url: String,
         kind: RepoKind,
-        onStep: ((String) -> Unit)? = null,
         originOnly: Boolean = false,
+        onStep: ((String) -> Unit)? = null,
     ): Result<Manifest> {
         if (kind == RepoKind.CS3 || kind == RepoKind.HIKARI) {
             val r = Http.fetchRepoJson(url, onStep, originOnly)
@@ -2594,7 +2594,7 @@ class ExtensionsScreenView {
         val matches: (String) -> Boolean =
             { u -> u == pluginUrl || keys.contains(u) || sourceKeys(u).any { keys.contains(it) } }
         fun read(repo: Cs3Repo, originOnly: Boolean): FreshIndex? {
-            val manifest = runCatching { fetchManifest(repo.url, repo.kind, null, originOnly) }
+            val manifest = runCatching { fetchManifest(repo.url, repo.kind, originOnly = originOnly) }
                 .getOrNull()?.getOrNull() ?: return null
             val plugins = runCatching { parsePlugins(effectiveKind(repo.kind, manifest), manifest) }
                 .getOrNull() ?: return null
