@@ -1477,8 +1477,13 @@ object Http {
      *  repo-desktop.json candidates are tried before repo.json ones: the desktop
      *  app runs JVM jars, and the desktop repos publish repo-desktop.json with
      *  .jar URLs — plain repo.json is the Android dex repo. [onStep] reports
-     *  progress so the UI can show which candidate is being tried. */
-    fun fetchRepoJson(raw: String, onStep: ((String) -> Unit)? = null): Result<Pair<String, String>> {
+     *  progress so the UI can show which candidate is being tried.
+     *
+     *  [originOnly] skips every CDN/proxy copy and the snapshot mirrors: the
+     *  answer can only be the live branch (or a failure). Used when a raced
+     *  manifest is suspected stale — a CDN copy of a branch file can be days
+     *  old, and confirming against the origin is the only way to tell. */
+    fun fetchRepoJson(raw: String, onStep: ((String) -> Unit)? = null, originOnly: Boolean = false): Result<Pair<String, String>> {
         val candidates = repoJsonCandidates(raw)
         val ordered = candidates.filter { it.contains("repo-desktop.json") } +
             candidates.filter { !it.contains("repo-desktop.json") }
@@ -1524,6 +1529,14 @@ object Http {
         }
         val snapshotUrls = LinkedHashSet<String>()
         for (c in snapshot) snapshotUrls.addAll(urlVariants(c))
+        if (originOnly) {
+            // The recovery path confirming a suspected-stale manifest: mirror
+            // copies are exactly what is being double-checked, so they (and
+            // the manual snapshots) are not candidates here. The OS-client
+            // tail below races whatever is left, i.e. origins only.
+            liveMirrors.clear()
+            snapshotUrls.clear()
+        }
 
         fun tryOne(c: OkHttpClient, u: String, throughProxy: Boolean): String? {
             val r = getStringStrictOn(c, u)

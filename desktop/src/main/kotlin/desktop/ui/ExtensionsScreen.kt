@@ -1285,9 +1285,10 @@ class ExtensionsScreenView {
         url: String,
         kind: RepoKind,
         onStep: ((String) -> Unit)? = null,
+        originOnly: Boolean = false,
     ): Result<Manifest> {
         if (kind == RepoKind.CS3 || kind == RepoKind.HIKARI) {
-            val r = Http.fetchRepoJson(url, onStep)
+            val r = Http.fetchRepoJson(url, onStep, originOnly)
             val pair = r.getOrNull()
                 ?: return Result.failure(r.exceptionOrNull() ?: Exception("Could not fetch repo"))
             val root = runCatching { JSONObject(pair.second) }.getOrNull()
@@ -1623,7 +1624,7 @@ class ExtensionsScreenView {
         AppShell.uiScope.launch {
             var note: String? = null
             val result = runCatching {
-                val (dl, usedHash) = downloadWithStaleIndexRetry(url, plugin.fileHash)
+                val (dl, usedHash) = downloadWithStaleIndexRetry(url, plugin.fileHash, plugin.jarHash)
                 val bytes = dl.bytes ?: throw Exception(dl.error ?: "Download failed — check the URL")
                 note = dl.takeIf { it.usedUrl != url }?.error
                 checkHash(bytes, usedHash)?.let { throw Exception(it) }
@@ -1687,7 +1688,7 @@ class ExtensionsScreenView {
         AppShell.uiScope.launch {
             var note: String? = null
             val result = runCatching {
-                val (dl, usedHash) = downloadWithStaleIndexRetry(url, plugin.fileHash)
+                val (dl, usedHash) = downloadWithStaleIndexRetry(url, plugin.fileHash, plugin.jarHash)
                 val bytes = dl.bytes ?: throw Exception(
                     (dl.error ?: "Download failed — check the URL") +
                         " (${url.substringAfterLast('/')} from ${repoLabelFor(url)})"
@@ -2156,8 +2157,15 @@ class ExtensionsScreenView {
                 if (outcome.registered == null && outcome.loadFailure == null) {
                     val u = unanimousServed(outcome.served)
                     if (u != null && unexpectedBy(u, listOf(curFh, curJh))) {
-                        val fresh = refreshHashesFor(dl)
-                        if (fresh != null && (fresh.first != curFh || fresh.second != curJh)) {
+                        val fresh = refreshHashesFor(dl, u, curFh, curJh)
+                        if (fresh != null) refreshed = true
+                        // A second round can only succeed when the fresh
+                        // signatures actually name the bytes every mirror is
+                        // serving — otherwise it would repeat the same
+                        // rejections for another full minute, so fail now.
+                        if (fresh != null && (fresh.first != curFh || fresh.second != curJh) &&
+                            !unexpectedBy(u, listOf(fresh.first, fresh.second))
+                        ) {
                             setStatus("The repo's index was outdated — refreshed it, retrying $name…", busy = true)
                             curFh = fresh.first
                             curJh = fresh.second
@@ -2183,9 +2191,10 @@ class ExtensionsScreenView {
                     val staleHint = if (u != null && unexpectedBy(u, listOf(curFh, curJh))) {
                         if (refreshed) {
                             "Every reachable mirror agrees on the same bytes (served " + u + "…), " +
-                                "and the repo's index was just re-read and still names a different build — " +
-                                "its publish is inconsistent (index vs files). Nothing on your network can fix " +
-                                "that; the repo owner has to republish. "
+                                "and the repo's index was just re-read (live origin checked when reachable) " +
+                                "and still names a different build — either the mirrors cache an older copy " +
+                                "or the publish is inconsistent. If Reload doesn't fix it, the repo owner has " +
+                                "to republish. "
                         } else {
                             "Every reachable mirror agrees on the same bytes (served " + u + "…), " +
                                 "which differ from this app's cached repo index — the extension was likely " +
@@ -2547,6 +2556,18 @@ class ExtensionsScreenView {
         hashes.filterNotNull().none { it.removePrefix("sha256-").lowercase().startsWith(servedPrefix) }
 
     /**
+     * A freshly re-read repo index behind one plugin URL.
+     */
+    private data class FreshIndex(
+        val servingUrl: String,
+        val plugins: List<PluginRef>,
+        val fileHash: String?,
+        val jarHash: String?,
+        val name: String,
+        val description: String,
+    )
+
+    /**
      * Re-reads the repo index behind [pluginUrl] and returns the CURRENT
      * (fileHash, jarHash) it publishes for it — or null when no owning repo
      * was found or it could not be re-read.
@@ -2556,33 +2577,66 @@ class ExtensionsScreenView {
      * extension was rebuilt upstream), so the install refreshes it and
      * retries once instead of failing. The screen's own copy is updated too,
      * so the row stops showing the old signature.
+     *
+     * When the raced re-read still disagrees with the unanimous bytes
+     * ([servedUnanimous]) and came from a mirror rather than the live
+     * origin, the origin is asked directly: a CDN copy of a branch file can
+     * be days old, and the recovery must not re-learn the same stale index
+     * it is trying to escape.
      */
-    private fun refreshHashesFor(pluginUrl: String): Pair<String?, String?>? {
+    private fun refreshHashesFor(
+        pluginUrl: String,
+        servedUnanimous: String?,
+        curFh: String?,
+        curJh: String?,
+    ): Pair<String?, String?>? {
         val keys = sourceKeys(pluginUrl)
         val matches: (String) -> Boolean =
             { u -> u == pluginUrl || keys.contains(u) || sourceKeys(u).any { keys.contains(it) } }
+        fun read(repo: Cs3Repo, originOnly: Boolean): FreshIndex? {
+            val manifest = runCatching { fetchManifest(repo.url, repo.kind, null, originOnly) }
+                .getOrNull()?.getOrNull() ?: return null
+            val plugins = runCatching { parsePlugins(effectiveKind(repo.kind, manifest), manifest) }
+                .getOrNull() ?: return null
+            val fresh = plugins.firstOrNull { matches(it.url) } ?: return null
+            val nm = manifest.root?.optString("name").orEmpty().ifBlank { Http.repoDisplayName(manifest.url) }
+            val desc = manifest.root?.optString("description").orEmpty()
+            return FreshIndex(manifest.url, plugins, fresh.fileHash, fresh.jarHash, nm, desc)
+        }
+        fun publish(repo: Cs3Repo, fresh: FreshIndex) {
+            // Publish what was re-read, the way a repo load does, so the
+            // screen and the disk cache stop showing the stale signatures too —
+            // but only when something actually changed, so a failed recovery
+            // does not repaint the whole screen for nothing.
+            if (fresh.fileHash == curFh && fresh.jarHash == curJh) return
+            val at = System.currentTimeMillis()
+            Fx.run {
+                val rd = RepoData(fresh.servingUrl, fresh.name, fresh.description, fresh.plugins)
+                repoData[repo.url] = rd
+                if (fresh.servingUrl != repo.url) repoData[fresh.servingUrl] = rd
+                repoFetchedAt[repo.url] = at
+                repoCache.save(repo.url, RepoCache.Entry(fresh.servingUrl, fresh.name, fresh.description, fresh.plugins, at))
+                renderAll()
+            }
+        }
         val repos = runCatching { AppShell.app.store.repos() }.getOrDefault(emptyList())
         for (repo in repos) {
             val data = repoData[repo.url] ?: repoData[repo.url.trimEnd('/')] ?: continue
             if (data.plugins.none { matches(it.url) }) continue
-            val manifest = runCatching { fetchManifest(repo.url, repo.kind, null) }.getOrNull()?.getOrNull() ?: continue
-            val plugins = runCatching { parsePlugins(effectiveKind(repo.kind, manifest), manifest) }.getOrNull() ?: continue
-            val fresh = plugins.firstOrNull { matches(it.url) } ?: continue
-            // Publish what was re-read, the way a repo load does, so the
-            // screen and the disk cache stop showing the stale signatures too.
-            val resolved = manifest.url
-            val nm = manifest.root?.optString("name").orEmpty().ifBlank { Http.repoDisplayName(resolved) }
-            val desc = manifest.root?.optString("description").orEmpty()
-            val at = System.currentTimeMillis()
-            Fx.run {
-                val rd = RepoData(resolved, nm, desc, plugins)
-                repoData[repo.url] = rd
-                if (resolved != repo.url) repoData[resolved] = rd
-                repoFetchedAt[repo.url] = at
-                repoCache.save(repo.url, RepoCache.Entry(resolved, nm, desc, plugins, at))
-                renderAll()
+            val raced = read(repo, originOnly = false) ?: continue
+            if (servedUnanimous == null || !unexpectedBy(servedUnanimous, listOf(raced.fileHash, raced.jarHash)) ||
+                Http.isGithubUrl(raced.servingUrl)
+            ) {
+                publish(repo, raced)
+                return raced.fileHash to raced.jarHash
             }
-            return fresh.fileHash to fresh.jarHash
+            // A mirror-served index that still disagrees with what every
+            // mirror serves as bytes: confirm against the live origin before
+            // concluding anything. When the origin is unreachable too, the
+            // raced copy is all there is — return it, don't make things worse.
+            val live = read(repo, originOnly = true) ?: return raced.fileHash to raced.jarHash
+            publish(repo, live)
+            return live.fileHash to live.jarHash
         }
         return null
     }
@@ -2595,14 +2649,18 @@ class ExtensionsScreenView {
      * enforced for it (the fresh one after a recovery), so the caller's final
      * check verifies against the right signature.
      */
-    private fun downloadWithStaleIndexRetry(url: String, fileHash: String?): Pair<Http.PluginDownload, String?> {
+    private fun downloadWithStaleIndexRetry(url: String, fileHash: String?, jarHash: String? = null): Pair<Http.PluginDownload, String?> {
         val rejects = java.util.concurrent.ConcurrentLinkedQueue<String>()
         val first = Http.downloadPluginFile(url, expectedSha = fileHash, rejectLog = rejects)
         if (first.bytes != null && first.bytes.isNotEmpty()) return first to fileHash
         val u = unanimousServedLines(rejects)
         if (u == null || !unexpectedBy(u, listOf(fileHash))) return first to fileHash
-        val fresh = refreshHashesFor(url) ?: return first to fileHash
+        val fresh = refreshHashesFor(url, u, fileHash, jarHash) ?: return first to fileHash
         if (fresh.first == fileHash) return first to fileHash
+        // A second download can only succeed when the fresh signatures name
+        // the bytes every mirror is serving — otherwise skip it and fail now
+        // instead of repeating the same rejections for another full minute.
+        if (unexpectedBy(u, listOf(fresh.first, fresh.second))) return first to fileHash
         System.err.println("install: every mirror serves $u… for $url — index refreshed, retrying with its signature")
         val retry = Http.downloadPluginFile(url, expectedSha = fresh.first)
         return if (retry.bytes != null && retry.bytes.isNotEmpty()) retry to fresh.first else first to fileHash
