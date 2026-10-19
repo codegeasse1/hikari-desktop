@@ -32,6 +32,15 @@ import java.io.File
  *
  * Needs the network (that is the point), so a runner without internet fails
  * loudly instead of passing quietly.
+ *
+ * A second, subtler cause failed installs the same way later: the walk raced
+ * every mirror and let the first FINISHER win, checking the repo's sha256 only
+ * afterwards — so a fast stale CDN copy (a valid zip of yesterday's build)
+ * failed the whole install although a good copy was one URL away, and the
+ * stale winner was even remembered as preferred. The signature now rides
+ * inside the race on every path (file and byte walks, OS-client rescue
+ * included) and the extension cache is keyed across sibling builds; §2b pins
+ * that down, mostly without needing the network at all.
  */
 fun main() {
     println("ExtensionInstallSelfTest: start")
@@ -122,6 +131,71 @@ fun main() {
         listed.length() > 0 && unmirrored == 0,
         "${listed.length()} listed, $unmirrored without mirrors",
     )
+
+    // ── 2b. a stale mirror can never again win an install ───────────────────
+    // The units below need no network; the loopback server after them proves
+    // the signature gate end to end on the real walk.
+    val zipBytes = byteArrayOf('P'.code.toByte(), 'K'.code.toByte(), 3, 4) + ByteArray(256) { it.toByte() }
+    val zipSha = "sha256-" + Http.sha256Hex(zipBytes)
+    fun tempBytes(prefix: String, bytes: ByteArray): File =
+        File.createTempFile(prefix, ".bin").apply { deleteOnExit(); writeBytes(bytes) }
+    val goodFile = tempBytes("hikari-verify-good-", zipBytes)
+    check(
+        "verified bytes are accepted",
+        Http.verifyArchiveFile(goodFile, zipSha) == null,
+        Http.verifyArchiveFile(goodFile, zipSha) ?: "",
+    )
+    val staleBytes = zipBytes.copyOf().also { it[100] = (it[100] + 1).toByte() }
+    check(
+        "a stale copy (right shape, wrong bytes) is rejected",
+        Http.verifyArchiveFile(tempBytes("hikari-verify-stale-", staleBytes), zipSha)?.contains("checksum mismatch") == true,
+        "a valid zip of the wrong build must never install",
+    )
+    check(
+        "an error page is rejected even with no hash to check",
+        Http.verifyArchiveFile(tempBytes("hikari-verify-html-", "<html><body>nope</body></html>".toByteArray()), null) ==
+            "served an error page, not an extension",
+        "",
+    )
+    check("no published hash means only the archive check runs", Http.verifyArchiveFile(goodFile, null) == null, "")
+    check("a nonsense hash is ignored, not fatal", Http.verifyArchiveFile(goodFile, "nonsense") == null, "")
+    try {
+        val server = com.sun.net.httpserver.HttpServer.create(java.net.InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/ext.cs3") { ex ->
+            ex.responseHeaders.add("Content-Type", "application/octet-stream")
+            ex.sendResponseHeaders(200, zipBytes.size.toLong())
+            ex.responseBody.use { it.write(zipBytes) }
+        }
+        server.start()
+        try {
+            val loop = "http://127.0.0.1:${server.address.port}/ext.cs3"
+            val probeDest = File.createTempFile("hikari-gate-probe-", ".jar").apply { deleteOnExit() }
+            if (!Http.downloadTo(loop, probeDest) || probeDest.length() == 0L) {
+                warn("loopback unreachable here (a proxy may intercept it) — verify-gate e2e skipped")
+            } else {
+                val gateDest = File.createTempFile("hikari-gate-test-", ".jar").apply { deleteOnExit() }
+                check(
+                    "a copy the signature rejects is never installed",
+                    !Http.downloadToRobust(loop, gateDest, verify = { _, _ -> "stale" }) && gateDest.length() == 0L,
+                    "rejected bytes must not land in place",
+                )
+                check(
+                    "a copy the signature accepts installs",
+                    Http.downloadToRobust(loop, gateDest, verify = { part, _ -> Http.verifyArchiveFile(part, zipSha) }) &&
+                        Http.verifyArchiveFile(gateDest, zipSha) == null,
+                    "verified bytes must win",
+                )
+                val gateBytes = Http.fetchBytesRobust(loop, verify = { bytes, _ -> Http.verifyBytes(bytes, zipSha) })
+                check("the byte walk accepts verified bytes too", gateBytes != null && gateBytes.contentEquals(zipBytes), "")
+                val gatedOut = Http.fetchBytesRobust(loop, verify = { _, _ -> "stale" })
+                check("the byte walk rejects wrong bytes too", gatedOut == null, "")
+            }
+        } finally {
+            server.stop(0)
+        }
+    } catch (t: Throwable) {
+        warn("loopback verify-gate test could not run on this machine", t.message ?: t.javaClass.simpleName)
+    }
 
     // ── 3. a real extension downloads (and is a real archive) ───────────────
     val dest = File.createTempFile("hikari-install-test-", ".jar").apply { deleteOnExit() }

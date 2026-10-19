@@ -1623,7 +1623,7 @@ class ExtensionsScreenView {
         AppShell.uiScope.launch {
             var note: String? = null
             val result = runCatching {
-                val dl = Http.downloadPluginFile(url)
+                val dl = Http.downloadPluginFile(url, expectedSha = plugin.fileHash)
                 val bytes = dl.bytes ?: throw Exception(dl.error ?: "Download failed — check the URL")
                 note = dl.takeIf { it.usedUrl != url }?.error
                 checkHash(bytes, plugin.fileHash)?.let { throw Exception(it) }
@@ -1687,7 +1687,7 @@ class ExtensionsScreenView {
         AppShell.uiScope.launch {
             var note: String? = null
             val result = runCatching {
-                val dl = Http.downloadPluginFile(url)
+                val dl = Http.downloadPluginFile(url, expectedSha = plugin.fileHash)
                 val bytes = dl.bytes ?: throw Exception(
                     (dl.error ?: "Download failed — check the URL") +
                         " (${url.substringAfterLast('/')} from ${repoLabelFor(url)})"
@@ -1812,7 +1812,8 @@ class ExtensionsScreenView {
             java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
                 .joinToString("") { "%02x".format(it) }
         }.getOrNull() ?: return null
-        return if (got != want) "checksum mismatch (file corrupted or tampered)" else null
+        return if (got != want) "checksum mismatch (served " + got.take(12) + "…, expected " + want.take(12) +
+            "… — a stale mirror copy)" else null
     }
 
     // ── installing / uninstalling ───────────────────────────────────────────
@@ -1923,8 +1924,10 @@ class ExtensionsScreenView {
 
     /** Downloads (auto-swapping .hiki → .jar), loads, and registers every
      *  provider inside the extension. Every candidate is verified (zip header
-     *  + the repo's sha256 when it publishes one) BEFORE it is loaded, and a
-     *  bad candidate falls through to the next one. Every path ends with a
+     *  + the repo's sha256 when it publishes one) BEFORE it is loaded — and the
+     *  check rides inside the mirror race itself, so a stale copy from one
+     *  mirror loses to a good copy from another instead of failing the install.
+     *  A bad candidate falls through to the next one. Every path ends with a
      *  visible status — nothing ever fails silently. */
     private fun installPlugin(name: String, url: String, fileHash: String? = null, jarHash: String? = null) {
         // A second click while the first is still running would download the
@@ -1969,33 +1972,42 @@ class ExtensionsScreenView {
                 //     Uninstall keeps the cached copy on purpose: the same build
                 //     is routinely re-added from another repo (or after removing
                 //     a repo by mistake), and its bytes were verified once.
-                var reused = dest.isFile && dest.length() > 0L && fileHash != null &&
+                //
+                // The cache is keyed by published sha256, and one plugin is
+                // published under two (the dex archive's and the JVM jar's) —
+                // the winning build may have been stored under the SIBLING's
+                // key, so every candidate's key is tried, and the bytes are
+                // remembered together with WHICH candidate they belong to (a
+                // jar must not be "reused" as its dex twin: their hashes
+                // differ, and checking one against the other could only fail).
+                var reusedFor: String? = null
+                if (dest.isFile && dest.length() > 0L && fileHash != null &&
                     verifyDownload(dest, dl, fileHash, jarHash) == null
-                if (!reused) {
-                    val cached = ExtCache.file(expectedShaFor(dl, fileHash, jarHash))
-                    if (cached != null) {
+                ) {
+                    reusedFor = dl
+                }
+                if (reusedFor == null) {
+                    val keys = siblingCandidates(dl).mapNotNull { c ->
+                        expectedShaFor(c, fileHash, jarHash)?.let { c to it }
+                    }.distinctBy { it.second }
+                    for ((candidate, key) in keys) {
+                        val cached = ExtCache.file(key) ?: continue
                         val fromCache = runCatching { cached.copyTo(dest, overwrite = true) }.isSuccess &&
-                            verifyDownload(dest, dl, fileHash, jarHash) == null
+                            verifyDownload(dest, candidate, fileHash, jarHash) == null
                         if (fromCache) {
-                            reused = true
+                            reusedFor = candidate
                             System.err.println("install: $name from the extension cache (no download)")
+                            break
                         }
                     }
                 }
-                if (!reused) dest.delete()
+                if (reusedFor == null) dest.delete()
                 // CloudStream repos publish the same plugin side by side as a
                 // dex .cs3 and a JVM .jar (Hikari repos: .hiki/.jar). When the
                 // preferred form 404s or is blocked on some mirror, the sibling
                 // in the same folder is the same plugin — and both DexJar and
                 // the URLClassLoader can load whichever one arrives.
-                val stem = dl.substringBeforeLast('.')
-                val candidates = linkedSetOf(dl)
-                if (dl.endsWith(".jar")) {
-                    candidates.add("$stem.cs3")
-                    candidates.add("$stem.hiki")
-                } else if (dl.endsWith(".cs3")) {
-                    candidates.add("$stem.jar")
-                }
+                val candidates = siblingCandidates(dl)
                 val attempts = StringBuilder()
                 var registered: String? = null
                 var loadFailure: String? = null
@@ -2027,7 +2039,18 @@ class ExtensionsScreenView {
                     }
                     val c = queue[qi++]
                     val why = StringBuilder()
-                    val ok = if (reused && c == dl) true else Http.downloadToRobust(c, dest) { tried, success, reason ->
+                    // The repo's sha256 for THIS candidate rides into the
+                    // download walk itself: whichever mirror answers first must
+                    // serve these bytes, and a stale copy just loses the race
+                    // instead of failing the install (a fast stale mirror used
+                    // to win, fail verification afterwards, and abandon a
+                    // candidate whose good copy was one URL away).
+                    val want = expectedShaFor(c, fileHash, jarHash)
+                    val ok = if (c == reusedFor) true else Http.downloadToRobust(
+                        c,
+                        dest,
+                        verify = { part, _ -> Http.verifyArchiveFile(part, want) },
+                    ) { tried, success, reason ->
                         if (!success) {
                             val host = tried.substringAfter("//").substringBefore('/')
                             if (why.isNotEmpty()) why.append(";  ")
@@ -2415,37 +2438,29 @@ class ExtensionsScreenView {
         return want.takeIf { it.length == 64 }
     }
 
-    /** Null = the downloaded file is a plausible, untampered extension; a
-     *  string says why it isn't. */
-    private fun verifyDownload(dest: File, url: String, fileHash: String?, jarHash: String?): String? {
-        val isZip = dest.inputStream().use { s ->
-            val h = s.readNBytes(4)
-            h.size == 4 && h[0] == 'P'.code.toByte() && h[1] == 'K'.code.toByte()
+    /** The same plugin under every published spelling: the dex archive and the
+     *  JVM jar side by side in one folder (CloudStream repos: `.cs3`/`.jar`,
+     *  Hikari repos: `.hiki`/`.jar`). One definition, used by both the
+     *  extension-cache lookup and the download walk, so the two can never
+     *  disagree about what "the same plugin" means. */
+    private fun siblingCandidates(dl: String): LinkedHashSet<String> {
+        val stem = dl.substringBeforeLast('.')
+        val out = linkedSetOf(dl)
+        if (dl.endsWith(".jar")) {
+            out.add("$stem.cs3")
+            out.add("$stem.hiki")
+        } else if (dl.endsWith(".cs3")) {
+            out.add("$stem.jar")
         }
-        if (!isZip) return "served an error page, not an extension"
-        val expected = when {
-            url.endsWith(".cs3") || url.endsWith(".hiki") -> fileHash
-            url.endsWith(".jar") -> jarHash ?: fileHash
-            else -> null
-        } ?: return null
-        val want = expected.removePrefix("sha256-").lowercase()
-        if (want.length != 64) return null
-        val got = sha256Hex(dest) ?: return null
-        return if (got != want) "checksum mismatch (file corrupted or tampered)" else null
+        return out
     }
 
-    private fun sha256Hex(f: File): String? = runCatching {
-        val md = java.security.MessageDigest.getInstance("SHA-256")
-        f.inputStream().use { s ->
-            val buf = ByteArray(64 * 1024)
-            while (true) {
-                val n = s.read(buf)
-                if (n < 0) break
-                md.update(buf, 0, n)
-            }
-        }
-        md.digest().joinToString("") { "%02x".format(it) }
-    }.getOrNull()
+    /** Null = the downloaded file is a plausible, untampered extension; a
+     *  string says why it isn't. The check itself lives in
+     *  [Http.verifyArchiveFile] — the same check the download walk applies
+     *  in-race — so the two can never drift apart. */
+    private fun verifyDownload(dest: File, url: String, fileHash: String?, jarHash: String?): String? =
+        Http.verifyArchiveFile(dest, expectedShaFor(url, fileHash, jarHash))
 
     /** Registers every provider inside [dest] as its own provider config.
      *  Bundle extensions (a manifest with several mainClass entries) become

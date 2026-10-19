@@ -2334,6 +2334,77 @@ object Http {
         return false
     }
 
+    /** Lowercase hex when [raw] is a sha256 (`<hex>` or `sha256-<hex>`), else null. */
+    fun normalizeSha(raw: String?): String? {
+        val h = raw?.removePrefix("sha256-")?.lowercase() ?: return null
+        return h.takeIf { it.length == 64 }
+    }
+
+    /** sha256 hex of [bytes], lowercase. */
+    fun sha256Hex(bytes: ByteArray): String = sha256HexOf(bytes)
+
+    /** sha256 hex of a file, or null when it cannot be read. */
+    fun fileSha256Hex(f: java.io.File): String? = runCatching {
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        f.inputStream().use { s ->
+            val buf = ByteArray(64 * 1024)
+            while (true) {
+                val n = s.read(buf)
+                if (n < 0) break
+                md.update(buf, 0, n)
+            }
+        }
+        md.digest().joinToString("") { "%02x".format(it) }
+    }.getOrNull()
+
+    /**
+     * Null when [f] is a plausible, untampered extension archive; a reason when
+     * it is not. Two checks, in order:
+     *
+     *  - a real extension is always a zip (PK header) — a proxy frontdoor's
+     *    non-HTML error blob is rejected here, not installed;
+     *  - when the repo published a sha256 for this build ([expectedSha], with or
+     *    without the `sha256-` prefix) it must match.
+     *
+     * This is the check the download walks apply to EVERY mirror's bytes BEFORE
+     * one of them is allowed to win (see [downloadToRobust] and
+     * [fetchBytesRobust]): a stale CDN copy used to be able to win the race and
+     * only then fail verification, which abandoned the whole install even though
+     * a good copy was one URL away.
+     */
+    fun verifyArchiveFile(f: java.io.File, expectedSha: String?): String? {
+        val isZip = runCatching {
+            f.inputStream().use { s ->
+                val h = s.readNBytes(4)
+                h.size == 4 && h[0] == 'P'.code.toByte() && h[1] == 'K'.code.toByte()
+            }
+        }.getOrDefault(false)
+        if (!isZip) return "served an error page, not an extension"
+        val want = normalizeSha(expectedSha) ?: return null
+        val got = fileSha256Hex(f) ?: return null
+        if (got != want) {
+            return "checksum mismatch (served " + got.take(12) + "…, expected " +
+                want.take(12) + "… — a stale mirror copy)"
+        }
+        return null
+    }
+
+    /**
+     * Null when [bytes] match [expectedSha]; a reason when they don't. The
+     * byte-level half of [verifyArchiveFile] for downloads that never land on
+     * disk as archives (Nuvio scripts, Aniyomi apks): no zip-header check here,
+     * because a `.js` scraper is text by nature.
+     */
+    fun verifyBytes(bytes: ByteArray, expectedSha: String?): String? {
+        val want = normalizeSha(expectedSha) ?: return null
+        val got = sha256HexOf(bytes)
+        if (got != want) {
+            return "checksum mismatch (served " + got.take(12) + "…, expected " +
+                want.take(12) + "… — a stale mirror copy)"
+        }
+        return null
+    }
+
     /** True when the OS has an HTTP(S) proxy configured — used to decide
      *  whether a final no-proxy rescue pass is worth trying. */
     private fun systemProxyInUse(): Boolean {
@@ -2578,7 +2649,12 @@ object Http {
             url + (if (throughProxy) "|p" else "|d")
     }
 
-    fun fetchBytesRobust(url: String, headers: Map<String, String> = emptyMap()): ByteArray? {
+    fun fetchBytesRobust(
+        url: String,
+        headers: Map<String, String> = emptyMap(),
+        verify: ((bytes: ByteArray, servedFrom: String) -> String?)? = null,
+        onReject: ((servedFrom: String, reason: String) -> Unit)? = null,
+    ): ByteArray? {
         val started = System.currentTimeMillis()
         val origins = MirrorMemory.order(url, originVariants(url))
         val mirrors = MirrorMemory.order(url, mirrorVariants(url))
@@ -2599,6 +2675,18 @@ object Http {
                 System.err.println("net: ignoring a web page served for $u")
                 walk.record(u, Exception("an HTML error page, not the file"), throughProxy)
                 MirrorMemory.markDead(u)
+                return null
+            }
+            val rejection = verify?.invoke(b, u)
+            if (rejection != null) {
+                // The bytes are real but they are NOT this build (a stale CDN /
+                // proxy copy of it): a failed verification, not a dead host. The
+                // host stays usable and is never remembered as the winner; this
+                // URL is just not asked again on the later passes (its bytes
+                // won't get fresher under another TLS stack) while everything
+                // else keeps racing.
+                walk.record(u, Exception(rejection), throughProxy)
+                onReject?.invoke(u, rejection)
                 return null
             }
             MirrorMemory.markAlive(u)
@@ -2627,7 +2715,15 @@ object Http {
         // a different trust store and a different TLS implementation (see
         // [osHttpClient]).
         if (osHttpClient() != null) {
-            raceFirst(origins + mirrors, OS_PARALLELISM, OS_WINDOW_MS) { osFetchBytes(it) }?.let {
+            raceFirst(origins + mirrors, OS_PARALLELISM, OS_WINDOW_MS) { u ->
+                val b = osFetchBytes(u) ?: return@raceFirst null
+                val rejection = verify?.invoke(b, u)
+                if (rejection != null) {
+                    onReject?.invoke(u, rejection)
+                    return@raceFirst null
+                }
+                b
+            }?.let {
                 System.err.println("os-http: served " + it.first + " for $url")
                 return it.second
             }
@@ -2645,6 +2741,15 @@ object Http {
      * A final rescue pass repeats every mirror with the system proxy
      * bypassed ([noProxyClient]) — the classic "browser works, JVM doesn't"
      * desktop misconfiguration.
+     *
+     * [verify] is the repo's signature for the file, checked against EVERY
+     * mirror's bytes before one of them may win (null = these bytes are this
+     * build, a string = why they are not). Without it a fast stale mirror
+     * wins the race and only then fails verification, abandoning an install
+     * whose good copy was one URL away; with it the stale copy just loses and
+     * the walk keeps waiting. Only verified bytes are remembered as the
+     * winner. Null (the default) keeps the old accept-first-finisher behaviour
+     * for callers with nothing to check against.
      */
     fun downloadToRobust(
         url: String,
@@ -2652,6 +2757,7 @@ object Http {
         headers: Map<String, String> = emptyMap(),
         onProgress: ((Long, Long) -> Unit)? = null,
         onAttempt: ((url: String, ok: Boolean, reason: String?) -> Unit)? = null,
+        verify: ((part: java.io.File, servedFrom: String) -> String?)? = null,
     ): Boolean {
         // Authoritative URLs first, CDN/proxy mirrors second (see
         // [mirrorVariants]): an extension install must never "succeed" with a
@@ -2688,7 +2794,7 @@ object Http {
             }
             onAttempt?.invoke(u, ok, why)
         }
-        if (raceDownload(origins, dest, headers, onProgress, counting, deadline, null, originWindow, url)) return true
+        if (raceDownload(origins, dest, headers, onProgress, counting, deadline, null, originWindow, url, verify = verify)) return true
         if (certRejected) {
             System.err.println("downloadToRobust: every candidate was rejected by the certificate store — stopping")
             return false
@@ -2700,7 +2806,7 @@ object Http {
         // where the connect hangs instead of failing) turn every install into a
         // one-minute spinner. A slow-but-working origin is not lost by that —
         // it is in this wave too, and this wave is the long one.
-        if (raceDownload(ordered, dest, headers, onProgress, counting, deadline, null, MAIN_RACE_MS, url)) return true
+        if (raceDownload(ordered, dest, headers, onProgress, counting, deadline, null, MAIN_RACE_MS, url, verify = verify)) return true
         if (certRejected) {
             System.err.println("downloadToRobust: every candidate was rejected by the certificate store — stopping")
             return false
@@ -2709,15 +2815,15 @@ object Http {
         // with TLS pinned to 1.2 ([rescueClient]) — the two desktop
         // misconfigurations where every request fails while the browser works.
         if (systemProxyInUse() &&
-            raceDownload(ordered, dest, headers, onProgress, counting, deadline, noProxyClient, RESCUE_RACE_MS, url, "(no proxy)")
+            raceDownload(ordered, dest, headers, onProgress, counting, deadline, noProxyClient, RESCUE_RACE_MS, url, "(no proxy)", verify)
         ) return true
-        if (raceDownload(ordered, dest, headers, onProgress, counting, deadline, rescueClient, RESCUE_RACE_MS, url, "(TLS 1.2)")) return true
+        if (raceDownload(ordered, dest, headers, onProgress, counting, deadline, rescueClient, RESCUE_RACE_MS, url, "(TLS 1.2)", verify)) return true
         // Every in-JVM stack has now failed. Hand the SAME candidate list to the
         // OS's own HTTP client — Schannel + the Windows certificate store, i.e.
         // the browser's TLS stack, running in a process of its own (see
         // [osHttpClient]). This is the only path that can turn "the browser
         // loads it, the app does not" into a finished install.
-        if (raceDownloadViaOs(ordered, dest, counting, maxOf(20_000L, deadline - System.currentTimeMillis()))) return true
+        if (raceDownloadViaOs(ordered, dest, counting, maxOf(20_000L, deadline - System.currentTimeMillis()), verify)) return true
         System.err.println("downloadToRobust failed for $url")
         return false
     }
@@ -2799,6 +2905,7 @@ object Http {
         windowMs: Long,
         rememberFor: String? = null,
         note: String = "",
+        verify: ((part: java.io.File, servedFrom: String) -> String?)? = null,
     ): Boolean {
         if (System.currentTimeMillis() > deadline) return false
         // Every mirror starts at once. Taking only the first eight and racing
@@ -2816,8 +2923,22 @@ object Http {
             staging[u] = part
             val reason = downloadToReason(u, part, headers, onProgress, via)
             if (reason == null && !looksLikeHtmlFile(part)) {
-                MirrorMemory.markAlive(u)
-                part
+                // The repo's signature rides along into the race: a mirror that
+                // answers first with the WRONG bytes (a stale CDN copy is the
+                // classic one — a valid zip of yesterday's build) just loses,
+                // and the walk keeps waiting for a copy that verifies, instead
+                // of winning and then failing the install afterwards. Only
+                // verified bytes are ever remembered as the winner, so a stale
+                // mirror can no longer teach the app to prefer it.
+                val rejection = verify?.invoke(part, u)
+                if (rejection != null) {
+                    runCatching { part.delete() }
+                    onAttempt?.invoke(u, false, if (note.isBlank()) rejection else "$rejection $note")
+                    null
+                } else {
+                    MirrorMemory.markAlive(u)
+                    part
+                }
             } else {
                 // A frontdoor that answers 200 with a small HTML page "wins" a
                 // race every time (100 bytes beats 100 KB), so a body that is
@@ -3044,13 +3165,21 @@ object Http {
         dest: java.io.File,
         onAttempt: ((String, Boolean, String?) -> Unit)?,
         budgetMs: Long,
+        verify: ((part: java.io.File, servedFrom: String) -> String?)? = null,
     ): Boolean {
         if (osHttpClient() == null || variants.isEmpty()) return false
         val window = minOf(OS_WINDOW_MS, maxOf(4_000L, budgetMs))
         val winner = raceFirst(variants, OS_PARALLELISM, window) { u ->
             val part = partOf(dest, "os:" + u)
             runCatching { part.delete() }
-            if (osFetchToFile(u, part) == null && part.isFile && part.length() > 0L) part else null
+            if (osFetchToFile(u, part) != null || !part.isFile || part.length() <= 0L) return@raceFirst null
+            val rejection = verify?.invoke(part, u)
+            if (rejection != null) {
+                runCatching { part.delete() }
+                onAttempt?.invoke(u, false, rejection)
+                return@raceFirst null
+            }
+            part
         } ?: return false
         val (from, part) = winner
         val ok = runCatching {
@@ -3249,12 +3378,32 @@ object Http {
      */
     class PluginDownload(val bytes: ByteArray?, val usedUrl: String, val error: String?)
 
-    fun downloadPluginFile(url: String, headers: Map<String, String> = emptyMap()): PluginDownload {
-        val direct = runCatching { fetchBytesRobust(url, headers) }.getOrNull()
+    fun downloadPluginFile(
+        url: String,
+        headers: Map<String, String> = emptyMap(),
+        expectedSha: String? = null,
+        rejectLog: MutableCollection<String>? = null,
+    ): PluginDownload {
+        // The repo's sha256 rides into the byte walk itself (see
+        // [fetchBytesRobust]): a stale mirror copy loses the race instead of
+        // becoming the bytes the caller then has to reject. [rejectLog] — which
+        // must be thread-safe, it is filled from the race's worker threads —
+        // collects one short line per mirror that served the wrong bytes, so a
+        // total failure can say so instead of "check the URL".
+        val verify: ((ByteArray, String) -> String?)? =
+            if (normalizeSha(expectedSha) == null) null
+            else { bytes, _ -> verifyBytes(bytes, expectedSha) }
+        val onReject: ((String, String) -> Unit)? =
+            rejectLog?.let { log ->
+                { u, reason ->
+                    log.add(u.substringAfter("//").substringBefore('/') + " — " + reason.take(160))
+                }
+            }
+        val direct = runCatching { fetchBytesRobust(url, headers, verify, onReject) }.getOrNull()
         if (direct != null && direct.isNotEmpty()) return PluginDownload(direct, url, null)
         val repaired = runCatching { repairGithubFileUrl(url) }.getOrNull()
         if (repaired != null) {
-            val bytes = runCatching { fetchBytesRobust(repaired, headers) }.getOrNull()
+            val bytes = runCatching { fetchBytesRobust(repaired, headers, verify, onReject) }.getOrNull()
             if (bytes != null && bytes.isNotEmpty()) {
                 return PluginDownload(bytes, repaired, "the file had moved in its repository — fetched from $repaired")
             }
@@ -3262,6 +3411,12 @@ object Http {
         val error = when {
             fileGoneFromRepo(url) ->
                 "the repository no longer holds this file (its index still lists it) — the extension was removed upstream"
+            rejectLog != null && rejectLog.isNotEmpty() ->
+                "every reachable copy failed the repo's sha256 check (" +
+                    rejectLog.size + " mirror" + (if (rejectLog.size == 1) "" else "s") +
+                    " served a stale copy" +
+                    (normalizeSha(expectedSha)?.let { ", expected " + it.take(12) + "…" } ?: "") +
+                    "): " + rejectLog.first().take(160)
             else -> "Download failed — check the URL"
         }
         System.err.println("net-plugin: gave up on $url ($error)")
