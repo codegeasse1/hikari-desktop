@@ -1103,6 +1103,8 @@ object PlayerWindow {
                 "  placed=" + w + "x" + h + " at the " + (if (atBottom) "bottom" else "top") +
                 "  scale=" + scale
             if (w < 40 || h < 16) return@runCatching
+            val x = app[0]
+            val y = if (atBottom) app[1] + app[3] - h else app[1]
             // The JavaFX-side position is written outright, BEFORE the native
             // window is even looked up: `WinShell.placeAbove` moves the native
             // window behind Glass's back, and Glass only learns the new
@@ -1124,8 +1126,6 @@ object PlayerWindow {
             if (!dressed && dressOverlay(st)) {
                 if (st === stripStage) stripDressed = true else barDressed = true
             }
-            val x = app[0]
-            val y = if (atBottom) app[1] + app[3] - h else app[1]
             WinShell.placeAbove(hwnd, video, x, y, w, h)
         }
     }
