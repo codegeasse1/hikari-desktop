@@ -1349,6 +1349,45 @@ object Http {
         return execute(client, builder.build())
     }
 
+    /**
+     * [relayFetch] with retries for the player relay: CDN edges hiccup (timeouts,
+     * 502/503, or a 200 with an empty body — which mpv reports as "Empty
+     * segment" and then dies on), and one retry usually sails through. 403/404
+     * are final (a spent single-use token or a dead link — retrying those only
+     * burns tokens) and are returned at once. The caller owns the returned
+     * response and must close it; intermediate failures are closed here.
+     */
+    fun relayFetchRetrying(
+        url: String,
+        headers: Map<String, String> = emptyMap(),
+        range: String? = null,
+        head: Boolean = false,
+        attempts: Int = 3,
+    ): Response {
+        repeat(attempts) { i ->
+            try {
+                val r = relayFetch(url, headers, range, head)
+                val emptyBody = !head && r.isSuccessful && r.code != 206 &&
+                    (r.body?.contentLength() ?: -1L) == 0L
+                if (r.isSuccessful || r.code == 206 || r.code == 403 || r.code == 404) {
+                    if (!emptyBody) return r
+                }
+                r.close()
+            } catch (e: Exception) {
+                System.err.println("net-relay: attempt ${i + 1}/$attempts failed for $url (${e.javaClass.simpleName})")
+            }
+            if (i < attempts - 1) {
+                try {
+                    Thread.sleep(250L * (i + 1))
+                } catch (ie: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
+        }
+        // Final attempt: its answer (or throw) belongs to the caller.
+        return relayFetch(url, headers, range, head)
+    }
+
     fun post(
         url: String,
         body: String,
@@ -1457,10 +1496,30 @@ object Http {
         return out.toList()
     }
 
-    /** Mirrors of official repos on a CDN that works even where GitHub is slow
-     *  or blocked. Regenerate whenever the source repo.json changes. */
-    private const val HIKARI_REPO_MIRROR = "https://user.uploads.dev/file/160d14f91512b838449f155070cb0c58.json"
-    private const val CLOUDSTREAM_REPO_MIRROR = "https://user.uploads.dev/file/42f88079718447227d8bf7ccc5a5e286.txt"
+    /** Static last-resort copies of the official repos on a CDN that works
+     *  even where GitHub is slow or blocked. FROZEN files — regenerate whenever
+     *  the source repo.json changes. They must never be added as repos in their
+     *  own right: an entry pointing at one of these can never update, so the
+     *  screen auto-migrates such entries to the live repo (see
+     *  [snapshotReplacement]) and labels any that remain. */
+    const val HIKARI_REPO_MIRROR = "https://user.uploads.dev/file/160d14f91512b838449f155070cb0c58.json"
+    const val CLOUDSTREAM_REPO_MIRROR = "https://user.uploads.dev/file/42f88079718447227d8bf7ccc5a5e286.txt"
+
+    /** True when [url] is one of the frozen snapshot files above rather than a
+     *  live repo — its contents are fixed at whatever day the snapshot was
+     *  taken, so installs from it fail with stale signatures forever. */
+    fun isSnapshotUrl(url: String): Boolean {
+        val u = url.trim()
+        return u == HIKARI_REPO_MIRROR || u == CLOUDSTREAM_REPO_MIRROR
+    }
+
+    /** The live repo a frozen snapshot entry migrates to, or null when the
+     *  snapshot's live address is not known (it is then labelled, not moved). */
+    fun snapshotReplacement(url: String): String? = when (url.trim()) {
+        CLOUDSTREAM_REPO_MIRROR ->
+            "https://cdn.jsdelivr.net/gh/codegeasse1/codegeasse-cloudstream-repos@builds/repo.json"
+        else -> null
+    }
 
     /** Hard cap for a repo fetch so a slow/blocked network fails with a clear
      *  error instead of leaving the UI stuck on "Checking…" for minutes. */

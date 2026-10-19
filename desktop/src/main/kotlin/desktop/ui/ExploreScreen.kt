@@ -102,10 +102,27 @@ class ExploreScreenView {
         catalogJob?.cancel()
         AppShell.toast("Loading ${p.name}…")
         catalogJob = AppShell.uiScope.launch {
-            val rows = runCatching {
-                AppShell.app.repository.homeRows(providerId = p.id)
-            }.getOrDefault(emptyList())
-            val items = rows.flatMap { it.items }.distinctBy { it.uniqueId }.take(150)
+            // A provider whose catalog fetch hangs used to leave this toast up
+            // forever ("opening X…" that never opens): the load has a hard
+            // budget, and a timeout names the provider instead of silence.
+            val items = try {
+                kotlinx.coroutines.withTimeout(20_000L) {
+                    val rows = AppShell.app.repository.homeRows(providerId = p.id)
+                    rows.flatMap { it.items }.distinctBy { it.uniqueId }.take(150)
+                }
+            } catch (t: kotlinx.coroutines.TimeoutCancellationException) {
+                desktop.fx.Fx.run {
+                    AppShell.toast("“${p.name}” took too long to answer — try again.", "error")
+                }
+                return@launch
+            } catch (t: kotlinx.coroutines.CancellationException) {
+                throw t
+            } catch (t: Throwable) {
+                desktop.fx.Fx.run {
+                    AppShell.toast("Couldn't open “${p.name}” (${t.message ?: t.javaClass.simpleName}).", "error")
+                }
+                return@launch
+            }
             desktop.fx.Fx.run {
                 if (items.isEmpty()) {
                     AppShell.toast("“${p.name}” returned no catalog rows — open the logs for the reason.", "error")

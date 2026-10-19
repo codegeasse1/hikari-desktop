@@ -502,6 +502,15 @@ class DetailScreenView(private val item: MediaItem) {
 
     private fun load() {
         scope.launch {
+            // Ratings + cast + artwork resolve in the background (TMDB search)
+            // from the FIRST frame: the old code waited for the provider's own
+            // meta + episode calls to finish before even starting the TMDB
+            // lookup, which is why the banner sat on the extension's artwork
+            // for seconds and then visibly swapped. Fired twice (here and below
+            // with the loaded meta) because the loaded title can differ; the
+            // lookup itself is cached by title, so the second call is free when
+            // nothing changed.
+            loadEnrich(item)
             // A UI shot has to page through a season of hundreds of episodes to
             // prove the pager works; the shot harness hands one in through this
             // seam instead of waiting on (and depending on) a provider. Null in
@@ -608,23 +617,13 @@ class DetailScreenView(private val item: MediaItem) {
         renderMeta(m, null)
         heroOverview.text = m.overview?.let { htmlToPlain(it) }?.takeIf { it.isNotBlank() }
             ?: "No synopsis available for this title."
-        // Provider art first — the TMDB slideshow upgrades it when it lands.
-        bgUrls = listOfNotNull(
-            desktop.img.ImageLoader.artFor(m.backdropUrl, null),
-            desktop.img.ImageLoader.artFor(m.posterUrl, null),
-        ).distinct()
+        // TMDB artwork owns the banner: it is painted the moment it lands
+        // (see [renderEnrich]), never the provider's own low-quality art. The
+        // provider art is only the fallback when TMDB has nothing for the
+        // title (see [paintProviderArt]).
+        bgUrls = emptyList()
         bgIndex = 0
-        bgUrls.firstOrNull()?.let { url ->
-            desktop.img.ImageLoader.loadAsync(url, onReady = { img ->
-                if (img != null) {
-                    heroArtA = img
-                    paintHeroBg()
-                    heroBgA.opacity = 1.0
-                    heroFgA = true
-                }
-            }, w = 1600, h = 900)
-        }
-        startBgTimer()
+        bgTimer?.stop()
         favourite = runCatching { AppShell.app.store.favorites().any { it.uniqueId == m.uniqueId } }.getOrDefault(false)
         refreshFavourite()
         updatePlayLabel()
@@ -647,6 +646,31 @@ class DetailScreenView(private val item: MediaItem) {
         heroMetaRow.children.setAll(cells.flatMap { listOf(it, themed("•", "x-d-dot")) }.dropLast(1))
         heroMetaRow.isVisible = cells.isNotEmpty()
         heroMetaRow.isManaged = cells.isNotEmpty()
+    }
+
+    /** Last-resort banner art: the provider's own backdrop/poster, used only
+     *  when TMDB has nothing for the title — a low-quality image beats an
+     *  empty banner, but it must never flash before TMDB art that is about to
+     *  arrive (see [renderHero]). */
+    private fun paintProviderArt() {
+        if (bgUrls.isNotEmpty()) return
+        val urls = listOfNotNull(
+            desktop.img.ImageLoader.artFor(meta.backdropUrl, null),
+            desktop.img.ImageLoader.artFor(meta.posterUrl, null),
+        ).distinct()
+        if (urls.isEmpty()) return
+        bgUrls = urls
+        bgIndex = 0
+        val gen = ++bgGen
+        desktop.img.ImageLoader.loadAsync(urls.first(), onReady = { img ->
+            if (img != null && gen == bgGen) {
+                heroArtA = img
+                paintHeroBg()
+                heroBgA.opacity = 1.0
+                heroFgA = true
+            }
+        }, w = 1600, h = 900)
+        startBgTimer()
     }
 
     private fun startBgTimer() {
@@ -864,9 +888,12 @@ class DetailScreenView(private val item: MediaItem) {
         renderTrailers()
         val panels = mutableListOf<Node>()
         if (isSeries && hasEps) {
+            // The range picker sits ABOVE the cards it pages (season pills,
+            // then the search/range/prev/next row, then the episode grid),
+            // not below them where it reads as an afterthought.
             panels.add(seasonRow)
-            panels.add(epRail)
             panels.add(pagerRow)
+            panels.add(epRail)
             panels.add(episodeHint)
         }
         if (castSection.isVisible) panels.add(castSection)
@@ -1029,11 +1056,18 @@ class DetailScreenView(private val item: MediaItem) {
     }
 
     private fun episodeCard(ep: Episode): VBox {
-        val still = stills[ep.number]
+        // Stills by number first; providers that number a season absolutely
+        // (a 247-episode "season 1" TMDB splits into seasons of ~100) miss the
+        // number map past TMDB's count, so fall back to the episode's POSITION
+        // in the season; and when nothing has any art at all, the show's own
+        // backdrop/poster beats a blank tile (spoiler mode still blurs it).
+        val still = stills[ep.number] ?: stillByPosition(ep)
         // Anti-spoiler BLURS the still, it never removes it: the card keeps
         // its artwork with a heavy gaussian blur, and the big number behind
         // only shows when there is no artwork at all.
         val imgUrl = (ep.image?.takeIf { it.isNotBlank() } ?: still?.stillUrl)
+            ?: meta.backdropUrl?.takeIf { it.isNotBlank() }
+            ?: meta.posterUrl?.takeIf { it.isNotBlank() }
         // Big number behind the still: titles without any artwork (a provider
         // with no images that TMDB cannot resolve either) still read as episode
         // cards instead of empty black boxes — the still covers it when one loads.
@@ -1118,6 +1152,16 @@ class DetailScreenView(private val item: MediaItem) {
         return card
     }
 
+    /** TMDB still by position in the season, for episodes whose absolute
+     *  provider numbering runs past TMDB's per-season count (see
+     *  [episodeCard]). Approximate — a wrong still beats a blank tile. */
+    private fun stillByPosition(ep: Episode): TmdbDetails.SeasonEpisode? {
+        if (stills.isEmpty()) return null
+        val ordered = stills.values.sortedBy { it.number }
+        val idx = orderedSeasonEps().indexOfFirst { it.id == ep.id }
+        return ordered.getOrNull(idx)
+    }
+
     private fun cleanEpTitle(ep: Episode): String {
         val name = ep.name?.trim().orEmpty()
         if (name.isBlank()) return "Episode ${ep.number}"
@@ -1177,6 +1221,10 @@ class DetailScreenView(private val item: MediaItem) {
                     renderEnrich(details)
                     renderSections()
                     if (meta.type == MediaType.SERIES) loadSeasonStills()
+                } else if (enrich == null) {
+                    // TMDB has nothing for this title: fall back to the
+                    // provider's own art instead of an empty banner.
+                    paintProviderArt()
                 }
             }
         }
@@ -1218,12 +1266,20 @@ class DetailScreenView(private val item: MediaItem) {
                 }
             }, w = 640, h = 200)
         }
-        // Rotating backdrops: the banner keeps changing through the title's
-        // own artwork.
+        // Rotating backdrops: the title's own artwork, painted the moment it
+        // lands — the first TMDB backdrop crossfades in immediately instead
+        // of waiting for the rotation timer, so the banner never shows the
+        // provider's art first and swaps seconds later.
         if (d.backdrops.isNotEmpty()) {
             bgUrls = d.backdrops
             bgIndex = 0
+            val gen = ++bgGen
+            desktop.img.ImageLoader.loadAsync(d.backdrops.first(), onReady = { img ->
+                if (img != null && gen == bgGen) crossfadeHero(img)
+            }, w = 1600, h = 900)
             startBgTimer()
+        } else {
+            paintProviderArt()
         }
     }
 

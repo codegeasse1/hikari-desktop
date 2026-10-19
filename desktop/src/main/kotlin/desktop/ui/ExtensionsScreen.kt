@@ -91,13 +91,20 @@ class ExtensionsScreenView {
      *  repo's own sha256 signatures ("sha256-<hex>") — fileHash for the dex
      *  archive (.cs3/.hiki), jarHash for the JVM .jar build. When present
      *  they're verified after download (Android-app parity), so a broken
-     *  mirror or proxy frontdoor can never install a tampered plugin. */
+     *  mirror or proxy frontdoor can never install a tampered plugin.
+     *  version/sizeLabel/description/language/tags are display-only manifest
+     *  extras (shown when the repo publishes them, hidden otherwise). */
     private data class PluginRef(
         val name: String,
         val url: String,
         val fileHash: String?,
         val jarHash: String?,
         val iconUrl: String? = null,
+        val version: String? = null,
+        val sizeLabel: String? = null,
+        val description: String? = null,
+        val language: String? = null,
+        val tags: List<String> = emptyList(),
     )
 
     private val repoData = HashMap<String, RepoData>()
@@ -246,6 +253,10 @@ class ExtensionsScreenView {
     // ── rendering ───────────────────────────────────────────────────────────
 
     private fun renderAll() {
+        // Frozen snapshot addresses can never update (see Http.isSnapshotUrl):
+        // move them to the live repo before anything paints, so a stale copy
+        // never sits in the list looking like the real thing.
+        migrateSnapshotRepos()
         // The page is rebuilt into a LIST and swapped in with ONE `setAll`.
         //
         // Clearing the children first collapses the page to zero height for a
@@ -388,11 +399,20 @@ class ExtensionsScreenView {
     }
 
     private fun submitComposer() {
-        val raw = composerInput.text.trim()
-        if (raw.isBlank()) {
+        val pasted = composerInput.text.trim()
+        if (pasted.isBlank()) {
             setStatus("Paste a URL first.", isError = true)
             return
         }
+        // A pasted snapshot address is a frozen copy, not a repo: swap it for
+        // the live repo up front (see Http.snapshotReplacement) instead of
+        // adding an entry that can never update.
+        val raw = Http.snapshotReplacement(Http.normalizeUrl(pasted))?.let { live ->
+            composerInput.text = live
+            setStatus("That address is a frozen snapshot copy — adding the live repo instead.")
+            AppShell.toast("Snapshot address replaced with the live repo", "ok")
+            live
+        } ?: pasted
         when (mode) {
             MODE_HIKARI -> addRepo(Http.normalizeUrl(raw), RepoKind.HIKARI)
             MODE_CS3 -> addRepo(Http.normalizeUrl(raw), RepoKind.CS3)
@@ -486,7 +506,152 @@ class ExtensionsScreenView {
         return null
     }
 
-    // ── repos ───────────────────────────────────────────────────────────────
+    /**
+     * Moves stored repo entries that point at frozen snapshot FILES to the
+     * live repo they were copied from. A snapshot entry can never update —
+     * every Reload re-reads the same frozen file and every install from it
+     * fails with stale signatures — so keeping it in the list is pure harm.
+     * Runs on every render and is a no-op once nothing points at a snapshot.
+     * When the live repo is already stored the snapshot entry is simply
+     * dropped (otherwise the same repo shows twice); otherwise the entry is
+     * rewritten to the live URL and loaded fresh.
+     */
+    private fun migrateSnapshotRepos() {
+        val repos = runCatching { AppShell.app.store.repos() }.getOrDefault(emptyList())
+        for (repo in repos) {
+            val live = Http.snapshotReplacement(repo.url) ?: continue
+            val already = repos.any { it.url == live }
+            runCatching { AppShell.app.store.removeCs3Repo(repo.url) }
+            repoData.remove(repo.url)
+            repoErrors.remove(repo.url)
+            repoFetchedAt.remove(repo.url)
+            repoCache.remove(repo.url)
+            if (openRepo?.url == repo.url) openRepo = null
+            if (already) {
+                setStatus("Removed a frozen snapshot copy of a repo you already have.", isError = true)
+                AppShell.toast("Removed frozen snapshot copy", "error")
+            } else {
+                runCatching { AppShell.app.store.addCs3Repo(Cs3Repo(url = live, name = repo.name, kind = repo.kind)) }
+                setStatus("Migrated a frozen snapshot repo to the live repo — loading its plugins…", busy = true)
+                AppShell.toast("Snapshot repo migrated to the live repo", "ok")
+                if (repoLoading.add(live)) loadRepoData(live)
+            }
+        }
+    }
+
+    // ── repos ───────────────────────────────────────────────────────────
+
+    /** A grid whose two columns always split the width 50/50, so two cards
+     *  share every row at any window width. Cards must be free to shrink
+     *  (minWidth 0): a card with a wide minimum would push its column past
+     *  half and squeeze its neighbour out. */
+    private fun twoColumnGrid(): javafx.scene.layout.GridPane {        val grid = javafx.scene.layout.GridPane().apply {
+            hgap = 10.0
+            vgap = 10.0
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
+        }
+        repeat(2) {
+            grid.columnConstraints.add(
+                javafx.scene.layout.ColumnConstraints().apply {
+                    percentWidth = 50.0
+                    hgrow = javafx.scene.layout.Priority.ALWAYS
+                    minWidth = 0.0
+                    maxWidth = Double.MAX_VALUE
+                }
+            )
+        }
+        return grid
+    }
+
+    /**
+     * A repo's avatar: the GitHub owner's picture for GitHub-hosted repos
+     * (github.com/owner.png always serves the profile image), else the repo's
+     * initial on a tile. The letter sits BEHIND the picture, so a repo whose
+     * avatar cannot load still has an identity instead of a blank box.
+     */
+    private fun repoAvatar(name: String, url: String): javafx.scene.layout.StackPane {
+        val initial = Label(name.trim().firstOrNull()?.uppercase() ?: "?").apply {
+            styleClass.add("x-prov-initial")
+        }
+        val badge = javafx.scene.layout.StackPane(initial).apply {
+            styleClass.add("x-prov-badge")
+            alignment = Pos.CENTER
+            minWidth = 46.0; prefWidth = 46.0; maxWidth = 46.0
+            minHeight = 46.0; prefHeight = 46.0; maxHeight = 46.0
+        }
+        val owner = Regex("github\\.com/([^/?#]+)", RegexOption.IGNORE_CASE).find(url)?.groupValues?.get(1)
+            ?: Regex("raw\\.githubusercontent\\.com/([^/?#]+)", RegexOption.IGNORE_CASE).find(url)?.groupValues?.get(1)
+            ?: Regex("cdn\\.jsdelivr\\.net/gh/([^/?#@]+)", RegexOption.IGNORE_CASE).find(url)?.groupValues?.get(1)
+        if (owner.isNullOrBlank()) return badge
+        val art = javafx.scene.image.ImageView().apply {
+            isPreserveRatio = false
+            isSmooth = true
+            isMouseTransparent = true
+            fitWidth = 46.0
+            fitHeight = 46.0
+        }
+        val frame = javafx.scene.layout.StackPane(badge, art).apply {
+            alignment = Pos.CENTER
+            minWidth = 46.0; prefWidth = 46.0; maxWidth = 46.0
+            minHeight = 46.0; prefHeight = 46.0; maxHeight = 46.0
+        }
+        desktop.img.ImageLoader.loadAsync("https://github.com/$owner.png", onReady = { img ->
+            if (img != null) {
+                javafx.scene.shape.Rectangle(46.0, 46.0).apply { arcWidth = 12.0; arcHeight = 12.0 }.let { art.clip = it }
+                art.image = img
+            }
+        }, w = 92, h = 92)
+        return frame
+    }
+
+    /**
+     * An extension's icon from the repo manifest ([PluginRef.iconUrl]), with     * the extension's initial behind it as the fallback while it loads (or
+     * when the manifest names none).
+     */
+    private fun extIcon(name: String, iconUrl: String?): javafx.scene.layout.StackPane {
+        val initial = Label(name.trim().firstOrNull()?.uppercase() ?: "?").apply {
+            styleClass.add("x-prov-initial")
+        }
+        val badge = javafx.scene.layout.StackPane(initial).apply {
+            styleClass.add("x-prov-badge")
+            alignment = Pos.CENTER
+            minWidth = 52.0; prefWidth = 52.0; maxWidth = 52.0
+            minHeight = 52.0; prefHeight = 52.0; maxHeight = 52.0
+        }
+        if (iconUrl.isNullOrBlank()) return badge
+        val art = javafx.scene.image.ImageView().apply {
+            isPreserveRatio = true
+            isSmooth = true
+            isMouseTransparent = true
+            fitWidth = 52.0
+            fitHeight = 52.0
+        }
+        val frame = javafx.scene.layout.StackPane(badge, art).apply {
+            alignment = Pos.CENTER
+            minWidth = 52.0; prefWidth = 52.0; maxWidth = 52.0
+            minHeight = 52.0; prefHeight = 52.0; maxHeight = 52.0
+        }
+        desktop.img.ImageLoader.loadAsync(iconUrl, onReady = { img ->
+            if (img != null) art.image = img
+        }, w = 104, h = 104)
+        return frame
+    }
+
+    /** Manifest sizes arrive as bytes ("84480") or already formatted ("84 KB"):
+     *  pass formatted ones through, format the rest. */
+    private fun humanSize(raw: String): String? {
+        val t = raw.trim()
+        if (t.isBlank()) return null
+        if (!t.all { it.isDigit() }) return t
+        val bytes = t.toLongOrNull() ?: return t
+        if (bytes <= 0) return null
+        return when {
+            bytes < 1024 -> "$bytes B"
+            bytes < 1024 * 1024 -> "${bytes / 1024} KB"
+            else -> "%.1f MB".format(bytes / (1024.0 * 1024.0))
+        }
+    }────
 
     /** The uppercase badge text for a repo's engine. */
     private fun kindLabel(kind: RepoKind): String = when (kind) {
@@ -540,26 +705,19 @@ class ExtensionsScreenView {
             }
             // The repos read as a 2-column card grid under one "N plugins from
             // M repositories" info bar — the shape the reference gives them —
-            // not a one-card-per-row list.
+            // not a one-card-per-row list. A GridPane with two 50% columns (not
+            // a TilePane: its column count is advisory and a wide card
+            // collapses it back to one per row), so two cards share every row
+            // at any window width.
             val totalPlugins = repos.sumOf { repoData[it.url]?.plugins?.size ?: 0 }
             val bar = themed(
                 "Showing $totalPlugins plugin${if (totalPlugins == 1) "" else "s"} from " +
                     "${repos.size} repositor${if (repos.size == 1) "y" else "ies"}",
                 "x-repo-infobar",
             ).apply { isWrapText = true; minWidth = 0.0; maxWidth = Double.MAX_VALUE }
-            val grid = TilePane(10.0, 10.0).apply {
-                styleClass.add("x-repo-grid")
-                prefColumns = 2
-                minWidth = 0.0
-                maxWidth = Double.MAX_VALUE
-            }
-            repos.forEach { repo ->
-                val card = repoCard(repo)
-                // Two columns at any window width: each card takes half the
-                // grid (minus the gap), instead of a fixed pixel width that a
-                // narrow window cannot fit.
-                card.prefWidthProperty().bind(grid.widthProperty().subtract(10.0).divide(2.0))
-                grid.children.add(card)
+            val grid = twoColumnGrid()
+            repos.forEachIndexed { index, repo ->
+                grid.add(repoCard(repo), index % 2, index / 2)
             }
             reposBox.children.setAll(bar, grid)
         }
@@ -609,6 +767,10 @@ class ExtensionsScreenView {
                 "badge-accent",
             ))
             children.add(Ui.badge(kindLabel(repo.kind), if (repo.kind == RepoKind.CS3) "badge" else "badge-accent"))
+            if (Http.isSnapshotUrl(repo.url)) {
+                // A frozen copy that can never update must say so on the card.
+                children.add(Ui.badge("static copy", "badge-danger"))
+            }
             if (error != null) children.add(Ui.badge("unreachable", "badge-danger"))
         }
 
@@ -623,7 +785,7 @@ class ExtensionsScreenView {
             }
         )
 
-        val icon = VBox(Icons.of(Icons.GLOBE, 20.0)).apply {
+        val icon = repoAvatar(repoDisplayName(repo), data?.url ?: repo.url).apply {
             styleClass.add("repo-ic")
             alignment = Pos.CENTER
         }
@@ -972,16 +1134,9 @@ class ExtensionsScreenView {
                 } else {
                     // The repo's plugins read as 2-column cards (reference
                     // parity with the repo grid above), not a one-row list.
-                    val grid = TilePane(10.0, 10.0).apply {
-                        styleClass.add("x-plugin-grid")
-                        prefColumns = 2
-                        minWidth = 0.0
-                        maxWidth = Double.MAX_VALUE
-                    }
-                    filtered.forEach {
-                        val card = pluginRow(it)
-                        card.prefWidthProperty().bind(grid.widthProperty().subtract(10.0).divide(2.0))
-                        grid.children.add(card)
+                    val grid = twoColumnGrid()
+                    filtered.forEachIndexed { index, plugin ->
+                        grid.add(pluginRow(plugin), index % 2, index / 2)
                     }
                     pluginsBox.children.add(grid)
                 }
@@ -996,31 +1151,57 @@ class ExtensionsScreenView {
      * of the list around it (see [refreshRow]).
      */
     private fun pluginRow(plugin: PluginRef): Region {
-        val name = themed(plugin.name, "src-name").apply {
-            isWrapText = true
+        // Reference shape (see the target screenshots): icon · name+language,
+        // version · size · repo / description / type tags · Install/Uninstall.
+        // Every manifest extra is optional — blanks collapse to nothing.
+        val icon = extIcon(plugin.name, plugin.iconUrl)
+        val titleRow = HBox(8.0).apply {
+            alignment = Pos.CENTER_LEFT
             minWidth = 0.0
+            children.add(themed(plugin.name, "src-name").apply {
+                isWrapText = true
+                minWidth = 0.0
+            })
+            plugin.language?.takeIf { it.isNotBlank() }?.let {
+                children.add(Ui.badge(it, "badge"))
+            }
         }
-        val url = themed(plugin.url, "h-mono").apply {
-            // Half-width cards: the URL wraps early instead of sizing the tile
-            // past the column.
-            maxWidth = 320.0
-            minWidth = 0.0
-            isWrapText = true
+        val metaBits = listOfNotNull(
+            plugin.version?.takeIf { it.isNotBlank() }?.let { "v$it".removePrefix("vv") },
+            plugin.sizeLabel?.takeIf { it.isNotBlank() },
+        )
+        val infoLines = VBox(3.0).apply { minWidth = 0.0 }
+        infoLines.children.add(titleRow)
+        if (metaBits.isNotEmpty()) {
+            infoLines.children.add(themed(metaBits.joinToString(" • "), "tiny").apply { minWidth = 0.0 })
         }
-        val info = VBox(3.0, name, url).apply { minWidth = 0.0 }
-        HBox.setHgrow(info, Priority.ALWAYS)
+        plugin.description?.takeIf { it.isNotBlank() }?.let { desc ->
+            infoLines.children.add(themed(desc, "x-ep-sub").apply {
+                isWrapText = true
+                minWidth = 0.0
+                maxHeight = 34.0
+            })
+        }
+        if (plugin.tags.isNotEmpty()) {
+            infoLines.children.add(HBox(5.0).apply {
+                alignment = Pos.CENTER_LEFT
+                minWidth = 0.0
+                children.addAll(plugin.tags.map { Ui.badge(it, "badge") })
+            })
+        }
+        HBox.setHgrow(infoLines, Priority.ALWAYS)
 
         val state = HBox(6.0).apply { alignment = Pos.CENTER_RIGHT }
         val action = HBox(8.0).apply { alignment = Pos.CENTER_RIGHT }
+        val right = VBox(6.0, state, action).apply { alignment = Pos.CENTER_RIGHT; minWidth = 0.0 }
         val error = themed("", "tiny").apply {
             styleClass.add("h-danger")
             isWrapText = true
-            maxWidth = 320.0
             minWidth = 0.0
             isVisible = false
             isManaged = false
         }
-        val row = HBox(12.0, info, state, action).apply {
+        val row = HBox(12.0, icon, infoLines, right).apply {
             styleClass.add("src-row")
             alignment = Pos.CENTER_LEFT
             minWidth = 0.0
@@ -1031,7 +1212,11 @@ class ExtensionsScreenView {
         fillRowParts(parts)
         // The error line is part of the row (not a separate node swapped in and
         // out) so a failure can appear and disappear without the list moving.
-        return VBox(6.0, row, error).apply { minWidth = 0.0; maxWidth = Double.MAX_VALUE }
+        return VBox(6.0, row, error).apply {
+            styleClass.add("src-row-card")
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
+        }
     }
 
     /** Rewrites the changing parts of one rendered row. */
@@ -1422,12 +1607,31 @@ class ExtensionsScreenView {
             if (name.isBlank() || url.isBlank()) continue
             if (baseUrl.isNotBlank()) url = Http.resolveRelativeTo(url, baseUrl)
             if (url.endsWith(".hiki")) url = url.removeSuffix(".hiki") + ".jar"
+            // Icons are very often relative ("icons/x.png"): resolve them
+            // against the manifest that named them, or every card blanks.
+            val rawIcon = p.optString("iconUrl").ifBlank { p.optString("icon") }
+                .ifBlank { p.optString("logo") }.ifBlank { null }
+            val icon = rawIcon?.let {
+                if (baseUrl.isNotBlank()) Http.resolveRelativeTo(it, baseUrl) else it
+            }
+            // Display extras: published by some repos, absent in others — every
+            // one is optional and blank means hidden on the card.
+            val sizeRaw = p.optString("fileSize").ifBlank { p.optString("size") }.ifBlank { null }
+            val sizeLabel = sizeRaw?.let { humanSize(it) }
+            val tags = p.optJSONArray("types")?.let { arr ->
+                (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { s -> s.isNotBlank() } }.take(3)
+            }.orEmpty()
             out += PluginRef(
                 name = name,
                 url = url,
                 fileHash = p.optString("fileHash").ifBlank { null },
                 jarHash = p.optString("jarHash").ifBlank { null },
-                iconUrl = p.optString("iconUrl").ifBlank { p.optString("logo") }.ifBlank { null },
+                iconUrl = icon,
+                version = p.optString("version").ifBlank { null },
+                sizeLabel = sizeLabel,
+                description = p.optString("description").ifBlank { null },
+                language = p.optString("language").ifBlank { p.optString("lang") }.ifBlank { null },
+                tags = tags,
             )
         }
         return out
@@ -3083,6 +3287,15 @@ class ExtensionsScreenView {
                         fileHash = jsonOpt(p, "fileHash"),
                         jarHash = jsonOpt(p, "jarHash"),
                         iconUrl = jsonOpt(p, "iconUrl"),
+                        version = jsonOpt(p, "version"),
+                        sizeLabel = jsonOpt(p, "sizeLabel"),
+                        description = jsonOpt(p, "description"),
+                        language = jsonOpt(p, "language"),
+                        tags = p.optJSONArray("tags")?.let { arr ->
+                            (0 until arr.length()).mapNotNull {
+                                arr.optString(it).takeIf { s -> s.isNotBlank() }
+                            }
+                        }.orEmpty(),
                     )
                 )
             }
@@ -3105,6 +3318,11 @@ class ExtensionsScreenView {
                         p.fileHash?.let { put("fileHash", it) }
                         p.jarHash?.let { put("jarHash", it) }
                         p.iconUrl?.let { put("iconUrl", it) }
+                        p.version?.let { put("version", it) }
+                        p.sizeLabel?.let { put("sizeLabel", it) }
+                        p.description?.let { put("description", it) }
+                        p.language?.let { put("language", it) }
+                        if (p.tags.isNotEmpty()) put("tags", JSONArray(p.tags))
                     })
                 }
                 val o = JSONObject().apply {

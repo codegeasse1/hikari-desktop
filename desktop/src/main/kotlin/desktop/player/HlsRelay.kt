@@ -102,7 +102,16 @@ object HlsRelay {
                     targetUrl = root.resolve(segKey).toString()
                 }
             }
-            val resp = Http.relayFetch(targetUrl, route.headers, incomingRange, isHead)
+            val resp = try {
+                // Edges hiccup: one failed segment kills the whole stream in
+                // mpv, while a retry usually sails through (403/404 stay final
+                // — a spent token or a dead link — see relayFetchRetrying).
+                Http.relayFetchRetrying(targetUrl, route.headers, incomingRange, isHead)
+            } catch (e: Exception) {
+                ex.sendResponseHeaders(502, -1)
+                ex.close()
+                return
+            }
             if (!resp.isSuccessful && resp.code != 206) {
                 val code = resp.code
                 resp.close()
@@ -147,9 +156,16 @@ object HlsRelay {
                 }
                 val rewritten = rewritePlaylist(text, targetUrl, route.headers)
                 val bytes = rewritten.toByteArray(StandardCharsets.UTF_8)
-                // Cache EVERY playlist level, not just the master: variant URLs
-                // can be single-use signed too, and mpv re-opens them.
-                masterCache[key] = bytes
+                // Cache VOD playlists only, not just the master: variant URLs
+                // can be single-use signed too, and mpv re-opens them. A LIVE
+                // playlist (no ENDLIST) keeps growing — caching it freezes the
+                // stream at whatever segments existed on the first read, so it
+                // is always re-fetched. The map is bounded: routes accumulate
+                // over a session and must not grow without limit.
+                if (text.contains("#EXT-X-ENDLIST")) {
+                    if (masterCache.size > 150) masterCache.clear()
+                    masterCache[key] = bytes
+                }
                 ex.responseHeaders.set("Content-Type", "application/vnd.apple.mpegurl")
                 ex.responseHeaders.set("Accept-Ranges", "bytes")
                 ex.sendResponseHeaders(200, bytes.size.toLong())

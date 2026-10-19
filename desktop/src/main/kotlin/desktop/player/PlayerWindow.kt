@@ -473,6 +473,10 @@ object PlayerWindow {
             teardown = false
             if (root == null) buildUi()
             val ui = root ?: return@runBlock false
+            // The layer is reused across plays but the glue timer dies with
+            // every close — without this a second play never re-glued the
+            // video or re-armed the controls (see [startSyncTimer]).
+            startSyncTimer()
             if (!mounted) {
                 host.children.setAll(ui)
                 mounted = true
@@ -1596,6 +1600,19 @@ object PlayerWindow {
                 positionOverlays()
             }
         }
+        syncTimer = null
+        startSyncTimer()
+    }
+
+    /**
+     * (Re)starts the 120 ms glue timer. It dies with the first close
+     * ([closeInternal]), and the player layer is REUSED across plays — so a
+     * second play without this restarted nothing: the video was never
+     * re-glued, the floating bars never re-placed, and mouse-over-video never
+     * brought the controls back (the "lost all buttons" report).
+     */
+    private fun startSyncTimer() {
+        if (syncTimer != null) return
         syncTimer = Timeline(
             KeyFrame(Duration.millis(SYNC_MS), EventHandler<ActionEvent> {
                 safeSync()
@@ -1606,7 +1623,6 @@ object PlayerWindow {
             cycleCount = Timeline.INDEFINITE
             play()
         }
-    }
 
     /**
      * Fits the two bars to the width the window actually has.
@@ -1820,9 +1836,22 @@ object PlayerWindow {
         // otherwise leave its last frame frozen over the app.
         parkSurface()
         // The floating bars are windows of their own: they do not go away with
-        // the app's own content, so they are taken down explicitly.
+        // the app's own content. They go back into the window's layout FIRST
+        // (which hides their stages) so a failed hide can never leave them
+        // floating over the home screen — the "player UI over the catalogue"
+        // report. The layer itself is then detached from its host, so nothing
+        // of the player survives to be re-shown by a late callback.
+        runCatching { releaseOverlayBars() }
         runCatching { hideOverlay(stripStage) }
         runCatching { hideOverlay(barStage) }
+        runCatching {
+            val host = AppShell.playerHost
+            val ui = root
+            if (ui != null) host.children.remove(ui)
+            host.isVisible = false
+            host.isManaged = false
+        }
+        mounted = false
         // Leaving the app fullscreen with no player in it would strand the user
         // on a screen with no controls.
         runCatching { AppShell.stage }.getOrNull()?.let { leaveFullscreen(it) }
@@ -1830,10 +1859,6 @@ object PlayerWindow {
         duration = 0.0
         scrubbing = false
         paused = false
-        runCatching {
-            AppShell.playerHost.isVisible = false
-            AppShell.playerHost.isManaged = false
-        }
     }
 
     /** Only the fullscreen button's icon depends on the stage's own fullscreen
@@ -1888,31 +1913,37 @@ object PlayerWindow {
     /**
      * The one place that puts the bars on screen or takes them away.
      *
-     * In the ordinary (in-layout) case, hiding them gives their height back to
-     * the video area, so the picture grows into the space instead of being
+     * The TOP strip never hides: it carries back/close, minimise, and the
+     * Source/Quality/Audio/Subs pickers, and an auto-hide that takes those
+     * away is exactly the reported "the player lost all buttons and can only
+     * be killed from the task manager". Only the bottom control bar gets out
+     * of the way of the picture.
+     *
+     * In the ordinary (in-layout) case, hiding the bar gives its height back
+     * to the video area, so the picture grows into the space instead of being
      * permanently wrapped in controls; [safeSync] then moves the video surface
      * to the new rectangle.
      *
      * When the bars float ([overlaysOn]) there is nothing to give back — the
-     * video area is already the whole window — so hiding them is purely "take
-     * the two little windows away", and the picture is uncovered rather than
-     * resized. That is the difference the user sees: the video is the same size
-     * with the controls up as with them hidden.
+     * video area is already the whole window — so hiding the bar is purely
+     * "take the little window away", and the picture is uncovered rather than
+     * resized. That is the difference the user sees: the video is the same
+     * size with the controls up as with them hidden.
      */
     private fun applyChrome() {
         val show = chromeVisible || paused || overlayUp
         if (!show) runCatching { hideChrome?.stop() }
+        topStrip?.let { it.isVisible = true; it.isManaged = true }
         if (overlaysOn) {
+            // The strip's own window stays up with the bar's coming and going.
+            showOverlay(stripStage)
+            positionOverlays()
             if (show) {
-                showOverlay(stripStage)
                 showOverlay(barStage)
-                positionOverlays()
             } else {
-                hideOverlay(stripStage)
                 hideOverlay(barStage)
             }
         } else {
-            topStrip?.let { it.isVisible = show; it.isManaged = show }
             bottomBar?.let { it.isVisible = show; it.isManaged = show }
         }
         // The pointer is the only thing left on the picture when the bars are
@@ -2284,6 +2315,11 @@ object PlayerWindow {
         refreshOverlay()
     }
 
+    /** True while the layer is showing a failure/note message — the owner's
+     *  watchdogs must not yank it away with a silent relaunch (the "error
+     *  flashes, then it plays by itself" dance). Safe from any thread. */
+    fun messageVisible(): Boolean = Fx.runBlock { messageBox?.isVisible == true } ?: false
+
     // ── the source picker ───────────────────────────────────────────────────
 
     /** Fills the Source menu with every stream the title/episode offered, and
@@ -2620,13 +2656,20 @@ object PlayerWindow {
     private fun seekTo(fraction: Double) {
         val d = duration
         if (d <= 0) return
+        // No control channel, no seek: moving the bar and the readout and then
+        // snapping back when the echo window expires is exactly the reported
+        // "click forward and the bar jumps to the end and comes back".
+        val h = ipc ?: run {
+            setStatus("The player's control channel is not connected — reopen the stream to seek.", isError = true)
+            return
+        }
         val f = fraction.coerceIn(0.0, 1.0)
         val pos = f * d
         seekBar?.let { it.value = f }
         lastPosition = (pos * 1000).toLong()
         renderTime()
         armSeekEcho(pos)
-        runCatching { ipc?.post("seek", pos, "absolute") }
+        runCatching { h.post("seek", pos, "absolute") }
     }
 
     /**
@@ -2637,12 +2680,18 @@ object PlayerWindow {
     private fun seekBy(delta: Double) {
         val d = duration
         if (d <= 0) return
+        // Same guard as [seekTo]: without a control channel the skip keys and
+        // buttons must say so instead of moving a bar that snaps back.
+        val h = ipc ?: run {
+            setStatus("The player's control channel is not connected — reopen the stream to seek.", isError = true)
+            return
+        }
         val pos = (lastPosition / 1000.0 + delta).coerceIn(0.0, d)
         lastPosition = (pos * 1000).toLong()
         renderTime()
         seekBar?.let { it.value = (pos / d).coerceIn(0.0, 1.0) }
         armSeekEcho(pos)
-        runCatching { ipc?.post("seek", pos, "absolute") }
+        runCatching { h.post("seek", pos, "absolute") }
     }
 
     /** Starts the window in which reports of the pre-seek position are ignored. */
@@ -2861,9 +2910,14 @@ object PlayerWindow {
                 safeSync()
             }
             "end-file", "ipc-closed" -> {
-                val fatalPipe = event == "ipc-closed"
+                // A deliberate exit (mpv's own window quit with ESC/Q, end of
+                // file, an app-side stop) is not a death: the drain thread (or
+                // the stop itself) owns the teardown, and "recovering" here
+                // would relaunch a player the user just closed.
                 val reason = data.optString("reason").ifBlank { data.optString("error") }
-                val realReason = reason.isNotBlank() && reason != "eof" && reason != "quit" && reason != "stop"
+                val cleanExit = reason == "eof" || reason == "quit" || reason == "stop"
+                val fatalPipe = event == "ipc-closed" && !cleanExit
+                val realReason = reason.isNotBlank() && !cleanExit
                 if (fatalPipe || realReason) {
                     val neverPlayed = !sawVideo
                     Fx.run {

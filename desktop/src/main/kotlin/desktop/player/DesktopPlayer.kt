@@ -90,6 +90,15 @@ object DesktopPlayer {
      *  stream-probe fallback), so the two can't double-popup. Reset per launch. */
     @Volatile private var dialogShown = false
 
+    /**
+     * Every launch takes a number. The failover, watchdog, drain and probe
+     * threads capture it at birth and check it before touching the UI: a
+     * thread from an older launch must never pop an error over (or silently
+     * relaunch away) a newer launch — that race is the reported "Retry shows,
+     * then it plays by itself a second later".
+     */
+    @Volatile private var launchGen = 0
+
     /** The exact command line the current player was launched with, and what it
      *  was asked to play. Kept for the player report — "which flags did it
      *  actually get" is the first question about a player that misbehaves. */
@@ -116,7 +125,13 @@ object DesktopPlayer {
             "M cycle mute\n" +
             "J seek -10\n" +
             "L seek 10\n" +
-            "F cycle fullscreen\n"
+            "F cycle fullscreen\n" +
+            // mpv's own window (machines where the video cannot be glued in):
+            // quitting it ends the process with code 0, which the app reads as
+            // "the stream finished" and takes its own layer down too — so ESC
+            // and Q always get the user out, even with no app controls around.
+            "ESC quit\n" +
+            "Q quit\n"
 
     /** Signed, short-lived stream URLs (chaturbate's `mmcdn.com`/`edge-hls`
      *  LL-HLS links) — their token is single-use and expires in seconds, so:
@@ -387,6 +402,7 @@ object DesktopPlayer {
     ) {
         Fx.run {
             ipcTarget = openIpcEndpoint()
+            val gen = ++launchGen
             val mpv = findMpv()
             if (mpv == null) {
                 val url = com.hikari.app.net.Http.sanitizeStreamUrl(stream.url)
@@ -549,6 +565,7 @@ object DesktopPlayer {
             if (!failedOver && glued) {
                 val myProc = p
                 val myUseRelay = useRelay
+                val myGen = gen
                 Thread(
                     {
                         Thread.sleep(12_000)
@@ -560,7 +577,11 @@ object DesktopPlayer {
                                 (if (myUseRelay) "relay" else "direct") + " — failing over once",
                         )
                         Fx.run {
-                            if (proc !== myProc) return@run
+                            // Superseded (a newer launch), or the user is
+                            // already reading a failure message — never yank
+                            // either away with a silent relaunch.
+                            if (myGen != launchGen || proc !== myProc) return@run
+                            if (PlayerWindow.messageVisible()) return@run
                             launchMpv(title, stream, refresh, attemptsLeft, failedOver = true)
                         }
                     },
@@ -573,6 +594,7 @@ object DesktopPlayer {
                 // the media segments). Say so over the video area — never leave
                 // a black rectangle sitting there, and never spawn a second
                 // player window behind the user's back.
+                val myGen = gen
                 Thread(
                     {
                         val startedAt = System.currentTimeMillis()
@@ -604,6 +626,9 @@ object DesktopPlayer {
                             }
                         }
                         Fx.run {
+                            // A newer launch superseded this watch: its UI is
+                            // none of this thread's business any more.
+                            if (myGen != launchGen) return@run
                             if (dialogShown || proc !== p || PlayerWindow.hasVideo()) return@run
                             if (!PlayerWindow.isEmbedded()) return@run
                             // Never blame the stream for a player we could not
@@ -621,7 +646,10 @@ object DesktopPlayer {
                             // left) does the browser fallback come up. The
                             // relaunched launch consumes one attempt, so this
                             // cannot loop: every retry decrements the budget.
-                            if (refresh != null && attemptsLeft > 0) {
+                            // A visible failure message always wins over this:
+                            // relaunching under it is the "Retry flashes, then
+                            // it plays by itself" dance.
+                            if (refresh != null && attemptsLeft > 0 && !PlayerWindow.messageVisible()) {
                                 val fresh = runCatching { refresh() }.getOrNull()
                                 if (fresh != null && fresh.url.isNotBlank()) {
                                     PlayerWindow.setStatus("Still opening the stream…", busy = true)
@@ -646,6 +674,7 @@ object DesktopPlayer {
                 ).apply { isDaemon = true; start() }
             }
             val startedAt = System.currentTimeMillis()
+            val myGen = gen
             Thread(
                 {
                     val tail = StringBuilder()
@@ -653,7 +682,7 @@ object DesktopPlayer {
                     val code = runCatching { p.exitValue() }.getOrDefault(-1)
                     // A newer launch (or a teardown) replaced this process while
                     // it was draining — its exit is not this player's business.
-                    if (proc !== p) return@Thread
+                    if (myGen != launchGen || proc !== p) return@Thread
                     if (code == 0 && !p.isAlive) {
                         // The stream finished with no error and no "next": mpv
                         // is gone, so the app's player layer goes too.
@@ -662,13 +691,20 @@ object DesktopPlayer {
                     if (code != 0 && !p.isAlive) {
                         val tailText = tail.toString()
                         val forbidden = tailText.contains("403")
-                        // Signed links (chaturbate) 403 the moment their token is
-                        // spent — grab a FRESH url from the provider and relaunch
-                        // instead of showing an error for a link that was fine.
-                        if (attemptsLeft > 0 && refresh != null && (signed || forbidden)) {
+                        // A dead link is fetched FRESH and relaunched silently —
+                        // for ANY failure with a refresh available, not just
+                        // signed/403 ones: an error dialog for a link that was
+                        // fine costs the user the stream, while the relaunch
+                        // costs nothing. Never yank away an error the user is
+                        // already reading (see [dialogShown]): that flash is the
+                        // reported "Retry shows, then it plays by itself".
+                        if (attemptsLeft > 0 && refresh != null && !dialogShown) {
                             val fresh = runCatching { refresh() }.getOrNull()
                             if (fresh != null && fresh.url.isNotBlank()) {
-                                Fx.run { launchMpv(title, fresh, refresh, attemptsLeft - 1) }
+                                Fx.run {
+                                    if (myGen != launchGen || proc !== p) return@run
+                                    launchMpv(title, fresh, refresh, attemptsLeft - 1)
+                                }
                                 return@Thread
                             }
                         }
@@ -680,7 +716,7 @@ object DesktopPlayer {
                                 .takeLast(10)
                                 .joinToString("\n")
                             Fx.run {
-                                if (dialogShown || proc !== p) return@run
+                                if (dialogShown || myGen != launchGen || proc !== p) return@run
                                 dialogShown = true
                                 val hint = if (forbidden)
                                     "\n\nThis site refused the stream link (HTTP 403). The link may have expired —" +
@@ -711,6 +747,7 @@ object DesktopPlayer {
             // Signed chaturbate links are skipped — probing them consumes the
             // single-use token and turns the actual playback into a 403.
             val myProc = p
+            val myGen = gen
             if (!signed) {
                 Thread(
                     {
@@ -720,7 +757,7 @@ object DesktopPlayer {
                             verdict != com.hikari.app.net.Http.StreamProbe.UNKNOWN
                         ) {
                             Fx.run {
-                                if (dialogShown || proc !== myProc || !myProc.isAlive) return@run
+                                if (dialogShown || myGen != launchGen || proc !== myProc || !myProc.isAlive) return@run
                                 dialogShown = true
                                 runCatching { myProc.destroy() }
                                 when (verdict) {
@@ -980,15 +1017,20 @@ object DesktopPlayer {
         attemptsLeft: Int,
         url: String,
     ) {
-        if (dialogShown) return
         System.err.println("player: the player process died — attemptsLeft=" + attemptsLeft)
         killPrevious(proc)
         proc = null
-        if (attemptsLeft > 0) {
+        if (attemptsLeft > 0 && !dialogShown) {
+            // Auto-recovery only while no failure is on screen: relaunching
+            // under a shown dialog is the "Retry flashes, then it plays by
+            // itself" dance. The relaunch clears the layer's message (see
+            // resetForNewStream), and the next launch's threads ignore this
+            // one (see launchGen).
             val fresh = if (refresh != null) runCatching { refresh() }.getOrNull() else null
             launchMpv(title, fresh ?: stream, refresh, attemptsLeft - 1)
             return
         }
+        if (dialogShown) return
         dialogShown = true
         showBrowserFallback(
             title, url,

@@ -1106,6 +1106,15 @@
     -fx-min-width: 40; -fx-min-height: 40;
     -fx-max-width: 40; -fx-max-height: 40;
 }
+.src-row-card {
+    -fx-background-color: -h-surface-2;
+    -fx-border-color: -h-border;
+    -fx-border-width: 1;
+    -fx-border-radius: 12;
+    -fx-background-radius: 12;
+    -fx-padding: 12 14 12 14;
+}
+.src-row-card:hover { -fx-border-color: -h-border-3; }
 .repo-ic .h-icon { -fx-fill: -h-accent; }
 .repo-tile {
     -fx-background-color: -h-surface-3;
@@ -1382,7 +1391,7 @@
 .x-side-logo { -fx-background-color: transparent; -fx-padding: 6; -fx-background-radius: 14; }
 .x-side-logo:hover { -fx-background-color: -h-accent-soft; }
 .x-side-mark { -fx-background-color: linear-gradient(to bottom right, -h-accent, -h-accent-2); -fx-background-radius: 12; -fx-min-width: 34; -fx-min-height: 34; -fx-pref-width: 34; -fx-pref-height: 34; -fx-max-width: 34; -fx-max-height: 34; }
-.x-side .x-side-btn { -fx-background-color: transparent; -fx-background-radius: 13; -fx-padding: 0; -fx-min-width: 44; -fx-min-height: 44; -fx-pref-width: 44; -fx-pref-height: 44; -fx-max-width: 44; -fx-max-height: 44; }
+.x-side .x-side-btn { -fx-background-color: transparent; -fx-background-radius: 13; -fx-alignment: center; -fx-padding: 0; -fx-min-width: 44; -fx-min-height: 44; -fx-pref-width: 44; -fx-pref-height: 44; -fx-max-width: 44; -fx-max-height: 44; }
 .x-side .x-side-btn SVGPath, .x-side .x-side-btn Shape { -fx-fill: -h-fg-3; }
 .x-side .x-side-btn:hover { -fx-background-color: -h-accent-soft; }
 .x-side .x-side-btn.nav-btn-selected { -fx-background-color: -h-accent-soft; -fx-border-color: -h-accent-line; -fx-border-radius: 13; -fx-border-width: 1; }
@@ -1553,9 +1562,9 @@
 .x-pd-plus .h-icon { -fx-fill: -h-accent; }
 
 /* The multi-feed toggle: a track with a knob, accent when on. */
-.x-switch { -fx-background-color: -h-surface-4; -fx-background-radius: 999; -fx-padding: 4; -fx-cursor: hand; -fx-min-width: 46; -fx-pref-width: 46; -fx-max-width: 46; -fx-min-height: 26; -fx-pref-height: 26; -fx-max-height: 26; }
+.x-switch { -fx-background-color: -h-surface-4; -fx-background-radius: 999; -fx-alignment: center-left; -fx-padding: 4; -fx-cursor: hand; -fx-min-width: 46; -fx-pref-width: 46; -fx-max-width: 46; -fx-min-height: 26; -fx-pref-height: 26; -fx-max-height: 26; }
 .x-switch-knob { -fx-background-color: -h-fg-3; -fx-background-radius: 999; -fx-min-width: 18; -fx-pref-width: 18; -fx-max-width: 18; -fx-min-height: 18; -fx-pref-height: 18; -fx-max-height: 18; }
-.x-switch-on { -fx-background-color: -h-accent; }
+.x-switch-on { -fx-background-color: -h-accent; -fx-alignment: center-right; }
 .x-switch-on .x-switch-knob { -fx-background-color: white; }
 .x-switch:focused { -fx-border-color: -h-accent-line; -fx-border-radius: 999; -fx-border-width: 1; }
 

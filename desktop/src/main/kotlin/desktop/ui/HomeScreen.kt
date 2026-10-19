@@ -309,6 +309,10 @@ class HomeScreenView {
         heroBox.isVisible = true
         heroBox.isManaged = true
         showHero()
+        // Warm the TMDB data for the whole rotation up front, so stepping to
+        // the next hero already has its high-quality backdrop (see [showHero])
+        // instead of painting the provider art and swapping seconds later.
+        heroItems.forEach { enrichHero(it) }
         heroTimer?.stop()
         heroTimer = Timeline(
             KeyFrame(Duration.seconds(9.0), javafx.event.EventHandler<javafx.event.ActionEvent> { stepHero(1) }),
@@ -359,8 +363,11 @@ class HomeScreenView {
         }
         paintHeroMeta(item, enrich)
         heroDesc.text = item.overview?.replace(Regex("<[^>]*>"), "")?.replace(Regex("\\s+"), " ")?.trim().orEmpty()
-        // Backdrop first, poster as the fallback — never an empty banner.
-        val art = desktop.img.ImageLoader.artFor(item.backdropUrl, item.posterUrl)
+        // TMDB artwork first (high quality), the provider's own art only as
+        // the fallback — the banner never shows a low-quality image when the
+        // database has the real backdrop.
+        val art = enrich?.backdrops?.firstOrNull()?.takeIf { it.isNotBlank() }
+            ?: desktop.img.ImageLoader.artFor(item.backdropUrl, item.posterUrl)
         if (!art.isNullOrBlank()) {
             desktop.img.ImageLoader.loadAsync(art, onReady = { img ->
                 if (img != null && myGen == heroGen) crossfadeHero(img)
@@ -600,13 +607,18 @@ class HomeScreenView {
                     delay(500)
                     attempts++
                 }
-                val enabled = AppShell.app.store.providers().filter { it.enabled }
+                val all = AppShell.app.store.providers()
                     .distinctBy { it.name }
                     // Alphabetical, not install order: this is a list of names
                     // the user scans to find one, and the order they were added
                     // is meaningless to them.
                     .sortedBy { it.name.lowercase() }
-                providerNamesById = enabled.associate { it.id to it.name }
+                // The picker lists EVERYTHING installed (disabled ones marked,
+                // adding one enables it) — the feed itself only ever loads from
+                // enabled providers (see filterIds below).
+                val enabled = all.filter { it.enabled }
+                val enabledIds = enabled.map { it.id }.toSet()
+                providerNamesById = all.associate { it.id to it.name }
                 // The picker holds the user's choice, so it is read on the FX
                 // thread from its LIVE state — there is no stale copy to
                 // reconcile (the old combo box needed that dance because JavaFX
@@ -614,7 +626,7 @@ class HomeScreenView {
                 // committed to `value`, which clobbered the user's pick back to
                 // "All providers").
                 val (chosen, filterId, filterIds) = Fx.runBlock {
-                    providerPicker.setProviders(enabled)
+                    providerPicker.setProviders(all)
                     // An Explore row asked for a provider while we were
                     // elsewhere: apply it now that the list is fresh, and the
                     // rest of this load reads it like a manual pick. Best
@@ -644,7 +656,11 @@ class HomeScreenView {
                         }
                     }
                     val cfg = providerPicker.selection
-                    val multi = if (providerPicker.multiOn) providerPicker.multiIds().toSet() else null
+                    // A persisted feed can name a provider that was disabled
+                    // since: the feed only loads from enabled ones.
+                    val multi = if (providerPicker.multiOn) {
+                        providerPicker.multiIds().filter { it in enabledIds }.toSet()
+                    } else null
                     val c = providerPicker.selectedName()
                     // The banner names whose catalog this page is, so a pick
                     // from Explore or the picker is unmistakable (see

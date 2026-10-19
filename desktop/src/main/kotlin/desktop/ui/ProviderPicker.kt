@@ -461,6 +461,9 @@ class ProviderPicker(private val onPick: () -> Unit) {
     private fun availableRow(p: ProviderConfig): HBox {
         val name = Label(p.name).apply { styleClass.add("x-pd-name"); isWrapText = true; minWidth = 0.0 }
         val sub = subLabelFor(p)
+        // Installed-but-disabled providers are offered too (with a mark):
+        // adding one enables it, so the feed can mix in anything installed.
+        if (!p.enabled) sub.text = (if (sub.text.isBlank() || sub.text == "…") "" else sub.text + " · ") + "disabled"
         val texts = VBox(3.0, name, sub).apply { minWidth = 0.0 }
         HBox.setHgrow(texts, Priority.ALWAYS)
         val add = Button().apply {
@@ -557,6 +560,14 @@ class ProviderPicker(private val onPick: () -> Unit) {
 
     private fun addActive(id: String) {
         if (activeIds.contains(id)) return
+        // Adding a disabled provider enables it first: the feed only loads
+        // from enabled providers, so adding without enabling would silently
+        // contribute nothing.
+        val cfg = providers.firstOrNull { it.id == id }
+        if (cfg != null && !cfg.enabled) {
+            runCatching { AppShell.app.store.setEnabled(id, true) }
+            providers = providers.map { if (it.id == id) it.copy(enabled = true) else it }
+        }
         activeIds.add(id)
         persist()
         rebuildMain()
@@ -573,6 +584,12 @@ class ProviderPicker(private val onPick: () -> Unit) {
     }
 
     private fun applySelection(cfg: ProviderConfig?, fire: Boolean) {
+        // Picking a disabled provider enables it: a pick that loads nothing
+        // would read as a broken picker.
+        if (cfg != null && !cfg.enabled) {
+            runCatching { AppShell.app.store.setEnabled(cfg.id, true) }
+            providers = providers.map { if (it.id == cfg.id) it.copy(enabled = true) else it }
+        }
         selection = cfg
         if (cfg != null) multiOn = false
         persist()

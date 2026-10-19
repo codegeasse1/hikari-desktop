@@ -130,7 +130,7 @@ object TmdbResolver {
     private suspend fun resolveNumericId(id: String, item: MediaItem): Resolved? {
         return when (item.type) {
             MediaType.MOVIE -> Resolved(id, "movie")
-            MediaType.SERIES -> Resolved(id, if (item.rawType.contains("anime", true)) "anime" else "tv")
+            MediaType.SERIES -> Resolved(id, "tv")
             else -> {
                 // Unknown type: probe both namespaces (first that exists).
                 if (apiGet("/tv/$id", emptyMap())?.has("id") == true) Resolved(id, "tv")
@@ -148,7 +148,7 @@ object TmdbResolver {
             if (arr != null && arr.length() > 0) arr.optJSONObject(0)?.optString("id") else null
         return when (item.type) {
             MediaType.MOVIE -> first(movies)?.let { Resolved(it, "movie") }
-            MediaType.SERIES -> first(tvs)?.let { Resolved(it, if (item.rawType.contains("anime", true)) "anime" else "tv") }
+            MediaType.SERIES -> first(tvs)?.let { Resolved(it, "tv") }
             else -> first(tvs)?.let { Resolved(it, "tv") }
                 ?: first(movies)?.let { Resolved(it, "movie") }
         }
