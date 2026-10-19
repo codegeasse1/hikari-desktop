@@ -154,37 +154,42 @@ object AppShell {
     }
 
     private fun sidebar(): Region {
-        val box = VBox(3.0).apply {
-            styleClass.add("sidebar")
-            minWidth = 216.0
-            prefWidth = 216.0
-            maxWidth = 216.0
+        val box = VBox(6.0).apply {
+            styleClass.add("x-side")
+            minWidth = 68.0
+            prefWidth = 68.0
+            maxWidth = 68.0
         }
 
-        val mark = Region().apply { styleClass.add("sidebar-logo-mark") }
-        val brand = VBox(0.0,
-            Theme.label("Hikari", size = 17.0, bold = true).apply { styleClass.add("sidebar-logo") },
-            Theme.label("every stream, one place", size = 10.5, dim = true),
-        )
-        box.children.add(HBox(10.0, mark, brand).apply {
-            alignment = Pos.CENTER_LEFT
-            padding = Insets(6.0, 6.0, 16.0, 6.0)
+        val version = runCatching { "v${desktop.Build.VERSION} · ${desktop.Build.COMMIT}" }.getOrDefault("Hikari")
+        val mark = Button().apply {
+            styleClass.add("x-side-logo")
+            graphic = Region().apply { styleClass.add("x-side-mark") }
+            isFocusTraversable = false
+            setOnAction { show(Screen.Home) }
+        }
+        // Tooltips here are safe: nothing overlaps the rail, so no popup can
+        // ever eat a click meant for a button under it.
+        Ui.tooltip(version).let { mark.tooltip = it }
+        box.children.add(HBox(mark).apply {
+            alignment = Pos.CENTER
+            padding = Insets(10.0, 0.0, 12.0, 0.0)
         })
 
         navButtons = mutableListOf()
         fun nav(screen: Screen, icon: String, text: String) {
-            val button = Button(text).apply {
-                styleClass.add("nav-btn")
-                graphic = Icons.of(icon, 17.0)
-                maxWidth = Double.MAX_VALUE
+            val button = Button().apply {
+                styleClass.addAll("nav-btn", "x-side-btn")
+                graphic = Icons.of(icon, 20.0)
+                accessibleText = text
                 isFocusTraversable = false
                 setOnAction { show(screen) }
             }
+            Ui.tooltip(text).let { button.tooltip = it }
             navButtons.add(screen to button)
-            box.children.add(button)
+            box.children.add(HBox(button).apply { alignment = Pos.CENTER })
         }
 
-        box.children.add(Theme.overline("Watch").apply { styleClass.add("sidebar-section") })
         nav(Screen.Home, Icons.HOME, "Home")
         nav(Screen.Explore, Icons.EXPLORE, "Explore")
         nav(Screen.Search, Icons.SEARCH, "Search")
@@ -192,30 +197,18 @@ object AppShell {
         nav(Screen.Downloads, Icons.DOWNLOAD, "Downloads")
         nav(Screen.History, Icons.HISTORY, "History")
 
-        box.children.add(Theme.overline("Sources").apply { styleClass.add("sidebar-section") })
+        box.children.add(Region().apply {
+            styleClass.add("x-side-sep")
+            minHeight = 1.0
+            maxHeight = 1.0
+            HBox.setMargin(this, Insets(8.0, 16.0, 8.0, 16.0))
+        })
         nav(Screen.Extensions, Icons.EXTENSIONS, "Extensions")
         nav(Screen.Settings, Icons.SETTINGS, "Settings")
 
         val grow = Region().apply { VBox.setVgrow(this, Priority.ALWAYS) }
         box.children.add(grow)
-        box.children.add(sidebarFooter())
         return box
-    }
-
-    private fun sidebarFooter(): Region {
-        val providers = runCatching {
-            val enabled = app.store.providers().count { it.enabled }
-            val repos = app.store.repos().size
-            "$enabled providers · $repos repos"
-        }.getOrDefault("no data yet")
-        return VBox(2.0,
-            Theme.label("Hikari Desktop", size = 11.5, bold = true),
-            Theme.label("v${desktop.Build.VERSION} · $providers", size = 10.5, dim = true),
-            Theme.label("build ${desktop.Build.DATE} ${desktop.Build.COMMIT}", size = 10.0, dim = true),
-        ).apply {
-            styleClass.add("sidebar-foot")
-            padding = Insets(9.0, 11.0, 9.0, 11.0)
-        }
     }
 
     private fun topbar(): Region {

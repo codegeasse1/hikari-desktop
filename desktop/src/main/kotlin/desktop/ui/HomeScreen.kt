@@ -1,16 +1,19 @@
 package desktop.ui
 
 import com.hikari.app.data.CatalogRow
+import com.hikari.app.data.HistoryEntry
 import com.hikari.app.data.MediaItem
 import com.hikari.app.data.MediaType
+import com.hikari.app.data.TmdbDetails
 import desktop.fx.Fx
-import javafx.animation.FadeTransition
 import javafx.animation.KeyFrame
 import javafx.animation.Timeline
 import javafx.geometry.Insets
 import javafx.geometry.Pos
 import javafx.scene.Node
+import javafx.scene.control.Button
 import javafx.scene.control.Label
+import javafx.scene.control.ProgressBar
 import javafx.scene.control.ScrollPane
 import javafx.scene.image.ImageView
 import javafx.scene.layout.HBox
@@ -25,8 +28,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
- * Home: a featured hero banner pulled from whatever the newest catalogs
- * returned, followed by one horizontal rail per catalog.
+ * Home: a full-bleed cinematic hero (auto-rotating backdrop art of the
+ * featured titles), a Continue Watching rail built from playback history, then
+ * one headed rail per catalog with View All + paging arrows.
  *
  * Rows render the moment each catalog lands, so the page fills in progressively
  * instead of waiting on the slowest addon, and a failing catalog is skipped
@@ -36,85 +40,89 @@ class HomeScreenView {
 
     // ── hero ────────────────────────────────────────────────────────────────
 
-    /**
-     * The featured card: the title's POSTER on the left (the same artwork the
-     * grid thumbnail uses — a poster is high-resolution and crisp at this size,
-     * where an upscaled backdrop was the blurry banner), and the details on the
-     * right, with the page dots under the card.
-     */
-    private val heroPoster = ImageView().apply {
-        isPreserveRatio = false
+    /** Two stacked artwork layers for the backdrop crossfade. */
+    private val heroBgA = ImageView().apply { isPreserveRatio = false; isSmooth = true; isMouseTransparent = true }
+    private val heroBgB = ImageView().apply { isPreserveRatio = false; isSmooth = true; isMouseTransparent = true; opacity = 0.0 }
+    private var heroFgA = true
+    private var heroArtA: javafx.scene.image.Image? = null
+    private var heroArtB: javafx.scene.image.Image? = null
+    private var heroGen = 0
+
+    private fun paintHeroBg() {
+        val w = heroStack.width
+        val h = heroStack.height
+        if (w > 0 && h > 0) {
+            Ui.coverImage(heroBgA, heroArtA, w, h)
+            Ui.coverImage(heroBgB, heroArtB, w, h)
+        }
+    }
+
+    private val heroLogo = ImageView().apply {
+        isPreserveRatio = true
         isSmooth = true
+        fitHeight = 118.0
+        isVisible = false
+        isManaged = false
+        isMouseTransparent = true
     }
-    private var heroPosterArt: javafx.scene.image.Image? = null
-    private val heroPosterClip = Rectangle().apply { arcWidth = 16.0; arcHeight = 16.0 }
-    private val heroPosterFrame = StackPane(heroPoster).apply {
-        styleClass.add("hero-poster")
-        clip = heroPosterClip
-    }
-
-    private fun paintHeroPoster() {
-        Ui.coverImage(heroPoster, heroPosterArt, POSTER_W, POSTER_H)
-    }
-
-    private val heroOver = themed("Featured", "hero-over")
-    private val heroTitle = themed("", "hero-title").apply {
-        // Wrapping the title (instead of letting it declare its full width as a
-        // minimum) is what keeps a long title — or a long provider name above it
-        // — from making the whole page wider than the window.
+    private val heroOver = themed("", "x-hero-over")
+    private val heroTitle = themed("", "x-hero-title").apply {
         isWrapText = true
-        maxWidth = 560.0
-        minWidth = 0.0
-        maxHeight = 74.0
-    }
-    private val heroMeta = themed("", "hero-meta").apply {
-        isWrapText = true
-        maxWidth = 560.0
+        maxWidth = 640.0
         minWidth = 0.0
     }
-    private val heroDesc = themed("", "hero-desc").apply {
+    private val heroMeta = themed("", "x-hero-meta").apply {
         isWrapText = true
-        maxWidth = 560.0
+        maxWidth = 640.0
         minWidth = 0.0
-        maxHeight = 68.0
-        textOverrun = javafx.scene.control.OverrunStyle.ELLIPSIS
+    }
+    private val heroDesc = themed("", "x-hero-desc").apply {
+        isWrapText = true
+        maxWidth = 600.0
+        minWidth = 0.0
     }
     private val heroActions = HBox(10.0).apply { alignment = Pos.CENTER_LEFT }
-    private val heroDots = HBox(7.0).apply { alignment = Pos.CENTER }
+    private val heroDots = HBox(7.0).apply { alignment = Pos.CENTER_LEFT }
     private val heroStack = StackPane().apply {
-        styleClass.add("hero-wrap")
+        styleClass.add("x-hero")
         prefHeight = HERO_H
         minHeight = HERO_H
         maxHeight = HERO_H
         minWidth = 0.0
         maxWidth = Double.MAX_VALUE
     }
-    private val heroDotsRow = StackPane(heroDots).apply {
-        alignment = Pos.CENTER
-        minWidth = 0.0
-        maxWidth = Double.MAX_VALUE
-    }
-    /** The hero as it is laid out on the page: the card, then the dots. */
-    private val heroBox = VBox(8.0, heroStack, heroDotsRow).apply {
+    private val heroBox = VBox(heroStack).apply {
         minWidth = 0.0
         maxWidth = Double.MAX_VALUE
     }
     private var heroItems: List<MediaItem> = emptyList()
     private var heroIndex = 0
     private var heroTimer: Timeline? = null
+    /** Enriched TMDB data per hero item, so ratings/logos survive rotation. */
+    private val heroEnrich = HashMap<String, TmdbDetails.Details?>()
+    private var heroEnrichStarted = HashSet<String>()
+
+    /** providerId → name, filled on every load so the hero can name the source
+     *  of the title it is featuring without re-reading the store. */
+    private var providerNamesById: Map<String, String> = emptyMap()
 
     /** The provider filter the hero's items were picked for. The hero is
      *  re-seeded whenever this changes, so it always features the provider the
      *  user has selected — not whichever provider happened to load first. */
     private var heroFilter: String? = null
 
-    /** providerId → name, filled on every load so the hero can name the source
-     *  of the title it is featuring without re-reading the store. */
-    private var providerNamesById: Map<String, String> = emptyMap()
+    // ── continue watching ───────────────────────────────────────────────────
+
+    private val cwSection = VBox(Theme.S3).apply {
+        minWidth = 0.0
+        maxWidth = Double.MAX_VALUE
+        isVisible = false
+        isManaged = false
+    }
 
     // ── page ────────────────────────────────────────────────────────────────
 
-    private val rowsBox = VBox(Theme.S4)
+    private val rowsBox = VBox(Theme.S5)
     /** The catalog's provider picker: chips by engine + a filter field + the
      *  list, and the only control that decides which provider the home page is
      *  built from. It calls back on every pick, so the catalog reloads. */
@@ -183,6 +191,7 @@ class HomeScreenView {
                 maxWidth = Double.MAX_VALUE
             },
             heroBox,
+            cwSection,
             statusLabel,
             errorLabel,
             rowsBox,
@@ -206,49 +215,56 @@ class HomeScreenView {
 
     private fun buildHero() {
         val clip = Rectangle().apply {
-            arcWidth = 30.0
-            arcHeight = 30.0
+            arcWidth = 26.0
+            arcHeight = 26.0
         }
         clip.widthProperty().bind(heroStack.widthProperty())
         clip.heightProperty().bind(heroStack.heightProperty())
         heroStack.clip = clip
-        // The poster is a fixed 2:3 card inside the featured card, so its art
-        // never has to be re-cropped on resize.
-        heroPoster.fitWidth = POSTER_W
-        heroPoster.fitHeight = POSTER_H
-        heroPosterClip.width = POSTER_W
-        heroPosterClip.height = POSTER_H
-        listOf(heroPosterFrame.prefWidthProperty(), heroPosterFrame.minWidthProperty(),
-            heroPosterFrame.maxWidthProperty()).forEach { it.set(POSTER_W) }
-        listOf(heroPosterFrame.prefHeightProperty(), heroPosterFrame.minHeightProperty(),
-            heroPosterFrame.maxHeightProperty()).forEach { it.set(POSTER_H) }
+        heroBgA.fitWidthProperty().bind(heroStack.widthProperty())
+        heroBgA.fitHeightProperty().bind(heroStack.heightProperty())
+        heroBgB.fitWidthProperty().bind(heroStack.widthProperty())
+        heroBgB.fitHeightProperty().bind(heroStack.heightProperty())
+        heroStack.widthProperty().addListener { _, _, _ -> paintHeroBg() }
+        heroStack.heightProperty().addListener { _, _, _ -> paintHeroBg() }
 
-        val body = VBox(8.0, heroOver, heroTitle, heroMeta, heroDesc, heroActions).apply {
-            alignment = Pos.CENTER_LEFT
+        val scrim = Region().apply {
+            styleClass.add("x-hero-scrim")
             maxWidth = Double.MAX_VALUE
+            maxHeight = Double.MAX_VALUE
+            isMouseTransparent = true
+        }
+        val scrimL = Region().apply {
+            styleClass.add("x-hero-scrim-l")
+            maxWidth = Double.MAX_VALUE
+            maxHeight = Double.MAX_VALUE
+            isMouseTransparent = true
+        }
+
+        val body = VBox(9.0, heroOver, heroLogo, heroTitle, heroMeta, heroDesc, heroActions).apply {
+            alignment = Pos.BOTTOM_LEFT
+            maxWidth = 680.0
             minWidth = 0.0
         }
-        HBox.setHgrow(body, Priority.ALWAYS)
+        StackPane.setAlignment(body, Pos.BOTTOM_LEFT)
+        StackPane.setMargin(body, Insets(0.0, 0.0, 30.0, 34.0))
 
-        val layout = HBox(24.0, heroPosterFrame, body).apply {
-            alignment = Pos.CENTER_LEFT
-            padding = Insets(CARD_PAD, 26.0, CARD_PAD, CARD_PAD)
-            minWidth = 0.0
-            maxWidth = Double.MAX_VALUE
-        }
-        heroStack.children.add(layout)
-        heroStack.cursor = javafx.scene.Cursor.HAND
-
-        val prev = Ui.iconButton(Icons.CHEVRON_LEFT, "Previous", 16.0) { stepHero(-1) }.apply { styleClass.add("round-btn") }
-        val next = Ui.iconButton(Icons.CHEVRON_RIGHT, "Next", 16.0) { stepHero(1) }.apply { styleClass.add("round-btn") }
+        val prev = Ui.iconButton(Icons.CHEVRON_LEFT, "Previous", 16.0) { stepHero(-1) }.apply { styleClass.add("x-round-btn") }
+        val next = Ui.iconButton(Icons.CHEVRON_RIGHT, "Next", 16.0) { stepHero(1) }.apply { styleClass.add("x-round-btn") }
         // The arrows sit inside a clickable banner, so their clicks must not
         // also open the featured title.
         Ui.isolateClicks(prev)
         Ui.isolateClicks(next)
         val nav = HBox(8.0, prev, next).apply { alignment = Pos.CENTER_RIGHT }
-        StackPane.setAlignment(nav, Pos.CENTER_RIGHT)
-        StackPane.setMargin(nav, Insets(0.0, 4.0, 0.0, 0.0))
-        heroDotsRow.children.add(nav)
+        StackPane.setAlignment(nav, Pos.BOTTOM_RIGHT)
+        StackPane.setMargin(nav, Insets(0.0, 22.0, 26.0, 0.0))
+
+        val dotsWrap = HBox(10.0, heroDots).apply { alignment = Pos.CENTER_LEFT }
+        StackPane.setAlignment(dotsWrap, Pos.BOTTOM_LEFT)
+        StackPane.setMargin(dotsWrap, Insets(0.0, 0.0, 30.0, 380.0))
+
+        heroStack.children.addAll(heroBgA, heroBgB, scrim, scrimL, body, dotsWrap, nav)
+        heroStack.cursor = javafx.scene.Cursor.HAND
 
         // Clicking the banner (anywhere that isn't a button) opens the title.
         heroStack.setOnMouseClicked { heroItems.getOrNull(heroIndex)?.let { AppShell.openDetail(it) } }
@@ -258,14 +274,17 @@ class HomeScreenView {
 
     private fun setHeroItems(items: List<MediaItem>) {
         if (items.isEmpty()) return
-        heroItems = items.take(6)
+        // Backdrop art first: the banner is a wide cinematic surface, and a
+        // landscape backdrop fills it edge to edge where a poster cannot.
+        val withArt = items.filter { !it.backdropUrl.isNullOrBlank() }
+        heroItems = (if (withArt.size >= 3) withArt else items).take(8)
         heroIndex = 0
         heroBox.isVisible = true
         heroBox.isManaged = true
         showHero()
         heroTimer?.stop()
         heroTimer = Timeline(
-            KeyFrame(Duration.seconds(10.0), javafx.event.EventHandler<javafx.event.ActionEvent> { stepHero(1) }),
+            KeyFrame(Duration.seconds(9.0), javafx.event.EventHandler<javafx.event.ActionEvent> { stepHero(1) }),
         ).apply {
             cycleCount = Timeline.INDEFINITE
             play()
@@ -284,50 +303,114 @@ class HomeScreenView {
 
     private fun showHero() {
         val item = heroItems.getOrNull(heroIndex) ?: return
+        val myGen = ++heroGen
         // Name the source of the featured title, so it is obvious that the
         // banner follows the provider selector above it.
         val provider = providerNamesById[item.providerId]
         heroOver.text = if (provider.isNullOrBlank()) "Featured" else "Featured · $provider"
-        heroTitle.text = item.title
-        heroMeta.text = listOfNotNull(
-            item.year?.toString(),
-            when (item.type) {
-                MediaType.SERIES -> "Series"
-                MediaType.MOVIE -> "Movie"
-                MediaType.UNKNOWN -> null
-            },
-            item.genres.take(3).joinToString(" · ").ifBlank { null },
-        ).joinToString("  ·  ")
-        heroDesc.text = item.overview?.replace(Regex("<[^>]*>"), "")?.replace(Regex("\\s+"), " ")?.trim().orEmpty()
-        heroPoster.opacity = 0.0
-        heroPosterArt = null
-        paintHeroPoster()
-        val art = desktop.img.ImageLoader.artFor(item.posterUrl, item.backdropUrl)
-        if (!art.isNullOrBlank()) {
-            desktop.img.ImageLoader.loadAsync(
-                art,
-                onReady = { img ->
-                    heroPosterArt = img
-                    paintHeroPoster()
-                    if (img != null) Ui.fade(heroPoster, 1.0, 300.0)
-                },
-                w = 480,
-                h = 720,
-            )
+        heroOver.isVisible = true
+        heroOver.isManaged = true
+        val enrich = heroEnrich[item.uniqueId]
+        if (enrich?.logoUrl != null) {
+            heroLogo.isVisible = false
+            heroLogo.isManaged = false
+            desktop.img.ImageLoader.loadAsync(enrich.logoUrl, onReady = { img ->
+                if (img != null && myGen == heroGen) {
+                    heroLogo.image = img
+                    heroLogo.isVisible = true
+                    heroLogo.isManaged = true
+                    heroTitle.isVisible = false
+                    heroTitle.isManaged = false
+                }
+            }, w = 640, h = 200)
         } else {
-            heroPoster.opacity = 1.0
+            heroLogo.isVisible = false
+            heroLogo.isManaged = false
+            heroTitle.text = item.title
+            heroTitle.isVisible = true
+            heroTitle.isManaged = true
+        }
+        paintHeroMeta(item, enrich)
+        heroDesc.text = item.overview?.replace(Regex("<[^>]*>"), "")?.replace(Regex("\\s+"), " ")?.trim().orEmpty()
+        // Backdrop first, poster as the fallback — never an empty banner.
+        val art = desktop.img.ImageLoader.artFor(item.backdropUrl, item.posterUrl)
+        if (!art.isNullOrBlank()) {
+            desktop.img.ImageLoader.loadAsync(art, onReady = { img ->
+                if (img != null && myGen == heroGen) crossfadeHero(img)
+            }, w = 1600, h = 900)
         }
         heroActions.children.setAll(
-            Ui.button("View Details", icon = Icons.PLAY, primary = true) { AppShell.openDetail(item) },
-            Ui.isolateClicks(Ui.button("Add to list", icon = Icons.PLUS, ghost = true) { addToLibrary(item) }),
+            Ui.isolateClicks(Button("Watch Now").apply {
+                styleClass.add("x-watch")
+                graphic = Icons.of(Icons.PLAY, 17.0)
+                isFocusTraversable = false
+                setOnAction { AppShell.openDetail(item) }
+            }),
+            Ui.isolateClicks(Ui.button("Add to list", icon = Icons.PLUS, ghost = true) {
+                addToLibrary(item)
+            }.apply { styleClass.add("x-glass-btn") }),
         )
         heroDots.children.setAll(heroItems.mapIndexed { index, _ ->
             Ui.isolateClicks(Region().apply {
-                styleClass.add("hero-dot")
-                if (index == heroIndex) styleClass.add("hero-dot-sel")
+                styleClass.add("x-hero-dot")
+                if (index == heroIndex) styleClass.add("x-hero-dot-sel")
                 setOnMouseClicked { heroIndex = index; showHero() }
             })
         })
+        enrichHero(item)
+    }
+
+    private fun paintHeroMeta(item: MediaItem, enrich: TmdbDetails.Details?) {
+        val parts = ArrayList<String>()
+        val rating = enrich?.tmdbRating?.takeIf { it > 0.0 } ?: enrich?.imdbRating?.takeIf { it > 0.0 }
+        val star = if (rating != null) "★ %.1f".format(rating) else null
+        val meta = listOfNotNull(
+            item.year?.toString(),
+            when (item.type) {
+                MediaType.SERIES -> "TV Series"
+                MediaType.MOVIE -> "Movie"
+                MediaType.UNKNOWN -> null
+            },
+            item.genres.take(2).joinToString(" • ").ifBlank { null },
+        ).joinToString("   ")
+        heroMeta.text = listOfNotNull(star, meta.ifBlank { null }).joinToString("    ")
+    }
+
+    /** Ratings + logo resolve in the background: the banner never waits on them. */
+    private fun enrichHero(item: MediaItem) {
+        if (heroEnrichStarted.contains(item.uniqueId)) return
+        heroEnrichStarted.add(item.uniqueId)
+        AppShell.uiScope.launch {
+            val d = runCatching { TmdbDetails.load(item) }.getOrNull()
+            heroEnrich[item.uniqueId] = d
+            Fx.run {
+                if (heroItems.getOrNull(heroIndex)?.uniqueId == item.uniqueId) showHero()
+                else paintHeroMeta(item, d)
+            }
+        }
+    }
+
+    private fun crossfadeHero(img: javafx.scene.image.Image) {
+        paintHeroBg()
+        if (heroFgA) {
+            heroArtB = img
+            Ui.coverImage(heroBgB, img, heroStack.width, heroStack.height)
+            Ui.fade(heroBgB, 1.0, 600.0)
+            heroFgA = false
+            javafx.animation.Timeline(
+                javafx.animation.KeyFrame(Duration.millis(650.0),
+                    javafx.event.EventHandler<javafx.event.ActionEvent> { heroBgA.opacity = 0.0; heroArtA = img }),
+            ).play()
+        } else {
+            heroArtA = img
+            Ui.coverImage(heroBgA, img, heroStack.width, heroStack.height)
+            Ui.fade(heroBgA, 1.0, 600.0)
+            heroFgA = true
+            javafx.animation.Timeline(
+                javafx.animation.KeyFrame(Duration.millis(650.0),
+                    javafx.event.EventHandler<javafx.event.ActionEvent> { heroBgB.opacity = 0.0; heroArtB = img }),
+            ).play()
+        }
     }
 
     private fun addToLibrary(item: MediaItem) {
@@ -338,6 +421,112 @@ class HomeScreenView {
             AppShell.toast("Added “${item.title}” to your library", "ok")
         }
     }
+
+    // ── continue watching ───────────────────────────────────────────────────
+
+    private fun buildContinueWatching() {
+        val entries = runCatching { AppShell.app.store.history() }.getOrDefault(emptyList())
+            .filter { it.positionMs > 30_000L && (it.durationMs <= 0L || it.positionMs < it.durationMs * 0.95) }
+            .sortedByDescending { it.watchedAt }
+            .take(12)
+        if (entries.isEmpty()) {
+            cwSection.isVisible = false
+            cwSection.isManaged = false
+            return
+        }
+        val row = HBox(Theme.S4).apply {
+            alignment = Pos.TOP_LEFT
+            padding = Insets(Theme.S1, Theme.S1, Theme.S2, Theme.S1)
+            minWidth = 0.0
+        }
+        entries.forEach { row.children.add(continueCard(it)) }
+        val scroll = Ui.rail(row)
+        val clear = Ui.button("Clear History", ghost = true) {
+            runCatching { AppShell.app.store.clearHistory() }
+            buildContinueWatching()
+        }.apply { styleClass.add("x-clear") }
+        val viewAll = Button("View All").apply {
+            styleClass.add("x-view-all")
+            isFocusTraversable = false
+            setOnAction { AppShell.show(Screen.History) }
+        }
+        val prev = Button().apply {
+            styleClass.add("x-head-arrow")
+            graphic = Icons.of(Icons.CHEVRON_LEFT, 15.0)
+            isFocusTraversable = false
+            setOnAction { Ui.nudge(scroll, -1) }
+        }
+        val next = Button().apply {
+            styleClass.add("x-head-arrow")
+            graphic = Icons.of(Icons.CHEVRON_RIGHT, 15.0)
+            isFocusTraversable = false
+            setOnAction { Ui.nudge(scroll, 1) }
+        }
+        val head = HBox(10.0,
+            Theme.label("Continue Watching", size = 19.0, bold = true).apply { styleClass.add("x-rail-title") },
+            Ui.spacer(), clear, viewAll, prev, next,
+        ).apply { alignment = Pos.CENTER_LEFT; minWidth = 0.0 }
+        cwSection.children.setAll(head, scroll)
+        cwSection.isVisible = true
+        cwSection.isManaged = true
+    }
+
+    private fun continueCard(e: HistoryEntry): VBox {
+        val art = ImageView().apply { isPreserveRatio = false; isSmooth = true; isMouseTransparent = true }
+        val frame = StackPane(art).apply {
+            styleClass.add("x-cw-art")
+            clip = Rectangle(CW_W, CW_H).apply { arcWidth = 18.0; arcHeight = 18.0 }
+            minWidth = CW_W; prefWidth = CW_W; maxWidth = CW_W
+            minHeight = CW_H; prefHeight = CW_H; maxHeight = CW_H
+        }
+        art.fitWidth = CW_W
+        art.fitHeight = CW_H
+        if (!e.posterUrl.isNullOrBlank()) {
+            desktop.img.ImageLoader.loadAsync(e.posterUrl, onReady = { img ->
+                if (img != null) Ui.coverImage(art, img, CW_W, CW_H)
+            }, w = 640, h = 360)
+        }
+        val scrim = Region().apply { styleClass.add("x-cw-scrim"); isMouseTransparent = true }
+        val title = Theme.label(e.title, size = 14.5, bold = true).apply {
+            styleClass.add("x-cw-title"); isWrapText = true; maxWidth = CW_W - 24.0; minWidth = 0.0; maxHeight = 40.0
+        }
+        val sub = Theme.label(
+            e.episodeName.takeIf { it.isNotBlank() } ?: e.title, size = 11.5, dim = true
+        ).apply { styleClass.add("x-cw-sub"); minWidth = 0.0; maxWidth = CW_W - 24.0 }
+        val left = if (e.durationMs > 0L) formatLeft(e.durationMs - e.positionMs) else null
+        val time = Theme.label(left ?: "", size = 11.0, dim = true).apply { styleClass.add("x-cw-time") }
+        val bar = ProgressBar(if (e.durationMs > 0L) (e.positionMs.toDouble() / e.durationMs).coerceIn(0.0, 1.0) else 0.0).apply {
+            styleClass.add("x-cw-prog"); prefWidth = CW_W - 24.0; maxWidth = CW_W - 24.0; minHeight = 4.0; prefHeight = 4.0; maxHeight = 4.0
+            isMouseTransparent = true; isFocusTraversable = false
+        }
+        val texts = VBox(2.0, title, HBox(8.0, sub, Ui.spacer(), time).apply { alignment = Pos.CENTER_LEFT }, bar).apply {
+            minWidth = 0.0; maxWidth = CW_W - 24.0
+        }
+        StackPane.setAlignment(texts, Pos.BOTTOM_LEFT)
+        StackPane.setMargin(texts, Insets(0.0, 0.0, 12.0, 12.0))
+        frame.children.addAll(scrim, texts)
+        return VBox(frame).apply {
+            styleClass.add("x-cw-card")
+            cursor = javafx.scene.Cursor.HAND
+            minWidth = CW_W; prefWidth = CW_W; maxWidth = CW_W
+            setOnMouseClicked {
+                AppShell.openDetail(
+                    MediaItem(
+                        providerId = e.providerId, id = e.mediaId, title = e.title, type = e.type,
+                        posterUrl = e.posterUrl,
+                    )
+                )
+            }
+        }
+    }
+
+    private fun formatLeft(ms: Long): String {
+        if (ms <= 0L) return ""
+        val m = ms / 60_000L
+        return if (m >= 60L) "${m / 60}h ${m % 60}m left" else "${m}m left"
+    }
+
+    // ── loading ─────────────────────────────────────────────────────────────
 
     private fun toggleLogs() {
         logsOpen = !logsOpen
@@ -362,6 +551,7 @@ class HomeScreenView {
     fun load(force: Boolean = false) {
         loadJob?.cancel()
         val myGen = ++gen
+        buildContinueWatching()
         loadJob = AppShell.uiScope.launch {
             try {
                 Fx.run {
@@ -506,24 +696,48 @@ class HomeScreenView {
         if (!logsOpen) toggleLogs()
     }
 
-    private fun buildRow(row: CatalogRow): Region = PosterRail.of(
-        title = row.title,
-        subtitle = row.providerName,
-        items = row.items,
-        onOpen = { AppShell.openDetail(it) },
-        onSeeAll = {
-            AppShell.show(Screen.Catalog(row.title, row.providerName, row.items))
-        },
-    )
+    private fun buildRow(row: CatalogRow): Region {
+        val cards = HBox(Theme.S4).apply {
+            alignment = Pos.TOP_LEFT
+            padding = Insets(Theme.S1, Theme.S1, Theme.S2, Theme.S1)
+            minWidth = 0.0
+        }
+        row.items.forEach { item ->
+            cards.children.add(PosterCard.make(item, onOpen = { AppShell.openDetail(it) }))
+        }
+        val scroll = Ui.rail(cards)
+        val viewAll = Button("View All").apply {
+            styleClass.add("x-view-all")
+            isFocusTraversable = false
+            setOnAction { AppShell.show(Screen.Catalog(row.title, row.providerName, row.items)) }
+        }
+        val prev = Button().apply {
+            styleClass.add("x-head-arrow")
+            graphic = Icons.of(Icons.CHEVRON_LEFT, 15.0)
+            isFocusTraversable = false
+            setOnAction { Ui.nudge(scroll, -1) }
+        }
+        val next = Button().apply {
+            styleClass.add("x-head-arrow")
+            graphic = Icons.of(Icons.CHEVRON_RIGHT, 15.0)
+            isFocusTraversable = false
+            setOnAction { Ui.nudge(scroll, 1) }
+        }
+        val head = HBox(10.0,
+            VBox(1.0,
+                Theme.label(row.title, size = 19.0, bold = true).apply { styleClass.add("x-rail-title"); minWidth = 0.0 },
+                Theme.label(row.providerName, size = 12.0, dim = true).apply { minWidth = 0.0 },
+            ).apply { minWidth = 0.0 },
+            Ui.spacer(), viewAll, prev, next,
+        ).apply { alignment = Pos.CENTER_LEFT; minWidth = 0.0 }
+        return VBox(Theme.S2, head, scroll).apply { minWidth = 0.0; maxWidth = Double.MAX_VALUE }
+    }
 
     private fun themed(text: String, cls: String): Label = Label(text).apply { styleClass.add(cls) }
 
     private companion object {
-        /** The featured card's height; the 2:3 poster inside it fills it minus
-         *  the card's padding. */
-        const val HERO_H = 300.0
-        const val CARD_PAD = 20.0
-        const val POSTER_H = HERO_H - 2 * CARD_PAD
-        const val POSTER_W = POSTER_H / 1.5
+        const val HERO_H = 440.0
+        const val CW_W = 320.0
+        const val CW_H = 180.0
     }
 }

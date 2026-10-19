@@ -14,15 +14,21 @@ import com.hikari.app.download.DownloadTask
 import com.hikari.app.download.DownloadsRepository
 import desktop.fx.Fx
 import desktop.player.DesktopPlayer
+import javafx.animation.KeyFrame
+import javafx.animation.Timeline
+import javafx.event.EventHandler
 import javafx.geometry.Insets
 import javafx.geometry.Pos
 import javafx.scene.Node
 import javafx.scene.control.Button
 import javafx.scene.control.Label
+import javafx.scene.control.ProgressBar
 import javafx.scene.control.ScrollPane
 import javafx.scene.control.TextField
+import javafx.scene.image.Image
 import javafx.scene.image.ImageView
 import javafx.scene.layout.BorderPane
+import javafx.scene.layout.GridPane
 import javafx.scene.layout.HBox
 import javafx.scene.layout.Priority
 import javafx.scene.layout.Region
@@ -30,6 +36,7 @@ import javafx.scene.layout.StackPane
 import javafx.scene.layout.TilePane
 import javafx.scene.layout.VBox
 import javafx.scene.shape.Rectangle
+import javafx.util.Duration
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -47,17 +54,16 @@ import kotlinx.coroutines.withContext
  * Layout rule — which region scrolls is decided once, and nothing else competes
  * for the same axis:
  *
- *  - the banner sits at the top at a fixed height;
- *  - the LEFT column scrolls as a whole (synopsis, facts, and the full episode
- *    grid, which can run to hundreds of tiles);
+ *  - the banner sits at the top at a fixed height (full-bleed artwork with a
+ *    rotating backdrop slideshow, logo treatment, meta, ratings and actions);
+ *  - the LEFT column scrolls as a whole (seasons + episode cards, cast & crew,
+ *    directors, studios, screenshots, trailers);
  *  - the RIGHT column is the fixed-width "Watch" panel: it never leaves the
  *    screen and instead owns the vertical space *inside* itself, with the
  *    source list as the one growing, scrolling child.
  *
  * Every piece here is bounded on both axes (`Ui.fill` + explicit min sizes), so
- * the screen fits any window — the previous version let the episode grid and
- * the source list report their full content size as a minimum, which pushed the
- * panel off the window and made both unscrollable.
+ * the screen fits any window.
  */
 /**
  * Test seam, set only by `desktop.uitest.UiShotTest`.
@@ -87,6 +93,12 @@ class DetailScreenView(private val item: MediaItem) {
     private var episodes: List<Episode> = emptyList()
     private var selectedEpisode: Episode? = null
     private var streams: List<StreamSource> = emptyList()
+    private var enrich: TmdbDetails.Details? = null
+    /** TMDB season stills for the current season, by episode number. */
+    private var stills: Map<Int, TmdbDetails.SeasonEpisode> = emptyMap()
+    private var stillsSeason = -1
+    /** Episode ids present in history — the watched check on the cards. */
+    private var watchedSet: Set<String> = emptySet()
 
     /** The job that keeps picking up servers found after the first one (see
      *  [pollSweep]). */
@@ -105,152 +117,145 @@ class DetailScreenView(private val item: MediaItem) {
      * One PAGE of episodes at a time — 30 by default — plus a range picker.
      *
      * A season with 400 episodes used to scroll as one endless grid (and a
-     * filter box you had to already know the number for). Now the grid shows the
-     * page you are on, the picker lists every range ("1 - 30", "31 - 60", …) so
-     * any part of the season is one click away, and Prev/Next walk the pages.
-     * Searching still looks across the WHOLE season — the picker governs the
-     * grid only when the search box is empty.
+     * filter box you had to already know the number for). Now the page renders
+     * as episode cards, the picker lists every range ("1 - 30", "31 - 60", …)
+     * so any part of the season is one click away, and Prev/Next walk the
+     * pages. Searching still looks across the WHOLE season — the picker governs
+     * the cards only when the search box is empty.
      */
     private var episodePage = 0
+    private var currentSeason = 1
+    private var seasonList: List<Int> = listOf(1)
+    private var sortAsc = true
+    private var antiSpoiler = false
+    private var castExpanded = false
+    private var shotsExpanded = false
 
     // ── hero ────────────────────────────────────────────────────────────────
 
-    private val heroImage = ImageView().apply {
-        isPreserveRatio = false
+    private val heroBgA = ImageView().apply { isPreserveRatio = false; isSmooth = true; isMouseTransparent = true }
+    private val heroBgB = ImageView().apply { isPreserveRatio = false; isSmooth = true; isMouseTransparent = true; opacity = 0.0 }
+    private var heroFgA = true
+    private var heroArtA: Image? = null
+    private var heroArtB: Image? = null
+    private var bgUrls: List<String> = emptyList()
+    private var bgIndex = 0
+    private var bgTimer: Timeline? = null
+    private var bgGen = 0
+
+    private fun paintHeroBg() {
+        val w = hero.width
+        val h = hero.height
+        if (w > 0 && h > 0) {
+            Ui.coverImage(heroBgA, heroArtA, w, h)
+            Ui.coverImage(heroBgB, heroArtB, w, h)
+        }
+    }
+
+    private fun crossfadeHero(img: Image) {
+        paintHeroBg()
+        if (heroFgA) {
+            heroArtB = img
+            Ui.coverImage(heroBgB, img, hero.width, hero.height)
+            Ui.fade(heroBgB, 1.0, 700.0)
+            heroFgA = false
+            Timeline(KeyFrame(Duration.millis(750.0), EventHandler { heroBgA.opacity = 0.0; heroArtA = img })).play()
+        } else {
+            heroArtA = img
+            Ui.coverImage(heroBgA, img, hero.width, hero.height)
+            Ui.fade(heroBgA, 1.0, 700.0)
+            heroFgA = true
+            Timeline(KeyFrame(Duration.millis(750.0), EventHandler { heroBgB.opacity = 0.0; heroArtB = img })).play()
+        }
+    }
+
+    private val heroLogo = ImageView().apply {
+        isPreserveRatio = true
         isSmooth = true
-    }
-
-    /** The banner's loaded artwork, kept so the cover-crop can be recomputed
-     *  whenever the banner is resized (see [paintHero]). */
-    private var heroArt: javafx.scene.image.Image? = null
-
-    private fun applyHeroArt(img: javafx.scene.image.Image?) {
-        heroArt = img
-        paintHero()
-    }
-
-    private fun paintHero() {
-        Ui.coverImage(heroImage, heroArt, hero.width, hero.height)
-    }
-
-    /**
-     * The poster card on the RIGHT of the banner.
-     *
-     * The backdrop alone is a wide, short crop — it cut the artwork off at the
-     * top and bottom and had nothing to say about the title as a *poster*. A 2:3
-     * poster beside the details is what makes the header read like a store page:
-     * artwork on the right, title/meta/actions on the left. It is sized from the
-     * banner's width, so it can never push the title off the left edge.
-     */
-    private val heroPoster = ImageView().apply {
-        isPreserveRatio = false
-        isSmooth = true
-    }
-    private var heroPosterArt: javafx.scene.image.Image? = null
-
-    private fun paintPoster() {
-        Ui.coverImage(heroPoster, heroPosterArt, posterW, posterH)
-    }
-
-    private val posterClip = Rectangle().apply {
-        arcWidth = 28.0
-        arcHeight = 28.0
-    }
-    private val heroPosterFrame = StackPane(heroPoster).apply {
-        styleClass.add("d-poster")
-        clip = posterClip
+        fitHeight = 118.0
         isVisible = false
         isManaged = false
+        isMouseTransparent = true
     }
-    private var posterW = 0.0
-    private var posterH = 0.0
-
-    /** Fits the poster to the room left beside the title; below ~720px there is
-     *  none and the banner falls back to text only. */
-    private fun sizePoster(heroWidth: Double) {
-        val w = when {
-            heroWidth >= 1040.0 -> 200.0
-            heroWidth >= 880.0 -> 176.0
-            heroWidth >= 720.0 -> 148.0
-            else -> 0.0
-        }
-        val show = w > 0.0 && heroPosterArt != null
-        if (w == posterW && show == heroPosterFrame.isVisible) return
-        posterW = w
-        posterH = w * 1.5
-        heroPosterFrame.isVisible = show
-        heroPosterFrame.isManaged = show
-        if (!show) return
-        heroPosterFrame.prefWidth = posterW
-        heroPosterFrame.minWidth = posterW
-        heroPosterFrame.maxWidth = posterW
-        heroPosterFrame.prefHeight = posterH
-        heroPosterFrame.minHeight = posterH
-        heroPosterFrame.maxHeight = posterH
-        posterClip.width = posterW
-        posterClip.height = posterH
-        paintPoster()
-    }
-
-    private val heroOver = themed("", "d-over")
-    private val heroTitle = themed("", "d-title").apply {
-        // Wrapped and width-bounded: an unwrapped 32px title declares its whole
-        // text width as a *minimum*, which is what slid this screen (and its
-        // window) sideways.
+    private val heroOver = themed("", "x-d-over")
+    private val heroTitle = themed("", "x-d-title").apply {
         isWrapText = true
-        maxWidth = 560.0
-        minWidth = 0.0
-        maxHeight = 84.0
-    }
-    private val heroMeta = themed("", "d-meta").apply {
-        isWrapText = true
-        maxWidth = 560.0
+        maxWidth = 640.0
         minWidth = 0.0
     }
-    private val heroChips = HBox(8.0).apply { alignment = Pos.CENTER_LEFT }
+    private val heroMetaRow = HBox(9.0).apply { alignment = Pos.CENTER_LEFT }
+    private val heroOverview = themed("", "x-d-overview").apply {
+        isWrapText = true
+        maxWidth = 580.0
+        minWidth = 0.0
+    }
     /** TMDB/IMDb rating pills — filled once [TmdbDetails] resolves the title. */
     private val heroRatings = HBox(8.0).apply {
         alignment = Pos.CENTER_LEFT
         isVisible = false
         isManaged = false
     }
-    /** Top-billed cast line under the ratings. */
-    private val heroStars = themed("", "d-cast").apply {
-        isWrapText = true
-        maxWidth = 560.0
-        minWidth = 0.0
-        isVisible = false
-        isManaged = false
+    private val playButton = Button("Play").apply {
+        styleClass.add("x-play")
+        graphic = Icons.of(Icons.PLAY, 17.0)
+        isFocusTraversable = false
+        id = "heroPlayBtn"
+        setOnAction { playFirst() }
     }
-    private val heroActions = HBox(10.0,
-        // The banner's Play button. It is the primary action on this screen and
-        // it has to be reachable by a plain click, so it carries an id for the
-        // UI test to find, measure and click (see UiShotTest's detail-back section
-        // — the same wiring the back arrow uses).
-        Ui.playButton("Play") { playFirst() }.apply { id = "heroPlayBtn" },
-        Ui.button("Download", icon = Icons.DOWNLOAD, ghost = true) { downloadFirst() },
-    ).apply { alignment = Pos.CENTER_LEFT }
-    private val heroBody = VBox(10.0, heroOver, heroTitle, heroMeta, heroRatings, heroStars, heroChips, heroActions).apply {
+    private val bookmarkButton = Button().apply {
+        styleClass.add("x-glass-sq")
+        isFocusTraversable = false
+        setOnAction { toggleFavourite() }
+    }
+    private val downloadButton = Button().apply {
+        styleClass.add("x-glass-sq")
+        graphic = Icons.of(Icons.DOWNLOAD, 17.0)
+        isFocusTraversable = false
+        setOnAction { downloadFirst() }
+    }
+    private val heroActions = HBox(10.0, playButton, bookmarkButton, downloadButton).apply {
+        alignment = Pos.CENTER_LEFT
+    }
+    private val heroBody = VBox(10.0, heroOver, heroLogo, heroTitle, heroMetaRow, heroRatings, heroOverview, heroActions).apply {
         alignment = Pos.BOTTOM_LEFT
         minWidth = 0.0
-        maxWidth = 580.0
+        maxWidth = 660.0
     }
-    private val favouriteButton = Ui.button("Add to library", icon = Icons.HEART_OUTLINE, ghost = true) { toggleFavourite() }
     private val hero = StackPane()
 
     // ── left column ─────────────────────────────────────────────────────────
 
-    private val leftColumn = VBox(Theme.S4)
-    private val synopsis = themed("", "prose").apply {
-        isWrapText = true
-        styleClass.add("h-dim")
+    private val leftColumn = VBox(Theme.S5)
+
+    private val seasonPills = HBox(8.0).apply { alignment = Pos.CENTER_LEFT }
+    private val seasonCount = themed("", "x-season-count")
+    private val markWatchedBtn = Ui.button("Mark Season Watched", ghost = true) { markSeasonWatched() }
+        .apply { styleClass.add("x-tool") }
+    private val spoilerBtn = Ui.button("Anti-spoiler", ghost = true) { toggleSpoiler() }
+        .apply { styleClass.add("x-tool") }
+    private val sortBtn = Ui.button("Sort ▼", ghost = true) { toggleSort() }
+        .apply { styleClass.add("x-tool") }
+    private val seasonRow = HBox(10.0, seasonPills, seasonCount, Ui.spacer(), markWatchedBtn, spoilerBtn, sortBtn).apply {
+        alignment = Pos.CENTER_LEFT
+        minWidth = 0.0
+        isVisible = false
+        isManaged = false
     }
-    private val facts = VBox(9.0)
+
+    private val epRow = HBox(Theme.S4).apply {
+        alignment = Pos.TOP_LEFT
+        padding = Insets(Theme.S1, Theme.S1, Theme.S2, Theme.S1)
+        minWidth = 0.0
+    }
+    private val epRail = Ui.rail(epRow).apply {
+        isVisible = false
+        isManaged = false
+    }
 
     private val episodeFilter = TextField().apply {
         styleClass.addAll("field", "ep-filter")
         promptText = "Find episode by number or name…"
-        textProperty().addListener { _, _, _ -> renderEpisodeGrid() }
+        textProperty().addListener { _, _, _ -> renderEpisodeCards() }
     }
 
     /** "1 - 30", "31 - 60", … — every range the season can be read in. */
@@ -266,40 +271,45 @@ class DetailScreenView(private val item: MediaItem) {
             val i = items.indexOf(label)
             if (i >= 0 && i != episodePage) {
                 episodePage = i
-                renderEpisodeGrid()
+                renderEpisodeCards()
             }
         }
     }
     private val episodePrev = Ui.button("Prev 30", ghost = true) {
         if (episodePage > 0) {
             episodePage--
-            renderEpisodeGrid()
+            renderEpisodeCards()
         }
     }
     private val episodeNext = Ui.button("Next 30", ghost = true) {
-        val pages = maxOf(1, (episodes.size + EPISODE_PAGE - 1) / EPISODE_PAGE)
+        val pages = maxOf(1, (orderedSeasonEps().size + EPISODE_PAGE - 1) / EPISODE_PAGE)
         if (episodePage < pages - 1) {
             episodePage++
-            renderEpisodeGrid()
+            renderEpisodeCards()
         }
     }
-    private val episodeGrid = TilePane(7.0, 7.0).apply {
-        prefColumns = 8
-        prefTileWidth = 56.0
-        prefTileHeight = 34.0
-        styleClass.add("ep-grid-inner")
-        minWidth = 0.0
-    }
     private val episodeHint = themed("", "tiny").apply { isWrapText = true }
+    private val pagerRow = HBox(Theme.S2, episodeFilter, episodeRange, episodePrev, episodeNext).apply {
+        alignment = Pos.CENTER_LEFT
+        HBox.setHgrow(episodeFilter, Priority.ALWAYS)
+        isVisible = false
+        isManaged = false
+    }
 
-    private val episodeSection = VBox(Theme.S3)
+    private val castSection = VBox(Theme.S3).apply { isVisible = false; isManaged = false; minWidth = 0.0 }
+    private val crewSection = VBox(Theme.S3).apply { isVisible = false; isManaged = false; minWidth = 0.0 }
+    private val studioSection = VBox(Theme.S3).apply { isVisible = false; isManaged = false; minWidth = 0.0 }
+    private val shotsSection = VBox(Theme.S3).apply { isVisible = false; isManaged = false; minWidth = 0.0 }
+    private val trailersSection = VBox(Theme.S3).apply { isVisible = false; isManaged = false; minWidth = 0.0 }
 
     /** The scrolling column that holds the episodes, so the selected episode can
      *  be brought into view (see [revealSelected]). */
     private lateinit var leftScroll: ScrollPane
 
-    /** Episode id → its tile, so the selected one can be scrolled to. */
+    /** Episode id → its number badge, so the selected one can be scrolled to. */
     private val episodeTiles = HashMap<String, Button>()
+    /** Episode id → its card frame, for the selected glow. */
+    private val episodeCards = HashMap<String, VBox>()
 
     // ── watch panel ─────────────────────────────────────────────────────────
 
@@ -331,7 +341,7 @@ class DetailScreenView(private val item: MediaItem) {
         maxWidth = Double.MAX_VALUE
     }
     private val watchPanel = VBox().apply {
-        styleClass.add("watch")
+        styleClass.addAll("watch", "x-watch")
         prefWidth = PANEL_W
         minWidth = PANEL_W
         maxWidth = PANEL_W
@@ -354,13 +364,50 @@ class DetailScreenView(private val item: MediaItem) {
         children.addAll(head, body)
     }
 
+    // ── source discovery overlay ────────────────────────────────────────────
+
+    private val discBg = ImageView().apply { isPreserveRatio = false; isSmooth = true; isMouseTransparent = true }
+    private var discArt: Image? = null
+    private val discLogo = ImageView().apply {
+        isPreserveRatio = true; isSmooth = true; fitHeight = 110.0
+        isVisible = false; isManaged = false; isMouseTransparent = true
+    }
+    private val discTitle = themed("", "x-disc-title").apply { isWrapText = true; minWidth = 0.0 }
+    private val discPill = themed("", "x-disc-pill").apply { isWrapText = true; minWidth = 0.0 }
+    private val discStatus1 = themed("Discovering streaming sources…", "x-disc-status")
+    private val discStatus2 = themed("", "x-disc-status2")
+    private val discBar = ProgressBar(-1.0).apply {
+        styleClass.add("x-disc-bar")
+        prefWidth = 460.0; maxWidth = 460.0
+        minHeight = 4.0; prefHeight = 4.0; maxHeight = 4.0
+        isMouseTransparent = true; isFocusTraversable = false
+    }
+    private val discCancel = Button("✕   Cancel").apply {
+        styleClass.add("x-disc-cancel")
+        isFocusTraversable = false
+        setOnAction { cancelDiscovery() }
+    }
+    private val discRoot = StackPane().apply {
+        styleClass.add("x-disc-root")
+        isVisible = false
+        isManaged = false
+    }
+
     val root: BorderPane = BorderPane().apply {
         padding = Insets(Theme.S4, Theme.S5, Theme.S5, Theme.S5)
     }
 
     init {
-        root.sceneProperty().addListener { _, _, scene -> if (scene == null) scope.cancel() }
+        root.sceneProperty().addListener { _, _, scene ->
+            if (scene == null) {
+                scope.cancel()
+                bgTimer?.stop()
+            } else {
+                bgTimer?.play()
+            }
+        }
         buildHero()
+        buildDiscovery()
         leftScroll = Ui.vScroll(leftColumn, Insets(0.0, 6.0, 24.0, 0.0))
         val side = HBox(Theme.S5, leftScroll, watchPanel).apply {
             alignment = Pos.TOP_LEFT
@@ -373,18 +420,20 @@ class DetailScreenView(private val item: MediaItem) {
         Ui.fill(leftScroll)
         Ui.fill(side)
         Ui.fill(content)
-        root.center = content
+        val center = StackPane(content, discRoot).apply { minWidth = 0.0; minHeight = 0.0 }
+        Ui.fill(center)
+        root.center = center
         // The screen is painted from the catalog item we were handed, BEFORE any
-        // network call: the banner, the title block and the Synopsis/Details
-        // panels are already on screen when the click's frame ends. The item a
-        // grid hands over carries the title, year, genres, overview and artwork,
-        // so `metaFor` only ever *enriches* what is already there. Opening a
+        // network call: the banner, the title block and the ratings area are
+        // already on screen when the click's frame ends. The item a grid hands
+        // over carries the title, year, genres, overview and artwork, so
+        // `metaFor` only ever *enriches* what is already there. Opening a
         // title used to show an empty banner and a spinner while that round-trip
         // ran, which is what "loading takes a moment" looked like.
         renderHero(item)
-        renderFacts(item)
+        renderSections()
         // The sources panel shows its own "Fetching sources…" spinner (see
-        // loadStreams), and the Episodes section pops in when the season lands.
+        // loadStreams), and the episode cards pop in when the season lands.
         renderPanel()
         load()
     }
@@ -414,46 +463,58 @@ class DetailScreenView(private val item: MediaItem) {
             Fx.run {
                 meta = loaded
                 episodes = dedupe(eps)
+                watchedSet = runCatching {
+                    AppShell.app.store.history()
+                        .filter { it.providerId == loaded.providerId && it.mediaId == loaded.id && it.episodeId.isNotBlank() }
+                        .map { it.episodeId }.toSet()
+                }.getOrDefault(emptySet())
+                initSeasons(resumeId)
                 renderHero(loaded)
-                renderFacts(loaded)
-                renderEpisodes()
-                val first = episodes.firstOrNull { it.id == resumeId } ?: episodes.firstOrNull()
+                renderSections()
+                val first = episodes.firstOrNull { it.id == resumeId } ?: orderedSeasonEps().firstOrNull()
                 if (first != null) {
                     selectedEpisode = first
-                    renderEpisodeGrid()
+                    val idx = orderedSeasonEps().indexOfFirst { it.id == first.id }
+                    if (idx >= 0) episodePage = idx / EPISODE_PAGE
+                    renderEpisodeCards()
                     updateNowPlaying()
                 }
                 renderPanel()
                 loadStreams()
                 revealSelected()
             }
-            // Ratings + cast resolve in the background (TMDB search): the screen
-            // never waits on them, they pop into the banner when they land.
-            loadRatings(loaded)
+            // Ratings + cast + artwork resolve in the background (TMDB search):
+            // the screen never waits on them, they pop into the banner and the
+            // sections below when they land.
+            loadEnrich(loaded)
         }
     }
 
+    private fun initSeasons(resumeId: String?) {
+        val ss = episodes.map { it.season }.distinct().sorted()
+        seasonList = if (ss.isEmpty()) listOf(1) else ss
+        val resumeSeason = resumeId?.let { id -> episodes.firstOrNull { it.id == id }?.season }
+        currentSeason = resumeSeason ?: seasonList.first()
+        episodePage = 0
+    }
+
     /**
-     * Brings the selected episode's tile into view.
+     * Brings the selected episode's card into view.
      *
      * Opening a series used to leave the episode list below the fold (under a
      * long synopsis) and, when resuming, the highlighted episode somewhere
      * inside a grid of hundreds — so the user could not tell where they were in
-     * the series. The episodes panel is now the first thing in the scrolling
-     * column, and this makes sure the *selected* tile is actually on screen.
+     * the series. The episode rail sits near the top of the scrolling column,
+     * and this scrolls the rail itself so the *selected* card is on screen.
      */
     private fun revealSelected() {
         val ep = selectedEpisode ?: return
-        val tile = episodeTiles[ep.id] ?: return
+        if (episodeTiles[ep.id] == null) return
         javafx.application.Platform.runLater {
-            javafx.application.Platform.runLater {
-                val viewport = leftScroll.viewportBounds.height
-                val content = leftColumn.height
-                if (viewport <= 0.0 || content <= viewport) return@runLater
-                val inColumn = leftColumn.sceneToLocal(tile.localToScene(tile.boundsInLocal))
-                val target = inColumn.minY + inColumn.height / 2.0 - viewport / 2.0
-                leftScroll.vvalue = (target / (content - viewport)).coerceIn(0.0, 1.0)
-            }
+            val cards = epRow.children.filterIsInstance<VBox>()
+            val idx = cards.indexOfFirst { it.properties["epId"] == ep.id }
+            if (idx < 0 || cards.size <= 1) return@runLater
+            epRail.hvalue = (idx.toDouble() / (cards.size - 1)).coerceIn(0.0, 1.0)
         }
     }
 
@@ -471,13 +532,9 @@ class DetailScreenView(private val item: MediaItem) {
         return if (ordered) list.sortedBy { it.number } else list
     }
 
+    // ── hero ────────────────────────────────────────────────────────────────
+
     private fun renderHero(m: MediaItem) {
-        hero.isVisible = true
-        hero.isManaged = true
-        // The title/meta/action block appears with the details; until then the
-        // banner is an empty surface with the back arrow on it (see init).
-        heroBody.isVisible = true
-        heroBody.isManaged = true
         val provider = runCatching {
             AppShell.app.store.providers().firstOrNull { it.id == m.providerId }?.name
         }.getOrNull()
@@ -485,93 +542,81 @@ class DetailScreenView(private val item: MediaItem) {
         heroOver.isVisible = !provider.isNullOrBlank()
         heroOver.isManaged = heroOver.isVisible
         heroTitle.text = m.title
-        heroMeta.text = listOfNotNull(
-            m.year?.toString(),
-            when (m.type) {
-                MediaType.SERIES -> "Series"
-                MediaType.MOVIE -> "Movie"
-                MediaType.UNKNOWN -> null
-            },
-            if (episodes.isNotEmpty()) "${episodes.size} episodes" else null,
-            m.genres.take(3).joinToString(" · ").ifBlank { null },
-        ).joinToString("  ·  ")
-        heroChips.children.setAll(m.genres.take(6).map { themed(it, "mchip") })
-        // The poster card on the right of the banner: only a real poster goes
-        // there — but when the provider leaves the poster empty (several anime
-        // catalogs only fill the landscape image) the backdrop is used instead,
-        // so the card shows the same artwork as the grid thumbnail rather than
-        // an empty box.
-        heroPosterArt = null
-        val posterArt = desktop.img.ImageLoader.artFor(m.posterUrl, m.backdropUrl)
-        if (!posterArt.isNullOrBlank()) {
-            desktop.img.ImageLoader.loadAsync(
-                posterArt,
-                onReady = { img ->
-                    heroPosterArt = img
-                    sizePoster(hero.width)
-                },
-                w = 480,
-                h = 720,
-            )
-        } else {
-            sizePoster(hero.width)
-        }
-        val url = desktop.img.ImageLoader.artFor(m.backdropUrl, m.posterUrl)
-        if (!url.isNullOrBlank()) {
-            desktop.img.ImageLoader.loadAsync(url, onReady = { img -> applyHeroArt(img) }, w = 1600, h = 900)
-        }
-        synopsis.text = m.overview?.let { htmlToPlain(it) }?.takeIf { it.isNotBlank() }
+        heroTitle.isVisible = true
+        heroTitle.isManaged = true
+        heroLogo.isVisible = false
+        heroLogo.isManaged = false
+        renderMeta(m, null)
+        heroOverview.text = m.overview?.let { htmlToPlain(it) }?.takeIf { it.isNotBlank() }
             ?: "No synopsis available for this title."
+        // Provider art first — the TMDB slideshow upgrades it when it lands.
+        bgUrls = listOfNotNull(
+            desktop.img.ImageLoader.artFor(m.backdropUrl, null),
+            desktop.img.ImageLoader.artFor(m.posterUrl, null),
+        ).distinct()
+        bgIndex = 0
+        bgUrls.firstOrNull()?.let { url ->
+            desktop.img.ImageLoader.loadAsync(url, onReady = { img ->
+                if (img != null) {
+                    heroArtA = img
+                    paintHeroBg()
+                    heroBgA.opacity = 1.0
+                    heroFgA = true
+                }
+            }, w = 1600, h = 900)
+        }
+        startBgTimer()
         favourite = runCatching { AppShell.app.store.favorites().any { it.uniqueId == m.uniqueId } }.getOrDefault(false)
         refreshFavourite()
+        updatePlayLabel()
     }
 
-    private fun renderFacts(m: MediaItem) {
-        val provider = runCatching {
-            AppShell.app.store.providers().firstOrNull { it.id == m.providerId }?.name
-        }.getOrNull()
-        val rows = listOfNotNull(
-            provider?.let { "Provider" to it },
-            "Type" to when (m.type) {
-                MediaType.SERIES -> "Series"
-                MediaType.MOVIE -> "Movie"
-                MediaType.UNKNOWN -> "Unknown"
-            },
-            m.year?.let { "Released" to it.toString() },
-            m.genres.takeIf { it.isNotEmpty() }?.let { "Genres" to it.joinToString(", ") },
-            if (episodes.isNotEmpty()) "Episodes" to "${episodes.size}" else null,
-            "Source id" to m.id,
-        )
-        facts.children.setAll(rows.map { (k, v) ->
-            val value = themed(v, "label").apply {
-                isWrapText = true
-                maxWidth = 620.0
-            }
-            HBox(12.0, themed(k, "tiny").apply { prefWidth = 82.0; minWidth = 82.0 }, value).apply {
-                alignment = Pos.TOP_LEFT
-                minWidth = 0.0
-            }
-        })
-        // Episodes come first: they are what the user opened the title for. A
-        // long synopsis above them pushed the whole episode grid below the fold,
-        // which is why opening a series gave no clue where the episodes (or the
-        // one you left off on) were.
-        val panels = mutableListOf<Node>()
-        if (episodes.isNotEmpty()) panels.add(episodeSection)
-        panels.add(Ui.panel(Ui.sectionHeader("Synopsis"), synopsis))
-        panels.add(Ui.panel(Ui.sectionHeader("Details"), facts))
-        leftColumn.children.setAll(panels)
+    private fun renderMeta(m: MediaItem, d: TmdbDetails.Details?) {
+        val cells = ArrayList<Node>()
+        m.year?.let { cells.add(themed(it.toString(), "x-d-meta")) }
+        cells.add(themed(when (m.type) {
+            MediaType.SERIES -> "TV Series"
+            MediaType.MOVIE -> "Movie"
+            MediaType.UNKNOWN -> ""
+        }, "x-d-meta"))
+        val cert = d?.certification.orEmpty()
+        if (cert.isNotBlank()) cells.add(themed(cert, "x-d-cert"))
+        val runtime = d?.runtime.orEmpty()
+        if (runtime.isNotBlank()) cells.add(themed(runtime, "x-d-meta"))
+        val genres = m.genres.take(3).joinToString(", ")
+        if (genres.isNotBlank()) cells.add(themed(genres, "x-d-meta"))
+        heroMetaRow.children.setAll(cells.flatMap { listOf(it, themed("•", "x-d-dot")) }.dropLast(1))
+        heroMetaRow.isVisible = cells.isNotEmpty()
+        heroMetaRow.isManaged = cells.isNotEmpty()
+    }
+
+    private fun startBgTimer() {
+        bgTimer?.stop()
+        if (bgUrls.size < 2) return
+        bgTimer = Timeline(
+            KeyFrame(Duration.seconds(9.0), EventHandler {
+                bgIndex = (bgIndex + 1) % bgUrls.size
+                val gen = ++bgGen
+                val url = bgUrls[bgIndex]
+                desktop.img.ImageLoader.loadAsync(url, onReady = { img ->
+                    if (img != null && gen == bgGen) crossfadeHero(img)
+                }, w = 1600, h = 900)
+            }),
+        ).apply {
+            cycleCount = Timeline.INDEFINITE
+            play()
+        }
     }
 
     private fun buildHero() {
         val clip = Rectangle().apply {
-            arcWidth = 32.0
-            arcHeight = 32.0
+            arcWidth = 26.0
+            arcHeight = 26.0
         }
         clip.widthProperty().bind(hero.widthProperty())
         clip.heightProperty().bind(hero.heightProperty())
         hero.clip = clip
-        hero.styleClass.add("d-hero-wrap")
+        hero.styleClass.add("x-d-hero")
         hero.minWidth = 0.0
         hero.maxWidth = Double.MAX_VALUE
         // A sane height for the very first layout pass; the listener below fits
@@ -579,40 +624,31 @@ class DetailScreenView(private val item: MediaItem) {
         hero.prefHeight = HERO_MIN
         hero.minHeight = HERO_MIN
         hero.maxHeight = HERO_MIN
-        // The banner carries the poster as well as the title now, and the old
-        // 248px ceiling left the two fighting for the same strip — the reason
-        // the header looked "cut off". It takes a generous slice of the window
-        // (clamped) instead. The window height is independent of this value, so
-        // the listener settles in one pass.
+        // The banner takes a generous slice of the window (clamped). The window
+        // height is independent of this value, so the listener settles in one pass.
         root.heightProperty().addListener { _, _, h ->
-            val target = (h.toDouble() * 0.42).coerceIn(HERO_MIN, HERO_H)
+            val target = (h.toDouble() * 0.50).coerceIn(HERO_MIN, HERO_H)
             if (hero.prefHeight != target) {
                 hero.prefHeight = target
                 hero.minHeight = target
                 hero.maxHeight = target
             }
         }
-        // The artwork always *covers* the banner: a portrait poster used to be
-        // letterboxed into a narrow strip in the middle of a wide banner, which
-        // is what "the header image is collapsing" looked like. Re-cropped on
-        // every resize instead of stretched.
-        heroImage.isPreserveRatio = false
-        heroImage.fitWidthProperty().bind(hero.widthProperty())
-        heroImage.fitHeightProperty().bind(hero.heightProperty())
-        hero.widthProperty().addListener { _, _, w ->
-            paintHero()
-            sizePoster(w.toDouble())
-        }
-        hero.heightProperty().addListener { _, _, _ -> paintHero() }
+        heroBgA.fitWidthProperty().bind(hero.widthProperty())
+        heroBgA.fitHeightProperty().bind(hero.heightProperty())
+        heroBgB.fitWidthProperty().bind(hero.widthProperty())
+        heroBgB.fitHeightProperty().bind(hero.heightProperty())
+        hero.widthProperty().addListener { _, _, _ -> paintHeroBg() }
+        hero.heightProperty().addListener { _, _, _ -> paintHeroBg() }
 
         val scrim = Region().apply {
-            styleClass.add("d-scrim")
+            styleClass.add("x-d-scrim")
             maxWidth = Double.MAX_VALUE
             maxHeight = Double.MAX_VALUE
             isMouseTransparent = true
         }
-        val scrimR = Region().apply {
-            styleClass.add("d-scrim-r")
+        val scrimL = Region().apply {
+            styleClass.add("x-d-scrim-l")
             maxWidth = Double.MAX_VALUE
             maxHeight = Double.MAX_VALUE
             isMouseTransparent = true
@@ -623,15 +659,12 @@ class DetailScreenView(private val item: MediaItem) {
         //  - it carries NO tooltip. A JavaFX tooltip is a popup window of its
         //    own, and a click that arrives while one is up is spent dismissing it
         //    instead of pressing the button (see Ui.tooltip) — on a one-click
-        //    control that reads as "the back button does not work". The arrow
-        //    needs no label anyway: the shell's top bar spells "Back" out right
-        //    above it.
+        //    control that reads as "the back button does not work".
         //  - it is added to the StackPane LAST (see the children.addAll at the
         //    end of this function), so nothing painted over the banner — the
-        //    title block, the poster card, the scrims — can cover it or take its
-        //    clicks.
+        //    title block, the scrims — can cover it or take its clicks.
         val back = Ui.iconButton(Icons.CHEVRON_LEFT, null, 18.0) { AppShell.back() }.apply {
-            styleClass.addAll("round-btn", "hero-back")
+            styleClass.addAll("x-round-btn", "hero-back")
             id = "heroBackBtn"
             accessibleText = "Back"
         }
@@ -639,37 +672,106 @@ class DetailScreenView(private val item: MediaItem) {
         StackPane.setMargin(back, Insets(16.0, 0.0, 0.0, 16.0))
 
         // Nothing decorative may be a pick target on a banner that carries
-        // buttons: the artwork and the poster card are pictures, so a click that
-        // lands on them is a click the user meant for Play or Download.
-        heroImage.isMouseTransparent = true
-        heroPosterFrame.isMouseTransparent = true
-
-        // Sized to its own content. A StackPane stretches a child out to the
-        // child's max size, and a VBox's max size is unbounded — so, left alone,
-        // this little container became an invisible full-banner box lying OVER the
-        // whole hero, added after the title block and therefore above the Play
-        // button in the paint order, and it swallowed every click meant for it.
-        // Its own bounds are all it needs.
-        val topRight = VBox(8.0, favouriteButton).apply {
-            alignment = Pos.TOP_RIGHT
-            maxWidth = javafx.scene.layout.Region.USE_PREF_SIZE
-            maxHeight = javafx.scene.layout.Region.USE_PREF_SIZE
-        }
-        StackPane.setAlignment(topRight, Pos.TOP_RIGHT)
-        StackPane.setMargin(topRight, Insets(16.0, 16.0, 0.0, 0.0))
+        // buttons: the artwork is a picture, so a click that lands on it is a
+        // click the user meant for Play or Download.
+        heroBgA.isMouseTransparent = true
+        heroBgB.isMouseTransparent = true
+        heroLogo.isMouseTransparent = true
 
         StackPane.setAlignment(heroBody, Pos.BOTTOM_LEFT)
-        StackPane.setMargin(heroBody, Insets(0.0, 24.0, 22.0, 26.0))
-
-        StackPane.setAlignment(heroPosterFrame, Pos.BOTTOM_RIGHT)
-        StackPane.setMargin(heroPosterFrame, Insets(0.0, 26.0, 24.0, 0.0))
+        StackPane.setMargin(heroBody, Insets(0.0, 24.0, 26.0, 30.0))
 
         // Paint order IS click priority in JavaFX: the back arrow goes in last so
         // it is on top of everything the banner draws, and the title/action block
         // sits directly under it. The Play button is the point of this screen, so
         // nothing but the arrow may ever be painted over it.
-        hero.children.addAll(heroImage, scrim, scrimR, heroPosterFrame, topRight, heroBody, back)
+        hero.children.addAll(heroBgA, heroBgB, scrim, scrimL, heroBody, back)
     }
+
+    // ── discovery overlay ───────────────────────────────────────────────────
+
+    private fun buildDiscovery() {
+        discBg.fitWidthProperty().bind(discRoot.widthProperty())
+        discBg.fitHeightProperty().bind(discRoot.heightProperty())
+        discRoot.widthProperty().addListener { _, _, w ->
+            Ui.coverImage(discBg, discArt, w.toDouble(), discRoot.height)
+        }
+        discRoot.heightProperty().addListener { _, _, h ->
+            Ui.coverImage(discBg, discArt, discRoot.width, h.toDouble())
+        }
+        val scrim = Region().apply {
+            styleClass.add("x-disc-scrim")
+            maxWidth = Double.MAX_VALUE
+            maxHeight = Double.MAX_VALUE
+            isMouseTransparent = true
+        }
+        val center = VBox(10.0, discLogo, discTitle, discPill).apply {
+            alignment = Pos.CENTER
+            minWidth = 0.0
+            maxWidth = 720.0
+        }
+        val statuses = VBox(6.0, discStatus1, discBar, discStatus2).apply {
+            alignment = Pos.CENTER
+            minWidth = 0.0
+            padding = Insets(26.0, 0.0, 0.0, 0.0)
+        }
+        val page = VBox(0.0, center, statuses, VBox(discCancel).apply {
+            alignment = Pos.CENTER
+            padding = Insets(40.0, 0.0, 0.0, 0.0)
+        }).apply {
+            alignment = Pos.CENTER
+            minWidth = 0.0
+            maxWidth = 760.0
+        }
+        discRoot.children.addAll(discBg, scrim, page)
+        StackPane.setAlignment(page, Pos.CENTER)
+    }
+
+    private fun showDiscovery() {
+        val m = meta
+        val ep = selectedEpisode
+        discArt = heroArtA ?: heroArtB
+        Ui.coverImage(discBg, discArt, discRoot.width.coerceAtLeast(800.0), discRoot.height.coerceAtLeast(500.0))
+        val logoImg = heroLogo.image
+        if (enrich?.logoUrl != null && logoImg != null) {
+            discLogo.image = logoImg
+            discLogo.isVisible = true
+            discLogo.isManaged = true
+            discTitle.isVisible = false
+            discTitle.isManaged = false
+        } else {
+            discLogo.isVisible = false
+            discLogo.isManaged = false
+            discTitle.text = m.title
+            discTitle.isVisible = true
+            discTitle.isManaged = true
+        }
+        discPill.text = if (ep != null && m.type == MediaType.SERIES) {
+            "S${ep.season}:E${ep.number} • " + (ep.name?.takeIf { it.isNotBlank() } ?: "Episode ${ep.number}")
+        } else {
+            m.title
+        }
+        discStatus1.text = "Discovering streaming sources…"
+        discStatus2.text = ""
+        discBar.progress = -1.0
+        discRoot.isVisible = true
+        discRoot.isManaged = true
+        Ui.fadeIn(discRoot, 220.0)
+    }
+
+    private fun hideDiscovery() {
+        discRoot.isVisible = false
+        discRoot.isManaged = false
+    }
+
+    private fun cancelDiscovery() {
+        pendingPlay = false
+        pendingDownload = false
+        sweepPoll?.cancel()
+        hideDiscovery()
+    }
+
+    // ── favourites ──────────────────────────────────────────────────────────
 
     private fun toggleFavourite() {
         val m = meta
@@ -686,41 +788,133 @@ class DetailScreenView(private val item: MediaItem) {
     }
 
     private fun refreshFavourite() {
-        favouriteButton.text = if (favourite) "In library" else "Add to library"
-        favouriteButton.graphic = Icons.of(if (favourite) Icons.HEART else Icons.HEART_OUTLINE, 16.0)
+        bookmarkButton.graphic = Icons.of(if (favourite) Icons.HEART else Icons.HEART_OUTLINE, 17.0)
+    }
+
+    // ── sections ────────────────────────────────────────────────────────────
+
+    private fun renderSections() {
+        val isSeries = meta.type == MediaType.SERIES
+        val hasEps = episodes.isNotEmpty()
+        seasonRow.isVisible = isSeries && hasEps
+        seasonRow.isManaged = seasonRow.isVisible
+        epRail.isVisible = isSeries && hasEps
+        epRail.isManaged = epRail.isVisible
+        pagerRow.isVisible = isSeries && hasEps
+        pagerRow.isManaged = pagerRow.isVisible
+        if (isSeries && hasEps) {
+            renderSeasonRow()
+            renderEpisodeCards()
+        }
+        renderCast()
+        renderCrew()
+        renderStudios()
+        renderShots()
+        renderTrailers()
+        val panels = mutableListOf<Node>()
+        if (isSeries && hasEps) {
+            panels.add(seasonRow)
+            panels.add(epRail)
+            panels.add(pagerRow)
+            panels.add(episodeHint)
+        }
+        if (castSection.isVisible) panels.add(castSection)
+        if (crewSection.isVisible) panels.add(crewSection)
+        if (studioSection.isVisible) panels.add(studioSection)
+        if (shotsSection.isVisible) panels.add(shotsSection)
+        if (trailersSection.isVisible) panels.add(trailersSection)
+        leftColumn.children.setAll(panels)
     }
 
     // ── episodes ────────────────────────────────────────────────────────────
 
-    private fun renderEpisodes() {
-        if (episodes.isEmpty()) {
-            episodeSection.isVisible = false
-            episodeSection.isManaged = false
-            return
-        }
-        episodeSection.isVisible = true
-        episodeSection.isManaged = true
-        episodeSection.children.setAll(
-            Ui.sectionHeader("Episodes", "${episodes.size} available — pick one to load its sources"),
-            HBox(Theme.S2, episodeFilter, episodeRange, episodePrev, episodeNext).apply {
-                alignment = Pos.CENTER_LEFT
-                HBox.setHgrow(episodeFilter, Priority.ALWAYS)
-            },
-            episodeGrid,
-            episodeHint,
-        )
-        renderEpisodeGrid()
+    /** The current season's episodes in display order (see [sortAsc]). */
+    private fun orderedSeasonEps(): List<Episode> {
+        val list = episodes.filter { it.season == currentSeason }
+        return if (sortAsc) list else list.reversed()
     }
 
-    private fun renderEpisodeGrid() {
-        if (episodes.isEmpty()) {
-            episodeGrid.children.setAll()
+    private fun renderSeasonRow() {
+        seasonPills.children.setAll(seasonList.map { s ->
+            Button("Season $s").apply {
+                styleClass.add("x-season-pill")
+                if (s == currentSeason) styleClass.add("x-season-sel")
+                isFocusTraversable = false
+                setOnAction { selectSeason(s) }
+            }
+        })
+        val count = episodes.count { it.season == currentSeason }
+        seasonCount.text = "• $count Episodes"
+        spoilerBtn.styleClass.remove("x-tool-on")
+        if (antiSpoiler) spoilerBtn.styleClass.add("x-tool-on")
+        sortBtn.text = if (sortAsc) "Sort ▼" else "Sort ▲"
+    }
+
+    private fun selectSeason(s: Int) {
+        currentSeason = s
+        episodePage = 0
+        episodeFilter.text = ""
+        stills = emptyMap()
+        stillsSeason = -1
+        val first = orderedSeasonEps().firstOrNull()
+        if (first != null) {
+            selectedEpisode = first
+            updateNowPlaying()
+            loadStreams()
+        }
+        renderSeasonRow()
+        renderEpisodeCards()
+        loadSeasonStills()
+    }
+
+    private fun toggleSpoiler() {
+        antiSpoiler = !antiSpoiler
+        renderSeasonRow()
+        renderEpisodeCards()
+    }
+
+    private fun toggleSort() {
+        sortAsc = !sortAsc
+        episodePage = 0
+        renderSeasonRow()
+        renderEpisodeCards()
+    }
+
+    private fun markSeasonWatched() {
+        val list = orderedSeasonEps()
+        if (list.isEmpty()) return
+        runCatching {
+            val now = System.currentTimeMillis()
+            list.forEach { ep ->
+                AppShell.app.store.addHistory(
+                    HistoryEntry(
+                        providerId = meta.providerId,
+                        mediaId = meta.id,
+                        type = meta.type,
+                        title = meta.title,
+                        posterUrl = meta.posterUrl,
+                        episodeId = ep.id,
+                        episodeName = ep.name ?: "",
+                        watchedAt = now,
+                    )
+                )
+            }
+        }
+        watchedSet = watchedSet + list.map { it.id }.toSet()
+        renderEpisodeCards()
+        AppShell.toast("Season $currentSeason marked as watched", "ok")
+    }
+
+    private fun renderEpisodeCards() {
+        val list = orderedSeasonEps()
+        if (episodes.isEmpty() || meta.type != MediaType.SERIES) {
+            epRow.children.setAll()
             episodeHint.text = ""
             return
         }
         val needle = episodeFilter.text.trim().lowercase()
         val matches = if (needle.isEmpty()) {
-            episodes.indices.toList()
+            list.indices.toList()
         } else {
             episodes.indices.filter { i ->
                 val ep = episodes[i]
@@ -730,7 +924,7 @@ class DetailScreenView(private val item: MediaItem) {
             }
         }
         val searching = needle.isNotEmpty()
-        val pages = maxOf(1, (episodes.size + EPISODE_PAGE - 1) / EPISODE_PAGE)
+        val pages = maxOf(1, (list.size + EPISODE_PAGE - 1) / EPISODE_PAGE)
         if (episodePage >= pages) episodePage = pages - 1
         if (episodePage < 0) episodePage = 0
         // The range picker lists the whole season as 30-episode ranges, so any
@@ -739,7 +933,7 @@ class DetailScreenView(private val item: MediaItem) {
         if (!searching) {
             val labels = (0 until pages).map { p ->
                 val from = p * EPISODE_PAGE + 1
-                val to = minOf(episodes.size, (p + 1) * EPISODE_PAGE)
+                val to = minOf(list.size, (p + 1) * EPISODE_PAGE)
                 "$from - $to"
             }
             if (episodeRange.items.size != labels.size) {
@@ -750,43 +944,27 @@ class DetailScreenView(private val item: MediaItem) {
                 episodeRange.selectionModel.select(episodePage)
             }
         }
-        val shown = if (searching) {
+        val shownIdx = if (searching) {
             matches.take(EPISODE_PAGE * 4)
         } else {
             val from = episodePage * EPISODE_PAGE
-            matches.filter { it in from until minOf(episodes.size, from + EPISODE_PAGE) }
+            val slice = (from until minOf(list.size, from + EPISODE_PAGE))
+            // Map back to `episodes` indices: `list` may be reversed.
+            slice.map { episodes.indexOf(list[it]) }
         }
         episodeTiles.clear()
-        val tiles = shown.map { i ->
-            val ep = episodes[i]
-            val text = ep.name?.takeIf { it.isNotBlank() }?.let { name ->
-                // Strip the show title so a tile reads "160" instead of 60 characters.
-                val trimmed = name.replace(meta.title, "").trim().trim('-', ':', '|', '·')
-                numOf(trimmed) ?: ep.number.toString()
-            } ?: ep.number.toString()
-            val tile = Button(text).apply {
-                styleClass.add("ep-num")
-                prefWidth = 56.0
-                prefHeight = 34.0
-                isFocusTraversable = false
-                if (ep.id == selectedEpisode?.id) styleClass.add("ep-num-sel")
-                setOnAction { selectEpisode(ep) }
-            }
-            episodeTiles[ep.id] = tile
-            tile
-        }
-        if (tiles.isEmpty()) {
-            episodeGrid.children.setAll(themed("No episode matches “${episodeFilter.text.trim()}”.", "tiny"))
-        } else {
-            episodeGrid.children.setAll(tiles)
+        episodeCards.clear()
+        epRow.children.setAll(shownIdx.map { episodes[it] }.map { episodeCard(it) })
+        if (epRow.children.isEmpty()) {
+            epRow.children.setAll(themed("No episode matches “${episodeFilter.text.trim()}”.", "tiny"))
         }
         episodeHint.text = when {
             needle.isNotEmpty() ->
                 "${matches.size} episode(s) match “${episodeFilter.text.trim()}” —" +
                     " clear the box to page through the season 30 at a time."
-            episodes.size > shown.size ->
+            list.size > shownIdx.size ->
                 "Showing episodes " + (episodePage * EPISODE_PAGE + 1) + " - " +
-                    (episodePage * EPISODE_PAGE + shown.size) + " of " + episodes.size +
+                    (episodePage * EPISODE_PAGE + shownIdx.size) + " of " + list.size +
                     " — pick another range above, or search by number or name."
             else -> ""
         }
@@ -797,15 +975,99 @@ class DetailScreenView(private val item: MediaItem) {
         episodeRange.isDisable = searching || pages <= 1
     }
 
-    private fun numOf(text: String): String? = Regex("(\\d{1,4})").find(text)?.groupValues?.get(1)
+    private fun episodeCard(ep: Episode): VBox {
+        val still = stills[ep.number]
+        val imgUrl = if (antiSpoiler) null else (ep.image?.takeIf { it.isNotBlank() } ?: still?.stillUrl)
+        val art = ImageView().apply { isPreserveRatio = false; isSmooth = true; isMouseTransparent = true }
+        val frame = StackPane(art).apply {
+            styleClass.add("x-ep-still")
+            clip = Rectangle(EP_CARD_W, EP_STILL_H).apply { arcWidth = 16.0; arcHeight = 16.0 }
+            minWidth = EP_CARD_W; prefWidth = EP_CARD_W; maxWidth = EP_CARD_W
+            minHeight = EP_STILL_H; prefHeight = EP_STILL_H; maxHeight = EP_STILL_H
+        }
+        art.fitWidth = EP_CARD_W
+        art.fitHeight = EP_STILL_H
+        if (!imgUrl.isNullOrBlank()) {
+            desktop.img.ImageLoader.loadAsync(imgUrl, onReady = { img ->
+                if (img != null) Ui.coverImage(art, img, EP_CARD_W, EP_STILL_H)
+            }, w = 480, h = 270)
+        } else {
+            art.styleClass.add("x-ep-ph")
+        }
+        val rating = still?.rating?.takeIf { it > 0.0 }
+        if (rating != null && !antiSpoiler) {
+            val badge = Label("★ %.1f".format(rating)).apply { styleClass.add("x-ep-badge") }
+            StackPane.setAlignment(badge, Pos.TOP_LEFT)
+            StackPane.setMargin(badge, Insets(8.0, 0.0, 0.0, 8.0))
+            frame.children.add(badge)
+        }
+        // The card's number badge doubles as the UI test's tile hook: exactly
+        // one `.ep-num` button with a pure integer label per card (see
+        // UiShotTest.episodeNumbers).
+        val num = Button(ep.number.toString()).apply {
+            styleClass.addAll("ep-num", "x-ep-num")
+            if (ep.id == selectedEpisode?.id) styleClass.add("ep-num-sel")
+            isFocusTraversable = false
+            setOnAction { selectEpisode(ep) }
+        }
+        episodeTiles[ep.id] = num
+        StackPane.setAlignment(num, Pos.TOP_RIGHT)
+        StackPane.setMargin(num, Insets(8.0, 8.0, 0.0, 0.0))
+        frame.children.add(Ui.isolateClicks(num))
+        if (watchedSet.contains(ep.id)) {
+            val check = HBox(4.0, Icons.of(Icons.CHECK, 12.0), Label("Watched").apply { styleClass.add("x-ep-watched-t") }).apply {
+                styleClass.add("x-ep-watched")
+                alignment = Pos.CENTER_LEFT
+                isMouseTransparent = true
+            }
+            StackPane.setAlignment(check, Pos.BOTTOM_LEFT)
+            StackPane.setMargin(check, Insets(0.0, 0.0, 8.0, 8.0))
+            frame.children.add(check)
+        }
+        val titleText = when {
+            antiSpoiler -> "Episode ${ep.number}"
+            !still?.name.isNullOrBlank() && (ep.name.isNullOrBlank() || ep.name!!.length > 60) -> still!!.name
+            !ep.name.isNullOrBlank() -> cleanEpTitle(ep)
+            !still?.name.isNullOrBlank() -> still!!.name
+            else -> "Episode ${ep.number}"
+        }
+        val over = themed("S${ep.season} • EPISODE ${ep.number}", "x-ep-over")
+        val title = themed(titleText, "x-ep-title").apply {
+            isWrapText = true; minWidth = 0.0; maxWidth = EP_CARD_W; maxHeight = 40.0
+        }
+        val sub = themed(
+            if (antiSpoiler) "No description available."
+            else (still?.overview?.takeIf { it.isNotBlank() } ?: "No description available."),
+            "x-ep-sub",
+        ).apply { isWrapText = true; minWidth = 0.0; maxWidth = EP_CARD_W; maxHeight = 34.0 }
+        val card = VBox(8.0, frame, VBox(3.0, over, title, sub).apply { minWidth = 0.0 }).apply {
+            styleClass.add("x-ep-card")
+            if (ep.id == selectedEpisode?.id) styleClass.add("x-ep-sel")
+            cursor = javafx.scene.Cursor.HAND
+            minWidth = EP_CARD_W; prefWidth = EP_CARD_W; maxWidth = EP_CARD_W
+            properties["epId"] = ep.id
+            setOnMouseClicked { selectEpisode(ep) }
+        }
+        episodeCards[ep.id] = card
+        return card
+    }
+
+    private fun cleanEpTitle(ep: Episode): String {
+        val name = ep.name?.trim().orEmpty()
+        if (name.isBlank()) return "Episode ${ep.number}"
+        // Strip the show title so a card reads "Kissa Zeher Ka: Part 1" instead
+        // of 60 characters.
+        val trimmed = name.replace(meta.title, "").trim().trim('-', ':', '|', '·').trim()
+        return trimmed.ifBlank { "Episode ${ep.number}" }
+    }
 
     private fun selectEpisode(ep: Episode) {
         selectedEpisode = ep
         // Put the page holding this episode on screen: picking "Next episode",
-        // or resuming at episode 187 of 379, must not leave the grid on page 1.
-        val idx = episodes.indexOfFirst { it.id == ep.id }
+        // or resuming at episode 187 of 379, must not leave the cards on page 1.
+        val idx = orderedSeasonEps().indexOfFirst { it.id == ep.id }
         if (idx >= 0) episodePage = idx / EPISODE_PAGE
-        renderEpisodeGrid()
+        renderEpisodeCards()
         updateNowPlaying()
         loadStreams()
     }
@@ -817,55 +1079,103 @@ class DetailScreenView(private val item: MediaItem) {
             nowPlaying.isManaged = false
             return
         }
-        nowPlayingTitle.text = ep.name?.takeIf { it.isNotBlank() } ?: "Episode ${ep.number}"
+        nowPlayingTitle.text = if (meta.type == MediaType.SERIES) {
+            ep.name?.takeIf { it.isNotBlank() } ?: "Episode ${ep.number}"
+        } else {
+            meta.title
+        }
         nowPlayingSub.text = meta.title
         nowPlaying.isVisible = true
         nowPlaying.isManaged = true
+        updatePlayLabel()
     }
+
+    private fun updatePlayLabel() {
+        val ep = selectedEpisode
+        playButton.text = if (meta.type == MediaType.SERIES && ep != null) {
+            "Play S${ep.season} E${ep.number}"
+        } else {
+            "Play"
+        }
+    }
+
+    // ── enrichment ──────────────────────────────────────────────────────────
 
     /**
-     * TMDB/IMDb enrichment for the banner (reference parity: the detail screen
-     * shows TMDB + IMDb data, not just the provider's meta).
+     * TMDB/IMDb enrichment for the banner and the lower sections (reference
+     * parity: the detail screen shows TMDB + IMDb data, not just the
+     * provider's meta).
      *
      * Runs off the load path: a title that does not resolve keeps its provider
-     * meta and simply shows no rating strip — enrichment must never block or
-     * break the screen.
+     * meta and simply shows no enriched sections — enrichment must never block
+     * or break the screen.
      */
-    private fun loadRatings(m: MediaItem) {
+    private fun loadEnrich(m: MediaItem) {
         scope.launch {
             val details = TmdbDetails.load(m)
-            Fx.run { renderRatings(details) }
+            Fx.run {
+                if (details != null) {
+                    enrich = details
+                    renderMeta(meta, details)
+                    renderEnrich(details)
+                    renderSections()
+                    if (meta.type == MediaType.SERIES) loadSeasonStills()
+                }
+            }
         }
     }
 
-    private fun renderRatings(d: TmdbDetails.Details?) {
-        if (d == null || (d.tmdbRating <= 0.0 && d.imdbRating <= 0.0 && d.imdbId.isBlank())) {
-            heroRatings.isVisible = false
-            heroRatings.isManaged = false
-            heroStars.isVisible = false
-            heroStars.isManaged = false
-            return
-        }
+    private fun renderEnrich(d: TmdbDetails.Details) {
         val pills = ArrayList<Node>()
-        if (d.tmdbRating > 0.0) {
-            val votes = if (d.tmdbVotes > 0) " (" + formatVotes(d.tmdbVotes) + ")" else ""
-            pills.add(themed("★ %.1f TMDB%s".format(d.tmdbRating, votes), "rating-pill"))
-        }
-        if (d.imdbId.isNotBlank()) {
-            val label = if (d.imdbRating > 0.0) "★ %.1f IMDb".format(d.imdbRating) else "IMDb ↗"
+        if (d.imdbRating > 0.0 || d.imdbId.isNotBlank()) {
+            val label = if (d.imdbRating > 0.0) "IMDb %.1f".format(d.imdbRating) else "IMDb ↗"
             pills.add(Button(label).apply {
-                styleClass.add("rating-pill-btn")
+                styleClass.add("x-pill-imdb")
                 isFocusTraversable = false
                 setOnAction { desktop.fx.DesktopUi.open(TmdbDetails.imdbUrl(d.imdbId)) }
             })
         }
+        if (d.tmdbRating > 0.0) {
+            val votes = if (d.tmdbVotes > 0) " (" + formatVotes(d.tmdbVotes) + ")" else ""
+            pills.add(themed("TMDB %.1f%s".format(d.tmdbRating, votes), "x-pill-tmdb"))
+        }
         heroRatings.children.setAll(pills)
         heroRatings.isVisible = pills.isNotEmpty()
         heroRatings.isManaged = pills.isNotEmpty()
-        if (d.cast.isNotEmpty()) {
-            heroStars.text = "Starring  " + d.cast.take(6).joinToString(", ")
-            heroStars.isVisible = true
-            heroStars.isManaged = true
+        // Logo treatment: the show's own artwork instead of a text title.
+        if (!d.logoUrl.isNullOrBlank()) {
+            desktop.img.ImageLoader.loadAsync(d.logoUrl, onReady = { img ->
+                if (img != null) {
+                    heroLogo.image = img
+                    heroLogo.isVisible = true
+                    heroLogo.isManaged = true
+                    heroTitle.isVisible = false
+                    heroTitle.isManaged = false
+                }
+            }, w = 640, h = 200)
+        }
+        // Rotating backdrops: the banner keeps changing through the title's
+        // own artwork.
+        if (d.backdrops.isNotEmpty()) {
+            bgUrls = d.backdrops
+            bgIndex = 0
+            startBgTimer()
+        }
+    }
+
+    private fun loadSeasonStills() {
+        val d = enrich ?: return
+        if (d.mediaType != "tv") return
+        if (stillsSeason == currentSeason) return
+        stillsSeason = currentSeason
+        scope.launch {
+            val eps = TmdbDetails.seasonEpisodes(d.tmdbId, currentSeason)
+            Fx.run {
+                if (stillsSeason == currentSeason) {
+                    stills = eps.associateBy { it.number }
+                    renderEpisodeCards()
+                }
+            }
         }
     }
 
@@ -875,7 +1185,238 @@ class DetailScreenView(private val item: MediaItem) {
         else -> v.toString()
     }
 
-    private fun renderPanel() {        panelSub.text = when {
+    // ── cast / crew / studios / shots / trailers ────────────────────────────
+
+    private fun renderCast() {
+        val cast = enrich?.cast.orEmpty()
+        if (cast.isEmpty()) {
+            castSection.isVisible = false; castSection.isManaged = false; return
+        }
+        val shown = if (castExpanded) cast else cast.take(8)
+        val row = HBox(Theme.S4).apply {
+            alignment = Pos.TOP_LEFT
+            padding = Insets(Theme.S1, Theme.S1, Theme.S2, Theme.S1)
+            minWidth = 0.0
+        }
+        shown.forEach { row.children.add(castCard(it.name, it.character.ifBlank { null }, it.photoUrl)) }
+        if (!castExpanded && cast.size > 8) {
+            row.children.add(viewAllCard("View All", "Full Roster") { castExpanded = true; renderSections() })
+        }
+        val head = Ui.sectionHeader("Cast & Crew", null,
+            if (!castExpanded && cast.size > 8) viewAllLink { castExpanded = true; renderSections() } else null)
+        castSection.children.setAll(head, Ui.rail(row))
+        castSection.isVisible = true; castSection.isManaged = true
+    }
+
+    private fun renderCrew() {
+        val crew = enrich?.crew.orEmpty()
+        if (crew.isEmpty()) {
+            crewSection.isVisible = false; crewSection.isManaged = false; return
+        }
+        val row = HBox(Theme.S4).apply {
+            alignment = Pos.TOP_LEFT
+            padding = Insets(Theme.S1, Theme.S1, Theme.S2, Theme.S1)
+            minWidth = 0.0
+        }
+        crew.take(9).forEach { row.children.add(castCard(it.name, null, it.photoUrl, it.job.uppercase())) }
+        crewSection.children.setAll(Ui.sectionHeader("Directors & Creators"), Ui.rail(row))
+        crewSection.isVisible = true; crewSection.isManaged = true
+    }
+
+    private fun castCard(name: String, character: String?, photoUrl: String?, badge: String? = null): VBox {
+        val art = ImageView().apply { isPreserveRatio = false; isSmooth = true; isMouseTransparent = true }
+        val frame = StackPane(art).apply {
+            styleClass.add("x-cast-photo")
+            clip = Rectangle(CAST_W, CAST_H).apply { arcWidth = 18.0; arcHeight = 18.0 }
+            minWidth = CAST_W; prefWidth = CAST_W; maxWidth = CAST_W
+            minHeight = CAST_H; prefHeight = CAST_H; maxHeight = CAST_H
+        }
+        art.fitWidth = CAST_W
+        art.fitHeight = CAST_H
+        if (!photoUrl.isNullOrBlank()) {
+            desktop.img.ImageLoader.loadAsync(photoUrl, onReady = { img ->
+                if (img != null) Ui.coverImage(art, img, CAST_W, CAST_H)
+            }, w = 220, h = 330)
+        } else {
+            art.styleClass.add("x-ep-ph")
+        }
+        if (!badge.isNullOrBlank()) {
+            val b = Label(badge).apply { styleClass.add("x-cast-badge") }
+            StackPane.setAlignment(b, Pos.TOP_LEFT)
+            StackPane.setMargin(b, Insets(8.0, 0.0, 0.0, 8.0))
+            frame.children.add(b)
+        }
+        val nameL = themed(name, "x-cast-name").apply { isWrapText = true; minWidth = 0.0; maxWidth = CAST_W }
+        val charL = themed(if (!character.isNullOrBlank()) "as $character" else "", "x-cast-char").apply {
+            isWrapText = true; minWidth = 0.0; maxWidth = CAST_W; maxHeight = 30.0
+        }
+        return VBox(6.0, frame, nameL, charL).apply {
+            minWidth = CAST_W; prefWidth = CAST_W; maxWidth = CAST_W
+        }
+    }
+
+    private fun viewAllLink(onClick: () -> Unit): Button = Button("View All →").apply {
+        styleClass.add("x-link")
+        isFocusTraversable = false
+        setOnAction { onClick() }
+    }
+
+    private fun viewAllCard(title: String, sub: String, onClick: () -> Unit): VBox {
+        val arrow = StackPane(Icons.of(Icons.CHEVRON_RIGHT, 22.0)).apply { styleClass.add("x-viewall-arrow") }
+        val box = VBox(8.0, arrow,
+            themed(title, "x-viewall-t").apply { textAlignment = javafx.scene.text.TextAlignment.CENTER },
+            themed(sub, "x-viewall-s").apply { textAlignment = javafx.scene.text.TextAlignment.CENTER },
+        ).apply {
+            styleClass.add("x-viewall")
+            alignment = Pos.CENTER
+            minWidth = CAST_W; prefWidth = CAST_W; maxWidth = CAST_W
+            minHeight = CAST_H; prefHeight = CAST_H; maxHeight = CAST_H
+            cursor = javafx.scene.Cursor.HAND
+            setOnMouseClicked { onClick() }
+        }
+        return VBox(6.0, box, themed("", "x-cast-name"), themed("", "x-cast-char")).apply {
+            minWidth = CAST_W; prefWidth = CAST_W; maxWidth = CAST_W
+        }
+    }
+
+    private fun renderStudios() {
+        val studios = enrich?.studios.orEmpty()
+        if (studios.isEmpty()) {
+            studioSection.isVisible = false; studioSection.isManaged = false; return
+        }
+        val row = HBox(10.0).apply { alignment = Pos.CENTER_LEFT; minWidth = 0.0 }
+        studios.forEach { st ->
+            val chip = HBox(8.0).apply {
+                styleClass.add("x-studio")
+                alignment = Pos.CENTER
+                if (!st.logoUrl.isNullOrBlank()) {
+                    val logo = ImageView().apply { isPreserveRatio = true; isSmooth = true; fitHeight = 26.0; isMouseTransparent = true }
+                    children.add(logo)
+                    desktop.img.ImageLoader.loadAsync(st.logoUrl, onReady = { img -> if (img != null) logo.image = img }, w = 240, h = 60)
+                } else {
+                    children.add(themed(st.name, "x-studio-t"))
+                }
+            }
+            row.children.add(chip)
+        }
+        studioSection.children.setAll(
+            themed("PRODUCTION STUDIOS", "x-over").apply { styleClass.add("h-upper") },
+            row,
+        )
+        studioSection.isVisible = true; studioSection.isManaged = true
+    }
+
+    private fun renderShots() {
+        val shots = enrich?.backdrops.orEmpty()
+        if (shots.size < 2) {
+            shotsSection.isVisible = false; shotsSection.isManaged = false; return
+        }
+        val shown = if (shotsExpanded) shots else shots.take(5)
+        val big = shotView(shown[0], SHOT_BIG_W, SHOT_BIG_H)
+        val grid = GridPane().apply { hgap = 8.0; vgap = 8.0; minWidth = 0.0 }
+        shown.drop(1).take(4).forEachIndexed { i, url ->
+            val last = i == 3 && !shotsExpanded && shots.size > 5
+            grid.add(shotView(url, SHOT_SM_W, SHOT_SM_H, if (last) "+${shots.size - 5} more" else null) {
+                if (last) {
+                    shotsExpanded = true; renderSections()
+                } else {
+                    desktop.fx.DesktopUi.open(url.replace("/w1280", "/original"))
+                }
+            }, i % 2, i / 2)
+        }
+        val mosaic = HBox(8.0, big, grid).apply { alignment = Pos.TOP_LEFT; minWidth = 0.0 }
+        big.setOnMouseClicked { desktop.fx.DesktopUi.open(shown[0].replace("/w1280", "/original")) }
+        val head = HBox(10.0,
+            themed("Screenshots", "x-sect").apply { styleClass.add("section-title") },
+            themed(shots.size.toString(), "x-count"),
+        ).apply { alignment = Pos.CENTER_LEFT }
+        shotsSection.children.setAll(head, mosaic)
+        shotsSection.isVisible = true; shotsSection.isManaged = true
+    }
+
+    private fun shotView(url: String, w: Double, h: Double, more: String? = null, onClick: (() -> Unit)? = null): StackPane {
+        val art = ImageView().apply { isPreserveRatio = false; isSmooth = true; isMouseTransparent = true }
+        val frame = StackPane(art).apply {
+            styleClass.add("x-shot")
+            clip = Rectangle(w, h).apply { arcWidth = 14.0; arcHeight = 14.0 }
+            minWidth = w; prefWidth = w; maxWidth = w
+            minHeight = h; prefHeight = h; maxHeight = h
+            cursor = javafx.scene.Cursor.HAND
+        }
+        art.fitWidth = w
+        art.fitHeight = h
+        desktop.img.ImageLoader.loadAsync(url, onReady = { img ->
+            if (img != null) Ui.coverImage(art, img, w, h)
+        }, w = w.toInt(), h = h.toInt())
+        if (more != null) {
+            val label = themed(more.split(" ")[0], "x-shot-more-n")
+            val sub = themed("more", "x-shot-more-s")
+            val moreBox = VBox(0.0, label, sub).apply {
+                styleClass.add("x-shot-more")
+                alignment = Pos.CENTER
+                maxWidth = Double.MAX_VALUE; maxHeight = Double.MAX_VALUE
+            }
+            frame.children.add(moreBox)
+        }
+        if (onClick != null) frame.setOnMouseClicked { onClick() }
+        return frame
+    }
+
+    private fun renderTrailers() {
+        val trailers = enrich?.trailers.orEmpty()
+        if (trailers.isEmpty()) {
+            trailersSection.isVisible = false; trailersSection.isManaged = false; return
+        }
+        val row = HBox(Theme.S4).apply {
+            alignment = Pos.TOP_LEFT
+            padding = Insets(Theme.S1, Theme.S1, Theme.S2, Theme.S1)
+            minWidth = 0.0
+        }
+        trailers.forEach { row.children.add(trailerCard(it)) }
+        val head = HBox(10.0,
+            themed("Videos & Trailers", "x-sect").apply { styleClass.add("section-title") },
+            themed(trailers.size.toString(), "x-count"),
+        ).apply { alignment = Pos.CENTER_LEFT }
+        trailersSection.children.setAll(head, Ui.rail(row))
+        trailersSection.isVisible = true; trailersSection.isManaged = true
+    }
+
+    private fun trailerCard(t: TmdbDetails.Trailer): VBox {
+        val art = ImageView().apply { isPreserveRatio = false; isSmooth = true; isMouseTransparent = true }
+        val frame = StackPane(art).apply {
+            styleClass.add("x-trailer")
+            clip = Rectangle(TRAIL_W, TRAIL_H).apply { arcWidth = 14.0; arcHeight = 14.0 }
+            minWidth = TRAIL_W; prefWidth = TRAIL_W; maxWidth = TRAIL_W
+            minHeight = TRAIL_H; prefHeight = TRAIL_H; maxHeight = TRAIL_H
+            cursor = javafx.scene.Cursor.HAND
+        }
+        art.fitWidth = TRAIL_W
+        art.fitHeight = TRAIL_H
+        desktop.img.ImageLoader.loadAsync(t.thumbUrl, onReady = { img ->
+            if (img != null) Ui.coverImage(art, img, TRAIL_W, TRAIL_H)
+        }, w = 480, h = 270)
+        val play = StackPane(Icons.of(Icons.PLAY, 20.0)).apply {
+            styleClass.add("x-trailer-play")
+            isMouseTransparent = true
+        }
+        frame.children.add(play)
+        val tags = HBox(6.0).apply { alignment = Pos.TOP_LEFT; isMouseTransparent = true }
+        if (t.official) tags.children.add(Label("OFFICIAL").apply { styleClass.add("x-tag-off") })
+        tags.children.add(Label("TRAILER").apply { styleClass.add("x-tag") })
+        StackPane.setAlignment(tags, Pos.TOP_LEFT)
+        StackPane.setMargin(tags, Insets(8.0, 0.0, 0.0, 8.0))
+        frame.children.add(tags)
+        frame.setOnMouseClicked { desktop.fx.DesktopUi.open(t.watchUrl) }
+        val name = themed(t.name, "x-trailer-t").apply {
+            isWrapText = true; minWidth = 0.0; maxWidth = TRAIL_W; maxHeight = 36.0
+        }
+        return VBox(6.0, frame, name).apply {
+            minWidth = TRAIL_W; prefWidth = TRAIL_W; maxWidth = TRAIL_W
+        }
+    }
+
+    private fun renderPanel() {
+        panelSub.text = when {
             episodes.isNotEmpty() -> "${episodes.size} episodes · pick one, then a source"
             streams.isNotEmpty() -> "${streams.size} source(s)"
             else -> "Find a source for this title"
@@ -910,6 +1451,12 @@ class DetailScreenView(private val item: MediaItem) {
                             themed("Stream lookup failed: ${t.message ?: t.javaClass.simpleName}", "tiny")
                                 .apply { styleClass.add("h-danger"); isWrapText = true }
                         )
+                        if (pendingPlay || pendingDownload) {
+                            hideDiscovery()
+                            pendingPlay = false
+                            pendingDownload = false
+                            AppShell.toast("Stream lookup failed: ${t.message ?: "unknown error"}", "error")
+                        }
                     }
                     emptyList()
                 }
@@ -918,13 +1465,20 @@ class DetailScreenView(private val item: MediaItem) {
                 renderStreams()
                 renderPanel()
                 if (pendingPlay) {
-                    pendingPlay = false
-                    // Play straight away: the race starts as soon as the
-                    // sources land, instead of waiting for a click.
-                    playBest(list)
+                    if (list.isEmpty()) {
+                        pendingPlay = false
+                        hideDiscovery()
+                        AppShell.toast("No playable source found for this title", "error")
+                    } else {
+                        // Play straight away: the race starts as soon as the
+                        // sources land, instead of waiting for a click.
+                        discStatus2.text = "Discovering high-speed playback sources…"
+                        playBest(list)
+                    }
                 }
                 if (pendingDownload) {
                     pendingDownload = false
+                    hideDiscovery()
                     downloadFirst()
                 }
             }
@@ -1060,9 +1614,10 @@ class DetailScreenView(private val item: MediaItem) {
         if (list.isNotEmpty()) {
             playBest(list)
         } else {
-            // Nothing looked up yet: fetch, and start the fastest one the moment
-            // the list lands (see [loadStreams]).
+            // Nothing looked up yet: the discovery screen opens while the
+            // sweep runs, and the fastest source starts the moment it lands.
             pendingPlay = true
+            showDiscovery()
             loadStreams()
         }
     }
@@ -1137,6 +1692,7 @@ class DetailScreenView(private val item: MediaItem) {
         }
         if (streams.isEmpty() && !pendingDownload) {
             pendingDownload = true
+            showDiscovery()
             loadStreams()
             return
         }
@@ -1195,6 +1751,7 @@ class DetailScreenView(private val item: MediaItem) {
     }
 
     private fun play(source: StreamSource) {
+        hideDiscovery()
         val ep = selectedEpisode
         lastPositionSave = 0L
         runCatching {
@@ -1211,6 +1768,7 @@ class DetailScreenView(private val item: MediaItem) {
                 )
             )
         }
+        watchedSet = if (ep != null) watchedSet + ep.id else watchedSet
         // Signed live links expire quickly, so a failed first attempt refetches
         // the provider's stream list instead of showing an error dialog.
         DesktopPlayer.play(
@@ -1256,7 +1814,7 @@ class DetailScreenView(private val item: MediaItem) {
         return {
             Fx.run {
                 selectedEpisode = next
-                renderEpisodeGrid()
+                renderEpisodeCards()
                 updateNowPlaying()
                 pendingPlay = true
                 loadStreams()
@@ -1307,16 +1865,27 @@ class DetailScreenView(private val item: MediaItem) {
     private companion object {
         const val PANEL_W = 396.0
 
-        /** Ceiling for the banner's height. It carries the poster as well as the
-         *  title, so it wants a real slice of the window. */
-        const val HERO_H = 430.0
+        /** Ceiling for the banner's height. It carries the logo treatment as
+         *  well as the title, so it wants a real slice of the window. */
+        const val HERO_H = 520.0
 
         /** The banner never shrinks below this, so the title, the metadata and
-         *  the poster all fit even on a short window. */
-        const val HERO_MIN = 300.0
+         *  the actions all fit even on a short window. */
+        const val HERO_MIN = 380.0
 
-        /** Tiles rendered per "page" before the Show-more button appears. */
+        /** Cards rendered per "page" before the pager moves on. */
         const val EPISODE_PAGE = 30
+
+        const val EP_CARD_W = 300.0
+        const val EP_STILL_H = 168.0
+        const val CAST_W = 132.0
+        const val CAST_H = 198.0
+        const val SHOT_BIG_W = 560.0
+        const val SHOT_BIG_H = 315.0
+        const val SHOT_SM_W = 272.0
+        const val SHOT_SM_H = 153.0
+        const val TRAIL_W = 320.0
+        const val TRAIL_H = 180.0
 
         /** Minimum gap between two history position writes while playing. */
         const val POSITION_SAVE_INTERVAL_MS = 10_000L
