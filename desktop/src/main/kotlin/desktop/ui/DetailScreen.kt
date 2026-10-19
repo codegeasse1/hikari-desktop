@@ -6,6 +6,7 @@ import com.hikari.app.data.HistoryEntry
 import com.hikari.app.data.MediaItem
 import com.hikari.app.data.MediaType
 import com.hikari.app.data.StreamSource
+import com.hikari.app.data.TmdbDetails
 import com.hikari.app.net.Http
 import com.hikari.app.download.DownloadKind
 import com.hikari.app.download.DownloadStatus
@@ -207,6 +208,20 @@ class DetailScreenView(private val item: MediaItem) {
         minWidth = 0.0
     }
     private val heroChips = HBox(8.0).apply { alignment = Pos.CENTER_LEFT }
+    /** TMDB/IMDb rating pills — filled once [TmdbDetails] resolves the title. */
+    private val heroRatings = HBox(8.0).apply {
+        alignment = Pos.CENTER_LEFT
+        isVisible = false
+        isManaged = false
+    }
+    /** Top-billed cast line under the ratings. */
+    private val heroStars = themed("", "d-cast").apply {
+        isWrapText = true
+        maxWidth = 560.0
+        minWidth = 0.0
+        isVisible = false
+        isManaged = false
+    }
     private val heroActions = HBox(10.0,
         // The banner's Play button. It is the primary action on this screen and
         // it has to be reachable by a plain click, so it carries an id for the
@@ -215,7 +230,7 @@ class DetailScreenView(private val item: MediaItem) {
         Ui.playButton("Play") { playFirst() }.apply { id = "heroPlayBtn" },
         Ui.button("Download", icon = Icons.DOWNLOAD, ghost = true) { downloadFirst() },
     ).apply { alignment = Pos.CENTER_LEFT }
-    private val heroBody = VBox(10.0, heroOver, heroTitle, heroMeta, heroChips, heroActions).apply {
+    private val heroBody = VBox(10.0, heroOver, heroTitle, heroMeta, heroRatings, heroStars, heroChips, heroActions).apply {
         alignment = Pos.BOTTOM_LEFT
         minWidth = 0.0
         maxWidth = 580.0
@@ -412,6 +427,9 @@ class DetailScreenView(private val item: MediaItem) {
                 loadStreams()
                 revealSelected()
             }
+            // Ratings + cast resolve in the background (TMDB search): the screen
+            // never waits on them, they pop into the banner when they land.
+            loadRatings(loaded)
         }
     }
 
@@ -805,8 +823,59 @@ class DetailScreenView(private val item: MediaItem) {
         nowPlaying.isManaged = true
     }
 
-    private fun renderPanel() {
-        panelSub.text = when {
+    /**
+     * TMDB/IMDb enrichment for the banner (reference parity: the detail screen
+     * shows TMDB + IMDb data, not just the provider's meta).
+     *
+     * Runs off the load path: a title that does not resolve keeps its provider
+     * meta and simply shows no rating strip — enrichment must never block or
+     * break the screen.
+     */
+    private fun loadRatings(m: MediaItem) {
+        scope.launch {
+            val details = TmdbDetails.load(m)
+            Fx.run { renderRatings(details) }
+        }
+    }
+
+    private fun renderRatings(d: TmdbDetails.Details?) {
+        if (d == null || (d.tmdbRating <= 0.0 && d.imdbRating <= 0.0 && d.imdbId.isBlank())) {
+            heroRatings.isVisible = false
+            heroRatings.isManaged = false
+            heroStars.isVisible = false
+            heroStars.isManaged = false
+            return
+        }
+        val pills = ArrayList<Node>()
+        if (d.tmdbRating > 0.0) {
+            val votes = if (d.tmdbVotes > 0) " (" + formatVotes(d.tmdbVotes) + ")" else ""
+            pills.add(themed("★ %.1f TMDB%s".format(d.tmdbRating, votes), "rating-pill"))
+        }
+        if (d.imdbId.isNotBlank()) {
+            val label = if (d.imdbRating > 0.0) "★ %.1f IMDb".format(d.imdbRating) else "IMDb ↗"
+            pills.add(Button(label).apply {
+                styleClass.add("rating-pill-btn")
+                isFocusTraversable = false
+                setOnAction { desktop.fx.DesktopUi.open(TmdbDetails.imdbUrl(d.imdbId)) }
+            })
+        }
+        heroRatings.children.setAll(pills)
+        heroRatings.isVisible = pills.isNotEmpty()
+        heroRatings.isManaged = pills.isNotEmpty()
+        if (d.cast.isNotEmpty()) {
+            heroStars.text = "Starring  " + d.cast.take(6).joinToString(", ")
+            heroStars.isVisible = true
+            heroStars.isManaged = true
+        }
+    }
+
+    private fun formatVotes(v: Int): String = when {
+        v >= 1_000_000 -> "%.1fM".format(v / 1_000_000.0)
+        v >= 1_000 -> "%.1fk".format(v / 1_000.0)
+        else -> v.toString()
+    }
+
+    private fun renderPanel() {        panelSub.text = when {
             episodes.isNotEmpty() -> "${episodes.size} episodes · pick one, then a source"
             streams.isNotEmpty() -> "${streams.size} source(s)"
             else -> "Find a source for this title"
@@ -1161,6 +1230,18 @@ class DetailScreenView(private val item: MediaItem) {
             // dead server can be swapped for another without leaving playback.
             sources = streams,
             onPickSource = { picked -> if (picked.url != source.url) play(picked) },
+            // The player's centered Episodes picker: the whole season, so an
+            // episode can be switched mid-playback. Picking one reselects it
+            // here and replays (streams reload, then auto-play — the same path
+            // the banner's Play button takes).
+            episodes = episodes,
+            currentEpisodeId = ep?.id.orEmpty(),
+            onPickEpisode = { picked ->
+                Fx.run {
+                    pendingPlay = true
+                    selectEpisode(picked)
+                }
+            },
         )
     }
 

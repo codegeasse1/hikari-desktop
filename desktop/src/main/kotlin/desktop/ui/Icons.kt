@@ -35,6 +35,8 @@ object Icons {
 
     const val PLAY = "play"
     const val PAUSE = "pause"
+    const val BACK10 = "back-10"
+    const val FORWARD10 = "forward-10"
     const val SKIP_NEXT = "skip-next"
     const val SKIP_PREV = "skip-prev"
     const val VOLUME = "volume"
@@ -205,6 +207,33 @@ object Icons {
         SKIP_PREV -> filled(
             Polygon(18.4, 5.0, 8.6, 12.0, 18.4, 19.0),
             Rectangle(3.0, 14.0).apply { x = 4.6; y = 5.0; arcWidth = 2.0; arcHeight = 2.0 },
+        )
+
+        // Circular-arrow ±10s transport buttons (reference player parity). The arc
+        // is stroked, the arrowhead and the "10" are filled — a Text IS a Shape,
+        // so it rides in the filled list and takes the icon fill from CSS.
+        BACK10 -> mix(
+            listOf(
+                Polygon(13.6, 2.6, 8.0, 5.0, 13.6, 7.4),
+                javafx.scene.text.Text("10").apply {
+                    x = 7.4
+                    y = 15.6
+                    font = javafx.scene.text.Font.font(8.0)
+                },
+            ),
+            listOf(SVGPath().apply { content = "M19.0 12.0 A7.0 7.0 0 1 0 12.0 5.0" }),
+        )
+
+        FORWARD10 -> mix(
+            listOf(
+                Polygon(10.4, 2.6, 16.0, 5.0, 10.4, 7.4),
+                javafx.scene.text.Text("10").apply {
+                    x = 7.4
+                    y = 15.6
+                    font = javafx.scene.text.Font.font(8.0)
+                },
+            ),
+            listOf(SVGPath().apply { content = "M5.0 12.0 A7.0 7.0 0 1 1 12.0 5.0" }),
         )
 
         VOLUME -> mix(

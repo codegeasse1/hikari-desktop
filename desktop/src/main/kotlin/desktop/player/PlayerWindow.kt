@@ -1,5 +1,6 @@
 package desktop.player
 
+import com.hikari.app.data.Episode
 import com.hikari.app.data.StreamSource
 import desktop.fx.DesktopUi
 import desktop.fx.Fx
@@ -52,10 +53,11 @@ import kotlin.math.roundToInt
  *
  * The layout is a player's, not a dashboard's:
  *
- *   top strip     Back · title · status · window controls
+ *   top strip     Back · title · status · Source · Quality · Audio · Subs ·
+ *                 Next Episode · window controls
  *   video area    mpv's window, glued over it (spinners/explanations park it)
- *   control bar   play/pause · time · seek · total · Source · Audio · Subs ·
- *                 next episode · fullscreen
+ *   bottom bar    full-width seek row, then transport: play · -10s · +10s ·
+ *                 mute · time · centered Episodes picker · fullscreen · close
  *
  * The video surface is a real window sitting ABOVE everything the app draws, so
  * it has to get out of the way while a spinner or an explanation is on screen.
@@ -185,7 +187,23 @@ object PlayerWindow {
     }
 
     private var topStrip: HBox? = null
-    private var bottomBar: HBox? = null
+    /** The whole bottom column: full-width seek row over the transport row. */
+    private var bottomBar: VBox? = null
+    /** The transport row inside [bottomBar] (play, skips, time, episodes, …). Kept
+     *  for tests and layout passes that address the row rather than the column. */
+    private var controlsRow: HBox? = null
+    /** The centered episode picker (reference parity: "Episodes"). */
+    private var episodesMenu: MenuButton? = null
+    /** Mute toggle next to the transport buttons. */
+    private var muteButton: Button? = null
+    /** Volume to restore on unmute. */
+    private var lastVolume = 100.0
+    /** The title's episode list, when the caller knows it (series). */
+    private var episodes: List<Episode> = emptyList()
+    private var currentEpisodeId = ""
+    private var onPickEpisode: ((Episode) -> Unit)? = null
+    /** Whether the title has a next episode (drives the top-strip button). */
+    private var hasNextEp = false
     private var closePlayerButton: Button? = null
 
     /** The control bar's own close button. Two ways out (the strip's and this
@@ -418,12 +436,19 @@ object PlayerWindow {
         sources: List<StreamSource> = emptyList(),
         sourceName: String = "",
         onPickSource: ((StreamSource) -> Unit)? = null,
+        episodes: List<Episode> = emptyList(),
+        currentEpisodeId: String = "",
+        onPickEpisode: ((Episode) -> Unit)? = null,
     ): Boolean {
         onNext = next
         onPosition = position
         onClosed = closed
         this.sources = sources
         this.onPickSource = onPickSource
+        this.episodes = episodes
+        this.currentEpisodeId = currentEpisodeId
+        this.onPickEpisode = onPickEpisode
+        this.hasNextEp = hasNext
         // Exactly what mpv is given as `--title=…` (see DesktopPlayer), so the
         // window can be found by title if the process-id search fails.
         this.mpvTitle = title.take(200).replace('\n', ' ')
@@ -444,6 +469,7 @@ object PlayerWindow {
             nextButton?.isVisible = hasNext
             nextButton?.isManaged = hasNext
             renderSources(sourceName)
+            renderEpisodes()
             releaseSurface()
             refreshFullscreenButton()
             // Whether the picture can be shown inside the app at all: embedding
@@ -479,7 +505,7 @@ object PlayerWindow {
         seekBar?.isDisable = true
         playButton?.isDisable = true
         nextButton?.isDisable = true
-        playButton?.graphic = Icons.of(Icons.PAUSE, 18.0)
+        playButton?.graphic = Icons.of(Icons.PAUSE, 20.0)
         audioMenu?.items?.setAll()
         subMenu?.items?.setAll()
         audioMenu?.isDisable = true
@@ -1104,6 +1130,18 @@ object PlayerWindow {
         runCatching { if (st.isShowing) st.hide() }
     }
 
+    /**
+     * Re-glues everything that floats over or inside the app window, at once:
+     * the adopted mpv video surface ([safeSync]) and the two floating bars
+     * ([positionOverlays]). Called on every window move/resize event so a drag
+     * can never separate the picture from its controls — the periodic timer
+     * only covers moves the OS makes behind our back.
+     */
+    private fun glueNow() {
+        safeSync()
+        positionOverlays()
+    }
+
     private fun safeSync() {
         runCatching { syncSurface() }.onFailure {
             lastSyncNote = "sync threw: " + (it.message ?: it.javaClass.simpleName)
@@ -1272,7 +1310,63 @@ object PlayerWindow {
         statusChip = statusBox
 
         val stripSpacer = Region().apply { HBox.setHgrow(this, Priority.ALWAYS) }
-        val strip = HBox(10.0, back, title, statusBox, stripSpacer).apply {
+
+        // ── top strip: back · title · status · Source · Quality · Audio · Subs ·
+        //    Next Episode · window controls (reference parity) ────────────────
+        // The Source picker: EVERY server the title offered, switchable without
+        // leaving the player. This is the button the Android player has and the
+        // reason sources are handed to this layer at all.
+        val source = MenuButton("Source").apply {
+            styleClass.addAll("player-pill", "player-pill-accent")
+            graphic = Icons.of(Icons.FILM, 14.0)
+            isFocusTraversable = false
+            javafx.scene.control.Tooltip.install(this, Ui.tooltip("Pick another source / server"))
+        }
+        sourceMenu = source
+
+        // Quality: which video track/rendition to play. Same shape as the Source
+        // picker (and as the Android player's) — a pill that opens a list, with
+        // the current choice ticked. Its label names the current rendition
+        // ("1080p") once mpv reports the track list.
+        val quality = MenuButton("Quality").apply {
+            styleClass.add("player-pill")
+            graphic = Icons.of(Icons.QUALITY, 14.0)
+            isFocusTraversable = false
+            isDisable = true
+            javafx.scene.control.Tooltip.install(this, Ui.tooltip("Video quality"))
+        }
+        qualityMenu = quality
+
+        val audio = MenuButton("Audio").apply {
+            styleClass.add("player-pill")
+            graphic = Icons.of(Icons.VOLUME, 14.0)
+            isFocusTraversable = false
+            isDisable = true
+            javafx.scene.control.Tooltip.install(this, Ui.tooltip("Audio track"))
+        }
+        audioMenu = audio
+
+        val subs = MenuButton("Subs").apply {
+            styleClass.add("player-pill")
+            graphic = Icons.of(Icons.SUBTITLES, 14.0)
+            isFocusTraversable = false
+            isDisable = true
+            javafx.scene.control.Tooltip.install(this, Ui.tooltip("Subtitle track"))
+        }
+        subMenu = subs
+
+        val nextEp = Button("Next Episode").apply {
+            styleClass.add("player-next")
+            graphic = Icons.of(Icons.SKIP_NEXT, 14.0)
+            isFocusTraversable = false
+            isVisible = false
+            isManaged = false
+            javafx.scene.control.Tooltip.install(this, Ui.tooltip("Next episode (N)"))
+            setOnAction { onNext?.invoke() }
+        }
+        nextButton = nextEp
+
+        val strip = HBox(10.0, back, title, statusBox, stripSpacer, source, quality, audio, subs, nextEp).apply {
             styleClass.add("player-top")
             alignment = Pos.CENTER_LEFT
             minWidth = 0.0
@@ -1288,8 +1382,8 @@ object PlayerWindow {
         runCatching { strip.children.add(playerWindowControls()) }
         topStrip = strip
 
-        // ── control bar: transport, then the pickers ────────────────────────
-        val play = roundButton(Icons.PAUSE, "Play / pause (space)", 18.0, 38.0) { togglePause() }
+        // ── bottom column: full-width seek over the transport row ────────────
+        val play = roundButton(Icons.PAUSE, "Play / pause (space)", 20.0, 44.0) { togglePause() }
             .apply { styleClass.add("player-play") }
         playButton = play
 
@@ -1345,52 +1439,26 @@ object PlayerWindow {
         }
         seekHit = seekRow
 
-        // The Source picker: EVERY server the title offered, switchable without
-        // leaving the player. This is the button the Android player has and the
-        // reason sources are handed to this layer at all.
-        val source = MenuButton("Source").apply {
-            styleClass.addAll("player-pill", "player-pill-accent")
-            graphic = Icons.of(Icons.FILM, 14.0)
-            isFocusTraversable = false
-            javafx.scene.control.Tooltip.install(this, Ui.tooltip("Pick another source / server"))
-        }
-        sourceMenu = source
+        // (Source / Quality / Audio / Subs live in the top strip now — see above.)
 
-        // Quality: which video track/rendition to play. Same shape as the Source
-        // picker (and as the Android player's) — a pill that opens a list, with
-        // the current choice ticked.
-        val quality = MenuButton("Quality").apply {
+        val back10 = roundButton(Icons.BACK10, "Back 10 seconds (Left)", 16.0, 34.0) { seekBy(-10.0) }
+        val fwd10 = roundButton(Icons.FORWARD10, "Forward 10 seconds (Right)", 16.0, 34.0) { seekBy(10.0) }
+        val mute = roundButton(Icons.VOLUME, "Mute (M)", 16.0, 34.0) { toggleMute() }
+        muteButton = mute
+        refreshMuteIcon()
+
+        // The centered episode picker (reference parity): every episode of the
+        // title, switchable without leaving the player. Hidden for movies and
+        // file playback, where the caller hands over no episode list.
+        val eps = MenuButton("Episodes").apply {
             styleClass.add("player-pill")
-            graphic = Icons.of(Icons.QUALITY, 14.0)
+            graphic = Icons.of(Icons.PLAYLIST, 14.0)
             isFocusTraversable = false
-            isDisable = true
-            javafx.scene.control.Tooltip.install(this, Ui.tooltip("Video quality"))
-        }
-        qualityMenu = quality
-
-        val audio = MenuButton("Audio").apply {
-            styleClass.add("player-pill")
-            graphic = Icons.of(Icons.VOLUME, 14.0)
-            isFocusTraversable = false
-            isDisable = true
-            javafx.scene.control.Tooltip.install(this, Ui.tooltip("Audio track"))
-        }
-        audioMenu = audio
-
-        val subs = MenuButton("Subs").apply {
-            styleClass.add("player-pill")
-            graphic = Icons.of(Icons.SUBTITLES, 14.0)
-            isFocusTraversable = false
-            isDisable = true
-            javafx.scene.control.Tooltip.install(this, Ui.tooltip("Subtitle track"))
-        }
-        subMenu = subs
-
-        val next = roundButton(Icons.SKIP_NEXT, "Next episode (N)", 16.0, 34.0) { onNext?.invoke() }.apply {
             isVisible = false
             isManaged = false
+            javafx.scene.control.Tooltip.install(this, Ui.tooltip("Episodes"))
         }
-        nextButton = next
+        episodesMenu = eps
 
         val full = roundButton(Icons.FULLSCREEN, "Fullscreen (F)", 16.0, 34.0) { toggleFullscreen() }
         fullscreenButton = full
@@ -1403,40 +1471,32 @@ object PlayerWindow {
         val barClose = roundButton(Icons.CLOSE, "Close the player (Esc)", 15.0, 34.0) { requestClose() }
         barCloseButton = barClose
 
-        val sepA = separator()
-        val sepB = separator()
-        barSeparators = listOf(sepA, sepB)
-        // Transport on the left, pickers on the right, and the flexible gap
-        // BETWEEN them. The seek bar used to be the growing child of this row,
-        // so it stretched from the time label all the way to the Source button —
-        // at every window size the two were in each other's lap, and on a
-        // maximised window the bar ran the width of the screen. Its length is
-        // now chosen in [applyResponsive] and the gap takes whatever is left.
-        val barGap = Region().apply {
-            HBox.setHgrow(this, Priority.ALWAYS)
-            minWidth = 12.0
-        }
-        val bar = HBox(10.0).apply {
-            styleClass.add("player-bar")
+        barSeparators = emptyList()
+        // Transport row: play · -10s · +10s · mute · time, then the centered
+        // Episodes picker between two equal spacers, then fullscreen · close.
+        // The seek row above spans the full width (reference parity) instead of
+        // fighting the buttons for one row.
+        val gapL = Region().apply { HBox.setHgrow(this, Priority.ALWAYS); minWidth = 8.0 }
+        val gapR = Region().apply { HBox.setHgrow(this, Priority.ALWAYS); minWidth = 8.0 }
+        val controls = HBox(10.0, play, back10, fwd10, mute, time, total, gapL, eps, gapR, full, barClose).apply {
+            styleClass.add("player-controls")
             alignment = Pos.CENTER_LEFT
             minWidth = 0.0
             maxWidth = Double.MAX_VALUE
-            children.addAll(
-                play, time, seekRow, total,
-                barGap,
-                sepA,
-                source, quality, audio, subs,
-                sepB,
-                next, full, barClose,
-            )
         }
-        bottomBar = bar
+        controlsRow = controls
+        val bottomCol = VBox(2.0, seekRow, controls).apply {
+            styleClass.add("player-bar")
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
+        }
+        bottomBar = bottomCol
 
         root = BorderPane().apply {
             styleClass.add("player-root")
             top = strip
             center = videoArea
-            bottom = bar
+            bottom = bottomCol
         }
 
         // ── the bars are shown, not always there ────────────────────────────
@@ -1485,15 +1545,20 @@ object PlayerWindow {
             applyResponsive()
         }
 
-        // Anything that moves or resizes the video area has to move the window
-        // glued to it.
-        videoArea.layoutBoundsProperty().addListener { _, _, _ -> safeSync() }
+        // Anything that moves or resizes the video area has to move the windows
+        // glued to it — the mpv video surface AND the two floating bars. The
+        // bars are separate native windows: they never follow the app window on
+        // their own, so a drag that only re-glued the video left the buttons
+        // behind while the picture floated away (and vice versa). glueNow()
+        // re-places all three at once, on every move event — the 120ms timer
+        // only covers what the OS moves behind our back (mpv resizing itself).
+        videoArea.layoutBoundsProperty().addListener { _, _, _ -> glueNow() }
         val stage = runCatching { AppShell.stage }.getOrNull()
         if (stage != null) {
-            stage.xProperty().addListener { _, _, _ -> safeSync() }
-            stage.yProperty().addListener { _, _, _ -> safeSync() }
-            stage.widthProperty().addListener { _, _, _ -> safeSync() }
-            stage.heightProperty().addListener { _, _, _ -> safeSync() }
+            stage.xProperty().addListener { _, _, _ -> glueNow() }
+            stage.yProperty().addListener { _, _, _ -> glueNow() }
+            stage.widthProperty().addListener { _, _, _ -> glueNow() }
+            stage.heightProperty().addListener { _, _, _ -> glueNow() }
             stage.fullScreenProperty().addListener { _, _, fs ->
                 // Full screen can also be left from OUTSIDE the button (the
                 // platform's own shortcut, a window manager), and the player's
@@ -1548,6 +1613,66 @@ object PlayerWindow {
         menu.text = if (barsNarrow) "" else (name?.let { shorten(it, 18) } ?: "Source")
     }
 
+    /**
+     * The Quality pill's label — mirrors [applySourceLabel]: the current
+     * rendition's short name ("1080p") once mpv reports the track list, the
+     * plain "Quality" otherwise, the icon alone on narrow windows.
+     */
+    private fun applyQualityLabel() {
+        val menu = qualityMenu ?: return
+        val current = videoTracks.firstOrNull { it.first == videoChoice }?.second
+            ?.substringBefore("·")?.trim().orEmpty()
+        menu.text = if (barsNarrow) "" else current.ifBlank { "Quality" }
+    }
+
+    /** Fills the centered Episodes picker; hidden when there is no episode list
+     *  (movies, file playback). */
+    private fun renderEpisodes() {
+        val menu = episodesMenu ?: return
+        if (episodes.isEmpty()) {
+            menu.isVisible = false
+            menu.isManaged = false
+            return
+        }
+        menu.isVisible = true
+        menu.isManaged = true
+        menu.text = if (barsNarrow) "" else "Episodes"
+        menu.items.setAll(
+            *episodes.map { ep ->
+                val name = ep.name?.takeIf { it.isNotBlank() }?.let { " · " + shorten(it, 42) } ?: ""
+                val season = if (ep.season > 1) "S${ep.season}" else ""
+                MenuItem("$season E${ep.number}$name").apply {
+                    if (ep.id == currentEpisodeId && ep.id.isNotBlank()) graphic = Icons.of(Icons.CHECK, 13.0)
+                    setOnAction { pickEpisode(ep) }
+                }
+            }.toTypedArray()
+        )
+    }
+
+    private fun pickEpisode(ep: Episode) {
+        if (ep.id == currentEpisodeId) return
+        currentEpisodeId = ep.id
+        renderEpisodes()
+        // The owner reselects and replays (it alone knows the streams); the
+        // layer stays up, so switching episodes never drops out of the player.
+        onPickEpisode?.invoke(ep)
+    }
+
+    /** Mutes or restores the volume, remembering what it was. */
+    private fun toggleMute() {
+        if (volume > 0.0) {
+            lastVolume = volume
+            setVolume(0.0)
+        } else {
+            setVolume(if (lastVolume > 0.0) lastVolume else 100.0)
+        }
+        refreshMuteIcon()
+    }
+
+    private fun refreshMuteIcon() {
+        muteButton?.graphic = Icons.of(if (volume <= 0.0) Icons.VOLUME_OFF else Icons.VOLUME, 16.0)
+    }
+
     private fun applyResponsive() {
         // Whichever container the bars are actually in decides how much room
         // they have: the window's own layout, or the floating bar window. The
@@ -1576,7 +1701,7 @@ object PlayerWindow {
         // that was the source NAME, which pushed the pill (and its text) off the
         // right edge of the bar.
         applySourceLabel()
-        qualityMenu?.let { it.text = if (narrow) "" else "Quality" }
+        applyQualityLabel()
         audioMenu?.let { it.text = if (narrow) "" else "Audio" }
         subMenu?.let { it.text = if (narrow) "" else "Subs" }
         // Source stays (switching server is the first thing to reach for when a
@@ -1587,6 +1712,15 @@ object PlayerWindow {
             menu.isVisible = !tiny
             menu.isManaged = !tiny
         }
+        // The strip's Next Episode button gives way on tiny windows (N still
+        // works); the centered Episodes picker collapses to its icon.
+        nextButton?.let {
+            val show = hasNextEp && !tiny
+            it.isVisible = show
+            it.isManaged = show
+            if (show) it.text = if (narrow) "" else "Next Episode"
+        }
+        episodesMenu?.let { if (it.isVisible) it.text = if (tiny) "" else "Episodes" }
         for (sep in barSeparators) {
             sep.isVisible = !tiny
             sep.isManaged = !tiny
@@ -1595,48 +1729,13 @@ object PlayerWindow {
         // window it gives them up instead of drawing under them.
         titleLabel?.let { it.maxWidth = if (narrow) 200.0 else 380.0 }
         statusLabel?.let { it.maxWidth = if (narrow) 170.0 else 320.0 }
-        // The seek bar's length is what is LEFT of the row after the controls
-        // that must always be there (transport buttons, three pickers, the window
-        // buttons and their gaps ≈ 480px), capped so it never grows into a
-        // corner-to-corner line: on a maximised window the two dozen other things
-        // on the row leave plenty of room, and on a narrow one the length is the
-        // first thing to go. Its floor (90px) is what keeps it scrubbable when
-        // the window is at its smallest.
-        // The seek bar gets whatever is LEFT of the row, and that budget is
-        // MEASURED from the controls that are actually there — never a constant.
-        // The old "controls need ≈480px" was written when the bar had three
-        // pickers; adding the fourth silently took ~90px of the row, so the
-        // pickers were squeezed below the width of their own labels and JavaFX
-        // ellipsized them ("Quality" → "Qua…", "00:00" → "0…") while the seek bar
-        // still had all of its length. Anything added to the bar is now accounted
-        // for automatically.
-        val row = bottomBar
-        if (row != null) {
-            var need = 0.0
-            var shown = 0
-            for (child in row.children) {
-                if (child === seekBar || child === seekHit) continue
-                if (!child.isVisible || !child.isManaged) continue
-                shown++
-                val r = child as? Region
-                val w = r?.prefWidth(-1.0) ?: 0.0
-                need += if (w > 0.0) w else (r?.minWidth(-1.0) ?: 0.0).coerceAtLeast(0.0)
-            }
-            if (shown > 1) need += row.spacing * (shown - 1)
-            val floor = if (tiny) 48.0 else 90.0
-            val length = (width - need - 10.0).coerceIn(floor, 620.0)
-            // The length belongs to the ROW (it is the row's child and the click
-            // target); the slider inside simply fills it.
-            seekHit?.let {
-                it.minWidth = floor
-                it.prefWidth = length
-                it.maxWidth = length
-            }
-            seekBar?.let {
-                it.minWidth = floor
-                it.prefWidth = length
-                it.maxWidth = length
-            }
+        // The seek row spans the full width of the bottom column (reference
+        // parity) — it is no longer measured against the buttons, so it can
+        // never be squeezed to a dot again. Only its floor is enforced, so it
+        // stays scrubbable at the smallest window size.
+        seekHit?.let {
+            it.minWidth = if (tiny) 48.0 else 90.0
+            it.maxWidth = Double.MAX_VALUE
         }
         // ...and the labels that must never be reduced to "Qua…" or "0…" say so.
         // A pill whose text no longer fits is worse than a shorter seek bar: the
@@ -1669,16 +1768,6 @@ object PlayerWindow {
             javafx.scene.control.Tooltip.install(this, Ui.tooltip(tooltip))
             setOnAction { runCatching { onClick() } }
         }
-
-    private fun separator(): Region = Region().apply {
-        styleClass.add("player-sep")
-        prefWidth = 1.0
-        minWidth = 1.0
-        maxWidth = 1.0
-        prefHeight = 20.0
-        minHeight = 20.0
-        maxHeight = 20.0
-    }
 
     private fun requestClose() {
         if (teardown) return
@@ -2572,6 +2661,7 @@ object PlayerWindow {
             KeyCode.RIGHT -> seekBy(10.0)
             KeyCode.UP -> setVolume(volume + 5)
             KeyCode.DOWN -> setVolume(volume - 5)
+            KeyCode.M -> toggleMute()
             KeyCode.F, KeyCode.F11 -> toggleFullscreen()
             KeyCode.N -> onNext?.invoke()
             KeyCode.ESCAPE -> requestClose()
@@ -2652,14 +2742,17 @@ object PlayerWindow {
             "pause" -> {
                 paused = value == true
                 Fx.run {
-                    playButton?.graphic = Icons.of(if (paused) Icons.PLAY else Icons.PAUSE, 18.0)
+                    playButton?.graphic = Icons.of(if (paused) Icons.PLAY else Icons.PAUSE, 20.0)
                     // Paused means the bars stay (they are how playback gets
                     // started again); playing means they get out of the way.
                     if (paused) runCatching { hideChrome?.stop() } else scheduleChromeHide()
                     applyChrome()
                 }
             }
-            "volume" -> volume = (value as? Number)?.toDouble() ?: 100.0
+            "volume" -> {
+                volume = (value as? Number)?.toDouble() ?: 100.0
+                Fx.run { refreshMuteIcon() }
+            }
             "track-list" -> renderTracks(value)
             "vo-configured" -> if (value == true) markVideoUp()
             "video-format" -> {
@@ -2855,6 +2948,7 @@ object PlayerWindow {
                 }
             }.toTypedArray()
         )
+        applyQualityLabel()
         if (updateTooltip) {
             val current = tracks.firstOrNull { it.first == videoChoice }?.second
             javafx.scene.control.Tooltip.install(

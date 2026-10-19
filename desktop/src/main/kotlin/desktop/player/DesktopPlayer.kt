@@ -74,6 +74,18 @@ object DesktopPlayer {
     @Volatile
     private var onPickSource: ((StreamSource) -> Unit)? = null
 
+    /** The title's episode list for the player's centered Episodes picker
+     *  (series only) — stored as fields so failover relaunches keep it without
+     *  re-threading every launchMpv call site. */
+    @Volatile
+    private var episodeList: List<com.hikari.app.data.Episode> = emptyList()
+
+    @Volatile
+    private var currentEpisodeId: String = ""
+
+    @Volatile
+    private var onPickEpisode: ((com.hikari.app.data.Episode) -> Unit)? = null
+
     /** True once the current launch has shown its failure dialog (mpv error or
      *  stream-probe fallback), so the two can't double-popup. Reset per launch. */
     @Volatile private var dialogShown = false
@@ -104,12 +116,18 @@ object DesktopPlayer {
         position: ((Long, Long) -> Unit)? = null,
         sources: List<StreamSource> = emptyList(),
         onPickSource: ((StreamSource) -> Unit)? = null,
+        episodes: List<com.hikari.app.data.Episode> = emptyList(),
+        currentEpisodeId: String = "",
+        onPickEpisode: ((com.hikari.app.data.Episode) -> Unit)? = null,
     ) {
         onEnded = next
         onPosition = position
         sourceList = sources.ifEmpty { listOf(stream) }
         sourceName = stream.name
         this.onPickSource = onPickSource
+        episodeList = episodes
+        this.currentEpisodeId = currentEpisodeId
+        this.onPickEpisode = onPickEpisode
         // Sanitize here too so a malformed URL from ANY provider (chaturbate's
         // root-relative escaped HLS path, stray quotes, JSON escapes) can't
         // reach mpv or the browser as garbage.
@@ -176,6 +194,9 @@ object DesktopPlayer {
         sourceList = emptyList()
         sourceName = ""
         onPickSource = null
+        episodeList = emptyList()
+        currentEpisodeId = ""
+        onPickEpisode = null
         Fx.run {
             val file = File(path)
             if (!file.exists()) {
@@ -344,6 +365,9 @@ object DesktopPlayer {
                 sources = sourceList,
                 sourceName = sourceName,
                 onPickSource = onPickSource,
+                episodes = episodeList,
+                currentEpisodeId = currentEpisodeId,
+                onPickEpisode = onPickEpisode,
             )
             if (!glued) {
                 PlayerWindow.note(

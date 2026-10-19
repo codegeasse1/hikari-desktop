@@ -500,15 +500,15 @@
 .poster-card { -fx-background-color: transparent; -fx-cursor: hand; }
 .poster-card .poster-frame {
     -fx-background-color: -h-surface-2;
-    -fx-background-radius: 12;
+    -fx-background-radius: 16;
     -fx-border-color: -h-border;
-    -fx-border-radius: 12;
+    -fx-border-radius: 16;
 }
-.poster-card:hover .poster-frame { -fx-border-color: -h-accent-line; -fx-effect: dropshadow(gaussian, -h-accent-glow, 20, 0, 0, 6); }
-.poster-img { -fx-background-color: -h-surface-2; -fx-background-radius: 12; }
+.poster-card:hover .poster-frame { -fx-border-color: -h-accent-line; -fx-effect: dropshadow(gaussian, -h-accent-glow, 26, 0, 0, 8); }
+.poster-img { -fx-background-color: -h-surface-2; -fx-background-radius: 16; }
 .poster-scrim {
-    -fx-background-color: linear-gradient(to top, rgba(0,0,0,0.86) 0%, rgba(0,0,0,0.30) 45%, rgba(0,0,0,0.00) 100%);
-    -fx-background-radius: 12;
+    -fx-background-color: linear-gradient(to top, rgba(0,0,0,0.88) 0%, rgba(0,0,0,0.32) 45%, rgba(0,0,0,0.00) 100%);
+    -fx-background-radius: 16;
 }
 .poster-title { -fx-text-fill: -h-fg; -fx-font-size: 12.5px; -fx-font-weight: 600; }
 .poster-meta  { -fx-text-fill: -h-fg-3; -fx-font-size: 11px; }
@@ -885,6 +885,21 @@
     -fx-font-weight: bold;
     -fx-padding: 5 11 5 11;
 }
+/* Clickable rating pill (IMDb link on the detail banner). */
+.rating-pill-btn {
+    -fx-background-color: rgba(0,0,0,0.55);
+    -fx-background-radius: 999;
+    -fx-border-color: rgba(255,255,255,0.22);
+    -fx-border-radius: 999;
+    -fx-border-width: 1;
+    -fx-text-fill: #ffffff;
+    -fx-font-size: 12px;
+    -fx-font-weight: bold;
+    -fx-padding: 4 11 4 11;
+    -fx-cursor: hand;
+}
+.rating-pill-btn:hover { -fx-background-color: rgba(169,112,255,0.35); -fx-border-color: #a970ff; }
+.d-cast { -fx-font-size: 12.5px; -fx-text-fill: rgba(255,255,255,0.72); }
 
 .watch {
     -fx-background-color: -h-surface;
@@ -1219,26 +1234,45 @@
    the plain `.player-top` / `.player-bar` rules above. */
 
 .player-top.player-floating {
-    -fx-background-color: rgba(8, 9, 14, 0.80);
+    -fx-background-color: linear-gradient(to bottom, rgba(4,5,10,0.90) 0%, rgba(4,5,10,0.55) 62%, rgba(4,5,10,0.00) 100%);
     -fx-border-color: transparent;
     -fx-border-width: 0;
-    -fx-padding: 8 12 8 12;
+    -fx-padding: 10 14 14 14;
 }
 
 .player-bar.player-floating {
-    -fx-background-color: rgba(8, 9, 14, 0.80);
+    -fx-background-color: linear-gradient(to top, rgba(4,5,10,0.92) 0%, rgba(4,5,10,0.60) 62%, rgba(4,5,10,0.00) 100%);
     -fx-border-color: transparent;
     -fx-border-width: 0;
-    -fx-padding: 8 14 8 14;
+    -fx-padding: 12 14 10 14;
 }
+
+/* The transport row inside the bottom column — transparent, the column's
+   scrim is the background. */
+.player-controls { -fx-background-color: transparent; }
+
+/* Top-strip "Next Episode" text button (reference parity). */
+.player-next {
+    -fx-background-color: transparent;
+    -fx-background-radius: 8;
+    -fx-text-fill: #eef0f7;
+    -fx-font-size: 12.5px;
+    -fx-font-weight: bold;
+    -fx-padding: 6 10 6 10;
+    -fx-graphic-text-gap: 6;
+    -fx-cursor: hand;
+}
+.player-next:hover { -fx-background-color: rgba(255, 255, 255, 0.10); }
+.player-next .h-icon { -fx-fill: #eef0f7; }
 
 .player-sep { -fx-background-color: rgba(255, 255, 255, 0.10); }
 
 .player-play {
-    -fx-background-color: #a970ff;
+    -fx-background-color: linear-gradient(to bottom right, #a970ff, #5aa2ff);
     -fx-border-color: transparent;
+    -fx-effect: dropshadow(gaussian, rgba(169, 112, 255, 0.45), 14, 0, 0, 0);
 }
-.player-play:hover { -fx-background-color: #5aa2ff; -fx-border-color: transparent; }
+.player-play:hover { -fx-background-color: linear-gradient(to bottom right, #b983ff, #6cb0ff); -fx-border-color: transparent; -fx-effect: dropshadow(gaussian, rgba(169, 112, 255, 0.65), 18, 0, 0, 0); }
 .player-play .h-icon { -fx-fill: #ffffff; }
 
 .player-round {
