@@ -216,7 +216,9 @@ class ProviderPicker(private val onPick: () -> Unit) {
             val x = if (vb != null) (at.minX).coerceIn(vb.minX + 8.0, (vb.maxX - w - 8.0).coerceAtLeast(vb.minX + 8.0)) else at.minX
             pop.show(button, x, at.maxY + 4.0)
         } else {
-            pop.show(button)
+            // No screen coordinates (button not laid out yet): anchor to its
+            // window instead — Popup.show takes a Window, never a Button.
+            button.scene?.window?.let { pop.show(it) }
         }
         // A Popup is a window of its own: its scene does NOT inherit the app's
         // stylesheets, and this sheet defines the colours the picker is drawn
