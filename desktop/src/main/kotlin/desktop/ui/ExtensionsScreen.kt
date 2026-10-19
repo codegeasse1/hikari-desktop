@@ -1623,10 +1623,10 @@ class ExtensionsScreenView {
         AppShell.uiScope.launch {
             var note: String? = null
             val result = runCatching {
-                val dl = Http.downloadPluginFile(url, expectedSha = plugin.fileHash)
+                val (dl, usedHash) = downloadWithStaleIndexRetry(url, plugin.fileHash)
                 val bytes = dl.bytes ?: throw Exception(dl.error ?: "Download failed — check the URL")
                 note = dl.takeIf { it.usedUrl != url }?.error
-                checkHash(bytes, plugin.fileHash)?.let { throw Exception(it) }
+                checkHash(bytes, usedHash)?.let { throw Exception(it) }
                 val fileName = plugin.name.substringBeforeLast('.').ifBlank { "provider" } + ".js"
                 com.hikari.app.nuvio.NuvioPluginManager.installScraper(
                     HikariApp.instance,
@@ -1687,13 +1687,13 @@ class ExtensionsScreenView {
         AppShell.uiScope.launch {
             var note: String? = null
             val result = runCatching {
-                val dl = Http.downloadPluginFile(url, expectedSha = plugin.fileHash)
+                val (dl, usedHash) = downloadWithStaleIndexRetry(url, plugin.fileHash)
                 val bytes = dl.bytes ?: throw Exception(
                     (dl.error ?: "Download failed — check the URL") +
                         " (${url.substringAfterLast('/')} from ${repoLabelFor(url)})"
                 )
                 note = dl.takeIf { it.usedUrl != url }?.error
-                checkHash(bytes, plugin.fileHash)?.let { throw Exception(it) }
+                checkHash(bytes, usedHash)?.let { throw Exception(it) }
                 com.hikari.app.aniyomi.AniyomiExtensionManager.install(
                     HikariApp.instance,
                     bytes,
@@ -1922,6 +1922,146 @@ class ExtensionsScreenView {
         return out
     }
 
+    /** What one download-verify-register round over every candidate produced. */
+    private data class RoundOutcome(
+        val registered: String?,
+        val loadFailure: String?,
+        val pendingSetup: Boolean,
+        val attempts: String,
+        /** served-bytes-hash → reporting hosts, for stale-index detection. */
+        val served: Map<String, Set<String>>,
+    )
+
+    /**
+     * One full round of [installPlugin]: every candidate (plus the lazy
+     * repository repair) is downloaded, verified and registered. Pure worker:
+     * no status lines, no row repaints — the caller decides what a round
+     * means (success, load failure, or a retry with refreshed signatures).
+     */
+    private fun runInstallRound(
+        name: String,
+        safeName: String,
+        dl: String,
+        dest: File,
+        fileHash: String?,
+        jarHash: String?,
+        reused: String?,
+    ): RoundOutcome {
+        // CloudStream repos publish the same plugin side by side as a
+        // dex .cs3 and a JVM .jar (Hikari repos: .hiki/.jar). When the
+        // preferred form 404s or is blocked on some mirror, the sibling
+        // in the same folder is the same plugin — and both DexJar and
+        // the URLClassLoader can load whichever one arrives.
+        val candidates = siblingCandidates(dl)
+        val attempts = StringBuilder()
+        var registered: String? = null
+        var loadFailure: String? = null
+        var pendingSetup = false
+        val servedHosts = HashMap<String, MutableSet<String>>()
+        // A repo's index can name a file the repository no longer serves
+        // under that name — a renamed build (`-v14.28` vs
+        // `-v14.28-release`), a folder that moved, a family prefix the
+        // index dropped (`aniyomi-` vs `anime-`). Those all resolve to
+        // "Download failed — check the URL" even though the extension is
+        // right there under another name. So when every candidate above
+        // has failed, ask the repository what it actually holds and try
+        // the match too (Http.repairGithubFileUrl). It is queued LAZILY
+        // so a working install never pays for the extra api.github.com
+        // call, and only when the repo really holds something else — a
+        // file genuinely deleted upstream stays a clear error.
+        val queue = ArrayList(candidates)
+        var qi = 0
+        var repairQueued = false
+        while (true) {
+            if (qi >= queue.size) {
+                if (repairQueued) break
+                repairQueued = true
+                val fixed = runCatching { Http.repairGithubFileUrl(dl) }.getOrNull()
+                if (fixed == null || fixed == dl || candidates.contains(fixed)) break
+                attempts.append(
+                    "the repo does not serve ${dl.substringAfterLast('/')} — " +
+                        "trying ${fixed.substringAfterLast('/')}\n"
+                )
+                queue.add(fixed)
+            }
+            val c = queue[qi++]
+            val why = StringBuilder()
+            // The repo's sha256 for THIS candidate rides into the
+            // download walk itself: whichever mirror answers first must
+            // serve these bytes, and a stale copy just loses the race
+            // instead of failing the install (a fast stale mirror used
+            // to win, fail verification afterwards, and abandon a
+            // candidate whose good copy was one URL away).
+            val want = expectedShaFor(c, fileHash, jarHash)
+            val ok = if (c == reused) true else Http.downloadToRobust(
+                c,
+                dest,
+                verify = { part, _ -> Http.verifyArchiveFile(part, want) },
+            ) { tried, success, reason ->
+                if (!success) {
+                    val host = tried.substringAfter("//").substringBefore('/')
+                    if (why.isNotEmpty()) why.append(";  ")
+                    why.append("$host — ${reason?.take(70) ?: "failed"}")
+                    SERVED_RE.find(reason ?: "")?.let { m ->
+                        servedHosts.getOrPut(m.groupValues[1]) { HashSet() }.add(host)
+                    }
+                }
+            }
+            if (!ok) {
+                if (why.isNotEmpty()) attempts.append(why).append('\n')
+                continue
+            }
+            // A blocked/misbehaving network (or one of the proxy
+            // frontdoors) can serve an HTML error page or a tampered
+            // file with a 200 — a real extension is always a zip (PK
+            // header), and when the repo publishes a sha256 for this
+            // build it must match before the file is ever loaded.
+            val verifyFail = verifyDownload(dest, c, fileHash, jarHash)
+            if (verifyFail != null) {
+                attempts.append("${c.substringAfterLast('/').substringBefore('?')} — $verifyFail\n")
+                dest.delete()
+                continue
+            }
+            // These bytes are verified (zip header + the repo's sha256),
+            // so keep them: the next install of this build — after an
+            // uninstall, or from another repo that lists it — is then
+            // instant, because nothing has to be downloaded at all.
+            ExtCache.put(expectedShaFor(c, fileHash, jarHash), dest)
+            // Register the extension from the archive's OWN manifest
+            // first. Reading that is one zip entry — no class loading,
+            // and therefore no dex→JVM translation — so the install
+            // finishes the moment the bytes are on disk and verified.
+            // The real load, which is the part that takes seconds on a
+            // dex plugin, runs behind it and reconciles what was
+            // registered (see [finishSetup]).
+            val planned = registerFromManifest(name, safeName, dest, dl)
+            if (planned != null) {
+                registered = planned
+                pendingSetup = true
+                break
+            }
+            // Only when the manifest cannot be read that way does the
+            // install have to WAIT for the load, which is the slow path
+            // it used to always take.
+            val result = registerExtension(name, safeName, dest, dl)
+            if (result != null) {
+                registered = result
+                break
+            }
+            // Report the reason from the loader that was actually
+            // supposed to handle this file: a dex archive's real error
+            // lives on Cs3PluginManager, and showing the Hikari loader's
+            // "manifest.json has no mainClass" for a .cs3 hid it.
+            val isDex = c.endsWith(".cs3") || c.endsWith(".hiki")
+            val primary = if (isDex) Cs3PluginManager.lastError else HikariPluginManager.lastError
+            val secondary = if (isDex) HikariPluginManager.lastError else Cs3PluginManager.lastError
+            loadFailure = listOfNotNull(primary, secondary).joinToString("  |  ")
+                .ifBlank { "not an extension" }
+            attempts.append("${c.substringAfterLast('/')} — not loadable (${loadFailure?.take(200)})\n")
+        }
+        return RoundOutcome(registered, loadFailure, pendingSetup, attempts.toString(), servedHosts)
+    }
+
     /** Downloads (auto-swapping .hiki → .jar), loads, and registers every
      *  provider inside the extension. Every candidate is verified (zip header
      *  + the repo's sha256 when it publishes one) BEFORE it is loaded — and the
@@ -2002,121 +2142,59 @@ class ExtensionsScreenView {
                     }
                 }
                 if (reusedFor == null) dest.delete()
-                // CloudStream repos publish the same plugin side by side as a
-                // dex .cs3 and a JVM .jar (Hikari repos: .hiki/.jar). When the
-                // preferred form 404s or is blocked on some mirror, the sibling
-                // in the same folder is the same plugin — and both DexJar and
-                // the URLClassLoader can load whichever one arrives.
-                val candidates = siblingCandidates(dl)
-                val attempts = StringBuilder()
-                var registered: String? = null
-                var loadFailure: String? = null
-                // A repo's index can name a file the repository no longer serves
-                // under that name — a renamed build (`-v14.28` vs
-                // `-v14.28-release`), a folder that moved, a family prefix the
-                // index dropped (`aniyomi-` vs `anime-`). Those all resolve to
-                // "Download failed — check the URL" even though the extension is
-                // right there under another name. So when every candidate above
-                // has failed, ask the repository what it actually holds and try
-                // the match too (Http.repairGithubFileUrl). It is queued LAZILY
-                // so a working install never pays for the extra api.github.com
-                // call, and only when the repo really holds something else — a
-                // file genuinely deleted upstream stays a clear error.
-                val queue = ArrayList(candidates)
-                var qi = 0
-                var repairQueued = false
-                while (true) {
-                    if (qi >= queue.size) {
-                        if (repairQueued) break
-                        repairQueued = true
-                        val fixed = runCatching { Http.repairGithubFileUrl(dl) }.getOrNull()
-                        if (fixed == null || fixed == dl || candidates.contains(fixed)) break
-                        attempts.append(
-                            "the repo does not serve ${dl.substringAfterLast('/')} — " +
-                                "trying ${fixed.substringAfterLast('/')}\n"
-                        )
-                        queue.add(fixed)
-                    }
-                    val c = queue[qi++]
-                    val why = StringBuilder()
-                    // The repo's sha256 for THIS candidate rides into the
-                    // download walk itself: whichever mirror answers first must
-                    // serve these bytes, and a stale copy just loses the race
-                    // instead of failing the install (a fast stale mirror used
-                    // to win, fail verification afterwards, and abandon a
-                    // candidate whose good copy was one URL away).
-                    val want = expectedShaFor(c, fileHash, jarHash)
-                    val ok = if (c == reusedFor) true else Http.downloadToRobust(
-                        c,
-                        dest,
-                        verify = { part, _ -> Http.verifyArchiveFile(part, want) },
-                    ) { tried, success, reason ->
-                        if (!success) {
-                            val host = tried.substringAfter("//").substringBefore('/')
-                            if (why.isNotEmpty()) why.append(";  ")
-                            why.append("$host — ${reason?.take(70) ?: "failed"}")
+                // One round over every candidate — and, when every reachable
+                // mirror unanimously serves bytes the cached index disagrees
+                // with, exactly one more round after re-reading the owning
+                // repo's index (the extension was rebuilt upstream: the index
+                // — not the mirrors — is stale, and failing here would be the
+                // app punishing the user for its own outdated copy).
+                var curFh = fileHash
+                var curJh = jarHash
+                var reuse = reusedFor
+                var refreshed = false
+                var outcome = runInstallRound(name, safeName, dl, dest, curFh, curJh, reuse)
+                if (outcome.registered == null && outcome.loadFailure == null) {
+                    val u = unanimousServed(outcome.served)
+                    if (u != null && unexpectedBy(u, listOf(curFh, curJh))) {
+                        val fresh = refreshHashesFor(dl)
+                        if (fresh != null && (fresh.first != curFh || fresh.second != curJh)) {
+                            setStatus("The repo's index was outdated — refreshed it, retrying $name…", busy = true)
+                            curFh = fresh.first
+                            curJh = fresh.second
+                            reuse = null
+                            refreshed = true
+                            outcome = runInstallRound(name, safeName, dl, dest, curFh, curJh, reuse)
                         }
                     }
-                    if (!ok) {
-                        if (why.isNotEmpty()) attempts.append(why).append('\n')
-                        continue
-                    }
-                    // A blocked/misbehaving network (or one of the proxy
-                    // frontdoors) can serve an HTML error page or a tampered
-                    // file with a 200 — a real extension is always a zip (PK
-                    // header), and when the repo publishes a sha256 for this
-                    // build it must match before the file is ever loaded.
-                    val verifyFail = verifyDownload(dest, c, fileHash, jarHash)
-                    if (verifyFail != null) {
-                        attempts.append("${c.substringAfterLast('/').substringBefore('?')} — $verifyFail\n")
-                        dest.delete()
-                        continue
-                    }
-                    // These bytes are verified (zip header + the repo's sha256),
-                    // so keep them: the next install of this build — after an
-                    // uninstall, or from another repo that lists it — is then
-                    // instant, because nothing has to be downloaded at all.
-                    ExtCache.put(expectedShaFor(c, fileHash, jarHash), dest)
-                    // Register the extension from the archive's OWN manifest
-                    // first. Reading that is one zip entry — no class loading,
-                    // and therefore no dex→JVM translation — so the install
-                    // finishes the moment the bytes are on disk and verified.
-                    // The real load, which is the part that takes seconds on a
-                    // dex plugin, runs behind it and reconciles what was
-                    // registered (see [finishSetup]).
-                    val planned = registerFromManifest(name, safeName, dest, dl)
-                    if (planned != null) {
-                        registered = planned
-                        pendingSetup = true
-                        break
-                    }
-                    // Only when the manifest cannot be read that way does the
-                    // install have to WAIT for the load, which is the slow path
-                    // it used to always take.
-                    val result = registerExtension(name, safeName, dest, dl)
-                    if (result != null) {
-                        registered = result
-                        break
-                    }
-                    // Report the reason from the loader that was actually
-                    // supposed to handle this file: a dex archive's real error
-                    // lives on Cs3PluginManager, and showing the Hikari loader's
-                    // "manifest.json has no mainClass" for a .cs3 hid it.
-                    val isDex = c.endsWith(".cs3") || c.endsWith(".hiki")
-                    val primary = if (isDex) Cs3PluginManager.lastError else HikariPluginManager.lastError
-                    val secondary = if (isDex) HikariPluginManager.lastError else Cs3PluginManager.lastError
-                    loadFailure = listOfNotNull(primary, secondary).joinToString("  |  ")
-                        .ifBlank { "not an extension" }
-                    attempts.append("${c.substringAfterLast('/')} — not loadable (${loadFailure?.take(200)})\n")
                 }
-                if (registered != null) {
-                    statusText = registered!!
+                pendingSetup = outcome.pendingSetup
+                if (outcome.registered != null) {
+                    statusText = outcome.registered!!
                     isErr = false
-                } else if (loadFailure != null && attempts.indexOf("not loadable") >= 0) {
-                    statusText = "Couldn't load $name: ${loadFailure!!.take(300)}"
+                } else if (outcome.loadFailure != null && outcome.attempts.indexOf("not loadable") >= 0) {
+                    statusText = "Couldn't load $name: ${outcome.loadFailure!!.take(300)}"
                 } else {
+                    // When every reachable mirror agrees on the same bytes and
+                    // the index disagrees, say exactly that: "no mirror served
+                    // the file" would blame the network for an outdated index
+                    // (or, after a refresh just re-read it, an inconsistent
+                    // publish the repo owner has to fix).
+                    val u = unanimousServed(outcome.served)
+                    val staleHint = if (u != null && unexpectedBy(u, listOf(curFh, curJh))) {
+                        if (refreshed) {
+                            "Every reachable mirror agrees on the same bytes (served " + u + "…), " +
+                                "and the repo's index was just re-read and still names a different build — " +
+                                "its publish is inconsistent (index vs files). Nothing on your network can fix " +
+                                "that; the repo owner has to republish. "
+                        } else {
+                            "Every reachable mirror agrees on the same bytes (served " + u + "…), " +
+                                "which differ from this app's cached repo index — the extension was likely " +
+                                "rebuilt upstream. Reload the repo, then install again. "
+                        }
+                    } else ""
                     statusText = "Download failed for $name — no mirror served the file:\n" +
-                        (if (attempts.isEmpty()) "(no reasons reported)" else attempts.toString()) +
+                        (if (outcome.attempts.isEmpty()) "(no reasons reported)" else outcome.attempts) +
+                        staleHint +
                         "If several hosts above say “blocked”/“SSL”, your network or DNS filters GitHub-family hosts — the ghfast.top/ghproxy.net rows should still get through."
                 }
             } catch (t: Throwable) {
@@ -2436,6 +2514,98 @@ class ExtensionsScreenView {
         } ?: return null
         val want = raw.removePrefix("sha256-").lowercase()
         return want.takeIf { it.length == 64 }
+    }
+
+    /** `served <12 hex>…` inside a verification rejection: the bytes-hash the
+     *  mirror actually sent. */
+    private val SERVED_RE = Regex("served ([0-9a-f]{12})")
+
+    /**
+     * The single served-bytes hash every reachable mirror agreed on (reported
+     * by at least two hosts), or null when mirrors disagree or nothing usable
+     * was reported. One hash from many independent hosts means the bytes are
+     * not the problem — whoever expected something else is.
+     */
+    private fun unanimousServed(served: Map<String, Set<String>>): String? {
+        if (served.size != 1) return null
+        val e = served.entries.single()
+        return e.key.takeIf { e.value.size >= 2 }
+    }
+
+    /** [unanimousServed] over raw `host — reason` lines. */
+    private fun unanimousServedLines(lines: Collection<String>): String? {
+        val byHash = HashMap<String, MutableSet<String>>()
+        for (line in lines) {
+            val h = SERVED_RE.find(line)?.groupValues?.get(1) ?: continue
+            byHash.getOrPut(h) { HashSet() }.add(line.substringBefore(" — ").trim())
+        }
+        return unanimousServed(byHash)
+    }
+
+    /** True when [servedPrefix] (12 hex chars) is NOT what [hashes] expect. */
+    private fun unexpectedBy(servedPrefix: String, hashes: List<String?>): Boolean =
+        hashes.filterNotNull().none { it.removePrefix("sha256-").lowercase().startsWith(servedPrefix) }
+
+    /**
+     * Re-reads the repo index behind [pluginUrl] and returns the CURRENT
+     * (fileHash, jarHash) it publishes for it — or null when no owning repo
+     * was found or it could not be re-read.
+     *
+     * Used when every reachable mirror unanimously serves bytes the cached
+     * index disagrees with: the index — not the mirrors — is stale (the
+     * extension was rebuilt upstream), so the install refreshes it and
+     * retries once instead of failing. The screen's own copy is updated too,
+     * so the row stops showing the old signature.
+     */
+    private fun refreshHashesFor(pluginUrl: String): Pair<String?, String?>? {
+        val keys = sourceKeys(pluginUrl)
+        val matches: (String) -> Boolean =
+            { u -> u == pluginUrl || keys.contains(u) || sourceKeys(u).any { keys.contains(it) } }
+        val repos = runCatching { AppShell.app.store.repos() }.getOrDefault(emptyList())
+        for (repo in repos) {
+            val data = repoData[repo.url] ?: repoData[repo.url.trimEnd('/')] ?: continue
+            if (data.plugins.none { matches(it.url) }) continue
+            val manifest = runCatching { fetchManifest(repo.url, repo.kind, null) }.getOrNull()?.getOrNull() ?: continue
+            val plugins = runCatching { parsePlugins(effectiveKind(repo.kind, manifest), manifest) }.getOrNull() ?: continue
+            val fresh = plugins.firstOrNull { matches(it.url) } ?: continue
+            // Publish what was re-read, the way a repo load does, so the
+            // screen and the disk cache stop showing the stale signatures too.
+            val resolved = manifest.url
+            val nm = manifest.root?.optString("name").orEmpty().ifBlank { Http.repoDisplayName(resolved) }
+            val desc = manifest.root?.optString("description").orEmpty()
+            val at = System.currentTimeMillis()
+            Fx.run {
+                val rd = RepoData(resolved, nm, desc, plugins)
+                repoData[repo.url] = rd
+                if (resolved != repo.url) repoData[resolved] = rd
+                repoFetchedAt[repo.url] = at
+                repoCache.save(repo.url, RepoCache.Entry(resolved, nm, desc, plugins, at))
+                renderAll()
+            }
+            return fresh.fileHash to fresh.jarHash
+        }
+        return null
+    }
+
+    /**
+     * [Http.downloadPluginFile] with one stale-index recovery: when every
+     * reachable mirror unanimously serves bytes the given [fileHash] does not
+     * expect, the owning repo's index is re-read and the download retried once
+     * with its current signature. Returns the download and the hash that was
+     * enforced for it (the fresh one after a recovery), so the caller's final
+     * check verifies against the right signature.
+     */
+    private fun downloadWithStaleIndexRetry(url: String, fileHash: String?): Pair<Http.PluginDownload, String?> {
+        val rejects = java.util.concurrent.ConcurrentLinkedQueue<String>()
+        val first = Http.downloadPluginFile(url, expectedSha = fileHash, rejectLog = rejects)
+        if (first.bytes != null && first.bytes.isNotEmpty()) return first to fileHash
+        val u = unanimousServedLines(rejects)
+        if (u == null || !unexpectedBy(u, listOf(fileHash))) return first to fileHash
+        val fresh = refreshHashesFor(url) ?: return first to fileHash
+        if (fresh.first == fileHash) return first to fileHash
+        System.err.println("install: every mirror serves $u… for $url — index refreshed, retrying with its signature")
+        val retry = Http.downloadPluginFile(url, expectedSha = fresh.first)
+        return if (retry.bytes != null && retry.bytes.isNotEmpty()) retry to fresh.first else first to fileHash
     }
 
     /** The same plugin under every published spelling: the dex archive and the
