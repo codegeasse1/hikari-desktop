@@ -311,27 +311,16 @@ class DetailScreenView(private val item: MediaItem) {
     /** Episode id → its card frame, for the selected glow. */
     private val episodeCards = HashMap<String, VBox>()
 
-    // ── watch panel ─────────────────────────────────────────────────────────
+    // ── source chooser dialog ───────────────────────────────────────────────
+    // The reference shows NO sources panel on the detail screen: clicking an
+    // episode opens the source list, and picking a source plays it. So the
+    // panel is gone — this centered sheet is the only place sources appear.
 
-    private val panelSub = themed("", "watch-sub")
-    private val nowPlayingTitle = themed("", "now-playing-title").apply {
-        // Episode names run long ("Renegade Immortal (Xian Ni) Episode 1 English
-        // Subtitles") and the panel is a fixed 396px — wrap to two lines rather
-        // than cutting it off mid-word with an ellipsis.
-        isWrapText = true
-        maxHeight = 34.0
-        minWidth = 0.0
-    }
-    private val nowPlayingSub = themed("", "now-playing-sub")
-    private val nowPlaying = VBox(2.0, nowPlayingTitle, nowPlayingSub).apply {
-        styleClass.add("now-playing")
-        isVisible = false
-        isManaged = false
-    }
-    private val sourcesHeader = themed("", "panel-title")
-    private val sourcesCount = themed("", "watch-sub")
-    private val sourcesBox = VBox(8.0)
-    private val sourcesScroll = ScrollPane(sourcesBox).apply {
+    private val srcDlgTitle = themed("Choose a source", "x-src-title")
+    private val srcDlgSub = themed("", "x-src-sub").apply { isWrapText = true; minWidth = 0.0 }
+    private val srcDlgCount = themed("", "x-src-count")
+    private val srcDlgRows = VBox(8.0).apply { minWidth = 0.0 }
+    private val srcDlgScroll = ScrollPane(srcDlgRows).apply {
         isFitToWidth = true
         styleClass.add("scroll-pane")
         vbarPolicy = ScrollPane.ScrollBarPolicy.AS_NEEDED
@@ -339,29 +328,19 @@ class DetailScreenView(private val item: MediaItem) {
         minWidth = 0.0
         minHeight = 0.0
         maxWidth = Double.MAX_VALUE
+        prefHeight = 380.0
     }
-    private val watchPanel = VBox().apply {
-        styleClass.addAll("watch", "x-watch")
-        prefWidth = PANEL_W
-        minWidth = PANEL_W
-        maxWidth = PANEL_W
-        minHeight = 0.0
-        maxHeight = Double.MAX_VALUE
-        val head = VBox(2.0, themed("Watch", "watch-title"), panelSub).apply { styleClass.add("watch-head") }
-        val body = VBox(Theme.S3).apply {
-            styleClass.add("watch-body")
-            minHeight = 0.0
-            maxHeight = Double.MAX_VALUE
-            children.addAll(
-                nowPlaying,
-                Ui.divider(),
-                HBox(10.0, sourcesHeader, Ui.spacer(), sourcesCount).apply { alignment = Pos.CENTER_LEFT },
-                sourcesScroll,
-            )
-        }
-        VBox.setVgrow(sourcesScroll, Priority.ALWAYS)
-        VBox.setVgrow(body, Priority.ALWAYS)
-        children.addAll(head, body)
+    private val srcDlgCard = VBox(Theme.S3).apply {
+        styleClass.add("x-src-card")
+        minWidth = 0.0
+        maxWidth = 620.0
+        prefWidth = 620.0
+    }
+    private var srcDlgEp: Episode? = null
+    private val srcDlgRoot = StackPane().apply {
+        styleClass.add("x-src-root")
+        isVisible = false
+        isManaged = false
     }
 
     // ── source discovery overlay ────────────────────────────────────────────
@@ -408,19 +387,14 @@ class DetailScreenView(private val item: MediaItem) {
         }
         buildHero()
         buildDiscovery()
+        buildSourceDialog()
         leftScroll = Ui.vScroll(leftColumn, Insets(0.0, 6.0, 24.0, 0.0))
-        val side = HBox(Theme.S5, leftScroll, watchPanel).apply {
-            alignment = Pos.TOP_LEFT
-            minHeight = 0.0
-        }
-        HBox.setHgrow(leftScroll, Priority.ALWAYS)
         Ui.fill(leftColumn)
-        val content = VBox(Theme.S4, hero, side).apply { minHeight = 0.0 }
-        VBox.setVgrow(side, Priority.ALWAYS)
+        val content = VBox(Theme.S4, hero, leftScroll).apply { minHeight = 0.0 }
+        VBox.setVgrow(leftScroll, Priority.ALWAYS)
         Ui.fill(leftScroll)
-        Ui.fill(side)
         Ui.fill(content)
-        val center = StackPane(content, discRoot).apply { minWidth = 0.0; minHeight = 0.0 }
+        val center = StackPane(content, discRoot, srcDlgRoot).apply { minWidth = 0.0; minHeight = 0.0 }
         Ui.fill(center)
         root.center = center
         // The screen is painted from the catalog item we were handed, BEFORE any
@@ -432,9 +406,6 @@ class DetailScreenView(private val item: MediaItem) {
         // ran, which is what "loading takes a moment" looked like.
         renderHero(item)
         renderSections()
-        // The sources panel shows its own "Fetching sources…" spinner (see
-        // loadStreams), and the episode cards pop in when the season lands.
-        renderPanel()
         load()
     }
 
@@ -479,7 +450,6 @@ class DetailScreenView(private val item: MediaItem) {
                     renderEpisodeCards()
                     updateNowPlaying()
                 }
-                renderPanel()
                 loadStreams()
                 revealSelected()
             }
@@ -978,8 +948,15 @@ class DetailScreenView(private val item: MediaItem) {
     private fun episodeCard(ep: Episode): VBox {
         val still = stills[ep.number]
         val imgUrl = if (antiSpoiler) null else (ep.image?.takeIf { it.isNotBlank() } ?: still?.stillUrl)
+        // Big number behind the still: titles without any artwork (a provider
+        // with no images that TMDB cannot resolve either) still read as episode
+        // cards instead of empty black boxes — the still covers it when one loads.
+        val bigNum = Label(ep.number.toString()).apply {
+            styleClass.add("x-ep-bignum")
+            isMouseTransparent = true
+        }
         val art = ImageView().apply { isPreserveRatio = false; isSmooth = true; isMouseTransparent = true }
-        val frame = StackPane(art).apply {
+        val frame = StackPane(bigNum, art).apply {
             styleClass.add("x-ep-still")
             clip = Rectangle(EP_CARD_W, EP_STILL_H).apply { arcWidth = 16.0; arcHeight = 16.0 }
             minWidth = EP_CARD_W; prefWidth = EP_CARD_W; maxWidth = EP_CARD_W
@@ -1070,24 +1047,15 @@ class DetailScreenView(private val item: MediaItem) {
         renderEpisodeCards()
         updateNowPlaying()
         loadStreams()
+        // The reference shows no sources list on the page: the list opens when
+        // an episode is picked. (The auto-play path sets pendingPlay first, so
+        // it never pops the chooser — it goes straight to discovery.)
+        if (!pendingPlay) openSourceDialog(ep)
     }
 
     private fun updateNowPlaying() {
-        val ep = selectedEpisode
-        if (ep == null) {
-            nowPlaying.isVisible = false
-            nowPlaying.isManaged = false
-            return
-        }
-        nowPlayingTitle.text = if (meta.type == MediaType.SERIES) {
-            ep.name?.takeIf { it.isNotBlank() } ?: "Episode ${ep.number}"
-        } else {
-            meta.title
-        }
-        nowPlayingSub.text = meta.title
-        nowPlaying.isVisible = true
-        nowPlaying.isManaged = true
         updatePlayLabel()
+        if (srcDlgRoot.isVisible) renderDialogRows()
     }
 
     private fun updatePlayLabel() {
@@ -1126,6 +1094,13 @@ class DetailScreenView(private val item: MediaItem) {
     }
 
     private fun renderEnrich(d: TmdbDetails.Details) {
+        // A provider with no synopsis borrows TMDB's — the banner never shows
+        // "No synopsis available" when the database has the real text.
+        if (d.overview.isNotBlank() &&
+            (heroOverview.text.isBlank() || heroOverview.text.startsWith("No synopsis"))
+        ) {
+            heroOverview.text = d.overview
+        }
         val pills = ArrayList<Node>()
         if (d.imdbRating > 0.0 || d.imdbId.isNotBlank()) {
             val label = if (d.imdbRating > 0.0) "IMDb %.1f".format(d.imdbRating) else "IMDb ↗"
@@ -1415,12 +1390,67 @@ class DetailScreenView(private val item: MediaItem) {
         }
     }
 
-    private fun renderPanel() {
-        panelSub.text = when {
-            episodes.isNotEmpty() -> "${episodes.size} episodes · pick one, then a source"
-            streams.isNotEmpty() -> "${streams.size} source(s)"
-            else -> "Find a source for this title"
+    // ── source chooser dialog ───────────────────────────────────────────────
+
+    private fun buildSourceDialog() {
+        val close = Ui.iconButton(Icons.CLOSE, "Close", 16.0) { closeSourceDialog() }
+        val head = HBox(10.0, VBox(2.0, srcDlgTitle, srcDlgSub).apply { minWidth = 0.0 }, Ui.spacer(), srcDlgCount, Ui.isolateClicks(close)).apply {
+            alignment = Pos.CENTER_LEFT
+            minWidth = 0.0
         }
+        HBox.setHgrow(head.children[1] as Region, Priority.ALWAYS)
+        srcDlgCard.children.addAll(head, Ui.divider(), srcDlgScroll)
+        Ui.isolateClicks(srcDlgCard)
+        srcDlgRoot.children.add(srcDlgCard)
+        StackPane.setAlignment(srcDlgCard, Pos.CENTER)
+        StackPane.setMargin(srcDlgCard, Insets(24.0))
+        srcDlgRoot.setOnMouseClicked { e ->
+            if (e.target === srcDlgRoot) closeSourceDialog()
+        }
+    }
+
+    private fun openSourceDialog(ep: Episode) {
+        srcDlgEp = ep
+        srcDlgSub.text = if (meta.type == MediaType.SERIES) {
+            "S${ep.season} • Episode ${ep.number}" + (ep.name?.takeIf { it.isNotBlank() }?.let { " — $it" } ?: "")
+        } else {
+            meta.title
+        }
+        renderDialogRows()
+        srcDlgRoot.isVisible = true
+        srcDlgRoot.isManaged = true
+        Ui.fadeIn(srcDlgCard, 160.0)
+    }
+
+    private fun closeSourceDialog() {
+        srcDlgRoot.isVisible = false
+        srcDlgRoot.isManaged = false
+        srcDlgEp = null
+    }
+
+    private fun renderDialogRows() {
+        val ep = srcDlgEp ?: return
+        if (streams.isEmpty()) {
+            val errors = AppShell.app.repository.sweepErrors(meta, ep)
+            val running = AppShell.app.repository.sweepRunning(meta, ep)
+            val body = buildString {
+                append(if (running) "Asking every installed extension…" else "No installed extension returned a stream for this episode.")
+                if (errors.isNotEmpty()) {
+                    append("\n\n")
+                    errors.entries.take(6).forEach { (id, why) ->
+                        append("• ${AppShell.app.repository.providerName(id)} — ${why.take(180)}\n")
+                    }
+                }
+            }.trim()
+            srcDlgCount.text = if (running) "searching…" else "0 found"
+            srcDlgRows.children.setAll(
+                if (running) Ui.loadingRow("Fetching sources…")
+                else Ui.emptyState(Icons.INFO, "No playable source found", body),
+            )
+            return
+        }
+        srcDlgCount.text = "${streams.size} found"
+        srcDlgRows.children.setAll(streams.map { sourceRow(it) })
     }
 
     // ── sources ─────────────────────────────────────────────────────────────
@@ -1438,32 +1468,26 @@ class DetailScreenView(private val item: MediaItem) {
      * first".
      */
     private fun loadStreams() {
-        sourcesBox.children.setAll(Ui.loadingRow("Fetching sources…"))
-        sourcesHeader.text = "Sources"
-        sourcesCount.text = ""
         sweepPoll?.cancel()
         val ep = selectedEpisode
+        if (srcDlgRoot.isVisible) renderDialogRows()
         scope.launch {
             val list = runCatching { AppShell.app.repository.streamsFor(meta, ep) }
                 .getOrElse { t ->
                     Fx.run {
-                        sourcesBox.children.setAll(
-                            themed("Stream lookup failed: ${t.message ?: t.javaClass.simpleName}", "tiny")
-                                .apply { styleClass.add("h-danger"); isWrapText = true }
-                        )
                         if (pendingPlay || pendingDownload) {
                             hideDiscovery()
                             pendingPlay = false
                             pendingDownload = false
                             AppShell.toast("Stream lookup failed: ${t.message ?: "unknown error"}", "error")
                         }
+                        if (srcDlgRoot.isVisible) renderDialogRows()
                     }
                     emptyList()
                 }
             Fx.run {
                 streams = list
-                renderStreams()
-                renderPanel()
+                if (srcDlgRoot.isVisible) renderDialogRows()
                 if (pendingPlay) {
                     if (list.isEmpty()) {
                         pendingPlay = false
@@ -1498,8 +1522,7 @@ class DetailScreenView(private val item: MediaItem) {
                 if (all.size > streams.size) {
                     Fx.run {
                         streams = all
-                        renderStreams()
-                        renderPanel()
+                        if (srcDlgRoot.isVisible) renderDialogRows()
                         // The player is open on this title: give it the new
                         // servers too, so its Source menu can move to one of them
                         // without a trip back here.
@@ -1508,42 +1531,9 @@ class DetailScreenView(private val item: MediaItem) {
                 }
                 if (!running) break
             }
-            Fx.run { renderStreams() }
+            Fx.run { if (srcDlgRoot.isVisible) renderDialogRows() }
         }
         sweepPoll = job
-    }
-
-    private fun renderStreams() {
-        if (streams.isEmpty()) {
-            // An empty list says WHAT happened, per extension. "No playable
-            // source found" with nothing under it is the answer that tells a
-            // user nothing at all — the sweep knows which extensions it asked
-            // and what each of them said (see ContentRepository.sweepErrors).
-            val errors = AppShell.app.repository.sweepErrors(meta, selectedEpisode)
-            val running = AppShell.app.repository.sweepRunning(meta, selectedEpisode)
-            val body = buildString {
-                append(
-                    if (selectedEpisode == null) {
-                        "No installed extension returned a stream for this title."
-                    } else {
-                        "No installed extension returned a stream for this episode."
-                    }
-                )
-                if (running) append(" Still asking…")
-                if (errors.isNotEmpty()) {
-                    append("\n\n")
-                    errors.entries.take(6).forEach { (id, why) ->
-                        val name = AppShell.app.repository.providerName(id)
-                        append("• $name — ${why.take(180)}\n")
-                    }
-                }
-            }.trim()
-            sourcesBox.children.setAll(Ui.emptyState(Icons.INFO, "No playable source found", body))
-            sourcesCount.text = if (running) "searching…" else "0 found"
-            return
-        }
-        sourcesCount.text = "${streams.size} found"
-        sourcesBox.children.setAll(streams.map { sourceRow(it) })
     }
 
     private fun sourceRow(source: StreamSource): HBox {
@@ -1752,6 +1742,7 @@ class DetailScreenView(private val item: MediaItem) {
 
     private fun play(source: StreamSource) {
         hideDiscovery()
+        closeSourceDialog()
         val ep = selectedEpisode
         lastPositionSave = 0L
         runCatching {
@@ -1863,8 +1854,6 @@ class DetailScreenView(private val item: MediaItem) {
     private fun themed(text: String, cls: String): Label = Label(text).apply { styleClass.add(cls) }
 
     private companion object {
-        const val PANEL_W = 396.0
-
         /** Ceiling for the banner's height. It carries the logo treatment as
          *  well as the title, so it wants a real slice of the window. */
         const val HERO_H = 520.0

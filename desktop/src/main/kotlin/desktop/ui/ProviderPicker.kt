@@ -266,6 +266,19 @@ class ProviderPicker(private val onPick: () -> Unit) {
         return true
     }
 
+    /** Picks the row for [name] WITHOUT firing the pick callback — for callers
+     *  that are already inside a load and will read the selection themselves
+     *  (see HomeScreenView.showProvider). */
+    fun select(name: String): Boolean {
+        val cfg = if (name == ALL) null else providers.firstOrNull { it.name == name } ?: return false
+        selection = cfg
+        button.text = cfg?.name ?: ALL
+        button.tooltip = Ui.tooltip(cfg?.name ?: ALL)
+        pop.hide()
+        rebuildList()
+        return true
+    }
+
     private fun pick(cfg: ProviderConfig?) {
         selection = cfg
         // The button carries the WHOLE name; a provider with a long name gets a

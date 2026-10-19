@@ -1496,3 +1496,16 @@
 .x-disc-cancel { -fx-background-color: rgba(255,255,255,0.10); -fx-text-fill: white; -fx-font-size: 13.5px; -fx-font-weight: bold; -fx-background-radius: 14; -fx-border-color: rgba(255,255,255,0.25); -fx-border-radius: 14; -fx-border-width: 1; -fx-padding: 12 34 12 34; -fx-cursor: hand; }
 .x-disc-cancel:hover { -fx-background-color: rgba(255,255,255,0.20); }
 .light .x-hero-title, .light .x-d-title, .light .x-disc-title { -fx-text-fill: white; }
+
+/* ---- pass 2: source dialog, ep placeholders, explore cards ---------------- */
+.x-src-root { -fx-background-color: rgba(3,4,7,0.72); }
+.x-src-card { -fx-background-color: -h-bg-2; -fx-background-radius: 20; -fx-border-color: -h-border-2; -fx-border-radius: 20; -fx-border-width: 1; -fx-padding: 22 22 22 22; -fx-effect: dropshadow(gaussian, rgba(0,0,0,0.6), 40, 0.3, 0, 12); }
+.x-src-title { -fx-text-fill: -h-fg; -fx-font-size: 18px; -fx-font-weight: bold; }
+.x-src-sub { -fx-text-fill: -h-fg-3; -fx-font-size: 12.5px; }
+.x-src-count { -fx-text-fill: -h-fg-3; -fx-font-size: 12.5px; }
+.x-ep-bignum { -fx-text-fill: #2a3040; -fx-font-size: 64px; -fx-font-weight: bold; -fx-alignment: center; }
+.x-prov-card { -fx-background-color: -h-bg-2; -fx-background-radius: 16; -fx-border-color: -h-border; -fx-border-radius: 16; -fx-border-width: 1; -fx-cursor: hand; }
+.x-prov-card:hover { -fx-border-color: -h-accent-line; -fx-effect: dropshadow(gaussian, -h-accent-glow, 16, 0.25, 0, 0); }
+.x-prov-badge { -fx-background-color: linear-gradient(to bottom right, -h-accent, -h-accent-2); -fx-background-radius: 14; }
+.x-prov-initial { -fx-text-fill: white; -fx-font-size: 20px; -fx-font-weight: bold; }
+.x-prov-name { -fx-text-fill: -h-fg; }

@@ -27,8 +27,10 @@ import javafx.stage.FileChooser
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 
 /**
  * Extensions: everything that feeds the app content.
@@ -2090,12 +2092,27 @@ class ExtensionsScreenView {
     private fun finishSetup(name: String, safeName: String, url: String, dest: File, sourceUrl: String) {
         AppShell.uiScope.launch {
             val startedAt = System.currentTimeMillis()
+            // The real load can HANG (not just run long) on some archives — the
+            // row then sits on "Finishing setup… Ns" and the top bar on
+            // "Installed X" forever, even though the optimistically registered
+            // providers already work. Bound it: on timeout the install finishes
+            // from the registration instead of hanging on screen.
+            var timedOut = false
             val loaded = runCatching {
-                val hiki = HikariPluginManager.reload(HikariApp.instance, dest)
-                if (hiki.isNotEmpty()) {
-                    hiki.map { it.name.ifBlank { name } }
+                withTimeout(SETUP_TIMEOUT_MS) {
+                    val hiki = HikariPluginManager.reload(HikariApp.instance, dest)
+                    if (hiki.isNotEmpty()) {
+                        hiki.map { it.name.ifBlank { name } }
+                    } else {
+                        Cs3PluginManager.reload(HikariApp.instance, dest).map { it.name.ifBlank { name } }
+                    }
+                }
+            }.recoverCatching { t ->
+                if (t is TimeoutCancellationException) {
+                    timedOut = true
+                    providersFor(url).map { it.name }.ifEmpty { listOf(name) }
                 } else {
-                    Cs3PluginManager.reload(HikariApp.instance, dest).map { it.name.ifBlank { name } }
+                    throw t
                 }
             }
             Fx.run {
@@ -2119,6 +2136,16 @@ class ExtensionsScreenView {
                     installErrors[url] = "Couldn't load $name: ${why.take(300)}"
                     setStatus("Couldn't load $name — see the row for the reason.", isError = true)
                     AppShell.toast("$name could not be loaded", "error")
+                } else if (timedOut) {
+                    // The loader hung, but the providers registered from the
+                    // manifest already serve content — keep them, say so, and
+                    // above all get the spinner and the top-bar chip off screen.
+                    installErrors.remove(url)
+                    setStatus(
+                        "Installed $name (${names.size} extension${if (names.size == 1) "" else "s"}) — " +
+                            "the background setup timed out, running from registration.",
+                    )
+                    AppShell.toast("$name installed", "ok")
                 } else {
                     installErrors.remove(url)
                     syncProviders(name, safeName, url, dest, sourceUrl, names)
@@ -2762,6 +2789,14 @@ class ExtensionsScreenView {
     }
 
     private companion object {
+        /** Ceiling for the background half of an install. The real load can
+         *  HANG on some archives (never returning, not just slow) — without
+         *  this the row sits on "Finishing setup…" and the top bar on
+         *  "Installed X" forever. 90s is far beyond any healthy dex
+         *  translation; past it the install finishes from the registration.
+         *  See [finishSetup]. */
+        const val SETUP_TIMEOUT_MS = 90_000L
+
         /** How long after an attempt before a repo that has NEVER loaded is tried
          *  again on its own. Long on purpose: a repo this network cannot reach
          *  must not re-run the whole mirror race every time the screen is

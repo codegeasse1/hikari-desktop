@@ -207,9 +207,19 @@ class HomeScreenView {
         }
     }
 
+    /** Open Home showing this provider's catalog (from Explore rows). */
+    fun showProvider(name: String) {
+        pendingProvider = name
+        AppShell.show(Screen.Home)
+    }
+
     fun onShown() {
         load()
     }
+
+    /** A provider Explore asked for while we were elsewhere. Consumed on the
+     *  next load, after the picker list is fresh. */
+    private var pendingProvider: String? = null
 
     // ── hero ────────────────────────────────────────────────────────────────
 
@@ -259,9 +269,11 @@ class HomeScreenView {
         StackPane.setAlignment(nav, Pos.BOTTOM_RIGHT)
         StackPane.setMargin(nav, Insets(0.0, 22.0, 26.0, 0.0))
 
-        val dotsWrap = HBox(10.0, heroDots).apply { alignment = Pos.CENTER_LEFT }
-        StackPane.setAlignment(dotsWrap, Pos.BOTTOM_LEFT)
-        StackPane.setMargin(dotsWrap, Insets(0.0, 0.0, 30.0, 380.0))
+        // Dots ride bottom-right, left of the arrows: centered dots collided
+        // with the action row on wide banners.
+        val dotsWrap = HBox(10.0, heroDots).apply { alignment = Pos.CENTER_RIGHT }
+        StackPane.setAlignment(dotsWrap, Pos.BOTTOM_RIGHT)
+        StackPane.setMargin(dotsWrap, Insets(0.0, 112.0, 32.0, 0.0))
 
         heroStack.children.addAll(heroBgA, heroBgB, scrim, scrimL, body, dotsWrap, nav)
         heroStack.cursor = javafx.scene.Cursor.HAND
@@ -342,6 +354,10 @@ class HomeScreenView {
         heroActions.children.setAll(
             Ui.isolateClicks(Button("Watch Now").apply {
                 styleClass.add("x-watch")
+                // Belt and suspenders: the class owns the hover, but the
+                // white-button identity is inline so it can never come out
+                // dark no matter what else matches this button.
+                style = "-fx-background-color: white; -fx-text-fill: #101218;"
                 graphic = Icons.of(Icons.PLAY, 17.0)
                 isFocusTraversable = false
                 setOnAction { AppShell.openDetail(item) }
@@ -384,6 +400,9 @@ class HomeScreenView {
             val d = runCatching { TmdbDetails.load(item) }.getOrNull()
             heroEnrich[item.uniqueId] = d
             Fx.run {
+                if (d?.overview?.isNotBlank() == true && heroDesc.text.isBlank()) {
+                    heroDesc.text = d.overview
+                }
                 if (heroItems.getOrNull(heroIndex)?.uniqueId == item.uniqueId) showHero()
                 else paintHeroMeta(item, d)
             }
@@ -581,6 +600,13 @@ class HomeScreenView {
                 // "All providers").
                 val (chosen, filterId) = Fx.runBlock {
                     providerPicker.setProviders(enabled)
+                    // An Explore row asked for a provider while we were
+                    // elsewhere: apply it now that the list is fresh, and the
+                    // rest of this load reads it like a manual pick.
+                    pendingProvider?.let { want ->
+                        pendingProvider = null
+                        providerPicker.select(want)
+                    }
                     val cfg = providerPicker.selection
                     val c = providerPicker.selectedName()
                     // Re-seed the banner whenever the source filter changes, so
