@@ -2756,8 +2756,8 @@ object Http {
         dest: java.io.File,
         headers: Map<String, String> = emptyMap(),
         onProgress: ((Long, Long) -> Unit)? = null,
-        onAttempt: ((url: String, ok: Boolean, reason: String?) -> Unit)? = null,
         verify: ((part: java.io.File, servedFrom: String) -> String?)? = null,
+        onAttempt: ((url: String, ok: Boolean, reason: String?) -> Unit)? = null,
     ): Boolean {
         // Authoritative URLs first, CDN/proxy mirrors second (see
         // [mirrorVariants]): an extension install must never "succeed" with a
