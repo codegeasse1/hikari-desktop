@@ -651,7 +651,7 @@ class ExtensionsScreenView {
             bytes < 1024 * 1024 -> "${bytes / 1024} KB"
             else -> "%.1f MB".format(bytes / (1024.0 * 1024.0))
         }
-    }────
+    }
 
     /** The uppercase badge text for a repo's engine. */
     private fun kindLabel(kind: RepoKind): String = when (kind) {

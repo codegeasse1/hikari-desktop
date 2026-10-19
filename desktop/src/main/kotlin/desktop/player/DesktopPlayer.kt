@@ -674,7 +674,7 @@ object DesktopPlayer {
                 ).apply { isDaemon = true; start() }
             }
             val startedAt = System.currentTimeMillis()
-            val myGen = gen
+            val drainGen = gen
             Thread(
                 {
                     val tail = StringBuilder()
@@ -682,7 +682,7 @@ object DesktopPlayer {
                     val code = runCatching { p.exitValue() }.getOrDefault(-1)
                     // A newer launch (or a teardown) replaced this process while
                     // it was draining — its exit is not this player's business.
-                    if (myGen != launchGen || proc !== p) return@Thread
+                    if (drainGen != launchGen || proc !== p) return@Thread
                     if (code == 0 && !p.isAlive) {
                         // The stream finished with no error and no "next": mpv
                         // is gone, so the app's player layer goes too.
@@ -702,7 +702,7 @@ object DesktopPlayer {
                             val fresh = runCatching { refresh() }.getOrNull()
                             if (fresh != null && fresh.url.isNotBlank()) {
                                 Fx.run {
-                                    if (myGen != launchGen || proc !== p) return@run
+                                    if (drainGen != launchGen || proc !== p) return@run
                                     launchMpv(title, fresh, refresh, attemptsLeft - 1)
                                 }
                                 return@Thread
@@ -716,7 +716,7 @@ object DesktopPlayer {
                                 .takeLast(10)
                                 .joinToString("\n")
                             Fx.run {
-                                if (dialogShown || myGen != launchGen || proc !== p) return@run
+                                if (dialogShown || drainGen != launchGen || proc !== p) return@run
                                 dialogShown = true
                                 val hint = if (forbidden)
                                     "\n\nThis site refused the stream link (HTTP 403). The link may have expired —" +
@@ -746,8 +746,8 @@ object DesktopPlayer {
             // mpv before it errors and offer a clear fallback instead.
             // Signed chaturbate links are skipped — probing them consumes the
             // single-use token and turns the actual playback into a 403.
-            val myProc = p
-            val myGen = gen
+            val probeProc = p
+            val probeGen = gen
             if (!signed) {
                 Thread(
                     {
@@ -757,9 +757,9 @@ object DesktopPlayer {
                             verdict != com.hikari.app.net.Http.StreamProbe.UNKNOWN
                         ) {
                             Fx.run {
-                                if (dialogShown || myGen != launchGen || proc !== myProc || !myProc.isAlive) return@run
+                                if (dialogShown || probeGen != launchGen || proc !== probeProc || !probeProc.isAlive) return@run
                                 dialogShown = true
-                                runCatching { myProc.destroy() }
+                                runCatching { probeProc.destroy() }
                                 when (verdict) {
                                     com.hikari.app.net.Http.StreamProbe.DASH -> showBrowserFallback(
                                         title, url,

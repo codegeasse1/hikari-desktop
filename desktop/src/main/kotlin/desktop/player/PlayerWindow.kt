@@ -1623,6 +1623,7 @@ object PlayerWindow {
             cycleCount = Timeline.INDEFINITE
             play()
         }
+    }
 
     /**
      * Fits the two bars to the width the window actually has.
