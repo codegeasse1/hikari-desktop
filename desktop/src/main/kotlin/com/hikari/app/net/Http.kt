@@ -1319,6 +1319,36 @@ object Http {
         return execute(client, builder.build())
     }
 
+    /**
+     * Fetch for the local stream relay ([desktop.player.HlsRelay]): the same
+     * stack as [get] (Conscrypt TLS, system proxy, DoH-first DNS), but with
+     * the player's `Range` and `HEAD` passed through.
+     *
+     * mpv seeks with `Range` (its moov-atom probe, its segment re-requests);
+     * a relay that drops it answers every partial request with the full file
+     * from byte 0 — for a 1080p MP4 that is gigabytes before the moov, which
+     * is the "Loading …" that never ends. HEAD is how mpv learns a length
+     * before it commits to a seek, so it is forwarded too, headers only.
+     */
+    fun relayFetch(
+        url: String,
+        headers: Map<String, String> = emptyMap(),
+        range: String? = null,
+        head: Boolean = false,
+    ): Response {
+        val builder = Request.Builder().url(url).header("User-Agent", UA)
+        headers.forEach { (k, v) ->
+            if (k.isBlank() || v.isBlank()) return@forEach
+            // The player's own Range must never come from stored route headers;
+            // only the live request's Range (passed explicitly) is sent.
+            if (k.equals("Range", ignoreCase = true)) return@forEach
+            builder.header(k, v)
+        }
+        if (!head && !range.isNullOrBlank()) builder.header("Range", range.trim())
+        if (head) builder.head()
+        return execute(client, builder.build())
+    }
+
     fun post(
         url: String,
         body: String,

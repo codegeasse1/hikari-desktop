@@ -2621,6 +2621,14 @@ object PlayerWindow {
                 Fx.run {
                     seekBar?.isDisable = duration <= 0.0
                     renderTime()
+                    // The file is open and mpv knows its length: the wait is
+                    // over even if the first video frame (and its
+                    // `video-format`) hasn't arrived yet. Dropping the overlay
+                    // here is what makes playback feel instant instead of
+                    // sitting on "Loading …" while the picture is one frame
+                    // away. `sawVideo` stays false until the video output
+                    // really is up, so the watchdog still knows.
+                    if (duration > 0.0 && loadingBox?.isVisible == true) playbackStarted()
                 }
             }
             "time-pos" -> {
@@ -2634,6 +2642,10 @@ object PlayerWindow {
                     lastPosition = shownMs
                     if (!scrubbing && duration > 0) seekBar?.value = shownFraction
                     renderTime()
+                    // Position advancing means the demuxer is delivering: same
+                    // instant-start as above, for streams whose duration arrives
+                    // late (or never, on live HLS).
+                    if (loadingBox?.isVisible == true) playbackStarted()
                 }
                 onPosition?.invoke(shownMs, (duration * 1000).toLong())
             }

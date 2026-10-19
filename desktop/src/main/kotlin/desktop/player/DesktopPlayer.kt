@@ -289,11 +289,36 @@ object DesktopPlayer {
         }
     }
 
+    /**
+     * True when a stream must go through the local relay ([HlsRelay]) instead
+     * of straight to mpv.
+     *
+     * The relay exists for HLS: single-use signed playlists, TLS-fingerprinted
+     * CDNs, and backslash playlist paths. A progressive MP4/MKV sent through
+     * it used to stall on "Loading …" forever: the relay drops mpv's `Range`
+     * (its moov-atom probe), so mpv waits for gigabytes from byte 0 before its
+     * first frame. Direct files play instantly in mpv with their headers, so
+     * only playlists (and the hosts that need the app's HTTP stack) take the
+     * relay now.
+     */
+    private fun needsRelay(url: String, isM3u8: Boolean): Boolean {
+        if (isM3u8) return true
+        val lower = url.substringBefore('?').substringBefore('#').lowercase()
+        if (lower.endsWith(".m3u8") || lower.endsWith(".m3u") || lower.endsWith(".txt")) return true
+        if (lower.contains(".m3u8")) return true
+        // Backslash playlist paths and single-use signed links need the relay's
+        // normalization + caching even when the suffix says otherwise.
+        if (url.contains('\\')) return true
+        if (isSignedStreamUrl(url)) return true
+        return false
+    }
+
     private fun launchMpv(
         title: String,
         stream: StreamSource,
         refresh: (() -> StreamSource?)?,
         attemptsLeft: Int,
+        failedOver: Boolean = false,
     ) {
         Fx.run {
             ipcTarget = openIpcEndpoint()
@@ -330,18 +355,26 @@ object DesktopPlayer {
             // .hikari/hikari-player.log (e.g. a lookalike separator that the
             // URL fixer missed).
             val logDir = File(System.getProperty("user.home"), ".hikari").apply { mkdirs() }
-            // Play through the app's own HTTP stack (HlsRelay): the CDNs that
-            // serve these streams (chaturbate's mmcdn, myspacecat, …) 403 the
-            // player's direct connections — single-use signed tokens and TLS
-            // fingerprint blocking — while the app's OkHttp fetches the same
-            // URLs fine. The relay also rewrites chaturbate's backslash
+            // HLS goes through the app's own HTTP stack (HlsRelay): the CDNs
+            // that serve these streams (chaturbate's mmcdn, myspacecat, …) 403
+            // the player's direct connections — single-use signed tokens and
+            // TLS fingerprint blocking — while the app's OkHttp fetches the
+            // same URLs fine. The relay also rewrites chaturbate's backslash
             // root-relative playlist lines into proper URLs.
-            val playUrl = HlsRelay.urlFor(url, stream.headers)
+            //
+            // Progressive files (MP4/MKV/WEBM) play DIRECTLY in mpv with their
+            // headers: routing them through the relay dropped mpv's Range
+            // (its moov probe) and left a 1080p file on "Loading …" forever.
+            // [failedOver] means the first path produced no picture in 12s, so
+            // the opposite path is tried once, automatically.
+            val wantRelay = needsRelay(url, stream.isM3u8)
+            val useRelay = if (!failedOver) wantRelay else !wantRelay
+            val playUrl = if (useRelay) HlsRelay.urlFor(url, stream.headers) else url
             File(logDir, "hikari-player.log").appendText(
                 "[" + java.time.Instant.now() + "] raw=" + debugEscaped(stream.url) +
                     "\n  san=" + debugEscaped(url) +
                     "\n  ply=" + debugEscaped(playUrl) +
-                    "\n  glue=" + glued + "\n"
+                    "\n  glue=" + glued + " relay=" + useRelay + " failover=" + failedOver + "\n"
             )
             val args = buildList {
                 add(mpv.absolutePath)
@@ -380,6 +413,13 @@ object DesktopPlayer {
                 // The app draws the one control bar, so mpv's on-screen
                 // controller would only fight it for the bottom of the video.
                 add("--no-osc")
+                // Start NOW, not after a long buffer: cap the network wait and
+                // the demuxer readahead so the first frame is asked for at
+                // once. A slow CDN then errors fast (and fails over below)
+                // instead of sitting on "Loading …" while mpv fills a deep
+                // buffer it will never need for the first frame.
+                add("--network-timeout=20")
+                add("--demuxer-readahead-secs=2")
                 add("--title=" + title.take(200).replace('\n', ' '))
                 val logDir2 = logDir
                 add("--log-file=${File(logDir2, "mpv.log").absolutePath}")
@@ -428,6 +468,34 @@ object DesktopPlayer {
             // Only the FIRST explanation per launch shows: the mpv error path and
             // the stream probe both try to explain a dead player, never both.
             dialogShown = false
+            // Fast failover: the wrong path (relay vs direct) looks like
+            // "Loading …" forever — no video, no file, no IPC error. After 12s
+            // with NOTHING (no picture, file not open), try the OTHER path once
+            // automatically instead of leaving the spinner up. A slow GPU
+            // shader compile answers no IPC either, so this only fires while
+            // the file isn't open AND the channel never answered; once mpv has
+            // the file, the 45s watchdog below owns the wait.
+            if (!failedOver && glued) {
+                val myProc = p
+                val myUseRelay = useRelay
+                Thread(
+                    {
+                        Thread.sleep(12_000)
+                        if (proc !== myProc || !myProc.isAlive) return@Thread
+                        if (PlayerWindow.hasVideo() || PlayerWindow.isLoaded() || PlayerWindow.ipcWorking()) return@Thread
+                        if (!PlayerWindow.isEmbedded()) return@Thread
+                        System.err.println(
+                            "player: no picture/file/ipc after 12s via " +
+                                (if (myUseRelay) "relay" else "direct") + " — failing over once",
+                        )
+                        Fx.run {
+                            if (proc !== myProc) return@run
+                            launchMpv(title, stream, refresh, attemptsLeft, failedOver = true)
+                        }
+                    },
+                    "hikari-play-failover",
+                ).apply { isDaemon = true; start() }
+            }
             if (glued) {
                 // A stream can load and still never produce a picture (a dead
                 // CDN edge, an unsupported codec, a geo-block that only bites
