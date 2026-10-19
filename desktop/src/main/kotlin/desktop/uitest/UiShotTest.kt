@@ -684,10 +684,13 @@ class UiShotApp : Application() {
                 File(out, "n-extensions-engine-filter.png"),
             )
         }
-        // ── the home catalog's provider picker (the Android provider sheet) ──
+        // ── the home catalog's provider picker (single grid + multi feed) ──
         // The control that decides which provider the whole home page is built
         // from. It is a Popup (a window with a scene of its own), so it is driven
-        // through the picker's own hooks — the same paths its rows and chips use.
+        // through the picker's own hooks — the same paths its cards and chips use.
+        // The sheet is a single 3-column card grid ("All providers" first) with
+        // content-kind chips (All | Movies | Series | Anime | Docs | Live) plus
+        // a multi-provider feed behind the toggle — NOT per-engine chips.
         steps += 300L to {
             AppShell.show(Screen.Home)
             AppShell.homeView.load(force = true)
@@ -703,14 +706,14 @@ class UiShotApp : Application() {
             if (!open) {
                 println("UiShotTest: FAIL the home provider picker did not open")
                 failures[0]++
-            } else if (chips.firstOrNull() != "All" || !chips.contains("Hikari") || !chips.contains("Nuvio")) {
-                println("UiShotTest: FAIL the provider picker has no All+engine chips (" + chips + ")")
+            } else if (chips != listOf("All", "Movies", "Series", "Anime", "Docs", "Live")) {
+                println("UiShotTest: FAIL the provider picker has no content-kind chips (" + chips + ")")
                 failures[0]++
             } else if (rows.firstOrNull() != "All providers") {
                 println("UiShotTest: FAIL the provider list does not start with \"All providers\" (" + rows.take(2) + ")")
                 failures[0]++
             } else {
-                println("UiShotTest: OK   the provider picker opens with All + one chip per engine")
+                println("UiShotTest: OK   the provider picker opens with kind chips + an All-first card grid")
             }
         }
         steps += 400L to {
@@ -759,16 +762,29 @@ class UiShotApp : Application() {
             }
         }
         steps += 300L to {
+            // The kind chips have to NARROW the grid. None of the ZZ test
+            // providers is anime-kind ("ZZ Test Hikari One" matches the Movies
+            // and Series fallbacks, not Anime), so the Anime chip must leave a
+            // grid with none of them — while "All providers" stays first and
+            // All restores them.
             val picker = AppShell.homeView.pickerForTest
-            picker.pressChipForTest("Hikari")
+            picker.pressChipForTest("Anime")
             val rows = picker.rowNamesForTest()
-            println("UiShotTest: provider picker, Hikari chip on: " + rows)
-            if (rows.any { it.startsWith("ZZ Test Hikari") } &&
-                rows.none { it.contains("Nuvio") || it.contains("CloudStream") }
+            println("UiShotTest: provider picker, Anime chip on: " + rows.take(6))
+            if (rows.firstOrNull() == "All providers" &&
+                rows.none { it.startsWith("ZZ Test") }
             ) {
-                println("UiShotTest: OK   picking an engine chip leaves only that engine's providers")
+                println("UiShotTest: OK   the kind chip narrows the provider grid")
             } else {
-                println("UiShotTest: FAIL the engine chip did not narrow the provider list")
+                println("UiShotTest: FAIL the kind chip did not narrow the provider grid")
+                failures[0]++
+            }
+            picker.pressChipForTest("All")
+            val back = picker.rowNamesForTest()
+            if (back.any { it.startsWith("ZZ Test Hikari") }) {
+                println("UiShotTest: OK   All restores the full provider grid")
+            } else {
+                println("UiShotTest: FAIL All did not restore the provider grid (" + back.take(4) + ")")
                 failures[0]++
             }
         }

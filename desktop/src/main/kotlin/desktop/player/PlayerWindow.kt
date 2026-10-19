@@ -306,6 +306,22 @@ object PlayerWindow {
     private var lastPosition = 0L
     private var volume = 100.0
     private var paused = false
+    /**
+     * Whether mpv reports itself muted (the `mute` property): the mute button
+     * and the `M` shortcut flip this mpv-side (`cycle mute`), so a mute from
+     * mpv's own window (its input.conf `M`, unglued mode) lands on the same
+     * state as one from the app's bar — observed, never locally simulated.
+     */
+    private var muted = false
+    /**
+     * The slider skin's own track node, kept once found: the played-fill is
+     * painted on it (see [paintSeekFill]), and looking it up on every frame
+     * would walk the skin for nothing once it is known.
+     */
+    private var seekTrack: Region? = null
+    /** The fill percent [paintSeekFill] last painted, so a resize storm that
+     *  changes no position does not repaint the track's style for nothing. */
+    private var lastFillPct = -1.0
 
     /** Set while the loading overlay or an explanation covers the video area, so
      *  the video surface can get out of the way. */
@@ -1408,6 +1424,12 @@ object PlayerWindow {
             maxWidth = Double.MAX_VALUE
         }
         seekBar = seek
+        // The played part of the bar is painted on the skin's own track node
+        // (see paintSeekFill): no extra bar children, so the `.player-seek`
+        // geometry the UI test measures is untouched — only its colours.
+        seek.valueProperty().addListener { _, _, _ -> paintSeekFill() }
+        seek.layoutBoundsProperty().addListener { _, _, _ -> paintSeekFill() }
+        javafx.application.Platform.runLater { paintSeekFill() }
 
         val seekRow = StackPane(seek).apply {
             styleClass.add("player-seek-hit")
@@ -1658,9 +1680,18 @@ object PlayerWindow {
         onPickEpisode?.invoke(ep)
     }
 
-    /** Mutes or restores the volume, remembering what it was. */
+    /**
+     * Mutes or unmutes mpv itself (`cycle mute`): the `mute` observation below
+     * reports the real state back, so the button, the `M` shortcut and mpv's
+     * own window (its input.conf `m`, unglued mode) all converge on one state
+     * instead of each keeping a local volume simulation. With no IPC channel
+     * (no mpv behind the layer) it falls back to the old volume trick.
+     */
     private fun toggleMute() {
-        if (volume > 0.0) {
+        val handle = ipc
+        if (handle != null) {
+            runCatching { handle.post("cycle", "mute") }
+        } else if (volume > 0.0) {
             lastVolume = volume
             setVolume(0.0)
         } else {
@@ -1670,7 +1701,7 @@ object PlayerWindow {
     }
 
     private fun refreshMuteIcon() {
-        muteButton?.graphic = Icons.of(if (volume <= 0.0) Icons.VOLUME_OFF else Icons.VOLUME, 16.0)
+        muteButton?.graphic = Icons.of(if (muted || volume <= 0.0) Icons.VOLUME_OFF else Icons.VOLUME, 16.0)
     }
 
     private fun applyResponsive() {
@@ -2517,6 +2548,36 @@ object PlayerWindow {
     // ── seeking ─────────────────────────────────────────────────────────────
 
     /**
+     * Paints the played-fill on the slider skin's own `.track` node: an inline
+     * gradient whose stop sits at the current value, accent up to the thumb
+     * and the theme's track colour after it.
+     *
+     * Inline (not a stylesheet rule) because the stop is a number, not a
+     * state; driven by the value listener above, so every path that moves the
+     * bar (reports, seeks, scrubs, duration changes) repaints it, and the
+     * percent guard keeps resize storms from churning the node's style.
+     * The colours match the static `.player-seek` rules (thumb accent, track
+     * base), so the bar looks identical with no picture loaded.
+     */
+    private fun paintSeekFill() {
+        val slider = seekBar ?: return
+        var track = seekTrack
+        if (track == null || track.scene == null) {
+            track = runCatching { slider.lookup(".track") as? Region }.getOrNull()
+            seekTrack = track
+            lastFillPct = -1.0
+            if (track == null) return
+        }
+        val pct = (slider.value * 100.0).coerceIn(0.0, 100.0)
+        if (pct == lastFillPct) return
+        lastFillPct = pct
+        val p = "%.2f".format(pct)
+        track.style = "-fx-background-color: linear-gradient(to right, #a970ff 0%, #a970ff " +
+            p + "%, rgba(255,255,255,0.22) " + p + "%, rgba(255,255,255,0.22) 100%); " +
+            "-fx-background-radius: 3;"
+    }
+
+    /**
      * The fraction of the bar the pointer at [x] (local to the seek row) is over.
      *
      * The skin's own track is measured when it has been laid out, so the value
@@ -2664,6 +2725,12 @@ object PlayerWindow {
             KeyCode.M -> toggleMute()
             KeyCode.F, KeyCode.F11 -> toggleFullscreen()
             KeyCode.N -> onNext?.invoke()
+            // The reference player's single-letter transport keys (mpv's own
+            // window gets the same bindings from its input.conf, unglued).
+            KeyCode.J -> seekBy(-10.0)
+            KeyCode.K -> togglePause()
+            KeyCode.L -> seekBy(10.0)
+            KeyCode.E -> onNext?.invoke()
             KeyCode.ESCAPE -> requestClose()
             else -> return
         }
@@ -2674,6 +2741,14 @@ object PlayerWindow {
         val clamped = next.coerceIn(0.0, 130.0)
         volume = clamped
         runCatching { ipc?.setProperty("volume", clamped) }
+        // Raising the volume unmutes mpv-side too: without this a volume key
+        // after `M` would move a number mpv keeps ignoring while `mute` stays
+        // set (muted at 100 looks broken, not loud).
+        if (clamped > 0.0 && muted) {
+            muted = false
+            runCatching { ipc?.setProperty("mute", false) }
+        }
+        refreshMuteIcon()
         setStatus("Volume ${clamped.roundToInt()}%", busy = false)
     }
 
@@ -2693,6 +2768,7 @@ object PlayerWindow {
             "track-list" to 6L,
             "video-format" to 7L,
             "vo-configured" to 8L,
+            "mute" to 9L,
         )
         // `observe` waits for a reply, so it must not run on the FX thread.
         Thread(
@@ -2751,6 +2827,10 @@ object PlayerWindow {
             }
             "volume" -> {
                 volume = (value as? Number)?.toDouble() ?: 100.0
+                Fx.run { refreshMuteIcon() }
+            }
+            "mute" -> {
+                muted = value == true
                 Fx.run { refreshMuteIcon() }
             }
             "track-list" -> renderTracks(value)

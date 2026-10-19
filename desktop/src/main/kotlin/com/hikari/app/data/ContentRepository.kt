@@ -80,11 +80,15 @@ class ContentRepository(private val manager: ProviderManager) {
      */
     suspend fun homeRows(
         providerId: String? = null,
+        providerIds: Set<String>? = null,
         force: Boolean = false,
         onRow: (CatalogRow) -> Unit = {},
     ): List<CatalogRow> = withContext(Dispatchers.IO) {
+        // One id, a set of ids (the multi-provider home feed), or everything.
+        val wanted: Set<String>? = providerIds?.takeIf { it.isNotEmpty() }
+            ?: providerId?.let { setOf(it) }
         val active = manager.providers.value.filter {
-            it.config.enabled && (providerId == null || it.config.id == providerId)
+            it.config.enabled && (wanted.isNullOrEmpty() || it.config.id in wanted)
         }
         // Bound the total work — this is what keeps Home feeling like a native
         // app instead of a webview. "All providers" shows the FIRST catalog of
@@ -92,7 +96,7 @@ class ContentRepository(private val manager: ProviderManager) {
         // provider gets up to 10 of its catalog rows. Firing every catalog of
         // every installed extension at once froze/crashed the app on any
         // machine, however powerful.
-        val allProviders = providerId == null
+        val allProviders = wanted.isNullOrEmpty()
         val useProviders = if (allProviders) active.take(8) else active
         val catalogsLimit = if (allProviders) 1 else 10
         val itemsLimit = 20

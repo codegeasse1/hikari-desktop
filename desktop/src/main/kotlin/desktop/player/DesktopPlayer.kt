@@ -99,6 +99,25 @@ object DesktopPlayer {
 
     @Volatile private var lastStreamUrl: String = ""
 
+    /** The key file written by [mpvInputConf]: one binding per line, mpv's own
+     *  `input.conf` syntax. Transport commands only (seek/volume/pause/mute):
+     *  anything the app must decide itself (next episode, close) stays
+     *  app-side, where the decision lives. */
+    private const val MPV_INPUT_CONF: String =
+        "# Written by Hikari on every launch: keys for mpv's own window,\n" +
+            "# mirroring the app player layer's shortcuts (see PlayerWindow.handleKey).\n" +
+            "RIGHT seek 10\n" +
+            "LEFT seek -10\n" +
+            "UP add volume 5\n" +
+            "DOWN add volume -5\n" +
+            "SPACE cycle pause\n" +
+            "ENTER cycle pause\n" +
+            "K cycle pause\n" +
+            "M cycle mute\n" +
+            "J seek -10\n" +
+            "L seek 10\n" +
+            "F cycle fullscreen\n"
+
     /** Signed, short-lived stream URLs (chaturbate's `mmcdn.com`/`edge-hls`
      *  LL-HLS links) — their token is single-use and expires in seconds, so:
      *  1) the pre-flight probe must NOT request them (it would burn the token
@@ -107,6 +126,28 @@ object DesktopPlayer {
      *  The rule itself lives on [Http] so the "play straight away" speed race
      *  respects it too. */
     private fun isSignedStreamUrl(url: String): Boolean = com.hikari.app.net.Http.isSignedStreamUrl(url)
+
+    /**
+     * mpv's key bindings for ITS OWN window, written on every launch.
+     *
+     * The app runs mpv with `--no-input-default-bindings` (its clicks and keys
+     * must not fight the app's own player layer), but on machines where the
+     * video cannot be glued into the app window mpv stays a window of its own
+     * — and a click into it used to swallow every shortcut dead. These mirror
+     * the app-side keys in [PlayerWindow.handleKey] with mpv-native commands,
+     * and the answers flow back through the observed properties (`time-pos`,
+     * `pause`, `volume`, `mute`), so both windows stay on the same state
+     * whichever one takes the key.
+     *
+     * `--no-config` only skips AUTO-LOADING config files; an explicit
+     * `--input-conf=` on the command line is still honoured.
+     */
+    private fun mpvInputConf(): String? = runCatching {
+        val dir = File(System.getProperty("user.home"), ".hikari").apply { mkdirs() }
+        val f = File(dir, "mpv-input.conf")
+        f.writeText(MPV_INPUT_CONF)
+        f.absolutePath
+    }.getOrNull()
 
     fun play(
         title: String,
@@ -256,6 +297,9 @@ object DesktopPlayer {
                 add("--auto-window-resize=no")
                 add("--keepaspect-window=no")
                 add("--no-input-default-bindings")
+                // Keys for mpv's own window (unglued mode): with the defaults
+                // above it would swallow every shortcut dead. See [mpvInputConf].
+                mpvInputConf()?.let { add("--input-conf=$it") }
                 add("--title=" + title.take(200).replace('\n', ' '))
                 ipcArg()?.let { add(it) }
                 add(file.absolutePath)
@@ -430,6 +474,9 @@ object DesktopPlayer {
                 add("--auto-window-resize=no")
                 add("--keepaspect-window=no")
                 add("--no-input-default-bindings")
+                // Keys for mpv's own window (unglued mode): with the defaults
+                // above it would swallow every shortcut dead. See [mpvInputConf].
+                mpvInputConf()?.let { add("--input-conf=$it") }
                 // No youtube-dl hook: for direct HLS/MP4 URLs it fires a SECOND,
                 // header-less probe (no Referer/Cookie) that 403s on protected
                 // CDNs and only adds confusing [ytdl_hook] errors to the dialog.
@@ -564,6 +611,23 @@ object DesktopPlayer {
                             if (!PlayerWindow.ipcWorking() && !PlayerWindow.isLoaded()) {
                                 PlayerWindow.setStatus("Still opening the stream…", busy = true)
                                 return@run
+                            }
+                            // SILENT retry first: the link this mpv was given may
+                            // have died between load and play (signed links live
+                            // seconds), and fetching a fresh one + relaunching
+                            // costs the user nothing — while an error dialog for
+                            // a link that was fine costs them the stream. Only
+                            // when there is nothing fresh to try (or no attempts
+                            // left) does the browser fallback come up. The
+                            // relaunched launch consumes one attempt, so this
+                            // cannot loop: every retry decrements the budget.
+                            if (refresh != null && attemptsLeft > 0) {
+                                val fresh = runCatching { refresh() }.getOrNull()
+                                if (fresh != null && fresh.url.isNotBlank()) {
+                                    PlayerWindow.setStatus("Still opening the stream…", busy = true)
+                                    launchMpv(title, fresh, refresh, attemptsLeft - 1, failedOver)
+                                    return@run
+                                }
                             }
                             dialogShown = true
                             showBrowserFallback(

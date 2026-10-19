@@ -1509,3 +1509,84 @@
 .x-prov-badge { -fx-background-color: linear-gradient(to bottom right, -h-accent, -h-accent-2); -fx-background-radius: 14; }
 .x-prov-initial { -fx-text-fill: white; -fx-font-size: 20px; -fx-font-weight: bold; }
 .x-prov-name { -fx-text-fill: -h-fg; }
+
+/* ---- pass 3: provider picker sheet, filter banner, scroll-over-hero,
+   fullscreen sources sheet, extensions grids ------------------------------ */
+
+/* Detail scrolls OVER its fixed hero backdrop: the pane (and its viewport)
+   stay transparent so the art shows through, with no focus ring. */
+.x-detail-scroll, .x-detail-scroll:focused { -fx-background-color: transparent; -fx-border-color: transparent; }
+.x-detail-scroll > .viewport { -fx-background-color: transparent; }
+/* Extra dim over the fixed backdrop, grown programmatically as the page
+   slides over it (see DetailScreen). */
+.x-d-scrolldim { -fx-background-color: rgba(3,4,7,0.92); }
+
+/* Home's in-page provider banner: which catalog the page is showing. */
+.x-filter-banner { -fx-background-color: -h-accent-soft; -fx-border-color: -h-accent-line; -fx-border-width: 1; -fx-border-radius: 12; -fx-background-radius: 12; -fx-padding: 8 12 8 12; }
+
+/* The catalog provider sheet (ProviderPicker): title, multi-feed switch,
+   card grid, and the two feed columns. All theme tokens, both themes safe. */
+.x-pd { -fx-background-color: -h-surface-2; -fx-background-radius: 14; -fx-border-color: -h-border-2; -fx-border-width: 1; -fx-border-radius: 14; -fx-effect: dropshadow(gaussian, -h-shadow-3, 26, 0, 0, 10); }
+.x-pd-title { -fx-text-fill: -h-fg; -fx-font-size: 16px; -fx-font-weight: bold; }
+.x-pd-sub { -fx-text-fill: -h-fg-3; -fx-font-size: 12.5px; }
+.x-pd-multi-t { -fx-text-fill: -h-fg-2; -fx-font-size: 12.5px; -fx-font-weight: bold; }
+.x-pd-scroll, .x-pd-col-scroll { -fx-background-color: transparent; -fx-border-color: transparent; }
+.x-pd-scroll > .viewport, .x-pd-col-scroll > .viewport { -fx-background-color: transparent; }
+.x-pd-grid { -fx-background-color: transparent; }
+.x-pd-card { -fx-background-color: -h-surface; -fx-background-radius: 12; -fx-border-color: -h-border; -fx-border-radius: 12; -fx-border-width: 1; -fx-cursor: hand; }
+.x-pd-card:hover { -fx-border-color: -h-accent-line; -fx-effect: dropshadow(gaussian, -h-accent-glow, 14, 0.2, 0, 0); }
+.x-pd-card-sel { -fx-background-color: -h-accent-soft; -fx-border-color: -h-accent-line; }
+.x-pd-badge { -fx-background-color: linear-gradient(to bottom right, -h-accent, -h-accent-2); -fx-background-radius: 12; -fx-min-width: 44; -fx-min-height: 44; -fx-pref-width: 44; -fx-pref-height: 44; -fx-max-width: 44; -fx-max-height: 44; }
+.x-pd-initial { -fx-text-fill: white; -fx-font-size: 18px; -fx-font-weight: bold; }
+.x-pd-name { -fx-text-fill: -h-fg; -fx-font-size: 13.5px; -fx-font-weight: bold; }
+.x-pd-sub2 { -fx-text-fill: -h-fg-3; -fx-font-size: 12px; }
+.x-pd-empty { -fx-text-fill: -h-fg-3; -fx-font-size: 12.5px; -fx-font-style: italic; }
+.x-pd-col-h { -fx-text-fill: -h-fg; -fx-font-size: 13px; -fx-font-weight: bold; }
+.x-pd-active { -fx-background-color: -h-accent-soft; -fx-background-radius: 10; -fx-border-color: -h-accent-line; -fx-border-radius: 10; -fx-border-width: 1; }
+.x-pd-avail { -fx-background-color: -h-surface; -fx-background-radius: 10; -fx-border-color: -h-border; -fx-border-radius: 10; -fx-border-width: 1; }
+.x-pd-avail:hover { -fx-border-color: -h-accent-line; }
+.x-pd-num { -fx-text-fill: -h-fg-3; -fx-font-size: 13px; -fx-font-weight: bold; }
+.x-pd-x, .x-pd-plus { -fx-background-color: transparent; -fx-background-radius: 8; -fx-padding: 6; -fx-cursor: hand; }
+.x-pd-x:hover, .x-pd-plus:hover { -fx-background-color: -h-surface-4; }
+.x-pd-x:focused, .x-pd-plus:focused { -fx-background-color: -h-surface-4; -fx-border-color: -h-accent-line; -fx-border-radius: 8; -fx-border-width: 1; }
+.x-pd-x .h-icon { -fx-fill: -h-fg-3; }
+.x-pd-plus .h-icon { -fx-fill: -h-accent; }
+
+/* The multi-feed toggle: a track with a knob, accent when on. */
+.x-switch { -fx-background-color: -h-surface-4; -fx-background-radius: 999; -fx-padding: 4; -fx-cursor: hand; -fx-min-width: 46; -fx-pref-width: 46; -fx-max-width: 46; -fx-min-height: 26; -fx-pref-height: 26; -fx-max-height: 26; }
+.x-switch-knob { -fx-background-color: -h-fg-3; -fx-background-radius: 999; -fx-min-width: 18; -fx-pref-width: 18; -fx-max-width: 18; -fx-min-height: 18; -fx-pref-height: 18; -fx-max-height: 18; }
+.x-switch-on { -fx-background-color: -h-accent; }
+.x-switch-on .x-switch-knob { -fx-background-color: white; }
+.x-switch:focused { -fx-border-color: -h-accent-line; -fx-border-radius: 999; -fx-border-width: 1; }
+
+/* The fullscreen sources sheet: fixed dark/white like the discovery overlay
+   (it sits over series art, not over the theme). Glassy rows, N SOURCES pill,
+   READY tag, Skip Loading + Cancel. */
+.x-src-sheet-root { -fx-background-color: rgba(3,4,7,0.88); }
+.x-src-sheet-scrim { -fx-background-color: linear-gradient(to bottom, rgba(3,4,7,0.60) 0%, rgba(3,4,7,0.30) 45%, rgba(3,4,7,0.90) 100%); }
+.x-src-sheet-title { -fx-text-fill: white; -fx-font-size: 30px; -fx-font-weight: bold; -fx-alignment: center; -fx-text-alignment: center; }
+.x-src-sheet-pill { -fx-text-fill: white; -fx-font-size: 13.5px; -fx-background-color: rgba(139,92,246,0.35); -fx-background-radius: 12; -fx-padding: 8 20 8 20; -fx-border-color: rgba(139,92,246,0.65); -fx-border-radius: 12; -fx-border-width: 1; -fx-alignment: center; -fx-text-alignment: center; }
+.x-src-sheet-status { -fx-text-fill: #dfe4f0; -fx-font-size: 14px; }
+.x-src-sheet-count { -fx-text-fill: white; -fx-font-size: 12px; -fx-font-weight: bold; -fx-background-color: rgba(139,92,246,0.35); -fx-background-radius: 11; -fx-padding: 6 14 6 14; -fx-border-color: rgba(139,92,246,0.65); -fx-border-radius: 11; -fx-border-width: 1; }
+.x-src-sheet-bar .track { -fx-background-color: rgba(255,255,255,0.16); -fx-background-radius: 3; }
+.x-src-sheet-bar .bar { -fx-background-color: #5aa2ff; -fx-background-radius: 3; -fx-background-insets: 0; -fx-padding: 4 0 4 0; }
+.x-src-sheet-scroll { -fx-background-color: transparent; -fx-border-color: transparent; }
+.x-src-sheet-scroll > .viewport { -fx-background-color: transparent; }
+.x-src-sheet-col { -fx-background-color: transparent; }
+.x-src-sheet-row { -fx-background-color: rgba(255,255,255,0.08); -fx-background-radius: 12; -fx-border-color: rgba(255,255,255,0.20); -fx-border-radius: 12; -fx-border-width: 1; -fx-padding: 8 10 8 10; }
+.x-src-sheet-row:hover { -fx-background-color: rgba(255,255,255,0.14); -fx-border-color: rgba(255,255,255,0.34); }
+.x-src-sheet-row .src-name { -fx-text-fill: white; }
+.x-src-sheet-row .src-meta { -fx-text-fill: #b9c0d4; }
+.x-src-sheet-row .h-icon { -fx-fill: #c3c9db; }
+.x-src-ready { -fx-text-fill: #7ee787; -fx-font-size: 11px; -fx-font-weight: bold; }
+.x-src-sheet-eye { -fx-background-color: transparent; -fx-background-radius: 10; -fx-padding: 8; -fx-cursor: hand; }
+.x-src-sheet-eye:hover { -fx-background-color: rgba(255,255,255,0.14); }
+.x-src-sheet-eye .h-icon { -fx-fill: #c3c9db; }
+.x-src-sheet-skip { -fx-background-color: linear-gradient(to right, -h-accent, -h-accent-2); -fx-text-fill: white; -fx-font-size: 13.5px; -fx-font-weight: bold; -fx-background-radius: 14; -fx-padding: 12 34 12 34; -fx-cursor: hand; }
+.x-src-sheet-skip:hover { -fx-opacity: 0.92; }
+.x-src-sheet-cancel { -fx-background-color: rgba(255,255,255,0.10); -fx-text-fill: white; -fx-font-size: 13.5px; -fx-font-weight: bold; -fx-background-radius: 14; -fx-border-color: rgba(255,255,255,0.25); -fx-border-radius: 14; -fx-border-width: 1; -fx-padding: 12 34 12 34; -fx-cursor: hand; }
+.x-src-sheet-cancel:hover { -fx-background-color: rgba(255,255,255,0.20); }
+
+/* Extensions: the purple info bar above the repo grid, and the grids. */
+.x-repo-infobar { -fx-background-color: rgba(139,92,246,0.14); -fx-background-radius: 12; -fx-border-color: rgba(139,92,246,0.45); -fx-border-radius: 12; -fx-border-width: 1; -fx-padding: 10 14 10 14; -fx-text-fill: -h-accent; -fx-font-size: 13px; -fx-font-weight: bold; }
+.x-repo-grid, .x-plugin-grid { -fx-background-color: transparent; }

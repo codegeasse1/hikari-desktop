@@ -25,6 +25,7 @@ import javafx.scene.control.Label
 import javafx.scene.control.ProgressBar
 import javafx.scene.control.ScrollPane
 import javafx.scene.control.TextField
+import javafx.scene.effect.GaussianBlur
 import javafx.scene.image.Image
 import javafx.scene.image.ImageView
 import javafx.scene.layout.BorderPane
@@ -221,7 +222,39 @@ class DetailScreenView(private val item: MediaItem) {
         minWidth = 0.0
         maxWidth = 660.0
     }
+    /**
+     * The hero block's wrapper in the scroll flow (see the scroll-over-hero
+     * layout in init): restores the banner's old insets once the block is a
+     * normal scrolling child instead of a StackPane overlay.
+     */
+    private val heroBodyWrap = VBox(heroBody).apply {
+        padding = Insets(0.0, 24.0, 26.0, 8.0)
+        minWidth = 0.0
+    }
     private val hero = StackPane()
+    /**
+     * Transparent headroom at the top of the scroll content: the fixed
+     * backdrop shows through it, so the title block sits over the lower art
+     * and the whole page slides OVER the image as it scrolls.
+     */
+    private val pageTop = Region().apply {
+        isMouseTransparent = true
+        minWidth = 0.0
+        maxWidth = Double.MAX_VALUE
+        minHeight = 300.0
+        prefHeight = 300.0
+        maxHeight = 300.0
+    }
+    /** Extra dim over the fixed backdrop, grows as the page scrolls over it. */
+    private val scrollDim = Region().apply {
+        styleClass.add("x-d-scrolldim")
+        maxWidth = Double.MAX_VALUE
+        maxHeight = Double.MAX_VALUE
+        isMouseTransparent = true
+        opacity = 0.0
+    }
+    /** The banner's back arrow — a fixed overlay so it never scrolls away. */
+    private lateinit var backBtn: Button
 
     // ── left column ─────────────────────────────────────────────────────────
 
@@ -311,34 +344,66 @@ class DetailScreenView(private val item: MediaItem) {
     /** Episode id → its card frame, for the selected glow. */
     private val episodeCards = HashMap<String, VBox>()
 
-    // ── source chooser dialog ───────────────────────────────────────────────
+    // ── source chooser sheet ────────────────────────────────────────────────
     // The reference shows NO sources panel on the detail screen: clicking an
-    // episode opens the source list, and picking a source plays it. So the
-    // panel is gone — this centered sheet is the only place sources appear.
+    // episode opens the source list full-screen OVER the series art — the
+    // show's logo/title, an episode pill, "Found N sources • …" with an
+    // N SOURCES pill, glassy rows (name, quality badge, READY), and
+    // Skip Loading + Cancel. This sheet is that.
 
-    private val srcDlgTitle = themed("Choose a source", "x-src-title")
+    private val srcDlgBg = ImageView().apply { isPreserveRatio = false; isSmooth = true; isMouseTransparent = true }
+    private var srcDlgArt: Image? = null
+    private val srcDlgLogo = ImageView().apply {
+        isPreserveRatio = true; isSmooth = true; fitHeight = 96.0
+        isVisible = false; isManaged = false; isMouseTransparent = true
+    }
+    private val srcDlgTitle = themed("", "x-src-sheet-title").apply { isWrapText = true; minWidth = 0.0 }
     private val srcDlgSub = themed("", "x-src-sub").apply { isWrapText = true; minWidth = 0.0 }
-    private val srcDlgCount = themed("", "x-src-count")
+    private val srcDlgPill = themed("", "x-src-sheet-pill").apply { isWrapText = true; minWidth = 0.0 }
+    private val srcDlgStatus = themed("Discovering streaming sources…", "x-src-sheet-status").apply {
+        isWrapText = true; minWidth = 0.0
+    }
+    private val srcDlgCount = themed("", "x-src-sheet-count")
+    private val srcDlgBar = ProgressBar(-1.0).apply {
+        styleClass.add("x-src-sheet-bar")
+        prefWidth = 640.0; maxWidth = 640.0
+        minHeight = 4.0; prefHeight = 4.0; maxHeight = 4.0
+        isMouseTransparent = true; isFocusTraversable = false
+    }
+    private val srcDlgEye = Ui.iconButton(Icons.EYE, "Blur the backdrop", 16.0) { toggleSheetBlur() }.apply {
+        styleClass.add("x-src-sheet-eye")
+    }
+    private var srcDlgBlurred = false
     private val srcDlgRows = VBox(8.0).apply { minWidth = 0.0 }
     private val srcDlgScroll = ScrollPane(srcDlgRows).apply {
         isFitToWidth = true
-        styleClass.add("scroll-pane")
+        styleClass.addAll("scroll-pane", "x-src-sheet-scroll")
         vbarPolicy = ScrollPane.ScrollBarPolicy.AS_NEEDED
         hbarPolicy = ScrollPane.ScrollBarPolicy.NEVER
         minWidth = 0.0
         minHeight = 0.0
         maxWidth = Double.MAX_VALUE
-        prefHeight = 380.0
+        prefHeight = 300.0
+    }
+    private val srcDlgSkip = Button("⏭   Skip Loading").apply {
+        styleClass.add("x-src-sheet-skip")
+        isFocusTraversable = false
+        setOnAction { skipLoading() }
+    }
+    private val srcDlgCancel = Button("✕   Cancel").apply {
+        styleClass.add("x-src-sheet-cancel")
+        isFocusTraversable = false
+        setOnAction { closeSourceDialog() }
     }
     private val srcDlgCard = VBox(Theme.S3).apply {
-        styleClass.add("x-src-card")
+        styleClass.add("x-src-sheet-col")
         minWidth = 0.0
-        maxWidth = 620.0
-        prefWidth = 620.0
+        maxWidth = 700.0
+        prefWidth = 700.0
     }
     private var srcDlgEp: Episode? = null
     private val srcDlgRoot = StackPane().apply {
-        styleClass.add("x-src-root")
+        styleClass.add("x-src-sheet-root")
         isVisible = false
         isManaged = false
     }
@@ -388,15 +453,39 @@ class DetailScreenView(private val item: MediaItem) {
         buildHero()
         buildDiscovery()
         buildSourceDialog()
-        leftScroll = Ui.vScroll(leftColumn, Insets(0.0, 6.0, 24.0, 0.0))
+        leftScroll = Ui.vScroll(leftColumn, Insets(0.0, 6.0, 24.0, 0.0)).apply {
+            styleClass.add("x-detail-scroll")
+        }
         Ui.fill(leftColumn)
-        val content = VBox(Theme.S4, hero, leftScroll).apply { minHeight = 0.0 }
-        VBox.setVgrow(leftScroll, Priority.ALWAYS)
         Ui.fill(leftScroll)
-        Ui.fill(content)
-        val center = StackPane(content, discRoot, srcDlgRoot).apply { minWidth = 0.0; minHeight = 0.0 }
+        // Scroll-over-hero: the backdrop is a FIXED full-bleed background and
+        // the scroll content (headroom + the hero block + every section) slides
+        // OVER it — the page never scrolls "below" the image.
+        Ui.fill(hero)
+        val bg = StackPane(hero).apply { minWidth = 0.0; minHeight = 0.0 }
+        Ui.fill(bg)
+        // The back arrow floats above the scroll (pick-transparent everywhere
+        // but the button itself) so it is always on screen and never covered.
+        val backOverlay = StackPane(backBtn).apply {
+            isPickOnBounds = false
+            minWidth = 0.0
+            minHeight = 0.0
+            maxWidth = Double.MAX_VALUE
+            maxHeight = Double.MAX_VALUE
+        }
+        StackPane.setAlignment(backBtn, Pos.TOP_LEFT)
+        StackPane.setMargin(backBtn, Insets(16.0, 0.0, 0.0, 16.0))
+        leftScroll.vvalueProperty().addListener { _, _, v ->
+            scrollDim.opacity = (v.toDouble() * 0.55).coerceIn(0.0, 0.55)
+        }
+        root.heightProperty().addListener { _, _, _ -> layoutSpacer() }
+        val center = StackPane(bg, leftScroll, backOverlay, discRoot, srcDlgRoot).apply {
+            minWidth = 0.0; minHeight = 0.0
+        }
         Ui.fill(center)
         root.center = center
+        AppShell.detailCloser = { closeTopOverlay() }
+        javafx.application.Platform.runLater { layoutSpacer() }
         // The screen is painted from the catalog item we were handed, BEFORE any
         // network call: the banner, the title block and the ratings area are
         // already on screen when the click's frame ends. The item a grid hands
@@ -589,21 +678,8 @@ class DetailScreenView(private val item: MediaItem) {
         hero.styleClass.add("x-d-hero")
         hero.minWidth = 0.0
         hero.maxWidth = Double.MAX_VALUE
-        // A sane height for the very first layout pass; the listener below fits
-        // it to the window once the root has been laid out.
-        hero.prefHeight = HERO_MIN
-        hero.minHeight = HERO_MIN
-        hero.maxHeight = HERO_MIN
-        // The banner takes a generous slice of the window (clamped). The window
-        // height is independent of this value, so the listener settles in one pass.
-        root.heightProperty().addListener { _, _, h ->
-            val target = (h.toDouble() * 0.50).coerceIn(HERO_MIN, HERO_H)
-            if (hero.prefHeight != target) {
-                hero.prefHeight = target
-                hero.minHeight = target
-                hero.maxHeight = target
-            }
-        }
+        hero.minHeight = 0.0
+        hero.maxHeight = Double.MAX_VALUE
         heroBgA.fitWidthProperty().bind(hero.widthProperty())
         heroBgA.fitHeightProperty().bind(hero.heightProperty())
         heroBgB.fitWidthProperty().bind(hero.widthProperty())
@@ -624,38 +700,43 @@ class DetailScreenView(private val item: MediaItem) {
             isMouseTransparent = true
         }
 
-        // The banner's own back arrow. Two things about it are load-bearing:
+        // The screen's own back arrow. Two things about it are load-bearing:
         //
         //  - it carries NO tooltip. A JavaFX tooltip is a popup window of its
         //    own, and a click that arrives while one is up is spent dismissing it
         //    instead of pressing the button (see Ui.tooltip) — on a one-click
         //    control that reads as "the back button does not work".
-        //  - it is added to the StackPane LAST (see the children.addAll at the
-        //    end of this function), so nothing painted over the banner — the
-        //    title block, the scrims — can cover it or take its clicks.
-        val back = Ui.iconButton(Icons.CHEVRON_LEFT, null, 18.0) { AppShell.back() }.apply {
+        //  - it lives in a fixed overlay ABOVE the scroll (see init), so nothing
+        //    the page draws — the title block, the scrims, scrolled content —
+        //    can ever cover it or take its clicks.
+        backBtn = Ui.iconButton(Icons.CHEVRON_LEFT, null, 18.0) { AppShell.back() }.apply {
             styleClass.addAll("x-round-btn", "hero-back")
             id = "heroBackBtn"
             accessibleText = "Back"
         }
-        StackPane.setAlignment(back, Pos.TOP_LEFT)
-        StackPane.setMargin(back, Insets(16.0, 0.0, 0.0, 16.0))
 
-        // Nothing decorative may be a pick target on a banner that carries
+        // Nothing decorative may be a pick target on a screen that carries
         // buttons: the artwork is a picture, so a click that lands on it is a
         // click the user meant for Play or Download.
         heroBgA.isMouseTransparent = true
         heroBgB.isMouseTransparent = true
         heroLogo.isMouseTransparent = true
 
-        StackPane.setAlignment(heroBody, Pos.BOTTOM_LEFT)
-        StackPane.setMargin(heroBody, Insets(0.0, 24.0, 26.0, 30.0))
+        // Paint order IS click priority in JavaFX: the scroll dim goes on last
+        // so it grades everything beneath it, and it is mouse-transparent so it
+        // never takes a click. The back arrow lives in its own fixed overlay
+        // above the scroll (see init) — never inside this stack.
+        hero.children.addAll(heroBgA, heroBgB, scrim, scrimL, scrollDim)
+    }
 
-        // Paint order IS click priority in JavaFX: the back arrow goes in last so
-        // it is on top of everything the banner draws, and the title/action block
-        // sits directly under it. The Play button is the point of this screen, so
-        // nothing but the arrow may ever be painted over it.
-        hero.children.addAll(heroBgA, heroBgB, scrim, scrimL, heroBody, back)
+    /** Sizes the scroll headroom from the window, so the title block sits over
+     *  the lower art at any window height. */
+    private fun layoutSpacer() {
+        val h = (root.height * 0.42).coerceIn(240.0, 400.0)
+        if (h <= 0.0) return
+        pageTop.minHeight = h
+        pageTop.prefHeight = h
+        pageTop.maxHeight = h
     }
 
     // ── discovery overlay ───────────────────────────────────────────────────
@@ -793,7 +874,9 @@ class DetailScreenView(private val item: MediaItem) {
         if (studioSection.isVisible) panels.add(studioSection)
         if (shotsSection.isVisible) panels.add(shotsSection)
         if (trailersSection.isVisible) panels.add(trailersSection)
-        leftColumn.children.setAll(panels)
+        // The hero block scrolls WITH the page, over the fixed backdrop: the
+        // headroom shows pure art, then the title block, then the season.
+        leftColumn.children.setAll(listOf(pageTop, heroBodyWrap) + panels)
     }
 
     // ── episodes ────────────────────────────────────────────────────────────
@@ -947,7 +1030,10 @@ class DetailScreenView(private val item: MediaItem) {
 
     private fun episodeCard(ep: Episode): VBox {
         val still = stills[ep.number]
-        val imgUrl = if (antiSpoiler) null else (ep.image?.takeIf { it.isNotBlank() } ?: still?.stillUrl)
+        // Anti-spoiler BLURS the still, it never removes it: the card keeps
+        // its artwork with a heavy gaussian blur, and the big number behind
+        // only shows when there is no artwork at all.
+        val imgUrl = (ep.image?.takeIf { it.isNotBlank() } ?: still?.stillUrl)
         // Big number behind the still: titles without any artwork (a provider
         // with no images that TMDB cannot resolve either) still read as episode
         // cards instead of empty black boxes — the still covers it when one loads.
@@ -955,7 +1041,10 @@ class DetailScreenView(private val item: MediaItem) {
             styleClass.add("x-ep-bignum")
             isMouseTransparent = true
         }
-        val art = ImageView().apply { isPreserveRatio = false; isSmooth = true; isMouseTransparent = true }
+        val art = ImageView().apply {
+            isPreserveRatio = false; isSmooth = true; isMouseTransparent = true
+            if (antiSpoiler) effect = SPOILER_BLUR
+        }
         val frame = StackPane(bigNum, art).apply {
             styleClass.add("x-ep-still")
             clip = Rectangle(EP_CARD_W, EP_STILL_H).apply { arcWidth = 16.0; arcHeight = 16.0 }
@@ -972,7 +1061,7 @@ class DetailScreenView(private val item: MediaItem) {
             art.styleClass.add("x-ep-ph")
         }
         val rating = still?.rating?.takeIf { it > 0.0 }
-        if (rating != null && !antiSpoiler) {
+        if (rating != null) {
             val badge = Label("★ %.1f".format(rating)).apply { styleClass.add("x-ep-badge") }
             StackPane.setAlignment(badge, Pos.TOP_LEFT)
             StackPane.setMargin(badge, Insets(8.0, 0.0, 0.0, 8.0))
@@ -1393,24 +1482,101 @@ class DetailScreenView(private val item: MediaItem) {
     // ── source chooser dialog ───────────────────────────────────────────────
 
     private fun buildSourceDialog() {
-        val close = Ui.iconButton(Icons.CLOSE, "Close", 16.0) { closeSourceDialog() }
-        val head = HBox(10.0, VBox(2.0, srcDlgTitle, srcDlgSub).apply { minWidth = 0.0 }, Ui.spacer(), srcDlgCount, Ui.isolateClicks(close)).apply {
+        srcDlgBg.fitWidthProperty().bind(srcDlgRoot.widthProperty())
+        srcDlgBg.fitHeightProperty().bind(srcDlgRoot.heightProperty())
+        srcDlgRoot.widthProperty().addListener { _, _, w ->
+            Ui.coverImage(srcDlgBg, srcDlgArt, w.toDouble(), srcDlgRoot.height)
+        }
+        srcDlgRoot.heightProperty().addListener { _, _, h ->
+            Ui.coverImage(srcDlgBg, srcDlgArt, srcDlgRoot.width, h.toDouble())
+        }
+        val scrim = Region().apply {
+            styleClass.add("x-src-sheet-scrim")
+            maxWidth = Double.MAX_VALUE
+            maxHeight = Double.MAX_VALUE
+            isMouseTransparent = true
+        }
+        val head = VBox(8.0, srcDlgLogo, srcDlgTitle, srcDlgPill).apply {
+            alignment = Pos.CENTER
+            minWidth = 0.0
+            maxWidth = 680.0
+        }
+        val statusRow = HBox(10.0, srcDlgStatus, Ui.spacer(), srcDlgCount, Ui.isolateClicks(srcDlgEye)).apply {
             alignment = Pos.CENTER_LEFT
             minWidth = 0.0
+            maxWidth = 680.0
         }
-        HBox.setHgrow(head.children[1] as Region, Priority.ALWAYS)
-        srcDlgCard.children.addAll(head, Ui.divider(), srcDlgScroll)
-        Ui.isolateClicks(srcDlgCard)
-        srcDlgRoot.children.add(srcDlgCard)
+        val buttons = HBox(12.0, Ui.isolateClicks(srcDlgSkip), Ui.isolateClicks(srcDlgCancel)).apply {
+            alignment = Pos.CENTER
+            minWidth = 0.0
+        }
+        srcDlgCard.children.addAll(head, statusRow, srcDlgBar, srcDlgScroll, buttons)
+        srcDlgCard.alignment = Pos.CENTER
+        val page = StackPane(srcDlgCard).apply {
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
+            padding = Insets(28.0, 24.0, 28.0, 24.0)
+        }
         StackPane.setAlignment(srcDlgCard, Pos.CENTER)
-        StackPane.setMargin(srcDlgCard, Insets(24.0))
+        srcDlgRoot.children.addAll(srcDlgBg, scrim, page)
         srcDlgRoot.setOnMouseClicked { e ->
             if (e.target === srcDlgRoot) closeSourceDialog()
         }
     }
 
+    private fun toggleSheetBlur() {
+        srcDlgBlurred = !srcDlgBlurred
+        srcDlgBg.effect = if (srcDlgBlurred) SPOILER_BLUR else null
+    }
+
+    /** "Skip Loading": play the best of what has landed so far, now. */
+    private fun skipLoading() {
+        val list = streams
+        if (list.isEmpty()) {
+            AppShell.toast("Still looking for sources…")
+            return
+        }
+        playBest(list)
+    }
+
+    /** Closes the topmost overlay for Escape (sheet first, discovery second). */
+    fun closeTopOverlay(): Boolean {
+        if (srcDlgRoot.isVisible) {
+            closeSourceDialog()
+            return true
+        }
+        if (discRoot.isVisible) {
+            cancelDiscovery()
+            return true
+        }
+        return false
+    }
+
     private fun openSourceDialog(ep: Episode) {
         srcDlgEp = ep
+        srcDlgBlurred = false
+        srcDlgBg.effect = null
+        srcDlgArt = heroArtA ?: heroArtB
+        Ui.coverImage(srcDlgBg, srcDlgArt, srcDlgRoot.width.coerceAtLeast(800.0), srcDlgRoot.height.coerceAtLeast(500.0))
+        val logoImg = heroLogo.image
+        if (enrich?.logoUrl != null && logoImg != null) {
+            srcDlgLogo.image = logoImg
+            srcDlgLogo.isVisible = true
+            srcDlgLogo.isManaged = true
+            srcDlgTitle.isVisible = false
+            srcDlgTitle.isManaged = false
+        } else {
+            srcDlgLogo.isVisible = false
+            srcDlgLogo.isManaged = false
+            srcDlgTitle.text = meta.title
+            srcDlgTitle.isVisible = true
+            srcDlgTitle.isManaged = true
+        }
+        srcDlgPill.text = if (meta.type == MediaType.SERIES) {
+            "S${ep.season}:E${ep.number} • " + (ep.name?.takeIf { it.isNotBlank() } ?: "Episode ${ep.number}")
+        } else {
+            meta.title
+        }
         srcDlgSub.text = if (meta.type == MediaType.SERIES) {
             "S${ep.season} • Episode ${ep.number}" + (ep.name?.takeIf { it.isNotBlank() }?.let { " — $it" } ?: "")
         } else {
@@ -1442,14 +1608,27 @@ class DetailScreenView(private val item: MediaItem) {
                     }
                 }
             }.trim()
-            srcDlgCount.text = if (running) "searching…" else "0 found"
+            srcDlgStatus.text = if (running) "Discovering streaming sources…" else "No sources found"
+            srcDlgCount.text = if (running) "searching…" else "0 SOURCES"
+            srcDlgBar.progress = -1.0
+            srcDlgBar.isVisible = running
+            srcDlgBar.isManaged = running
             srcDlgRows.children.setAll(
                 if (running) Ui.loadingRow("Fetching sources…")
                 else Ui.emptyState(Icons.INFO, "No playable source found", body),
             )
             return
         }
-        srcDlgCount.text = "${streams.size} found"
+        val running = AppShell.app.repository.sweepRunning(meta, ep)
+        srcDlgStatus.text = if (running) {
+            "Found ${streams.size} source${if (streams.size == 1) "" else "s"} • Finding more…"
+        } else {
+            "Found ${streams.size} source${if (streams.size == 1) "" else "s"} • Select a source to play"
+        }
+        srcDlgCount.text = "${streams.size} SOURCES"
+        srcDlgBar.progress = 1.0
+        srcDlgBar.isVisible = running
+        srcDlgBar.isManaged = running
         srcDlgRows.children.setAll(streams.map { sourceRow(it) })
     }
 
@@ -1547,7 +1726,7 @@ class DetailScreenView(private val item: MediaItem) {
             source.subtitles.takeIf { it.isNotEmpty() }?.let { "SUBS ${it.size}" },
         ).joinToString(" · ")
 
-        val qualityBadge = Ui.badge(quality.ifBlank { "SRC" }, if (quality.isNotBlank()) "badge-accent" else "badge")
+        val qualityBadge = Ui.badge(quality.ifBlank { "SRC" }, if (quality.isNotBlank()) "x-src-q" else "badge")
         val qualityBox = VBox(qualityBadge).apply {
             alignment = Pos.CENTER
             prefWidth = 54.0
@@ -1580,8 +1759,9 @@ class DetailScreenView(private val item: MediaItem) {
             isFocusTraversable = false
             setOnAction { play(source) }
         }
-        val row = HBox(9.0, qualityBox, info, grab, browser, play).apply {
-            styleClass.add("src-row")
+        val ready = themed("READY", "x-src-ready")
+        val row = HBox(9.0, qualityBox, info, Ui.spacer(), ready, grab, browser, play).apply {
+            styleClass.addAll("src-row", "x-src-sheet-row")
             alignment = Pos.CENTER_LEFT
             minWidth = 0.0
         }
@@ -1854,6 +2034,11 @@ class DetailScreenView(private val item: MediaItem) {
     private fun themed(text: String, cls: String): Label = Label(text).apply { styleClass.add(cls) }
 
     private companion object {
+        /** The anti-spoiler blur, shared by every episode still (and the
+         *  sources sheet's eye toggle): heavy enough that no frame is
+         *  recognisable, light enough to keep the card's colour. */
+        val SPOILER_BLUR = GaussianBlur(26.0)
+
         /** Ceiling for the banner's height. It carries the logo treatment as
          *  well as the title, so it wants a real slice of the window. */
         const val HERO_H = 520.0

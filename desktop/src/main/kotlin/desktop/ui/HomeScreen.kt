@@ -4,6 +4,7 @@ import com.hikari.app.data.CatalogRow
 import com.hikari.app.data.HistoryEntry
 import com.hikari.app.data.MediaItem
 import com.hikari.app.data.MediaType
+import com.hikari.app.data.ProviderConfig
 import com.hikari.app.data.TmdbDetails
 import desktop.fx.Fx
 import javafx.animation.KeyFrame
@@ -157,6 +158,19 @@ class HomeScreenView {
     }
     private val logsBtn = Ui.button("Logs", icon = Icons.LIST, ghost = true) { toggleLogs() }
     private val refreshBtn = Ui.button("Refresh", icon = Icons.REFRESH, primary = true) { load(force = true) }
+    /**
+     * The in-page provider banner: when Home is showing one provider's catalog
+     * (or a multi-provider mix), this names it right above the hero — the page
+     * never silently looks "the same" after a pick from Explore or the picker.
+     */
+    private val filterBanner = HBox(10.0).apply {
+        styleClass.add("x-filter-banner")
+        alignment = Pos.CENTER_LEFT
+        isVisible = false
+        isManaged = false
+        minWidth = 0.0
+        maxWidth = Double.MAX_VALUE
+    }
     private val content = VBox(Theme.S4)
     val root: ScrollPane = Ui.vScroll(content)
 
@@ -190,6 +204,7 @@ class HomeScreenView {
                 minWidth = 0.0
                 maxWidth = Double.MAX_VALUE
             },
+            filterBanner,
             heroBox,
             cwSection,
             statusLabel,
@@ -598,23 +613,50 @@ class HomeScreenView {
                 // can deliver a popup's action event before the chosen item is
                 // committed to `value`, which clobbered the user's pick back to
                 // "All providers").
-                val (chosen, filterId) = Fx.runBlock {
+                val (chosen, filterId, filterIds) = Fx.runBlock {
                     providerPicker.setProviders(enabled)
                     // An Explore row asked for a provider while we were
                     // elsewhere: apply it now that the list is fresh, and the
-                    // rest of this load reads it like a manual pick.
+                    // rest of this load reads it like a manual pick. Best
+                    // effort (exact, case-insensitive, substring) so a renamed
+                    // provider still lands somewhere sensible.
                     pendingProvider?.let { want ->
                         pendingProvider = null
-                        providerPicker.select(want)
+                        if (!providerPicker.selectBestEffort(want)) {
+                            AppShell.toast("“$want” is not installed any more — showing everything", "error")
+                        }
+                    } ?: run {
+                        // No explicit ask: restore the persisted choice (single
+                        // id or multi feed) the first time the screen loads it.
+                        if (!providerPicker.hasChoice()) {
+                            val store = AppShell.app.store
+                            val multi = store.homeMultiIds()
+                            if (store.homeMultiOn() && !providerPicker.setMultiSilent(multi)) {
+                                store.setHomeMultiOn(false)
+                                store.setHomeMultiIds(emptyList())
+                            }
+                            if (!providerPicker.multiOn) {
+                                val hid = store.homeProvider()
+                                if (hid.isNotBlank() && !providerPicker.selectById(hid)) {
+                                    store.setHomeProvider("")
+                                }
+                            }
+                        }
                     }
                     val cfg = providerPicker.selection
+                    val multi = if (providerPicker.multiOn) providerPicker.multiIds().toSet() else null
                     val c = providerPicker.selectedName()
+                    // The banner names whose catalog this page is, so a pick
+                    // from Explore or the picker is unmistakable (see
+                    // renderFilterBanner).
+                    renderFilterBanner(enabled, cfg?.id, multi)
                     // Re-seed the banner whenever the source filter changes, so
                     // the hero features the provider the user picked. Without
                     // this it kept showing whichever provider answered first and
                     // never changed again for the life of the screen.
-                    if (c != heroFilter) {
-                        heroFilter = c
+                    val key = if (multi != null) "MULTI:" + multi.sorted().joinToString(",") else c
+                    if (key != heroFilter) {
+                        heroFilter = key
                         heroSeeded = false
                         heroItems = emptyList()
                         heroIndex = 0
@@ -622,10 +664,10 @@ class HomeScreenView {
                         heroBox.isVisible = false
                         heroBox.isManaged = false
                     }
-                    c to cfg?.id
+                    Triple(c, cfg?.id, multi)
                 }
                 val firstRow = booleanArrayOf(false)
-                val rows = AppShell.app.repository.homeRows(filterId, force = force) { row ->
+                val rows = AppShell.app.repository.homeRows(providerId = filterId, providerIds = filterIds, force = force) { row ->
                     Fx.run {
                         if (myGen == gen) {
                             if (!firstRow[0]) {
@@ -645,7 +687,7 @@ class HomeScreenView {
                         }
                     }
                 }
-                Fx.run { render(rows, filterId, chosen) }
+                Fx.run { render(rows, filterId, chosen, filterIds) }
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (t: Throwable) {
@@ -660,7 +702,7 @@ class HomeScreenView {
     /** The first catalog that lands supplies the hero. */
     private var heroSeeded = false
 
-    private fun render(rows: List<CatalogRow>, filterId: String?, chosen: String? = null) {
+    private fun render(rows: List<CatalogRow>, filterId: String?, chosen: String? = null, filterIds: Set<String>? = null) {
         statusLabel.text = ""
         if (!heroSeeded) {
             val candidates = rows.flatMap { it.items }
@@ -708,10 +750,66 @@ class HomeScreenView {
 
             else -> {
                 errorLabel.text = ""
-                statusLabel.text = "${rows.size} row(s) from ${statuses.count { it.loaded }} loaded source(s)"
+                // A plain count, not a census: the old "N row(s) from M loaded
+                // source(s)" read as a clipped fragment on narrow windows and
+                // said nothing about whose catalog is on screen (the banner
+                // above says that now).
+                val scope = when {
+                    filterIds != null -> "Mix of ${filterIds.size}"
+                    chosen != null && chosen != ProviderPicker.ALL -> "“$chosen”"
+                    else -> null
+                }
+                statusLabel.text = if (scope != null) "$scope · ${rows.size} row(s)"
+                else if (rows.size == 1) "1 row" else "${rows.size} rows"
             }
         }
         refreshLogsButton()
+    }
+
+    /**
+     * Names whose catalog Home is showing, right above the hero: one provider
+     * ("Anime4i — showing this provider's catalog" + Show all) or a mix
+     * ("Mix of 3…" + Manage). Hidden for the unfiltered page.
+     */
+    private fun renderFilterBanner(enabled: List<ProviderConfig>, singleId: String?, multi: Set<String>?) {
+        val byId = enabled.associateBy { it.id }
+        when {
+            multi != null -> {
+                val names = multi.mapNotNull { byId[it]?.name }
+                val who = if (names.isEmpty()) "Mix" else {
+                    "Mix of ${multi.size}" + if (names.isNotEmpty()) ": " + names.take(3).joinToString(", ") else "" +
+                        if (names.size > 3) "…" else ""
+                }
+                filterBanner.children.setAll(
+                    Ui.badge("MIX", "badge-accent"),
+                    Theme.label(who, size = 13.5, bold = true).apply { minWidth = 0.0 },
+                    Ui.spacer(),
+                    Ui.button("Manage", ghost = true) { providerPicker.open() },
+                )
+                filterBanner.isVisible = true
+                filterBanner.isManaged = true
+            }
+            singleId != null -> {
+                val name = byId[singleId]?.name ?: providerPicker.selectedName()
+                filterBanner.children.setAll(
+                    Ui.badge("1", "badge-accent"),
+                    Theme.label("$name — showing this provider's catalog", size = 13.5, bold = true).apply {
+                        minWidth = 0.0
+                    },
+                    Ui.spacer(),
+                    Ui.button("Show all", ghost = true) {
+                        providerPicker.select(ProviderPicker.ALL)
+                        load(force = true)
+                    },
+                )
+                filterBanner.isVisible = true
+                filterBanner.isManaged = true
+            }
+            else -> {
+                filterBanner.isVisible = false
+                filterBanner.isManaged = false
+            }
+        }
     }
 
     private fun fallback(message: String) {

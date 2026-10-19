@@ -70,6 +70,8 @@ class AppStore(private val dir: File) {
         const val WEBVIEW_DEFAULT_UA = "webviewDefaultUa"
         const val WEBVIEW_CUSTOM_UA = "webviewCustomUa"
         const val HOME_PROVIDER = "homeProvider"
+        const val HOME_MULTI_IDS = "homeMultiIds"
+        const val HOME_MULTI_ON = "homeMultiOn"
         const val TRANSLATE_PROVIDERS = "translateProviders"
         const val TRANSLATE_CACHE = "translateCache"
         const val DL_CONCURRENCY = "downloadConcurrency"
@@ -111,6 +113,21 @@ class AppStore(private val dir: File) {
     fun homeProvider(): String = get(K.HOME_PROVIDER) ?: ""
     fun setHomeProvider(id: String) {
         put(K.HOME_PROVIDER, id)
+    }
+
+    /**
+     * Multi-provider home feed (see the provider picker's "Enable
+     * Multi-Provider Feed"): the ordered provider ids Home mixes rows from,
+     * and whether the mix is on. Empty/off = the single [homeProvider] choice
+     * (or every enabled provider when that is blank too).
+     */
+    fun homeMultiIds(): List<String> = parseStringList(get(K.HOME_MULTI_IDS))
+    fun setHomeMultiIds(ids: List<String>) {
+        put(K.HOME_MULTI_IDS, encodeStringList(ids))
+    }
+    fun homeMultiOn(): Boolean = (get(K.HOME_MULTI_ON) ?: "false").toBoolean()
+    fun setHomeMultiOn(on: Boolean) {
+        put(K.HOME_MULTI_ON, on.toString())
     }
 
     fun translateProvidersFlow(): Flow<Set<String>> = flowOf { translateProviders() }

@@ -162,9 +162,28 @@ object AppShell {
         }
 
         val version = runCatching { "v${desktop.Build.VERSION} · ${desktop.Build.COMMIT}" }.getOrDefault("Hikari")
+        // The Hikari mark: the app icon itself, clipped round, in the logo
+        // slot — with the gradient tile as the fallback when the resource is
+        // missing (a logo that fails to load must never blank the rail).
+        val markGraphic: javafx.scene.Node = runCatching {
+            val stream = AppShell::class.java.getResourceAsStream("/hikari.png")
+                ?: return@runCatching null
+            val img = javafx.scene.image.Image(stream)
+            if (img.isError || img.width <= 0.0) return@runCatching null
+            javafx.scene.image.ImageView(img).apply {
+                fitWidth = 32.0
+                fitHeight = 32.0
+                isPreserveRatio = true
+                isSmooth = true
+                clip = javafx.scene.shape.Rectangle(32.0, 32.0).apply {
+                    arcWidth = 10.0
+                    arcHeight = 10.0
+                }
+            }
+        }.getOrNull() ?: Region().apply { styleClass.add("x-side-mark") }
         val mark = Button().apply {
             styleClass.add("x-side-logo")
-            graphic = Region().apply { styleClass.add("x-side-mark") }
+            graphic = markGraphic
             isFocusTraversable = false
             setOnAction { show(Screen.Home) }
         }
@@ -187,7 +206,14 @@ object AppShell {
             }
             Ui.tooltip(text).let { button.tooltip = it }
             navButtons.add(screen to button)
-            box.children.add(HBox(button).apply { alignment = Pos.CENTER })
+            // Every tab owns an identical slot and sits dead-center in it, so
+            // no icon can drift high/low of its selected box.
+            box.children.add(HBox(button).apply {
+                alignment = Pos.CENTER
+                minHeight = 52.0
+                prefHeight = 52.0
+                maxHeight = 52.0
+            })
         }
 
         nav(Screen.Home, Icons.HOME, "Home")
@@ -284,7 +310,21 @@ object AppShell {
         scene.accelerators[KeyCodeCombination(KeyCode.DIGIT2, KeyCombination.CONTROL_DOWN)] = Runnable { show(Screen.Search) }
         scene.accelerators[KeyCodeCombination(KeyCode.DIGIT3, KeyCombination.CONTROL_DOWN)] = Runnable { show(Screen.Library) }
         scene.accelerators[KeyCodeCombination(KeyCode.DIGIT4, KeyCombination.CONTROL_DOWN)] = Runnable { show(Screen.Downloads) }
-        scene.accelerators[KeyCodeCombination(KeyCode.ESCAPE)] = Runnable { back() }
+        // Escape closes an in-page overlay first (sources sheet, discovery),
+        // and only goes back when there is nothing to close.
+        scene.accelerators[KeyCodeCombination(KeyCode.ESCAPE)] = Runnable {
+            if (detailCloser?.invoke() != true) back()
+        }
+        // "/" focuses global search — but never while the user is typing in a
+        // field, where "/" is text, not a shortcut.
+        scene.addEventFilter(javafx.scene.input.KeyEvent.KEY_PRESSED) { e ->
+            if (e.code == KeyCode.SLASH && !e.isControlDown && !e.isAltDown && !e.isMetaDown) {
+                val t = e.target
+                if (t is javafx.scene.control.TextInputControl) return@addEventFilter
+                openSearch()
+                e.consume()
+            }
+        }
     }
 
     private fun openSearch() {
@@ -322,9 +362,17 @@ object AppShell {
      * providers) reports itself here so the user always has a visible answer to
      * "is anything happening?", wherever they have scrolled to. Safe to call
      * from any thread.
+     *
+     * The chip ALWAYS expires on its own (12s): a code path that reports work
+     * and then hangs — a loader that never returns — used to leave its label
+     * ("Installed X", "Fetching repo…") in the top bar for the rest of the
+     * session. Genuinely long work re-reports as it goes; a stale label is
+     * worse than none.
      */
+    private var activityGen = 0
     fun activity(text: String?) {
         val label = text?.takeIf { it.isNotBlank() }
+        val gen = ++activityGen
         desktop.fx.Fx.run {
             if (::activityBox.isInitialized) {
                 if (label != null) activityLabel.text = label
@@ -332,7 +380,20 @@ object AppShell {
                 activityBox.isManaged = label != null
             }
         }
+        if (label != null) {
+            uiScope.launch {
+                kotlinx.coroutines.delay(12_000L)
+                if (activityGen == gen) activity(null)
+            }
+        }
     }
+
+    /**
+     * Closes the topmost in-page overlay (the detail screen's sources sheet or
+     * discovery), for Escape. Set by the detail screen while it is up, cleared
+     * whenever another screen shows. True when something was closed.
+     */
+    var detailCloser: (() -> Boolean)? = null
 
     fun show(screen: Screen, remember: Boolean = true) {
         if (remember && screen != currentScreen) {
@@ -340,6 +401,9 @@ object AppShell {
             while (backStack.size > 24) backStack.pollFirst()
         }
         currentScreen = screen
+        // An overlay closer belongs to the screen that registered it: leaving
+        // the detail screen must not leave its closer behind.
+        if (screen !is Screen.Detail) detailCloser = null
         Theme.refresh()
         val node = try {
             viewFor(screen)

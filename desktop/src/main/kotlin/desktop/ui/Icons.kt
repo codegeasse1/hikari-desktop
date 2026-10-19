@@ -92,6 +92,10 @@ object Icons {
     const val TAG = "tag"
     const val USER = "user"
     const val SPARKLE = "sparkle"
+    const val EYE = "eye"
+    const val SLIDERS = "sliders"
+    const val ARROW_UP = "arrow-up"
+    const val ARROW_DOWN = "arrow-down"
 
     /** An icon node with a fixed [size]x[size] layout box, centred. */
     fun of(name: String, size: Double = 18.0): Node {
@@ -548,6 +552,28 @@ object Icons {
                 content = "M12 2.6l1.7 5.1 5.1 1.7-5.1 1.7L12 16.2l-1.7-5.1L5.2 9.4l5.1-1.7z M18.6 15.4l.8 2.4 2.4.8-2.4.8-.8 2.4-.8-2.4-2.4-.8 2.4-.8z"
             }
         )
+
+        EYE -> mix(
+            listOf(Circle(12.0, 12.0, 2.6)),
+            listOf(SVGPath().apply { content = "M2.6 12.0 S6.5 5.8 12.0 5.8 S21.4 12.0 21.4 12.0 S17.5 18.2 12.0 18.2 S2.6 12.0 2.6 12.0 Z" }),
+        )
+
+        SLIDERS -> mix(
+            listOf(
+                Circle(15.4, 6.8, 2.3),
+                Circle(8.6, 12.0, 2.3),
+                Circle(14.2, 17.2, 2.3),
+            ),
+            listOf(
+                Line(3.4, 6.8, 20.6, 6.8),
+                Line(3.4, 12.0, 20.6, 12.0),
+                Line(3.4, 17.2, 20.6, 17.2),
+            ),
+        )
+
+        ARROW_UP -> outline(SVGPath().apply { content = "M12.0 19.2 V4.8 M5.4 11.4 L12.0 4.8 L18.6 11.4" })
+
+        ARROW_DOWN -> outline(SVGPath().apply { content = "M12.0 4.8 V19.2 M5.4 12.6 L12.0 19.2 L18.6 12.6" })
 
         else -> outline(Rectangle(14.0, 14.0).apply { x = 5.0; y = 5.0; arcWidth = 4.0; arcHeight = 4.0 })
     }

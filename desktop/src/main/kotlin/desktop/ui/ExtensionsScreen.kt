@@ -22,6 +22,7 @@ import javafx.scene.control.Tooltip
 import javafx.scene.layout.HBox
 import javafx.scene.layout.Priority
 import javafx.scene.layout.Region
+import javafx.scene.layout.TilePane
 import javafx.scene.layout.VBox
 import javafx.stage.FileChooser
 import org.json.JSONArray
@@ -30,7 +31,6 @@ import java.io.File
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeout
 
 /**
  * Extensions: everything that feeds the app content.
@@ -167,6 +167,15 @@ class ExtensionsScreenView {
     )
 
     private val rowParts = HashMap<String, RowParts>()
+
+    /**
+     * The real extension load runs here — its own daemon thread, never the
+     * shared IO pool: a loader that hangs must not be able to hold pooled
+     * threads (or the visible install state) hostage. See [finishSetup].
+     */
+    private val setupExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "hikari-setup").apply { isDaemon = true }
+    }
 
 
     // ── composer state (kept across re-renders) ─────────────────────────────
@@ -515,7 +524,6 @@ class ExtensionsScreenView {
             primeRepoCache()
             val now = System.currentTimeMillis()
             repos.forEach { repo ->
-                reposBox.children.add(repoCard(repo))
                 // Contents are painted from disk above, but a cache that is
                 // never revisited is a lie: a repo whose index dropped a plugin
                 // (or added one) would show its first-ever snapshot forever, and
@@ -530,6 +538,30 @@ class ExtensionsScreenView {
                           else age >= FAILED_RETRY_MS && !repoErrors.containsKey(repo.url)
                 if (due && repoLoading.add(repo.url)) loadRepoData(repo.url, silent = true)
             }
+            // The repos read as a 2-column card grid under one "N plugins from
+            // M repositories" info bar — the shape the reference gives them —
+            // not a one-card-per-row list.
+            val totalPlugins = repos.sumOf { repoData[it.url]?.plugins?.size ?: 0 }
+            val bar = themed(
+                "Showing $totalPlugins plugin${if (totalPlugins == 1) "" else "s"} from " +
+                    "${repos.size} repositor${if (repos.size == 1) "y" else "ies"}",
+                "x-repo-infobar",
+            ).apply { isWrapText = true; minWidth = 0.0; maxWidth = Double.MAX_VALUE }
+            val grid = TilePane(10.0, 10.0).apply {
+                styleClass.add("x-repo-grid")
+                prefColumns = 2
+                minWidth = 0.0
+                maxWidth = Double.MAX_VALUE
+            }
+            repos.forEach { repo ->
+                val card = repoCard(repo)
+                // Two columns at any window width: each card takes half the
+                // grid (minus the gap), instead of a fixed pixel width that a
+                // narrow window cannot fit.
+                card.prefWidthProperty().bind(grid.widthProperty().subtract(10.0).divide(2.0))
+                grid.children.add(card)
+            }
+            reposBox.children.setAll(bar, grid)
         }
         page.add(reposBox)
     }
@@ -549,7 +581,7 @@ class ExtensionsScreenView {
         }
     }
 
-    private fun repoCard(repo: Cs3Repo): Node {
+    private fun repoCard(repo: Cs3Repo): Region {
         val data = repoData[repo.url]
         val error = repoErrors[repo.url]
         // The name gets a row of its own: "Hikari Extensions (desktop)" and
@@ -583,6 +615,7 @@ class ExtensionsScreenView {
         // Clicking a row action must not also open the repo (the card itself is
         // clickable): isolate each button from the card's own handler.
         val open = Ui.isolateClicks(Ui.button("Open", primary = true) { openRepoData(repo) })
+        val copy = Ui.isolateClicks(Ui.iconButton(Icons.COPY, "Copy repo URL", 15.0) { copyRepoUrl(repo) })
         val reload = Ui.isolateClicks(Ui.iconButton(Icons.REFRESH, "Reload this repo", 15.0) { refreshRepo(repo.url) })
         val remove = Ui.isolateClicks(
             Ui.iconButton(Icons.TRASH, "Remove this repo", 15.0) { removeRepo(repo) }.apply {
@@ -601,7 +634,7 @@ class ExtensionsScreenView {
             minWidth = 0.0
             maxWidth = Double.MAX_VALUE
         }
-        val actions = HBox(8.0, Ui.spacer(), open, reload, remove).apply {
+        val actions = HBox(8.0, Ui.spacer(), open, copy, reload, remove).apply {
             alignment = Pos.CENTER_RIGHT
             minWidth = 0.0
             maxWidth = Double.MAX_VALUE
@@ -613,6 +646,17 @@ class ExtensionsScreenView {
         }
         card.setOnMouseClicked { openRepoData(repo) }
         return card
+    }
+
+    /** Copies a repo's URL for sharing: one click on the card, no selecting. */
+    private fun copyRepoUrl(repo: Cs3Repo) {
+        runCatching {
+            val content = javafx.scene.input.ClipboardContent()
+            content.putString(repo.url)
+            javafx.scene.input.Clipboard.getSystemClipboard().setContent(content)
+            setStatus("Repo URL copied to the clipboard")
+            AppShell.toast("Repo URL copied", "ok")
+        }.onFailure { e -> setStatus("Could not copy the URL: " + e.message) }
     }
 
     private fun openRepoData(repo: Cs3Repo) {
@@ -925,8 +969,22 @@ class ExtensionsScreenView {
                 }
                 if (filtered.isEmpty()) {
                     pluginsBox.children.add(themed("No plugin matches “$needle”.", "tiny"))
+                } else {
+                    // The repo's plugins read as 2-column cards (reference
+                    // parity with the repo grid above), not a one-row list.
+                    val grid = TilePane(10.0, 10.0).apply {
+                        styleClass.add("x-plugin-grid")
+                        prefColumns = 2
+                        minWidth = 0.0
+                        maxWidth = Double.MAX_VALUE
+                    }
+                    filtered.forEach {
+                        val card = pluginRow(it)
+                        card.prefWidthProperty().bind(grid.widthProperty().subtract(10.0).divide(2.0))
+                        grid.children.add(card)
+                    }
+                    pluginsBox.children.add(grid)
                 }
-                filtered.forEach { pluginsBox.children.add(pluginRow(it)) }
             }
         }
     }
@@ -937,13 +995,15 @@ class ExtensionsScreenView {
      * [fillRowParts], so a later state change can rewrite just this row instead
      * of the list around it (see [refreshRow]).
      */
-    private fun pluginRow(plugin: PluginRef): Node {
+    private fun pluginRow(plugin: PluginRef): Region {
         val name = themed(plugin.name, "src-name").apply {
             isWrapText = true
             minWidth = 0.0
         }
         val url = themed(plugin.url, "h-mono").apply {
-            maxWidth = 520.0
+            // Half-width cards: the URL wraps early instead of sizing the tile
+            // past the column.
+            maxWidth = 320.0
             minWidth = 0.0
             isWrapText = true
         }
@@ -955,20 +1015,23 @@ class ExtensionsScreenView {
         val error = themed("", "tiny").apply {
             styleClass.add("h-danger")
             isWrapText = true
-            maxWidth = 620.0
+            maxWidth = 320.0
+            minWidth = 0.0
             isVisible = false
             isManaged = false
         }
         val row = HBox(12.0, info, state, action).apply {
             styleClass.add("src-row")
             alignment = Pos.CENTER_LEFT
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
         }
         val parts = RowParts(plugin, state, action, error)
         rowParts[plugin.url] = parts
         fillRowParts(parts)
         // The error line is part of the row (not a separate node swapped in and
         // out) so a failure can appear and disappear without the list moving.
-        return VBox(6.0, row, error)
+        return VBox(6.0, row, error).apply { minWidth = 0.0; maxWidth = Double.MAX_VALUE }
     }
 
     /** Rewrites the changing parts of one rendered row. */
@@ -2084,6 +2147,15 @@ class ExtensionsScreenView {
      * the plugin actually holds — the manifest names one entry point, but a
      * bundle can register several providers from it, and only the load knows.
      *
+     * The load runs on its own thread with a SHORT visible budget. The real
+     * load can HANG (never returning, not just slow) on some archives, and
+     * coroutine cancellation cannot interrupt blocking class loading — so the
+     * old bounded-coroutine version still sat on "Finishing setup…" with the
+     * top bar on "Installed X" whenever a loader hung. Past the visible budget
+     * the install finishes from the registration (which already serves
+     * content) and a slow load reconciles quietly in the background, with no
+     * row spinner and no chip anywhere.
+     *
      * If it turns out the plugin cannot be loaded at all, the optimistic
      * registration is taken back and the reason is shown on the row: an install
      * that says "installed" and then silently does nothing would be worse than
@@ -2092,27 +2164,46 @@ class ExtensionsScreenView {
     private fun finishSetup(name: String, safeName: String, url: String, dest: File, sourceUrl: String) {
         AppShell.uiScope.launch {
             val startedAt = System.currentTimeMillis()
-            // The real load can HANG (not just run long) on some archives — the
-            // row then sits on "Finishing setup… Ns" and the top bar on
-            // "Installed X" forever, even though the optimistically registered
-            // providers already work. Bound it: on timeout the install finishes
-            // from the registration instead of hanging on screen.
-            var timedOut = false
-            val loaded = runCatching {
-                withTimeout(SETUP_TIMEOUT_MS) {
-                    val hiki = HikariPluginManager.reload(HikariApp.instance, dest)
-                    if (hiki.isNotEmpty()) {
-                        hiki.map { it.name.ifBlank { name } }
-                    } else {
-                        Cs3PluginManager.reload(HikariApp.instance, dest).map { it.name.ifBlank { name } }
-                    }
-                }
-            }.recoverCatching { t ->
-                if (t is TimeoutCancellationException) {
-                    timedOut = true
-                    providersFor(url).map { it.name }.ifEmpty { listOf(name) }
+            val future = setupExecutor.submit<List<String>> {
+                val hiki = HikariPluginManager.reload(HikariApp.instance, dest)
+                if (hiki.isNotEmpty()) {
+                    hiki.map { it.name.ifBlank { name } }
                 } else {
-                    throw t
+                    Cs3PluginManager.reload(HikariApp.instance, dest).map { it.name.ifBlank { name } }
+                }
+            }
+            var timedOut = false
+            var failed: Throwable? = null
+            val names: List<String> = try {
+                future.get(SETUP_VISIBLE_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
+            } catch (t: java.util.concurrent.TimeoutException) {
+                timedOut = true
+                emptyList()
+            } catch (t: java.util.concurrent.ExecutionException) {
+                failed = t.cause ?: t
+                emptyList()
+            } catch (t: Throwable) {
+                failed = t
+                emptyList()
+            }
+            // A timed-out load keeps running on its executor thread (it cannot
+            // be interrupted) and reconciles when it eventually lands — with no
+            // UI state held while it does.
+            if (timedOut) {
+                AppShell.uiScope.launch {
+                    val late = runCatching {
+                        future.get(LATE_SETUP_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    }.getOrNull().orEmpty()
+                    if (late.isNotEmpty()) {
+                        Fx.run {
+                            runCatching { syncProviders(name, safeName, url, dest, sourceUrl, late) }
+                            installErrors.remove(url)
+                            refreshRow(url)
+                            fillInstalled()
+                            refreshHeader()
+                        }
+                    }
+                    reloadProvidersQuietly()
                 }
             }
             Fx.run {
@@ -2127,39 +2218,53 @@ class ExtensionsScreenView {
                 settingUpPlugins.remove(url)
                 busySince.remove(url)
                 busy.isVisible = busyPlugins.isNotEmpty() || settingUpPlugins.isNotEmpty()
-                val names = loaded.getOrNull().orEmpty()
-                if (names.isEmpty()) {
-                    val why = listOfNotNull(HikariPluginManager.lastError, Cs3PluginManager.lastError)
-                        .joinToString("  |  ")
-                        .ifBlank { "the extension registered no providers" }
-                    providersFor(url).forEach { AppShell.app.store.removeProvider(it.id) }
-                    installErrors[url] = "Couldn't load $name: ${why.take(300)}"
-                    setStatus("Couldn't load $name — see the row for the reason.", isError = true)
-                    AppShell.toast("$name could not be loaded", "error")
-                } else if (timedOut) {
-                    // The loader hung, but the providers registered from the
-                    // manifest already serve content — keep them, say so, and
-                    // above all get the spinner and the top-bar chip off screen.
-                    installErrors.remove(url)
-                    setStatus(
-                        "Installed $name (${names.size} extension${if (names.size == 1) "" else "s"}) — " +
-                            "the background setup timed out, running from registration.",
-                    )
-                    AppShell.toast("$name installed", "ok")
-                } else {
-                    installErrors.remove(url)
-                    syncProviders(name, safeName, url, dest, sourceUrl, names)
-                    // The optimistic half of the install put "Installed X (N …)"
-                    // on the status line and, because the real load was still
-                    // running, left the same text in the top bar's activity chip
-                    // — and nothing ever took it down again, so a finished
-                    // install sat in the top bar for the rest of the session.
-                    // The extension is fully installed now: the message becomes
-                    // the real count and is no longer "busy", which clears the
-                    // chip.
-                    setStatus(
-                        "Installed $name (${names.size} extension${if (names.size == 1) "" else "s"}).",
-                    )
+                when {
+                    failed != null -> {
+                        val why = listOfNotNull(HikariPluginManager.lastError, Cs3PluginManager.lastError)
+                            .joinToString("  |  ")
+                            .ifBlank { failed.message?.take(300) ?: "the extension registered no providers" }
+                        providersFor(url).forEach { AppShell.app.store.removeProvider(it.id) }
+                        installErrors[url] = "Couldn't load $name: ${why.take(300)}"
+                        setStatus("Couldn't load $name — see the row for the reason.", isError = true)
+                        AppShell.toast("$name could not be loaded", "error")
+                    }
+                    timedOut -> {
+                        // The loader hung, but the providers registered from the
+                        // manifest already serve content — keep them, say so
+                        // once, and above all get the spinner and the top-bar
+                        // chip off screen.
+                        installErrors.remove(url)
+                        val keep = providersFor(url).map { it.name }.ifEmpty { listOf(name) }
+                        setStatus(
+                            "Installed $name (${keep.size} extension${if (keep.size == 1) "" else "s"}) — " +
+                                "the background setup is still finishing.",
+                        )
+                        AppShell.toast("$name installed", "ok")
+                    }
+                    names.isEmpty() -> {
+                        val why = listOfNotNull(HikariPluginManager.lastError, Cs3PluginManager.lastError)
+                            .joinToString("  |  ")
+                            .ifBlank { "the extension registered no providers" }
+                        providersFor(url).forEach { AppShell.app.store.removeProvider(it.id) }
+                        installErrors[url] = "Couldn't load $name: ${why.take(300)}"
+                        setStatus("Couldn't load $name — see the row for the reason.", isError = true)
+                        AppShell.toast("$name could not be loaded", "error")
+                    }
+                    else -> {
+                        installErrors.remove(url)
+                        syncProviders(name, safeName, url, dest, sourceUrl, names)
+                        // The optimistic half of the install put "Installed X (N …)"
+                        // on the status line and, because the real load was still
+                        // running, left the same text in the top bar's activity chip
+                        // — and nothing ever took it down again, so a finished
+                        // install sat in the top bar for the rest of the session.
+                        // The extension is fully installed now: the message becomes
+                        // the real count and is no longer "busy", which clears the
+                        // chip.
+                        setStatus(
+                            "Installed $name (${names.size} extension${if (names.size == 1) "" else "s"}).",
+                        )
+                    }
                 }
                 refreshRow(url)
                 fillInstalled()
@@ -2789,13 +2894,16 @@ class ExtensionsScreenView {
     }
 
     private companion object {
-        /** Ceiling for the background half of an install. The real load can
-         *  HANG on some archives (never returning, not just slow) — without
-         *  this the row sits on "Finishing setup…" and the top bar on
-         *  "Installed X" forever. 90s is far beyond any healthy dex
-         *  translation; past it the install finishes from the registration.
+        /** Visible budget for the background half of an install. Past it the
+         *  install finishes from the registration (which already serves
+         *  content) and a slow load reconciles quietly — the row and the top
+         *  bar never sit on "Finishing setup…" longer than this.
          *  See [finishSetup]. */
-        const val SETUP_TIMEOUT_MS = 90_000L
+        const val SETUP_VISIBLE_MS = 12_000L
+
+        /** Best-effort budget for a timed-out load's late reconcile. Past it
+         *  the background thread is simply abandoned (it is a daemon). */
+        const val LATE_SETUP_MS = 120_000L
 
         /** How long after an attempt before a repo that has NEVER loaded is tried
          *  again on its own. Long on purpose: a repo this network cannot reach

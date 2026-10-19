@@ -12,20 +12,23 @@ import javafx.scene.layout.Region
 import javafx.scene.layout.StackPane
 import javafx.scene.layout.TilePane
 import javafx.scene.layout.VBox
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 
 /**
  * Explore: every enabled provider's catalogs, browsable in one place.
  *
  * One card per provider — initial badge, name, engine chip — and opening a
- * card jumps Home straight to that provider's catalog (see
- * [HomeScreenView.showProvider]). It reuses the same ContentRepository the
- * Home rails read from, grouped by provider, so no new data path is
- * introduced.
+ * card loads THAT provider's catalog page (its catalogs, flattened into one
+ * grid), so a tap always lands on the provider's own catalogue instead of a
+ * filtered Home that looks unchanged. It reuses the same ContentRepository
+ * the Home rails read from, so no new data path is introduced.
  */
 class ExploreScreenView {
 
     private val body = VBox(Theme.S4)
     val root: ScrollPane = Ui.vScroll(body)
+    private var catalogJob: Job? = null
 
     fun onShown() {
         render()
@@ -87,7 +90,29 @@ class ExploreScreenView {
             minWidth = 0.0
             prefWidth = 330.0
             maxWidth = 420.0
-            setOnMouseClicked { AppShell.homeView.showProvider(p.name) }
+            setOnMouseClicked { openCatalog(p) }
+        }
+    }
+
+    /**
+     * Loads this provider's catalogs and opens them as their own page — the
+     * provider's catalogue, not a Home that merely has it selected.
+     */
+    private fun openCatalog(p: ProviderConfig) {
+        catalogJob?.cancel()
+        AppShell.toast("Loading ${p.name}…")
+        catalogJob = AppShell.uiScope.launch {
+            val rows = runCatching {
+                AppShell.app.repository.homeRows(providerId = p.id)
+            }.getOrDefault(emptyList())
+            val items = rows.flatMap { it.items }.distinctBy { it.uniqueId }.take(150)
+            desktop.fx.Fx.run {
+                if (items.isEmpty()) {
+                    AppShell.toast("“${p.name}” returned no catalog rows — open the logs for the reason.", "error")
+                } else {
+                    AppShell.show(Screen.Catalog(p.name, p.name, items))
+                }
+            }
         }
     }
 }

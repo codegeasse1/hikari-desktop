@@ -1,7 +1,7 @@
 package desktop.ui
 
 import com.hikari.app.data.ProviderConfig
-import com.hikari.app.data.ProviderType
+import javafx.geometry.Insets
 import javafx.geometry.Pos
 import javafx.scene.control.Button
 import javafx.scene.control.ContentDisplay
@@ -10,27 +10,31 @@ import javafx.scene.control.ScrollPane
 import javafx.scene.control.TextField
 import javafx.scene.layout.HBox
 import javafx.scene.layout.Priority
+import javafx.scene.layout.Region
+import javafx.scene.layout.StackPane
+import javafx.scene.layout.TilePane
 import javafx.scene.layout.VBox
 import javafx.stage.Popup
+import javafx.stage.Screen
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
- * The catalog's provider picker — the desktop twin of the Android app's
- * "choose a provider" sheet.
+ * The catalog's provider picker — "Select Provider" / "Manage Home Screen Feed".
  *
- * What it replaces: a plain combo box holding one flat, alphabetical list of
- * every enabled provider. With a hundred of them from six engines that is a
- * scroller you cannot search and cannot narrow — and the list is exactly what
- * chooses which catalog the whole home page is built from, so finding the right
- * entry is not a detail.
+ * Single mode (the toggle off): a card per provider — badge, name, catalog
+ * count — and clicking one loads its catalog on Home straight away (plus
+ * "Save & Close" to dismiss). "All providers" is the first card and clears
+ * the filter. Multi mode (the toggle on): an ordered Active Providers Feed
+ * (reorder with ↑/↓, drop with ×) plus the Available Plugins list (add with
+ * +), and Home mixes rows from exactly those providers in that order.
  *
- * What it is: a filter field, one chip per engine that actually has providers
- * installed (`All | Aniyomi | CloudStream | Hikari | Nuvio | …`), and the list —
- * the same three parts, in the same order, as the Android picker. Picking a row
- * selects that provider as the catalog source and calls [onPick], so the caller
- * reloads.
+ * The choice is persisted (single id / ordered id list / on-off), so it
+ * survives a restart — the old sheet forgot it every launch.
  *
- * Everything here is FX-thread only (it is all JavaFX nodes); [setProviders] is
- * called from the screen's own load, inside its `Fx.run` block.
+ * Everything here is FX-thread only (it is all JavaFX nodes); [setProviders]
+ * is called from the screen's own load, inside its `Fx.run` block.
  */
 class ProviderPicker(private val onPick: () -> Unit) {
 
@@ -38,17 +42,38 @@ class ProviderPicker(private val onPick: () -> Unit) {
         /** The "no provider filter" label — also what the button shows before a
          *  pick, and the vocabulary the home status lines already use. */
         const val ALL = "All providers"
+
+        /** Content-kind chips above the grid. They are finders, not partitions:
+         *  most providers serve movies AND series, so those two match every
+         *  general provider while Anime/Docs/Live match by name. */
+        private val KINDS = listOf("All", "Movies", "Series", "Anime", "Docs", "Live")
     }
 
     private var providers: List<ProviderConfig> = emptyList()
-    private var kindFilter: ProviderType? = null
+    private var kindFilter: String? = null
+    private var query: String = ""
 
     /** The chosen provider, or null for [ALL]. Read on the FX thread. */
     var selection: ProviderConfig? = null
         private set
 
-    /** What the caller shows and compares: the chosen provider's name, or [ALL]. */
-    fun selectedName(): String = selection?.name ?: ALL
+    /** Multi-feed state: on/off plus the ORDERED active ids. */
+    var multiOn: Boolean = false
+        private set
+    private var activeIds: ArrayList<String> = ArrayList()
+
+    /** What the caller shows and compares: the chosen provider's name, [ALL],
+     *  or "Mix of N" for a multi feed. */
+    fun selectedName(): String = when {
+        multiOn && activeIds.isNotEmpty() -> "Mix of ${activeIds.size}"
+        else -> selection?.name ?: ALL
+    }
+
+    /** True once the user (or the persisted state) has picked something. */
+    fun hasChoice(): Boolean = selection != null || (multiOn && activeIds.isNotEmpty())
+
+    /** The ordered active ids of the multi feed. */
+    fun multiIds(): List<String> = activeIds.toList()
 
     /** The button that opens the sheet. Styled like the combo box it replaced,
      *  so the top bar looks the same. */
@@ -69,32 +94,44 @@ class ProviderPicker(private val onPick: () -> Unit) {
         setOnAction { toggle() }
     }
 
+    private val titleLabel = Label("Select Provider").apply { styleClass.add("x-pd-title") }
+    private val subLabel = Label("Choose a provider to display on your Home Screen.").apply {
+        styleClass.add("x-pd-sub")
+    }
+    private val multiSwitch = Button().apply {
+        styleClass.add("x-switch")
+        isFocusTraversable = false
+        graphic = Region().apply { styleClass.add("x-switch-knob") }
+        setOnAction { setMulti(!multiOn, fire = true) }
+    }
     private val search = TextField().apply {
         styleClass.addAll("field", "provider-search")
         promptText = "Find a provider…"
-        textProperty().addListener { _, _, _ -> rebuildList() }
+        textProperty().addListener { _, _, v ->
+            query = v.trim().lowercase()
+            rebuildMain()
+        }
     }
-    private val chips = HBox(4.0).apply { styleClass.addAll("segmented", "provider-chips") }
-
-    /**
-     * The chip row, horizontally scrollable.
-     *
-     * One chip per engine is a row that grows past any reasonable popup width
-     * once six or seven engines have providers installed — and an HBox that
-     * cannot fit its children squeezes them instead of overflowing, which
-     * ellipsized every label into "…" (the chips were on screen and unreadable,
-     * the worst of both). The chips now keep their full name
-     * (`minWidth = USE_PREF_SIZE`, see [rebuildChips]) and the row scrolls, so
-     * every engine is reachable whatever is installed.
-     */
+    private val chips = HBox(6.0).apply { styleClass.addAll("segmented", "provider-chips") }
     private val chipsScroll = Ui.chipRow(chips)
-    private val listBox = VBox(2.0).apply { styleClass.add("picker-list") }
-    private val listScroll = ScrollPane(listBox).apply {
-        styleClass.add("scroll-pane")
+    private val mainBox = VBox(10.0).apply { minWidth = 0.0 }
+    private val mainScroll = ScrollPane(mainBox).apply {
+        styleClass.addAll("scroll-pane", "x-pd-scroll")
         isFitToWidth = true
-        prefHeight = 300.0
-        minHeight = 140.0
-        maxHeight = 320.0
+        prefHeight = 400.0
+        minHeight = 200.0
+        maxHeight = 480.0
+        minWidth = 0.0
+        hbarPolicy = ScrollPane.ScrollBarPolicy.NEVER
+    }
+    private val saveClose = Ui.button("Save & Close", primary = true) { pop.hide() }
+    private val foot = HBox(Ui.spacer(), saveClose).apply {
+        alignment = Pos.CENTER_RIGHT
+        minWidth = 0.0
+    }
+    private val body = VBox(12.0).apply {
+        styleClass.addAll("picker-pop", "x-pd")
+        padding = Insets(22.0, 24.0, 20.0, 24.0)
         minWidth = 0.0
     }
     private val pop = Popup().apply {
@@ -102,14 +139,26 @@ class ProviderPicker(private val onPick: () -> Unit) {
         isHideOnEscape = true
     }
 
+    /** provider id → its "N catalogs" subtitle label, for the background fill. */
+    private val countLabels = HashMap<String, Label>()
+    /** provider id → catalog count, kept for the session. */
+    private val countCache = HashMap<String, Int>()
+    private var countJob: Job? = null
+
     init {
-        val body = VBox(Theme.S2, search, chipsScroll, listScroll).apply {
-            styleClass.add("picker-pop")
-            prefWidth = 380.0
-            maxWidth = 460.0
-            minWidth = 320.0
+        val head = HBox(12.0,
+            VBox(3.0, titleLabel, subLabel).apply { minWidth = 0.0 },
+            Ui.spacer(),
+            VBox(4.0,
+                Label("Enable Multi-Provider Feed").apply { styleClass.add("x-pd-multi-t") },
+                HBox(multiSwitch).apply { alignment = Pos.CENTER_RIGHT },
+            ).apply { alignment = Pos.CENTER_RIGHT },
+        ).apply {
+            alignment = Pos.CENTER_LEFT
+            minWidth = 0.0
         }
-        VBox.setVgrow(listScroll, Priority.ALWAYS)
+        HBox.setHgrow(head.children[1] as Region, Priority.ALWAYS)
+        body.children.addAll(head, search, chipsScroll, mainScroll, foot)
         pop.content.add(body)
     }
 
@@ -127,13 +176,22 @@ class ProviderPicker(private val onPick: () -> Unit) {
         val cur = selection
         if (cur != null && sorted.none { it.id == cur.id }) {
             selection = null
-            button.text = ALL
+            refreshButton()
         }
-        if (kindFilter != null && sorted.none { it.type == kindFilter }) kindFilter = null
+        val kept = activeIds.filter { id -> sorted.any { it.id == id } }
+        if (kept.size != activeIds.size) {
+            activeIds = ArrayList(kept)
+            if (activeIds.isEmpty()) multiOn = false
+        }
         if (changed) {
             rebuildChips()
-            if (pop.isShowing) rebuildList()
+            if (pop.isShowing) rebuildMain()
         }
+    }
+
+    /** Opens the sheet (used by Home's "Manage" banner action). */
+    fun open() {
+        if (!pop.isShowing) toggle()
     }
 
     private fun toggle() {
@@ -142,10 +200,24 @@ class ProviderPicker(private val onPick: () -> Unit) {
             return
         }
         search.text = ""
+        query = ""
+        kindFilter = null
         rebuildChips()
-        rebuildList()
+        rebuildMain()
+        // The dialog is wide: keep it on screen even when the picker button
+        // sits at the window's right edge.
+        val vb = runCatching { Screen.getPrimary().visualBounds }.getOrNull()
+        val wantW = 880.0
+        val w = if (vb != null) wantW.coerceAtMost(vb.width - 40.0) else wantW
+        body.prefWidth = w
+        body.maxWidth = w
         val at = button.localToScreen(button.boundsInLocal)
-        if (at != null) pop.show(button, at.minX, at.maxY + 4.0)
+        if (at != null) {
+            val x = if (vb != null) (at.minX).coerceIn(vb.minX + 8.0, (vb.maxX - w - 8.0).coerceAtLeast(vb.minX + 8.0)) else at.minX
+            pop.show(button, x, at.maxY + 4.0)
+        } else {
+            pop.show(button)
+        }
         // A Popup is a window of its own: its scene does NOT inherit the app's
         // stylesheets, and this sheet defines the colours the picker is drawn
         // with as looked-up colours. Copying the owner's list at show time is
@@ -159,60 +231,356 @@ class ProviderPicker(private val onPick: () -> Unit) {
         // without keyboard focus makes a hundred-item list feel like the combo
         // box it replaced.
         javafx.application.Platform.runLater { search.requestFocus() }
+        ensureCounts()
     }
 
-    /** `All` first, then one chip per engine that actually has providers — a chip
-     *  for an engine with nothing installed would filter to an empty list. */
+    // ── filtering ─────────────────────────────────────────────────────────
+
+    private fun kindMatches(p: ProviderConfig): Boolean {
+        val kind = kindFilter ?: return true
+        val n = p.name.lowercase()
+        val isAnime = n.contains("anime") || n.contains("donghua") || n.contains("hanime") ||
+            n.startsWith("ani") || n.contains("otaku")
+        val isDocs = n.contains("docu") || n.contains("documentary")
+        val isLive = n.contains("live") || n.contains("iptv") || n.contains("sport") ||
+            n.contains("cricket") || n.contains("news")
+        return when (kind) {
+            "Anime" -> isAnime
+            "Docs" -> isDocs
+            "Live" -> isLive
+            "Movies" -> n.contains("movie") || n.contains("film") || n.contains("cinema") ||
+                n.contains("yts") || n.contains("hub") || n.contains("mirror") ||
+                n.contains("flix") || n.contains("multiplex") || n.contains("hollywood") ||
+                n.contains("bollywood") || n.contains("vidsrc") || n.contains("land") ||
+                (!isAnime && !isDocs && !isLive)
+            "Series" -> n.contains("series") || n.contains("show") || n.contains("drama") ||
+                n.contains("episode") || n.contains("season") || n.contains("web") ||
+                n.contains("tv") || (!isAnime && !isDocs && !isLive)
+            else -> true
+        }
+    }
+
+    private fun shownProviders(): List<ProviderConfig> =
+        providers
+            .filter { kindMatches(it) }
+            .filter { query.isEmpty() || it.name.lowercase().contains(query) }
+
+    // ── building ──────────────────────────────────────────────────────────
+
     private fun rebuildChips() {
-        val kinds = providers.map { it.type }.distinct().sortedBy { Ui.providerEngineLabel(it) }
-        val index = kinds.indexOfFirst { it == kindFilter }.let { if (it < 0) 0 else it + 1 }
+        val labels = KINDS
+        val index = labels.indexOf(kindFilter).let { if (it < 0) 0 else it }
         if (index == 0) kindFilter = null
-        val labels = listOf("All") + kinds.map { Ui.providerEngineLabel(it) }
-        // Built in a throw-away box and MOVED here: re-parenting a node pulls it
-        // out of its old parent's children list, so the copy matters — handing
-        // `setAll` the box's live list would mutate it while it is iterated.
         val seg = Ui.segmented(labels, index) { picked ->
-            kindFilter = if (picked <= 0) null else kinds.getOrNull(picked - 1)
-            rebuildList()
+            kindFilter = if (picked <= 0) null else labels.getOrNull(picked)
+            rebuildMain()
         }
         Ui.keepChipLabels(seg)
         chips.children.setAll(ArrayList<javafx.scene.Node>(seg.children))
         chipsScroll.hvalue = 0.0
     }
 
-    private fun rebuildList() {
-        val q = search.text.trim().lowercase()
-        val shown = providers
-            .filter { kindFilter == null || it.type == kindFilter }
-            .filter { q.isEmpty() || it.name.lowercase().contains(q) }
-        val rows = ArrayList<javafx.scene.Node>(shown.size + 1)
-        rows.add(row(null, selection == null))
-        shown.forEach { rows.add(row(it, selection?.id == it.id)) }
-        listBox.children.setAll(rows)
+    private fun rebuildMain() {
+        titleLabel.text = if (multiOn) "Manage Home Screen Feed" else "Select Provider"
+        subLabel.text = if (multiOn) "Mix, reorder, and customize multiple providers."
+        else "Choose a provider to display on your Home Screen."
+        refreshSwitch()
+        countLabels.clear()
+        if (multiOn) buildMulti() else buildGrid()
     }
 
-    private fun row(cfg: ProviderConfig?, selected: Boolean): HBox {
-        val name = Label(cfg?.name ?: ALL).apply {
-            styleClass.add("src-name")
-            isWrapText = false
-            minWidth = 0.0
-            maxWidth = 300.0
-            // The full name is always reachable even when a very long one has to
-            // be ellipsized to fit the row.
-            tooltip = Ui.tooltip(cfg?.name ?: ALL)
+    private fun badgeFor(name: String, icon: String? = null): StackPane {
+        val initial = Label(name.trim().firstOrNull()?.uppercase() ?: "?").apply {
+            styleClass.add("x-pd-initial")
         }
-        val right = if (cfg == null) {
-            Label("every enabled provider").apply { styleClass.add("tiny") }
-        } else {
-            Ui.badge(Ui.providerEngineLabel(cfg.type), if (cfg.type == ProviderType.HIKARI) "badge-accent" else "badge")
-        }
-        return HBox(8.0, name, Ui.spacer(), right).apply {
-            styleClass.add("picker-row")
-            if (selected) styleClass.add("picker-row-sel")
-            alignment = Pos.CENTER_LEFT
-            setOnMouseClicked { pick(cfg) }
+        val node: javafx.scene.Node = if (icon != null) Icons.of(icon, 20.0) else initial
+        return StackPane(node).apply {
+            styleClass.add("x-pd-badge")
+            alignment = Pos.CENTER
+            minWidth = 44.0; prefWidth = 44.0; maxWidth = 44.0
+            minHeight = 44.0; prefHeight = 44.0; maxHeight = 44.0
         }
     }
+
+    private fun subLabelFor(p: ProviderConfig): Label {
+        val cached = countCache[p.id]
+        return Label(
+            if (cached != null) "$cached catalog${if (cached == 1) "" else "s"}" else "…"
+        ).apply {
+            styleClass.add("x-pd-sub2")
+            countLabels[p.id] = this
+        }
+    }
+
+    private fun providerCard(p: ProviderConfig): HBox {
+        val name = Label(p.name).apply {
+            styleClass.add("x-pd-name")
+            isWrapText = true
+            minWidth = 0.0
+        }
+        val texts = VBox(3.0, name, subLabelFor(p)).apply { minWidth = 0.0 }
+        HBox.setHgrow(texts, Priority.ALWAYS)
+        val tune = Icons.of(Icons.SLIDERS, 17.0).apply { opacity = 0.75 }
+        return HBox(12.0, badgeFor(p.name), texts, tune).apply {
+            styleClass.add("x-pd-card")
+            if (selection?.id == p.id) styleClass.add("x-pd-card-sel")
+            alignment = Pos.CENTER_LEFT
+            padding = Insets(12.0, 14.0, 12.0, 12.0)
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
+            prefWidth = 264.0
+            cursor = javafx.scene.Cursor.HAND
+            setOnMouseClicked { pick(p) }
+        }
+    }
+
+    private fun buildGrid() {
+        val grid = TilePane(10.0, 10.0).apply {
+            styleClass.add("x-pd-grid")
+            prefColumns = 3
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
+        }
+        // "All providers" first: every enabled provider, no filter.
+        val allName = Label(ALL).apply { styleClass.add("x-pd-name"); isWrapText = true; minWidth = 0.0 }
+        val allSub = Label("every enabled provider").apply { styleClass.add("x-pd-sub2") }
+        val allTexts = VBox(3.0, allName, allSub).apply { minWidth = 0.0 }
+        HBox.setHgrow(allTexts, Priority.ALWAYS)
+        val allCard = HBox(12.0, badgeFor("All", Icons.GRID), allTexts, Icons.of(Icons.SLIDERS, 17.0).apply { opacity = 0.75 }).apply {
+            styleClass.add("x-pd-card")
+            if (selection == null) styleClass.add("x-pd-card-sel")
+            alignment = Pos.CENTER_LEFT
+            padding = Insets(12.0, 14.0, 12.0, 12.0)
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
+            prefWidth = 264.0
+            cursor = javafx.scene.Cursor.HAND
+            setOnMouseClicked { pick(null) }
+        }
+        grid.children.add(allCard)
+        val shown = shownProviders()
+        if (shown.isEmpty()) {
+            grid.children.add(
+                Label("No provider matches.").apply { styleClass.add("x-pd-empty") }
+            )
+        } else {
+            shown.forEach { grid.children.add(providerCard(it)) }
+        }
+        mainBox.children.setAll(grid)
+    }
+
+    private fun buildMulti() {
+        val byId = providers.associateBy { it.id }
+        val active = activeIds.mapNotNull { byId[it] }
+        val activeSet = activeIds.toSet()
+        val available = shownProviders().filter { it.id !in activeSet }
+
+        val leftList = VBox(8.0).apply { minWidth = 0.0 }
+        if (active.isEmpty()) {
+            leftList.children.add(
+                Label("Nothing here yet — add providers from the right.").apply {
+                    styleClass.add("x-pd-empty")
+                    isWrapText = true
+                }
+            )
+        } else {
+            active.forEachIndexed { index, p ->
+                leftList.children.add(activeRow(index, active.size, p))
+            }
+        }
+        val left = VBox(8.0,
+            Label("Active Providers Feed").apply { styleClass.add("x-pd-col-h") },
+            ScrollPane(leftList).apply {
+                styleClass.addAll("scroll-pane", "x-pd-col-scroll")
+                isFitToWidth = true
+                prefHeight = 300.0
+                minHeight = 160.0
+                maxHeight = 340.0
+                hbarPolicy = ScrollPane.ScrollBarPolicy.NEVER
+            },
+        ).apply { minWidth = 0.0; maxWidth = Double.MAX_VALUE }
+        HBox.setHgrow(left, Priority.ALWAYS)
+
+        val rightList = VBox(8.0).apply { minWidth = 0.0 }
+        if (available.isEmpty()) {
+            rightList.children.add(
+                Label("Every matching provider is already in the feed.").apply {
+                    styleClass.add("x-pd-empty")
+                    isWrapText = true
+                }
+            )
+        } else {
+            available.forEach { p -> rightList.children.add(availableRow(p)) }
+        }
+        val right = VBox(8.0,
+            Label("Available Plugins").apply { styleClass.add("x-pd-col-h") },
+            ScrollPane(rightList).apply {
+                styleClass.addAll("scroll-pane", "x-pd-col-scroll")
+                isFitToWidth = true
+                prefHeight = 300.0
+                minHeight = 160.0
+                maxHeight = 340.0
+                hbarPolicy = ScrollPane.ScrollBarPolicy.NEVER
+            },
+        ).apply { minWidth = 0.0; maxWidth = Double.MAX_VALUE }
+        HBox.setHgrow(right, Priority.ALWAYS)
+
+        mainBox.children.setAll(
+            HBox(14.0, left, right).apply { minWidth = 0.0 }
+        )
+    }
+
+    private fun activeRow(index: Int, total: Int, p: ProviderConfig): HBox {
+        val num = Label("${index + 1}.").apply { styleClass.add("x-pd-num") }
+        val name = Label(p.name).apply { styleClass.add("x-pd-name"); isWrapText = true; minWidth = 0.0 }
+        val sub = Label("Catalogs: all active").apply { styleClass.add("x-pd-sub2") }
+        val texts = VBox(3.0, name, sub).apply { minWidth = 0.0 }
+        HBox.setHgrow(texts, Priority.ALWAYS)
+        val up = Ui.iconButton(Icons.ARROW_UP, "Move up", 14.0) {
+            moveActive(p.id, -1)
+        }.apply { isDisable = index == 0 }
+        val down = Ui.iconButton(Icons.ARROW_DOWN, "Move down", 14.0) {
+            moveActive(p.id, 1)
+        }.apply { isDisable = index == total - 1 }
+        val remove = Button().apply {
+            styleClass.add("x-pd-x")
+            graphic = Icons.of(Icons.CLOSE, 14.0)
+            isFocusTraversable = false
+            setOnAction { dropActive(p.id) }
+        }
+        return HBox(8.0, num, badgeFor(p.name), texts, up, down, remove).apply {
+            styleClass.add("x-pd-active")
+            alignment = Pos.CENTER_LEFT
+            padding = Insets(10.0, 10.0, 10.0, 10.0)
+            minWidth = 0.0
+        }
+    }
+
+    private fun availableRow(p: ProviderConfig): HBox {
+        val name = Label(p.name).apply { styleClass.add("x-pd-name"); isWrapText = true; minWidth = 0.0 }
+        val sub = subLabelFor(p)
+        val texts = VBox(3.0, name, sub).apply { minWidth = 0.0 }
+        HBox.setHgrow(texts, Priority.ALWAYS)
+        val add = Button().apply {
+            styleClass.add("x-pd-plus")
+            graphic = Icons.of(Icons.PLUS, 15.0)
+            isFocusTraversable = false
+            setOnAction { addActive(p.id) }
+        }
+        return HBox(10.0, badgeFor(p.name), texts, add).apply {
+            styleClass.add("x-pd-avail")
+            alignment = Pos.CENTER_LEFT
+            padding = Insets(10.0, 12.0, 10.0, 10.0)
+            minWidth = 0.0
+        }
+    }
+
+    private fun refreshSwitch() {
+        multiSwitch.styleClass.remove("x-switch-on")
+        if (multiOn) multiSwitch.styleClass.add("x-switch-on")
+    }
+
+    private fun refreshButton() {
+        button.text = selectedName()
+        button.tooltip = Ui.tooltip(selectedName())
+    }
+
+    // ── catalog counts ────────────────────────────────────────────────────
+    // A card names its catalog count ("23 catalogs"). Listing catalogs can hit
+    // the network (a Stremio manifest), so it happens in the background AFTER
+    // the dialog is already open, one provider at a time with a short budget,
+    // and a provider that will not answer keeps its "…".
+
+    private fun ensureCounts() {
+        countJob?.cancel()
+        val missing = providers.filter { !countCache.containsKey(it.id) }
+        if (missing.isEmpty()) return
+        countJob = AppShell.uiScope.launch {
+            for (p in missing) {
+                if (!pop.isShowing) break
+                val n = withTimeoutOrNull(2_500L) {
+                    runCatching { AppShell.app.providers.byId(p.id)?.catalogs()?.size }.getOrNull()
+                }
+                if (n != null) {
+                    countCache[p.id] = n
+                    val label = countLabels[p.id]
+                    if (label != null) {
+                        val text = "$n catalog${if (n == 1) "" else "s"}"
+                        desktop.fx.Fx.run { label.text = text }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── picking ───────────────────────────────────────────────────────────
+
+    /** Turns multi mode on/off. With it off, the single [selection] (or All)
+     *  decides the catalog; with it on, the [activeIds] feed does. */
+    fun setMulti(on: Boolean, fire: Boolean = true) {
+        // Switching ON with an empty feed starts from the current single pick
+        // (or everything when that is All), so the toggle never blanks Home.
+        if (on && activeIds.isEmpty()) {
+            val sel = selection
+            activeIds = if (sel != null) ArrayList(listOf(sel.id))
+            else ArrayList(providers.map { it.id })
+        }
+        multiOn = on && activeIds.isNotEmpty()
+        persist()
+        refreshButton()
+        rebuildMain()
+        if (fire) onPick()
+    }
+
+    private fun moveActive(id: String, delta: Int) {
+        val i = activeIds.indexOf(id)
+        val j = i + delta
+        if (i < 0 || j < 0 || j >= activeIds.size) return
+        val tmp = activeIds[i]
+        activeIds[i] = activeIds[j]
+        activeIds[j] = tmp
+        persist()
+        rebuildMain()
+        onPick()
+    }
+
+    private fun dropActive(id: String) {
+        if (!activeIds.remove(id)) return
+        if (activeIds.isEmpty()) multiOn = false
+        persist()
+        refreshButton()
+        rebuildMain()
+        onPick()
+    }
+
+    private fun addActive(id: String) {
+        if (activeIds.contains(id)) return
+        activeIds.add(id)
+        persist()
+        rebuildMain()
+        onPick()
+    }
+
+    private fun persist() {
+        runCatching {
+            val store = AppShell.app.store
+            store.setHomeMultiOn(multiOn)
+            store.setHomeMultiIds(activeIds.toList())
+            store.setHomeProvider(selection?.id ?: "")
+        }
+    }
+
+    private fun applySelection(cfg: ProviderConfig?, fire: Boolean) {
+        selection = cfg
+        if (cfg != null) multiOn = false
+        persist()
+        refreshButton()
+        pop.hide()
+        rebuildMain()
+        if (fire) onPick()
+    }
+
+    private fun pick(cfg: ProviderConfig?) = applySelection(cfg, fire = true)
 
     // ── test hooks ──────────────────────────────────────────────────────────
     // The sheet is a Popup — a window with a scene of its own — so a UI test
@@ -250,12 +618,16 @@ class ProviderPicker(private val onPick: () -> Unit) {
         return true
     }
 
-    /** The row names the open sheet is showing ("All providers" first). */
+    /** The card names the open sheet is showing ("All providers" first). */
     fun rowNamesForTest(): List<String> =
-        listBox.children.filterIsInstance<HBox>()
-            .mapNotNull { row -> row.children.filterIsInstance<Label>().firstOrNull()?.text }
+        if (multiOn) {
+            activeIds.mapNotNull { id -> providers.firstOrNull { it.id == id }?.name } +
+                shownProviders().filter { p -> activeIds.none { it == p.id } }.map { it.name }
+        } else {
+            listOf(ALL) + shownProviders().map { it.name }
+        }
 
-    /** Picks the row for [name] (use [ALL] for the first row), as a click would. */
+    /** Picks the card for [name] (use [ALL] for the first card), as a click would. */
     fun selectForTest(name: String): Boolean {
         if (name == ALL) {
             pick(null)
@@ -266,29 +638,44 @@ class ProviderPicker(private val onPick: () -> Unit) {
         return true
     }
 
-    /** Picks the row for [name] WITHOUT firing the pick callback — for callers
+    /** Picks the card for [name] WITHOUT firing the pick callback — for callers
      *  that are already inside a load and will read the selection themselves
      *  (see HomeScreenView.showProvider). */
     fun select(name: String): Boolean {
         val cfg = if (name == ALL) null else providers.firstOrNull { it.name == name } ?: return false
-        selection = cfg
-        button.text = cfg?.name ?: ALL
-        button.tooltip = Ui.tooltip(cfg?.name ?: ALL)
-        pop.hide()
-        rebuildList()
+        applySelection(cfg, fire = false)
         return true
     }
 
-    private fun pick(cfg: ProviderConfig?) {
-        selection = cfg
-        // The button carries the WHOLE name; a provider with a long name gets a
-        // tooltip rather than a truncated label (see the button's own width
-        // rules: it may shrink on a narrow window, but it never ellipsizes the
-        // engine name into "…" while there is room).
-        button.text = cfg?.name ?: ALL
-        button.tooltip = Ui.tooltip(cfg?.name ?: ALL)
-        pop.hide()
-        rebuildList()
-        onPick()
+    /** Picks by provider id (the persisted form), silently. */
+    fun selectById(id: String): Boolean {
+        val cfg = providers.firstOrNull { it.id == id } ?: return false
+        applySelection(cfg, fire = false)
+        return true
+    }
+
+    /** Best-effort name match for an Explore row: exact, case-insensitive,
+     *  then substring — silently. */
+    fun selectBestEffort(want: String): Boolean {
+        val w = want.trim()
+        if (w.isEmpty()) return false
+        providers.firstOrNull { it.name == w }?.let { applySelection(it, fire = false); return true }
+        providers.firstOrNull { it.name.equals(w, ignoreCase = true) }?.let { applySelection(it, fire = false); return true }
+        providers.firstOrNull { it.name.contains(w, ignoreCase = true) }?.let { applySelection(it, fire = false); return true }
+        return false
+    }
+
+    /** Restores a persisted multi feed, silently. False when none of the ids
+     *  exist any more. */
+    fun setMultiSilent(ids: List<String>): Boolean {
+        val live = ids.filter { id -> providers.any { it.id == id } }
+        if (live.isEmpty()) return false
+        activeIds = ArrayList(live)
+        multiOn = true
+        selection = null
+        persist()
+        refreshButton()
+        rebuildMain()
+        return true
     }
 }
