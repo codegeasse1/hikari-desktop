@@ -68,13 +68,22 @@ jobs:
         shell: bash
 
       - name: Bundle mpv player (video engine)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
           mpv_url="https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20260814/mpv-x86_64-20260814-git-7b8915bc1d.7z"
           if ! curl -fsSL -o mpv.7z "$mpv_url"; then
             echo "pinned mpv build is unavailable - resolving the newest release asset"
-            mpv_url=$(curl -fsSL "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest" | grep -o '"browser_download_url": *"[^"]*mpv-x86_64-[^"]*\.7z"' | head -n 1 | cut -d'"' -f4)
+            # `gh` is preinstalled on the runner and authenticates with the job
+            # token: the anonymous api.github.com call 403s under runner-IP
+            # rate limits, which used to fail the whole build here.
+            mpv_url=$(gh api "repos/shinchiro/mpv-winbuild-cmake/releases/latest" --jq '[.assets[].browser_download_url | select(test("mpv-x86_64-.*\\.7z$"))][0]')
             echo "newest: $mpv_url"
+            if [ -z "$mpv_url" ] || [ "$mpv_url" = "null" ]; then
+              echo "::error::could not resolve the newest mpv asset"
+              exit 1
+            fi
             curl -fsSL -o mpv.7z "$mpv_url"
           fi
           7z x -bso0 -bsp0 -ompv-tmp mpv.7z
