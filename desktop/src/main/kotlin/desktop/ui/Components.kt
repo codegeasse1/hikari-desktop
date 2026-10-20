@@ -86,6 +86,41 @@ object Ui {
         if (onClick != null) setOnAction { onClick() }
     }
 
+    /**
+     * A provider/extension badge: the extension's published icon with the
+     * name's initial behind it, so the tile keeps an identity while the
+     * picture loads (or when no icon exists). One place, so the provider
+     * picker, the Explore cards and the Extensions rows cannot drift apart.
+     */
+    fun provBadge(name: String, iconUrl: String?, size: Double = 46.0): StackPane {
+        val initial = Label(name.trim().firstOrNull()?.uppercase() ?: "?").apply {
+            styleClass.add("x-prov-initial")
+        }
+        val badge = StackPane(initial).apply {
+            styleClass.add("x-prov-badge")
+            alignment = Pos.CENTER
+            minWidth = size; prefWidth = size; maxWidth = size
+            minHeight = size; prefHeight = size; maxHeight = size
+        }
+        if (iconUrl.isNullOrBlank()) return badge
+        val art = ImageView().apply {
+            isPreserveRatio = true
+            isSmooth = true
+            isMouseTransparent = true
+            fitWidth = size
+            fitHeight = size
+        }
+        val frame = StackPane(badge, art).apply {
+            alignment = Pos.CENTER
+            minWidth = size; prefWidth = size; maxWidth = size
+            minHeight = size; prefHeight = size; maxHeight = size
+        }
+        desktop.img.ImageLoader.loadAsync(iconUrl, onReady = { img ->
+            if (img != null) art.image = img
+        }, w = (size * 2).toInt(), h = (size * 2).toInt())
+        return frame
+    }
+
     fun tooltip(text: String): Tooltip = Tooltip(text).apply {
         // Deliberately unhurried: a JavaFX tooltip is its own popup window, and
         // a popup that appears while the pointer is resting on a control can

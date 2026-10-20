@@ -634,4 +634,8 @@ object AppShell {
     fun toggleWindowMaximize() {
         chrome.toggleMaximize()
     }
+
+    /** Whether the main window is currently maximised — the player strip's
+     *  own maximise button reads this so it never shows a stale icon. */
+    fun isWindowMaximized(): Boolean = chrome.isMaximized()
 }

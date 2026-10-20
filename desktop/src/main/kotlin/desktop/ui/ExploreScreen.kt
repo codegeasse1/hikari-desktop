@@ -4,12 +4,10 @@ import com.hikari.app.data.ProviderConfig
 import com.hikari.app.data.ProviderType
 import javafx.geometry.Insets
 import javafx.geometry.Pos
-import javafx.scene.control.Label
 import javafx.scene.control.ScrollPane
 import javafx.scene.layout.HBox
 import javafx.scene.layout.Priority
 import javafx.scene.layout.Region
-import javafx.scene.layout.StackPane
 import javafx.scene.layout.TilePane
 import javafx.scene.layout.VBox
 import kotlinx.coroutines.Job
@@ -37,6 +35,12 @@ class ExploreScreenView {
      *  a snapshot that predates its load, and this is what reloads it. */
     private var lastProvider: ProviderConfig? = null
 
+    /** Re-entrancy guard for [openCatalog]: navigating to the Catalog screen
+     *  synchronously calls back into [onCatalogShown] with the empty snapshot
+     *  we navigated with — without this it re-opens the same catalog, which
+     *  re-navigates, until the stack overflows and the page stays black. */
+    private var inOpen = false
+
     /**
      * A Catalog screen just showed with whatever snapshot it carries. Fresh
      * navigation brings its own rows; a back-stack return brings an empty
@@ -48,6 +52,10 @@ class ExploreScreenView {
             AppShell.lastCatalog[s.provider] = s.items
             return
         }
+        // Our own navigation (see [openCatalog]): the async load already
+        // started will fill this page — reloading here recurses until the
+        // stack overflows and leaves a black page.
+        if (inOpen) return
         val cached = AppShell.lastCatalog[s.provider]
         if (!cached.isNullOrEmpty()) {
             AppShell.catalogView?.setItems(cached)
@@ -74,7 +82,7 @@ class ExploreScreenView {
             column.children.add(
                 Ui.sectionHeader(
                     "Explore",
-                    "Browse catalogs across ${providers.size} provider${if (providers.size == 1) "" else "s"} — open one to see its catalog on Home.",
+                    "Browse catalogs across ${providers.size} provider${if (providers.size == 1) "" else "s"} — open one to browse its catalog.",
                 )
             )
             val grid = TilePane(Theme.S4, Theme.S4).apply {
@@ -89,15 +97,10 @@ class ExploreScreenView {
     }
 
     private fun providerCard(p: ProviderConfig): VBox {
-        val initial = Label(p.name.trim().firstOrNull()?.uppercase() ?: "?").apply {
-            styleClass.add("x-prov-initial")
-        }
-        val badge = StackPane(initial).apply {
-            styleClass.add("x-prov-badge")
-            alignment = Pos.CENTER
-            minWidth = 46.0; prefWidth = 46.0; maxWidth = 46.0
-            minHeight = 46.0; prefHeight = 46.0; maxHeight = 46.0
-        }
+        // The extension's own icon when it names one (see
+        // [ExtensionsScreenView.providerIconFor]), the initial tile while it
+        // loads or when none exists — never a bare letter when art is there.
+        val badge = Ui.provBadge(p.name, runCatching { AppShell.extensionsView.providerIconFor(p) }.getOrNull(), 46.0)
         val name = Theme.label(p.name, size = 14.5, bold = true).apply {
             styleClass.add("x-prov-name")
             isWrapText = true
@@ -133,8 +136,15 @@ class ExploreScreenView {
         lastProvider = p
         val gen = ++catalogGen
         // Navigate first, load second: the screen is up before a single
-        // packet is awaited.
-        AppShell.show(Screen.Catalog(p.name, p.name, emptyList()))
+        // packet is awaited. The navigation itself calls back into
+        // [onCatalogShown] with this empty snapshot, so [inOpen] is held
+        // across it — that callback must NOT reload (see its note).
+        inOpen = true
+        try {
+            AppShell.show(Screen.Catalog(p.name, p.name, emptyList()))
+        } finally {
+            inOpen = false
+        }
         catalogJob = AppShell.uiScope.launch {
             // A provider whose catalog fetch hangs used to leave the wait up
             // forever ("opening X…" that never opens): the load has a hard

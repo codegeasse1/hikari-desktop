@@ -367,8 +367,11 @@ class HomeScreenView {
         heroDesc.text = item.overview?.replace(Regex("<[^>]*>"), "")?.replace(Regex("\\s+"), " ")?.trim().orEmpty()
         // TMDB artwork first (high quality), the provider's own art only as
         // the fallback — the banner never shows a low-quality image when the
-        // database has the real backdrop.
+        // database has the real backdrop. The full file, not the w1280
+        // preview: the banner decodes at 1920 wide, and a 1280 source
+        // upscaled onto it is what read as "blurry".
         val art = enrich?.backdrops?.firstOrNull()?.takeIf { it.isNotBlank() }
+            ?.replace("/w1280/", "/original/")
             ?: desktop.img.ImageLoader.artFor(item.backdropUrl, item.posterUrl)
         if (!art.isNullOrBlank()) {
             desktop.img.ImageLoader.loadAsync(art, onReady = { img ->
@@ -770,17 +773,10 @@ class HomeScreenView {
 
             else -> {
                 errorLabel.text = ""
-                // A plain count, not a census: the old "N row(s) from M loaded
-                // source(s)" read as a clipped fragment on narrow windows and
-                // said nothing about whose catalog is on screen (the banner
-                // above says that now).
-                val scope = when {
-                    filterIds != null -> "Mix of ${filterIds.size}"
-                    chosen != null && chosen != ProviderPicker.ALL -> "“$chosen”"
-                    else -> null
-                }
-                statusLabel.text = if (scope != null) "$scope · ${rows.size} row(s)"
-                else if (rows.size == 1) "1 row" else "${rows.size} rows"
+                // No count line on success: "X · N row(s)" read as a stray
+                // fragment under Continue Watching and pushed the rails apart.
+                // Failures and empty catalogs still say so above.
+                statusLabel.text = ""
                 rowsRendered = true
                 upgradeArt(rows)
             }

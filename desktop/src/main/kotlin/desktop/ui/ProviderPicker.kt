@@ -305,6 +305,12 @@ class ProviderPicker(private val onPick: () -> Unit) {
         }
     }
 
+    /** A provider's card badge: its extension's own icon when it names one
+     *  (see [ExtensionsScreenView.providerIconFor]), the initial tile while
+     *  it loads or when none exists. */
+    private fun badgeFor(p: ProviderConfig): StackPane =
+        Ui.provBadge(p.name, runCatching { AppShell.extensionsView.providerIconFor(p) }.getOrNull(), 44.0)
+
     private fun subLabelFor(p: ProviderConfig): Label {
         val cached = countCache[p.id]
         return Label(countText(p, cached)).apply {
@@ -360,7 +366,7 @@ class ProviderPicker(private val onPick: () -> Unit) {
         val texts = VBox(3.0, name, subLabelFor(p)).apply { minWidth = 0.0 }
         HBox.setHgrow(texts, Priority.ALWAYS)
         val tune = Icons.of(Icons.SLIDERS, 17.0).apply { opacity = 0.75 }
-        return HBox(12.0, badgeFor(p.name), texts, tune).apply {
+        return HBox(12.0, badgeFor(p), texts, tune).apply {
             styleClass.add("x-pd-card")
             if (selection?.id == p.id) styleClass.add("x-pd-card-sel")
             alignment = Pos.CENTER_LEFT
@@ -487,7 +493,7 @@ class ProviderPicker(private val onPick: () -> Unit) {
             isFocusTraversable = false
             setOnAction { dropActive(p.id) }
         }
-        return HBox(8.0, num, badgeFor(p.name), texts, up, down, remove).apply {
+        return HBox(8.0, num, badgeFor(p), texts, up, down, remove).apply {
             styleClass.add("x-pd-active")
             alignment = Pos.CENTER_LEFT
             padding = Insets(10.0, 10.0, 10.0, 10.0)
@@ -509,7 +515,7 @@ class ProviderPicker(private val onPick: () -> Unit) {
             isFocusTraversable = false
             setOnAction { addActive(p.id) }
         }
-        return HBox(10.0, badgeFor(p.name), texts, add).apply {
+        return HBox(10.0, badgeFor(p), texts, add).apply {
             styleClass.add("x-pd-avail")
             alignment = Pos.CENTER_LEFT
             padding = Insets(10.0, 12.0, 10.0, 10.0)

@@ -3224,6 +3224,15 @@ class ExtensionsScreenView {
         return repoAvatarUrl(source)
     }
 
+    /** The icon for a provider card anywhere else (the Home provider picker,
+     *  the Explore cards): the provider's own icon URL first, else its
+     *  installed extension's repo icon by file stem, else its repo's avatar.
+     *  Null means "keep the initial tile". */
+    fun providerIconFor(cfg: ProviderConfig): String? {
+        cfg.iconUrl?.takeIf { it.isNotBlank() }?.let { return it }
+        return installedIconFor(cfg, pluginIconByStem())
+    }
+
     /**
      * The engine filter, laid out exactly like the Android picker's: `All` first,
      * then one chip per engine that is actually installed. Selecting one narrows

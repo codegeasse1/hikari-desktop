@@ -205,6 +205,10 @@ object PlayerWindow {
     /** Whether the title has a next episode (drives the top-strip button). */
     private var hasNextEp = false
     private var closePlayerButton: Button? = null
+    /** The player strip's own maximise button, between minimise and close. */
+    private var maximizePlayerButton: Button? = null
+    /** Which icon it currently shows, so a refresh only touches it on change. */
+    private var maximizePlayerIcon = ""
 
     /** The control bar's own close button. Two ways out (the strip's and this
      *  one), because the strip is hidden whenever the chrome is idle — see
@@ -247,6 +251,24 @@ object PlayerWindow {
 
     /** Invalidates stale seek-echo expiry callbacks; see [armSeekEcho]. */
     @Volatile private var seekEchoGen = 0
+
+    /** Where the picture was when the current seek was sent: if the echo
+     *  window closes with the picture unmoved, the seek never landed. */
+    @Volatile private var seekFromSecs = 0.0
+
+    /** Invalidates stale reply-checked seeks; see [sendSeekChecked]. */
+    @Volatile private var seekVerifyGen = 0
+
+    /** Throttles the "the stream refused the seek" line (see
+     *  [warnSeekRefused]): holding the arrow key must not stack it. */
+    @Volatile private var lastSeekWarnAt = 0L
+
+    /** One daemon thread for seek verifications, so holding the arrow key
+     *  cannot pile a thread per repeat (see [sendSeekChecked]). */
+    private val seekVerifier: java.util.concurrent.ExecutorService =
+        java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "hikari-seek-verify").apply { isDaemon = true }
+        }
 
     /** What [syncSurface] last did, for the harness to report. */
     @Volatile private var lastSyncNote = ""
@@ -1956,6 +1978,7 @@ object PlayerWindow {
     fun pokeChrome() {
         Fx.run {
             setChromeVisible(true)
+            refreshMaximizePlayerIcon()
             scheduleChromeHide()
         }
     }
@@ -2563,15 +2586,17 @@ object PlayerWindow {
     }
 
     /**
-     * The window buttons the PLAYER offers: minimise the app window, and a close
-     * that closes the PLAYER.
+     * The window buttons the PLAYER offers: minimise and maximise the app
+     * window, and a close that closes the PLAYER.
      *
      * The app's own window controls are deliberately not used here. The player
      * takes over the whole window, so the app's close button sat in the player's
      * strip looking like "close the player" and actually took the whole app (and
      * the playback) down — a click that reads as one thing and does another is
      * worse than no button. Getting back to the app is what [requestClose] (and
-     * Esc, and the back arrow) already do.
+     * Esc, and the back arrow) already do. Maximise is safe to share (it only
+     * resizes the window), so the strip carries its own between minimise and
+     * close, reading the same maximised state as the app's top bar.
      */
     private fun playerWindowControls(): HBox = HBox(2.0).apply {
         alignment = Pos.CENTER_RIGHT
@@ -2580,6 +2605,20 @@ object PlayerWindow {
                 runCatching { AppShell.stage.isIconified = true }
             }
         )
+        // Held so its icon can follow the window state (see
+        // [refreshMaximizePlayerIcon]): the window can also be maximised from
+        // the app's own top bar or a double-click drag.
+        maximizePlayerButton = Ui.iconButton(Icons.MAXIMIZE, "Maximise", size = 13.0) {
+            runCatching { AppShell.toggleWindowMaximize() }
+            refreshMaximizePlayerIcon()
+            // The window rectangle settles after the OS side does — re-place
+            // the surface now and over the next second (see [settleSurface]).
+            settleSurface()
+            safeSync()
+            positionOverlays()
+        }
+        maximizePlayerIcon = Icons.MAXIMIZE
+        children.add(maximizePlayerButton)
         // Held so a test can press it: "the player's X closes only the player"
         // is a claim about what a click on THIS button does, and nothing short of
         // clicking it can check that.
@@ -2587,6 +2626,19 @@ object PlayerWindow {
             requestClose()
         }
         children.add(closePlayerButton)
+    }
+
+    /** Keeps the player strip's maximise button honest: called after its own
+     *  press and whenever the bars are put on screen, so a maximise done from
+     *  anywhere else still flips its icon. */
+    private fun refreshMaximizePlayerIcon() {
+        val btn = maximizePlayerButton ?: return
+        val maximized = runCatching { AppShell.isWindowMaximized() }.getOrDefault(false)
+        val want = if (maximized) Icons.RESTORE else Icons.MAXIMIZE
+        if (maximizePlayerIcon != want) {
+            maximizePlayerIcon = want
+            btn.graphic = Icons.of(want, 13.0)
+        }
     }
 
     /**
@@ -2740,12 +2792,13 @@ object PlayerWindow {
         seekBar?.let { it.value = f }
         lastPosition = (pos * 1000).toLong()
         renderTime()
+        seekFromSecs = lastReportedSecs
         armSeekEcho(pos)
-        runCatching { h.post("seek", pos, "absolute") }
+        sendSeekChecked(h, pos)
     }
 
     /**
-     * Skips [delta] seconds from where playback is SHOWN to be, through the same
+     * Skips [delta] seconds from where the picture IS, through the same
      * echo-suppressing path as a click on the bar — an arrow-key skip used to
      * flick the bar back for a frame for exactly the same reason.
      */
@@ -2758,12 +2811,19 @@ object PlayerWindow {
             setStatus("The player's control channel is not connected — reopen the stream to seek.", isError = true)
             return
         }
-        val pos = (lastPosition / 1000.0 + delta).coerceIn(0.0, d)
+        // The picture's own last report is the base, not the readout: the
+        // readout can still hold an un-landed seek target, and stacking
+        // arrow-key skips onto that walks the bar somewhere the picture never
+        // was (a skip from a stale readout is the "forward jumps to the end
+        // and comes back" report).
+        val base = if (seekPendingSecs != null) lastPosition / 1000.0 else lastReportedSecs
+        val pos = (base + delta).coerceIn(0.0, d)
         lastPosition = (pos * 1000).toLong()
         renderTime()
         seekBar?.let { it.value = (pos / d).coerceIn(0.0, 1.0) }
+        seekFromSecs = lastReportedSecs
         armSeekEcho(pos)
-        runCatching { h.post("seek", pos, "absolute") }
+        sendSeekChecked(h, pos)
     }
 
     /** Starts the window in which reports of the pre-seek position are ignored. */
@@ -2782,11 +2842,51 @@ object PlayerWindow {
                         lastPosition = (lastReportedSecs * 1000).toLong()
                         if (!scrubbing) seekBar?.value = frac
                         renderTime()
+                        // The window closed with the picture unmoved from where
+                        // it was when the seek was sent: the seek never landed,
+                        // and the bar just snapped back. Say so instead of
+                        // leaving "forward does nothing" a mystery.
+                        if (kotlin.math.abs(lastReportedSecs - seekFromSecs) < 0.5) warnSeekRefused()
                     }
                 }
             },
             "hikari-seek-echo",
         ).apply { isDaemon = true; start() }
+    }
+
+    /**
+     * Sends one seek and checks it actually happened.
+     *
+     * The bar and the readout already moved (the caller does that first, so a
+     * key press answers instantly); this is the backstop. A dropped or refused
+     * command used to be invisible — a fire-and-forget post — which is exactly
+     * the reported "forward moves the bar and it snaps back, and the picture
+     * never moves". The reply is awaited off the FX thread, so a wedged pipe
+     * costs this seek its timeout, never the UI; a superseding seek drops the
+     * check, and a failed one names itself in the status line and the command
+     * log the player report carries.
+     */
+    private fun sendSeekChecked(h: MpvIpc, pos: Double) {
+        val gen = ++seekVerifyGen
+        seekVerifier.execute {
+            val reply = runCatching { h.command(3_500L, "seek", pos, "absolute") }.getOrNull()
+            if (gen != seekVerifyGen) return@execute
+            val err = reply?.optString("error").orEmpty()
+            if (reply == null || (err.isNotEmpty() && err != "success")) {
+                System.err.println("seek: unanswered/refused seek " + pos + " (" + err.ifBlank { "no reply" } + ")")
+                Fx.run { if (gen == seekVerifyGen) warnSeekRefused() }
+            }
+        }
+    }
+
+    /** One honest line instead of a bar that silently snaps back: without this
+     *  a refused seek looks exactly like "forward does nothing". Throttled, so
+     *  holding the arrow key does not stack it. */
+    private fun warnSeekRefused() {
+        val now = System.currentTimeMillis()
+        if (now - lastSeekWarnAt < 5_000L) return
+        lastSeekWarnAt = now
+        setStatus("The stream refused the seek — it may not allow seeking.", isError = true)
     }
 
     /**
