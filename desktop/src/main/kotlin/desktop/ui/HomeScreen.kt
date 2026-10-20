@@ -25,8 +25,12 @@ import javafx.scene.layout.VBox
 import javafx.scene.shape.Rectangle
 import javafx.util.Duration
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 
 /**
  * Home: a full-bleed cinematic hero (auto-rotating backdrop art of the
@@ -53,8 +57,8 @@ class HomeScreenView {
         val w = heroStack.width
         val h = heroStack.height
         if (w > 0 && h > 0) {
-            Ui.coverImage(heroBgA, heroArtA, w, h)
-            Ui.coverImage(heroBgB, heroArtB, w, h)
+            Ui.coverImageTop(heroBgA, heroArtA, w, h)
+            Ui.coverImageTop(heroBgB, heroArtB, w, h)
         }
     }
 
@@ -204,7 +208,6 @@ class HomeScreenView {
                 minWidth = 0.0
                 maxWidth = Double.MAX_VALUE
             },
-            filterBanner,
             heroBox,
             cwSection,
             statusLabel,
@@ -371,7 +374,7 @@ class HomeScreenView {
         if (!art.isNullOrBlank()) {
             desktop.img.ImageLoader.loadAsync(art, onReady = { img ->
                 if (img != null && myGen == heroGen) crossfadeHero(img)
-            }, w = 1600, h = 900)
+            }, w = 1920, h = 1080)
         }
         heroActions.children.setAll(
             Ui.isolateClicks(Button("Watch Now").apply {
@@ -435,7 +438,7 @@ class HomeScreenView {
         paintHeroBg()
         if (heroFgA) {
             heroArtB = img
-            Ui.coverImage(heroBgB, img, heroStack.width, heroStack.height)
+            Ui.coverImageTop(heroBgB, img, heroStack.width, heroStack.height)
             Ui.fade(heroBgB, 1.0, 600.0)
             heroFgA = false
             javafx.animation.Timeline(
@@ -444,7 +447,7 @@ class HomeScreenView {
             ).play()
         } else {
             heroArtA = img
-            Ui.coverImage(heroBgA, img, heroStack.width, heroStack.height)
+            Ui.coverImageTop(heroBgA, img, heroStack.width, heroStack.height)
             Ui.fade(heroBgA, 1.0, 600.0)
             heroFgA = true
             javafx.animation.Timeline(
@@ -720,6 +723,8 @@ class HomeScreenView {
 
     private fun render(rows: List<CatalogRow>, filterId: String?, chosen: String? = null, filterIds: Set<String>? = null) {
         statusLabel.text = ""
+        lastRows = rows
+        rowsRendered = false
         if (!heroSeeded) {
             val candidates = rows.flatMap { it.items }
                 .filter { !it.posterUrl.isNullOrBlank() || !it.backdropUrl.isNullOrBlank() }
@@ -777,55 +782,23 @@ class HomeScreenView {
                 }
                 statusLabel.text = if (scope != null) "$scope · ${rows.size} row(s)"
                 else if (rows.size == 1) "1 row" else "${rows.size} rows"
+                rowsRendered = true
+                upgradeArt(rows)
             }
         }
         refreshLogsButton()
     }
 
     /**
-     * Names whose catalog Home is showing, right above the hero: one provider
-     * ("Anime4i — showing this provider's catalog" + Show all) or a mix
-     * ("Mix of 3…" + Manage). Hidden for the unfiltered page.
+     * Which catalog Home is showing used to be named by an in-page banner
+     * ("X — showing this provider's catalog"). That banner is gone: the hero's
+     * "Featured · X" line and the picker button already say it, and the strip
+     * just pushed the artwork down. Kept as a hiding stub so the load path
+     * compiles unchanged.
      */
     private fun renderFilterBanner(enabled: List<ProviderConfig>, singleId: String?, multi: Set<String>?) {
-        val byId = enabled.associateBy { it.id }
-        when {
-            multi != null -> {
-                val names = multi.mapNotNull { byId[it]?.name }
-                val who = if (names.isEmpty()) "Mix" else {
-                    "Mix of ${multi.size}" + if (names.isNotEmpty()) ": " + names.take(3).joinToString(", ") else "" +
-                        if (names.size > 3) "…" else ""
-                }
-                filterBanner.children.setAll(
-                    Ui.badge("MIX", "badge-accent"),
-                    Theme.label(who, size = 13.5, bold = true).apply { minWidth = 0.0 },
-                    Ui.spacer(),
-                    Ui.button("Manage", ghost = true) { providerPicker.open() },
-                )
-                filterBanner.isVisible = true
-                filterBanner.isManaged = true
-            }
-            singleId != null -> {
-                val name = byId[singleId]?.name ?: providerPicker.selectedName()
-                filterBanner.children.setAll(
-                    Ui.badge("1", "badge-accent"),
-                    Theme.label("$name — showing this provider's catalog", size = 13.5, bold = true).apply {
-                        minWidth = 0.0
-                    },
-                    Ui.spacer(),
-                    Ui.button("Show all", ghost = true) {
-                        providerPicker.select(ProviderPicker.ALL)
-                        load(force = true)
-                    },
-                )
-                filterBanner.isVisible = true
-                filterBanner.isManaged = true
-            }
-            else -> {
-                filterBanner.isVisible = false
-                filterBanner.isManaged = false
-            }
-        }
+        filterBanner.isVisible = false
+        filterBanner.isManaged = false
     }
 
     private fun fallback(message: String) {
@@ -836,14 +809,89 @@ class HomeScreenView {
         if (!logsOpen) toggleLogs()
     }
 
+    /** Session TMDB art upgrades: uniqueId → landscape backdrop / poster.
+     *  Filled by [upgradeArt] after rows land, applied by [withUpgrade] in
+     *  [buildRow] — so a provider that only serves thumbnails still shows
+     *  high-quality TMDB art, and the upgrade survives reloads in-session. */
+    private val artUpgrades = HashMap<String, String>()
+    private val posterUpgrades = HashMap<String, String>()
+
+    /** The last successfully rendered rows, for repainting after upgrades. */
+    private var lastRows: List<CatalogRow> = emptyList()
+    private var rowsRendered = false
+
+    private fun withUpgrade(item: MediaItem): MediaItem {
+        val b = artUpgrades[item.uniqueId]
+        val p = posterUpgrades[item.uniqueId]
+        if (b == null && p == null) return item
+        return item.copy(
+            backdropUrl = b ?: item.backdropUrl,
+            posterUrl = p ?: item.posterUrl,
+        )
+    }
+
+    /**
+     * Pulls TMDB landscape/poster art for row items that arrived without any
+     * (provider thumbnails), bounded and off the load path: at most 24 titles,
+     * 3 concurrent lookups, results cached by [TmdbDetails] for the session.
+     * Rows repaint once with the upgraded art instead of waiting on it.
+     */
+    private fun upgradeArt(rows: List<CatalogRow>) {
+        val myGen = gen
+        val missing = rows.flatMap { it.items }
+            .filter { it.backdropUrl.isNullOrBlank() && !artUpgrades.containsKey(it.uniqueId) }
+            .distinctBy { it.uniqueId }
+            .take(24)
+        if (missing.isEmpty()) return
+        AppShell.uiScope.launch {
+            val gate = Semaphore(3)
+            val hits = missing.map { item ->
+                async {
+                    gate.withPermit {
+                        val d = runCatching { TmdbDetails.load(item) }.getOrNull()
+                            ?: return@withPermit null
+                        val b = d.backdrops.firstOrNull()
+                        val p = d.posters.firstOrNull()
+                        if (b.isNullOrBlank() && p.isNullOrBlank()) null
+                        else Triple(item.uniqueId, b, p)
+                    }
+                }
+            }.awaitAll().filterNotNull()
+            if (hits.isEmpty()) return@launch
+            Fx.run {
+                if (myGen != gen) return@run
+                var changed = false
+                for ((id, b, p) in hits) {
+                    if (!b.isNullOrBlank() && !artUpgrades.containsKey(id)) {
+                        artUpgrades[id] = b
+                        changed = true
+                    }
+                    if (!p.isNullOrBlank() && !posterUpgrades.containsKey(id)) {
+                        posterUpgrades[id] = p
+                        changed = true
+                    }
+                }
+                if (changed && rowsRendered) {
+                    rowsBox.children.setAll(lastRows.map { buildRow(it) })
+                }
+            }
+        }
+    }
+
     private fun buildRow(row: CatalogRow): Region {
+        val cinema = runCatching { AppShell.app.store.homeLayout() }.getOrDefault("cinema") == "cinema"
         val cards = HBox(Theme.S4).apply {
             alignment = Pos.TOP_LEFT
             padding = Insets(Theme.S1, Theme.S1, Theme.S2, Theme.S1)
             minWidth = 0.0
         }
-        row.items.forEach { item ->
-            cards.children.add(PosterCard.make(item, onOpen = { AppShell.openDetail(it) }))
+        row.items.forEach { raw ->
+            val item = withUpgrade(raw)
+            cards.children.add(
+                if (cinema) PosterCard.make(item, onOpen = { AppShell.openDetail(it) },
+                    width = CINEMA_W, height = CINEMA_H, wide = true)
+                else PosterCard.make(item, onOpen = { AppShell.openDetail(it) })
+            )
         }
         val scroll = Ui.rail(cards)
         val viewAll = Button("View All").apply {
@@ -879,5 +927,8 @@ class HomeScreenView {
         const val HERO_H = 440.0
         const val CW_W = 320.0
         const val CW_H = 180.0
+        /** Cinema card frame: 16:9, the PC-friendly home layout (default). */
+        const val CINEMA_W = 320.0
+        const val CINEMA_H = 180.0
     }
 }

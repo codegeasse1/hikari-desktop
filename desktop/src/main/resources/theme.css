@@ -1387,7 +1387,8 @@
 }
 
 /* ---- premium 1:1 pass (home / detail / discovery / slim rail) ------------- */
-.x-side { -fx-background-color: -h-bg-2; -fx-background-radius: 18; -fx-padding: 6 0 12 0; -fx-border-color: -h-border; -fx-border-radius: 18; }
+.x-side { -fx-background-color: -h-bg-2; -fx-background-radius: 22; -fx-padding: 6 0 12 0; -fx-border-color: -h-border; -fx-border-radius: 22; -fx-effect: dropshadow(gaussian, rgba(0,0,0,0.45), 18, 0.2, 0, 4); }
+.x-side-float { -fx-background-color: transparent; }
 .x-side-logo { -fx-background-color: transparent; -fx-padding: 6; -fx-background-radius: 14; }
 .x-side-logo:hover { -fx-background-color: -h-accent-soft; }
 .x-side-mark { -fx-background-color: linear-gradient(to bottom right, -h-accent, -h-accent-2); -fx-background-radius: 12; -fx-min-width: 34; -fx-min-height: 34; -fx-pref-width: 34; -fx-pref-height: 34; -fx-max-width: 34; -fx-max-height: 34; }

@@ -38,7 +38,10 @@ object HikariNet {
     /** GET and return the response body as text (null on any failure). */
     suspend fun getString(url: String, headers: Map<String, String> = emptyMap()): String? =
         withContext(Dispatchers.IO) {
-            com.hikari.app.net.Http.getString(url, headers)
+            RemoteConfig.cached(url)?.let { return@withContext it }
+            val body = com.hikari.app.net.Http.getString(url, headers)
+            RemoteConfig.store(url, body)
+            body
         }
 
     /** POST a string body and return the response body as text (null on any
@@ -166,5 +169,50 @@ object HikariNet {
                 add(HikariWebViewResult(r.url, headers))
             }
         }
+    }
+}
+
+/**
+ * Tiny TTL cache for the static remote blobs extensions re-fetch on every
+ * call: gist/translation configs and other small provider-config endpoints.
+ *
+ * The 51CG/MRDS-family template fetches its remote config (a gist) plus a
+ * Google Translate round-trip per title with no caching of its own — every
+ * getStreams paid for both, holding the provider lock while a Play lookup
+ * burned its budget behind it. Caching those two endpoint families here (10
+ * min, small bodies only) turns repeat lookups into memory hits. Post pages,
+ * API searches and stream URLs never match and are never cached.
+ */
+private object RemoteConfig {
+
+    private data class Entry(val body: String, val at: Long)
+
+    private const val TTL_MS = 10 * 60_000L
+    private const val MAX_BODY = 100 * 1024
+    private const val MAX_ENTRIES = 200
+
+    private val cache = java.util.concurrent.ConcurrentHashMap<String, Entry>()
+
+    private fun matches(url: String): Boolean {
+        val u = url.lowercase()
+        return u.contains("gist.githubusercontent.com") ||
+            u.contains("translate.googleapis.com") ||
+            (u.contains("raw.githubusercontent.com") && (u.endsWith(".json") || u.contains("config")))
+    }
+
+    fun cached(url: String): String? {
+        if (!matches(url)) return null
+        val e = cache[url] ?: return null
+        if (System.currentTimeMillis() - e.at > TTL_MS) {
+            cache.remove(url)
+            return null
+        }
+        return e.body
+    }
+
+    fun store(url: String, body: String?) {
+        if (body == null || !matches(url) || body.length > MAX_BODY) return
+        if (cache.size > MAX_ENTRIES) cache.clear()
+        cache[url] = Entry(body, System.currentTimeMillis())
     }
 }

@@ -106,7 +106,11 @@ object HlsRelay {
                 // Edges hiccup: one failed segment kills the whole stream in
                 // mpv, while a retry usually sails through (403/404 stay final
                 // — a spent token or a dead link — see relayFetchRetrying).
-                Http.relayFetchRetrying(targetUrl, route.headers, incomingRange, isHead)
+                // Signed 51CG/MRDS-family URLs REQUIRE their Referer: when the
+                // provider recorded no headers, fall back to the target's own
+                // origin instead of fetching bare (a bare fetch 403s and the
+                // title reads as "no playable source").
+                Http.relayFetchRetrying(targetUrl, effectiveHeaders(route.headers, targetUrl), incomingRange, isHead)
             } catch (e: Exception) {
                 ex.sendResponseHeaders(502, -1)
                 ex.close()
@@ -201,6 +205,22 @@ object HlsRelay {
     }
 
     /** True when the upstream answer should be parsed as an HLS playlist. */
+
+    /**
+     * The headers a relay fetch goes out with: the provider's own headers,
+     * plus a browser UA when it recorded none, plus a Referer derived from
+     * the target's origin when it recorded none (hotlink-protected signed
+     * CDNs 403 a bare fetch).
+     */
+    private fun effectiveHeaders(recorded: Map<String, String>, targetUrl: String): Map<String, String> {
+        if (recorded.keys.any { it.equals("Referer", ignoreCase = true) }) return recorded
+        val origin = runCatching {
+            val u = URI(targetUrl)
+            "${u.scheme}://${u.host}/"
+        }.getOrNull() ?: return recorded
+        return HashMap(recorded).apply { put("Referer", origin) }
+    }
+
     private fun isPlaylistAnswer(ct: String, targetUrl: String, contentLength: String?): Boolean {
         val c = ct.lowercase()
         if (c.contains("mpegurl") || c.contains("x-mpegurl") || c.contains("hls")) return true

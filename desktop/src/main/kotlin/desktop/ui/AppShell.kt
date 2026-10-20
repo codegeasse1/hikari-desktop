@@ -234,7 +234,18 @@ object AppShell {
 
         val grow = Region().apply { VBox.setVgrow(this, Priority.ALWAYS) }
         box.children.add(grow)
-        return box
+        // Floating pill dock (reference shot 775): the rail floats off the
+        // window edges with a gap all round instead of docking flush
+        // full-height — same buttons, detached pill.
+        VBox.setVgrow(box, Priority.ALWAYS)
+        return VBox(box).apply {
+            styleClass.add("x-side-float")
+            padding = Insets(12.0, 0.0, 12.0, 12.0)
+            minWidth = 92.0
+            prefWidth = 92.0
+            maxWidth = 92.0
+            minHeight = 0.0
+        }
     }
 
     private fun topbar(): Region {

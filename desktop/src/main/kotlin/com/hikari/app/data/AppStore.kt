@@ -72,6 +72,7 @@ class AppStore(private val dir: File) {
         const val HOME_PROVIDER = "homeProvider"
         const val HOME_MULTI_IDS = "homeMultiIds"
         const val HOME_MULTI_ON = "homeMultiOn"
+        const val HOME_LAYOUT = "homeLayout"
         const val TRANSLATE_PROVIDERS = "translateProviders"
         const val TRANSLATE_CACHE = "translateCache"
         const val DL_CONCURRENCY = "downloadConcurrency"
@@ -128,6 +129,17 @@ class AppStore(private val dir: File) {
     fun homeMultiOn(): Boolean = (get(K.HOME_MULTI_ON) ?: "false").toBoolean()
     fun setHomeMultiOn(on: Boolean) {
         put(K.HOME_MULTI_ON, on.toString())
+    }
+
+    /**
+     * Home catalog layout: "cinema" (16:9 landscape cards, the default — the
+     * right shape for a PC window and for backdrop art) or "poster" (the
+     * classic vertical 2:3 posters). See Settings → Home and [HomeScreenView].
+     */
+    fun homeLayoutFlow(): Flow<String> = flowOf { homeLayout() }
+    fun homeLayout(): String = (get(K.HOME_LAYOUT) ?: "cinema").lowercase().takeIf { it == "poster" } ?: "cinema"
+    fun setHomeLayout(layout: String) {
+        put(K.HOME_LAYOUT, if (layout == "poster") "poster" else "cinema")
     }
 
     fun translateProvidersFlow(): Flow<Set<String>> = flowOf { translateProviders() }

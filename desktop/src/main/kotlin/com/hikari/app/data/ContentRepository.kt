@@ -44,9 +44,19 @@ class ContentRepository(private val manager: ProviderManager) {
          *  the slowest extension; the rest of the sweep keeps running. */
         const val FIRST_SOURCE_WAIT_MS = 14_000L
 
+        /** Extra first-source wait for HIKARI extensions: their template
+         *  re-fetches a remote config + translates every title on first touch,
+         *  so the first answer legitimately takes longer than a Stremio
+         *  manifest. Without this the lookup timed out while the provider was
+         *  still warming up ("No playable source" with a healthy catalog). */
+        const val FIRST_SOURCE_WAIT_HIKARI_MS = 20_000L
+
         /** How long one provider gets to answer a stream lookup before it is
          *  left behind by the rest of the family. */
         const val SOURCE_BUDGET_MS = 40_000L
+
+        /** The same, for HIKARI extensions (see above). */
+        const val SOURCE_BUDGET_HIKARI_MS = 60_000L
 
         /** The same, for the title-search wave (search + episodes + streams). */
         const val TITLE_BUDGET_MS = 55_000L
@@ -326,7 +336,9 @@ class ContentRepository(private val manager: ProviderManager) {
                     }
                 }
             }
-            val deadline = System.currentTimeMillis() + FIRST_SOURCE_WAIT_MS
+            val originHikari = manager.byId(item.providerId)?.config?.type == ProviderType.HIKARI
+            val deadline = System.currentTimeMillis() +
+                if (originHikari) FIRST_SOURCE_WAIT_HIKARI_MS else FIRST_SOURCE_WAIT_MS
             while (System.currentTimeMillis() < deadline) {
                 val now = sweep.snapshot()
                 if (now.isNotEmpty()) return@withContext now
@@ -362,8 +374,9 @@ class ContentRepository(private val manager: ProviderManager) {
     }
 
     /** Asks [providers] for the item itself, in parallel, bounded by
-     *  [ProviderGate] (one call per provider at a time) and a per-provider
-     *  budget. */
+     *  [ProviderGate] (one call per provider at a time, playback on the
+     *  interactive lane so a catalog sweep can never block it) and a
+     *  per-provider budget (longer for HIKARI warm-up, see above). */
     private suspend fun askAll(
         providers: List<ContentProvider>,
         item: MediaItem,
@@ -375,9 +388,10 @@ class ContentRepository(private val manager: ProviderManager) {
             providers.map { p ->
                 async {
                     gate.withPermit {
+                        val budget = if (p.config.type == ProviderType.HIKARI) SOURCE_BUDGET_HIKARI_MS else SOURCE_BUDGET_MS
                         val found = cancellableCatching {
-                            withTimeoutOrNull(SOURCE_BUDGET_MS) {
-                                com.hikari.app.providers.ProviderGate.withProvider(p.config.id) {
+                            withTimeoutOrNull(budget) {
+                                com.hikari.app.providers.ProviderGate.withProvider(p.config.id, "fg") {
                                     p.getStreams(item, episode)
                                 }
                             }.orEmpty()
@@ -414,7 +428,7 @@ class ContentRepository(private val manager: ProviderManager) {
                     gate.withPermit {
                         val found = cancellableCatching {
                             withTimeoutOrNull(TITLE_BUDGET_MS) {
-                                com.hikari.app.providers.ProviderGate.withProvider(p.config.id) {
+                                com.hikari.app.providers.ProviderGate.withProvider(p.config.id, "fg") {
                                     // No match on this engine = this engine cannot
                                     // serve the title by name either.
                                     val hit = bestMatch(item, p.search(query, 1))

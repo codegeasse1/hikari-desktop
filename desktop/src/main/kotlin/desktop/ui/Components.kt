@@ -355,6 +355,39 @@ object Ui {
         }
     }
 
+    /**
+     * Like [coverImage], but the vertical crop is anchored to the TOP.
+     *
+     * The home/detail heroes are far wider than any backdrop (a ~2.5:1 frame
+     * vs 16:9 art), so every backdrop is cropped top AND bottom by the
+     * centered rule — which is exactly the "heads cut off" look: faces live
+     * in the upper third of key art. Top-anchoring keeps the headroom and the
+     * faces, cropping the empty lower half instead.
+     */
+    fun coverImageTop(view: ImageView, img: Image?, w: Double, h: Double) {
+        view.image = img
+        view.isPreserveRatio = false
+        if (img == null) {
+            view.viewport = null
+            return
+        }
+        val iw = img.width
+        val ih = img.height
+        if (iw <= 0.0 || ih <= 0.0 || w <= 0.0 || h <= 0.0) {
+            view.viewport = null
+            return
+        }
+        val target = w / h
+        val source = iw / ih
+        view.viewport = if (source > target) {
+            val cw = ih * target
+            Rectangle2D((iw - cw) / 2.0, 0.0, cw, ih)
+        } else {
+            val ch = iw / target
+            Rectangle2D(0.0, 0.0, iw, ch)
+        }
+    }
+
     // ---- scroll helpers -----------------------------------------------------
 
     fun vScroll(content: Node, padding: Insets = Insets(Theme.S5, Theme.S5, Theme.S6, Theme.S5)): ScrollPane =

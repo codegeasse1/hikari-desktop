@@ -9,6 +9,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 
 /**
@@ -100,14 +101,16 @@ object Translator {
     }
 
     /** Translates one string to English (returns it unchanged when it can't
-     *  be translated or is already English). */
+     *  be translated or is already English). Bounded: a stalled translate
+     *  endpoint must never hold the shared IO pool hostage while a stream
+     *  lookup is waiting on it. */
     suspend fun translate(text: String): String {
         if (!shouldTranslate(text)) return text
         synchronized(lock) {
             cache[text]?.let { return it }
             if (done.contains(text)) return text
         }
-        val translated = fetch(text)
+        val translated = withTimeoutOrNull(8_000L) { fetch(text) } ?: return text
         if (translated.isBlank() || translated == text) {
             synchronized(lock) { done.add(text) }
             return text

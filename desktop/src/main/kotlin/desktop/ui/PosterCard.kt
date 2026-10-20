@@ -42,6 +42,11 @@ object PosterCard {
         cornerBadge: String? = null,
         showTitle: Boolean = true,
         onMore: ((MediaItem) -> Unit)? = null,
+        /** Cinema mode: a 16:9 frame fed by the LANDSCAPE art (backdrop
+         *  first). Posters are 2:3; stretching one into a wide frame is the
+         *  blurry smeared look — the backdrop is already the right shape and
+         *  usually the higher-resolution file too. */
+        wide: Boolean = false,
     ): VBox {
         val image = ImageView().apply {
             fitWidth = width
@@ -55,7 +60,8 @@ object PosterCard {
             }
         }
         desktop.img.ImageLoader.loadAsync(
-            desktop.img.ImageLoader.artFor(item.posterUrl, item.backdropUrl),
+            if (wide) desktop.img.ImageLoader.artFor(item.backdropUrl, item.posterUrl)
+            else desktop.img.ImageLoader.artFor(item.posterUrl, item.backdropUrl),
             // Cover-crop instead of `preserveRatio`: a 2:3 frame should be
             // filled edge to edge. With the ratio preserved, a source that is
             // not exactly 2:3 (a wide backdrop standing in for a missing

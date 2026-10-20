@@ -15,6 +15,7 @@ import com.hikari.ext.HikariMediaType
 import com.hikari.ext.HikariProvider
 import com.hikari.ext.HikariStream
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 
 /**
@@ -28,6 +29,32 @@ class HikariProviderAdapter(override val config: ProviderConfig) : ContentProvid
     private var loadedProvider: HikariProvider? = null
     @Volatile
     private var providerResolved = false
+
+    /** Why the last [getStreams] call came back empty — surfaced on the
+     *  detail screen's empty state instead of a silent "no playable source". */
+    @Volatile
+    private var lastErr: String? = null
+
+    override fun lastStreamError(): String? = lastErr
+
+    /**
+     * The extension's provider, waiting briefly for a mid-load extension.
+     *
+     * The desktop used to read the provider exactly once: when the extension
+     * was still loading (right after install, or while the plugin manager was
+     * translating its first classes) the lookup got an instant null and the
+     * title showed "no playable source" until a restart. The Android app waits
+     * ~2.5s for a provider that is still coming up — this is that wait: ten
+     * quarter-second polls, then the null stands.
+     */
+    private suspend fun awaitProvider(): HikariProvider? {
+        provider?.let { return it }
+        repeat(10) {
+            delay(250)
+            provider?.let { return it }
+        }
+        return provider
+    }
 
     /** The extension's provider, resolved on first access. Only a SUCCESS is
      *  cached — a transient failure (extension still loading, a one-off hiccup)
@@ -48,10 +75,11 @@ class HikariProviderAdapter(override val config: ProviderConfig) : ContentProvid
         }
 
     override suspend fun catalogs(): List<CatalogRef> = withContext(Dispatchers.IO) {
-        val p = provider
+        val p = awaitProvider()
         if (p == null) {
             val err = com.hikari.app.hiki.HikariPluginManager.lastError
                 ?: com.hikari.app.cs3.Cs3PluginManager.lastError
+            lastErr = "extension still loading — try again in a moment"
             com.hikari.app.util.LiveLogs.error("catalog/${config.name}",
                 "HIKARI provider did not resolve — no catalog rows. ${err ?: "no error captured"}")
             return@withContext emptyList()
@@ -73,23 +101,26 @@ class HikariProviderAdapter(override val config: ProviderConfig) : ContentProvid
     }
 
     override suspend fun getCatalog(ref: CatalogRef, page: Int): List<MediaItem> =
-        provider?.getCatalog(HikariCatalog(ref.id, ref.name, ref.type.toExt(), ref.rawType), page)
-            ?.map { it.toApp(config.id) }
-            ?: emptyList()
+        (awaitProvider()?.let {
+            runCatching {
+                it.getCatalog(HikariCatalog(ref.id, ref.name, ref.type.toExt(), ref.rawType), page)
+            }.getOrNull()
+        }.orEmpty()).map { it.toApp(config.id) }
 
     override suspend fun search(query: String, page: Int): List<MediaItem> =
-        provider?.search(query, page)?.map { it.toApp(config.id) }
-            ?: emptyList()
+        (awaitProvider()?.let {
+            runCatching { it.search(query, page) }.getOrNull()
+        }.orEmpty()).map { it.toApp(config.id) }
 
     override suspend fun getMeta(item: MediaItem): MediaItem {
-        val p = provider ?: return item
-        return p.getMeta(item.toExt()).toApp(config.id)
+        val p = awaitProvider() ?: return item
+        return runCatching { p.getMeta(item.toExt()) }.getOrNull()?.toApp(config.id) ?: item
     }
 
     override suspend fun getEpisodes(item: MediaItem): List<Episode>? {
-        val p = provider ?: return null
+        val p = awaitProvider() ?: return null
         if (item.type == MediaType.MOVIE) return null
-        return p.getEpisodes(item.toExt())?.map { ep ->
+        return runCatching { p.getEpisodes(item.toExt()) }.getOrNull()?.map { ep ->
             val base = ep.name ?: "Episode ${ep.number}"
             Episode(
                 number = ep.number,
@@ -101,9 +132,26 @@ class HikariProviderAdapter(override val config: ProviderConfig) : ContentProvid
     }
 
     override suspend fun getStreams(item: MediaItem, episode: Episode?): List<StreamSource> {
-        val p = provider ?: return emptyList()
+        val p = awaitProvider()
+        if (p == null) {
+            lastErr = "extension still loading — try again in a moment"
+            return emptyList()
+        }
         val ep = episode?.let { HikariEpisode(it.number, it.id, it.name, it.image) }
-        return p.getStreams(item.toExt(), ep).map { it.toApp() }
+        val streams = try {
+            p.getStreams(item.toExt(), ep)
+        } catch (t: Throwable) {
+            lastErr = (t.message?.take(200) ?: t.javaClass.simpleName)
+            com.hikari.app.util.LiveLogs.error("streams/${config.name}",
+                "getStreams() threw: ${t.javaClass.simpleName}: ${t.message}", t)
+            return emptyList()
+        }
+        if (streams.isEmpty()) {
+            lastErr = "no streams returned for this title"
+        } else {
+            lastErr = null
+        }
+        return streams.map { it.toApp() }
     }
 
     // ---- conversions ----

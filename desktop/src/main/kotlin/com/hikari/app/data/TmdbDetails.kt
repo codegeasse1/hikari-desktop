@@ -60,6 +60,9 @@ object TmdbDetails {
         val certification: String,
         val runtime: String,
         val seasons: Int,
+        /** TMDB poster files (w500) — the high-quality art the home cinema
+         *  cards upgrade to when a provider only serves a thumbnail. */
+        val posters: List<String> = emptyList(),
     ) {
         /** Plain cast names — the old banner "Starring" line. */
         val castNames: List<String> get() = cast.map { it.name }
@@ -107,6 +110,7 @@ object TmdbDetails {
             val studios = parseStudios(details)
             val backdrops = parseBackdrops(imagesD.await())
             val logo = parseLogo(imagesD.await())
+            val posters = parsePosters(imagesD.await())
             val trailers = parseTrailers(videosD.await())
             val certification = parseCertification(certD.await(), resolved.mediaType)
             val runtime = parseRuntime(details, resolved.mediaType)
@@ -130,6 +134,7 @@ object TmdbDetails {
                 certification = certification,
                 runtime = runtime,
                 seasons = seasons,
+                posters = posters,
             )
         }
     }
@@ -149,7 +154,7 @@ object TmdbDetails {
                         number = e.optInt("episode_number", i + 1),
                         name = e.optString("name"),
                         overview = e.optString("overview"),
-                        stillUrl = img(e.optString("still_path"), "w300"),
+                        stillUrl = img(e.optString("still_path"), "w780"),
                         rating = e.optDouble("vote_average", 0.0),
                     )
                 )
@@ -216,8 +221,7 @@ object TmdbDetails {
         return paths.sortedByDescending { it.first }.take(8).mapNotNull { img(it.second, "w1280") }
     }
 
-    private fun parseLogo(images: JSONObject?): String? {
-        val arr = images?.optJSONArray("logos") ?: return null
+    private fun parseLogo(images: JSONObject?): String? {        val arr = images?.optJSONArray("logos") ?: return null
         var fallback: String? = null
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
@@ -228,6 +232,17 @@ object TmdbDetails {
             if (lang == "en" || lang.isBlank() || lang == "null") return img(p, "w500")
         }
         return img(fallback, "w500")
+    }
+
+    private fun parsePosters(images: JSONObject?): List<String> {
+        val arr = images?.optJSONArray("posters") ?: return emptyList()
+        val paths = ArrayList<Pair<Double, String>>()
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val p = o.optString("file_path")
+            if (p.isNotBlank()) paths.add(o.optDouble("vote_average", 0.0) to p)
+        }
+        return paths.sortedByDescending { it.first }.take(4).mapNotNull { img(it.second, "w500") }
     }
 
     private fun parseTrailers(videos: JSONObject?): List<Trailer> {

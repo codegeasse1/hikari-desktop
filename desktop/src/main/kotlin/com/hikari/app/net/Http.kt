@@ -903,6 +903,12 @@ object Http {
     private fun slowClient(pass: NetPass): OkHttpClient =
         cached("s-" + pass.key) { buildClient(pass.tls12, pass.noProxy, 20_000L, 30_000L) }
 
+    /** Single-shot client for the install fast path: a host that served before
+     *  gets one direct ask on a short budget instead of a twenty-way fanout. */
+    private val fastClient: OkHttpClient by lazy {
+        cached("fast-direct") { buildClient(false, false, 4_000L, 8_000L) }
+    }
+
     /** One client per (pass, timeout) pair, built once. */
     private fun cached(key: String, build: () -> OkHttpClient): OkHttpClient {
         clientCache[key]?.let { return it }
@@ -2892,6 +2898,30 @@ object Http {
         // so trailing-lambda callers keep binding their lambda to [onAttempt].
         val origins = MirrorMemory.order(url, originVariants(url)).map { withCacheBuster(it, cacheBuster) }
         val ordered = origins + MirrorMemory.order(url, mirrorVariants(url)).map { withCacheBuster(it, cacheBuster) }
+        // Fast path: when a previous install already learned which mirror
+        // serves this file, ask exactly that host once on a short budget
+        // instead of fanning out twenty parallel TLS handshakes. On a healthy
+        // network that is the difference between "click… installed" and a
+        // 6-7 second spinner; on any failure the full race below runs as
+        // before, so this can only ever skip work, never lose it.
+        runCatching {
+            val winner = MirrorMemory.winnerFor(url)?.let { withCacheBuster(it, cacheBuster) }
+            if (winner != null && !MirrorMemory.isDead(winner)) {
+                sweepParts(dest)
+                val part = partOf(dest, "$winner|fast")
+                val headers = NO_CACHE_HEADERS + headers
+                val reason = downloadToReason(winner, part, headers, onProgress, fastClient)
+                if (reason == null && !looksLikeHtmlFile(part) && verify?.invoke(part, winner) == null) {
+                    dest.delete()
+                    if (part.renameTo(dest) || (part.copyTo(dest, overwrite = true).let { part.delete(); true })) {
+                        MirrorMemory.markAlive(winner)
+                        onAttempt?.invoke(winner, true, null)
+                        return true
+                    }
+                }
+                runCatching { part.delete() }
+            }
+        }
         // Overall budget: on a black-hole network every mirror costs a full
         // connect timeout; bound the walk so the UI doesn't sit for minutes
         // (the Android app caps installs at 90s for the same reason).

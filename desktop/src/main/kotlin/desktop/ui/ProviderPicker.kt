@@ -91,7 +91,7 @@ class ProviderPicker(private val onPick: () -> Unit) {
         // scrolls instead (see HomeScreen), which is what keeps "Anime · Animeko"
         // from being drawn as "Anim…".
         minWidth = javafx.scene.layout.Region.USE_PREF_SIZE
-        maxWidth = 420.0
+        maxWidth = 560.0
         setOnAction { toggle() }
     }
 
@@ -309,6 +309,10 @@ class ProviderPicker(private val onPick: () -> Unit) {
         val cached = countCache[p.id]
         return Label(countText(p, cached)).apply {
             styleClass.add("x-pd-sub2")
+            // The origin ("Hikari · owner/repo") is the whole point of the
+            // sub-line — it wraps onto two lines instead of drawing as "…".
+            isWrapText = true
+            minWidth = 0.0
             countLabels[p.id] = this
         }
     }
@@ -378,7 +382,7 @@ class ProviderPicker(private val onPick: () -> Unit) {
         }
         // "All providers" first: every enabled provider, no filter.
         val allName = Label(ALL).apply { styleClass.add("x-pd-name"); isWrapText = true; minWidth = 0.0 }
-        val allSub = Label("every enabled provider").apply { styleClass.add("x-pd-sub2") }
+        val allSub = Label("every enabled provider").apply { styleClass.add("x-pd-sub2"); isWrapText = true; minWidth = 0.0 }
         val allTexts = VBox(3.0, allName, allSub).apply { minWidth = 0.0 }
         HBox.setHgrow(allTexts, Priority.ALWAYS)
         val allCard = HBox(12.0, badgeFor("All", Icons.GRID), allTexts, Icons.of(Icons.SLIDERS, 17.0).apply { opacity = 0.75 }).apply {
@@ -468,7 +472,7 @@ class ProviderPicker(private val onPick: () -> Unit) {
     private fun activeRow(index: Int, total: Int, p: ProviderConfig): HBox {
         val num = Label("${index + 1}.").apply { styleClass.add("x-pd-num") }
         val name = Label(p.name).apply { styleClass.add("x-pd-name"); isWrapText = true; minWidth = 0.0 }
-        val sub = Label("Catalogs: all active").apply { styleClass.add("x-pd-sub2") }
+        val sub = Label("Catalogs: all active").apply { styleClass.add("x-pd-sub2"); isWrapText = true; minWidth = 0.0 }
         val texts = VBox(3.0, name, sub).apply { minWidth = 0.0 }
         HBox.setHgrow(texts, Priority.ALWAYS)
         val up = Ui.iconButton(Icons.ARROW_UP, "Move up", 14.0) {

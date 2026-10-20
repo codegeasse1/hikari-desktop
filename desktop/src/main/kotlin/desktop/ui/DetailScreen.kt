@@ -148,8 +148,8 @@ class DetailScreenView(private val item: MediaItem) {
         val w = hero.width
         val h = hero.height
         if (w > 0 && h > 0) {
-            Ui.coverImage(heroBgA, heroArtA, w, h)
-            Ui.coverImage(heroBgB, heroArtB, w, h)
+            Ui.coverImageTop(heroBgA, heroArtA, w, h)
+            Ui.coverImageTop(heroBgB, heroArtB, w, h)
         }
     }
 
@@ -157,13 +157,13 @@ class DetailScreenView(private val item: MediaItem) {
         paintHeroBg()
         if (heroFgA) {
             heroArtB = img
-            Ui.coverImage(heroBgB, img, hero.width, hero.height)
+            Ui.coverImageTop(heroBgB, img, hero.width, hero.height)
             Ui.fade(heroBgB, 1.0, 700.0)
             heroFgA = false
             Timeline(KeyFrame(Duration.millis(750.0), EventHandler { heroBgA.opacity = 0.0; heroArtA = img })).play()
         } else {
             heroArtA = img
-            Ui.coverImage(heroBgA, img, hero.width, hero.height)
+            Ui.coverImageTop(heroBgA, img, hero.width, hero.height)
             Ui.fade(heroBgA, 1.0, 700.0)
             heroFgA = true
             Timeline(KeyFrame(Duration.millis(750.0), EventHandler { heroBgB.opacity = 0.0; heroArtB = img })).play()
@@ -1065,9 +1065,13 @@ class DetailScreenView(private val item: MediaItem) {
         // Anti-spoiler BLURS the still, it never removes it: the card keeps
         // its artwork with a heavy gaussian blur, and the big number behind
         // only shows when there is no artwork at all.
-        val imgUrl = (ep.image?.takeIf { it.isNotBlank() } ?: still?.stillUrl)
+        // TMDB's high-resolution still first (w780), the provider's thumbnail
+        // only as the fallback — provider stills are low-resolution thumbs,
+        // and the TMDB file is the same episode in full quality.
+        val imgUrl = still?.stillUrl?.takeIf { it.isNotBlank() }
+            ?: (ep.image?.takeIf { it.isNotBlank() }
             ?: meta.backdropUrl?.takeIf { it.isNotBlank() }
-            ?: meta.posterUrl?.takeIf { it.isNotBlank() }
+            ?: meta.posterUrl?.takeIf { it.isNotBlank() })
         // Big number behind the still: titles without any artwork (a provider
         // with no images that TMDB cannot resolve either) still read as episode
         // cards instead of empty black boxes — the still covers it when one loads.
@@ -1090,7 +1094,7 @@ class DetailScreenView(private val item: MediaItem) {
         if (!imgUrl.isNullOrBlank()) {
             desktop.img.ImageLoader.loadAsync(imgUrl, onReady = { img ->
                 if (img != null) Ui.coverImage(art, img, EP_CARD_W, EP_STILL_H)
-            }, w = 480, h = 270)
+            }, w = 960, h = 540)
         } else {
             art.styleClass.add("x-ep-ph")
         }
@@ -1276,7 +1280,7 @@ class DetailScreenView(private val item: MediaItem) {
             val gen = ++bgGen
             desktop.img.ImageLoader.loadAsync(d.backdrops.first(), onReady = { img ->
                 if (img != null && gen == bgGen) crossfadeHero(img)
-            }, w = 1600, h = 900)
+            }, w = 1920, h = 1080)
             startBgTimer()
         } else {
             paintProviderArt()

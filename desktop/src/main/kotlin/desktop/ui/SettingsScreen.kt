@@ -30,6 +30,7 @@ class SettingsScreenView {
     fun onShown() {
         val children = mutableListOf<Region>(
             playbackSection(),
+            homeSection(),
             appearanceSection(),
             browserSection(),
             updatesSection(),
@@ -74,8 +75,36 @@ class SettingsScreenView {
         )
     }
 
-    private fun crashSection(): Region? {
-        val crash = HikariApp.lastCrash ?: return null
+    /**
+     * Home catalog layout: cinema (16:9 landscape cards, the default — the
+     * right shape for a PC window, fed by high-quality TMDB backdrop art) or
+     * poster (classic vertical 2:3 posters). Applies on the next Home load.
+     */
+    private fun homeSection(): Region {
+        val current = app.store.homeLayout()
+        val seg = Ui.segmented(listOf("Cinema", "Poster"), if (current == "poster") 1 else 0) { picked ->
+            app.store.setHomeLayout(if (picked == 1) "poster" else "cinema")
+            AppShell.toast(
+                if (picked == 1) "Home catalogs show as posters"
+                else "Home catalogs show as cinema cards",
+                "ok",
+            )
+        }
+        val note = Theme.label(
+            "Cinema cards are 16:9 and use landscape artwork (TMDB backdrops where " +
+                "available), so rows look right on a wide PC window. Poster keeps " +
+                "the classic vertical cards.",
+            size = 11.5,
+            dim = true,
+        ).apply { isWrapText = true }
+        return Ui.panel(
+            Ui.sectionHeader("Home", "How the catalog rows look"),
+            labelled("Catalog layout", seg),
+            note,
+        )
+    }
+
+    private fun crashSection(): Region? {        val crash = HikariApp.lastCrash ?: return null
         return Ui.panel(
             Ui.sectionHeader("Last crash", "Recorded from the previous session"),
             Theme.label(crash, size = 11.5).apply {
