@@ -106,6 +106,62 @@ object HlsRelay {
                     targetUrl = root.resolve(segKey).toString()
                 }
             }
+            val playlistTarget = parts.size == 1 && isPlaylistUrl(targetUrl)
+            // mpv ranges its FIRST read of everything (its 128KB probe) —
+            // playlists included. A ranged playlist answer used to be served
+            // raw ("a ranged answer is ALWAYS bytes"), handing mpv the
+            // original CDN URLs and killing the stream on the direct-fetch
+            // path (observed: relay answers code=206 type=text/plain, then a
+            // direct .ts open and a mid-open crash). So playlist targets are
+            // ALWAYS served from rewritten bytes: cached when possible, else
+            // fetched whole (no Range upstream) and rewritten, with mpv's
+            // Range answered from the rewritten bytes below.
+            if (playlistTarget && !isHead) {
+                masterCache[targetUrl]?.let { cached ->
+                    serveRangeBytes(ex, cached, "application/vnd.apple.mpegurl", incomingRange)
+                    return
+                }
+                val got = try {
+                    Http.relayFetchRetrying(targetUrl, effectiveHeaders(route.headers, targetUrl), null, false)
+                } catch (e: Exception) {
+                    ex.sendResponseHeaders(502, -1)
+                    ex.close()
+                    return
+                }
+                if (!got.isSuccessful && got.code != 206) {
+                    val code = got.code
+                    got.close()
+                    ex.sendResponseHeaders(code, -1)
+                    ex.close()
+                    return
+                }
+                val gotCode = got.code
+                val gotRange = got.header("Content-Range")
+                val gct = got.header("Content-Type") ?: "application/octet-stream"
+                val gbody = readCapped(runCatching { got.body?.byteStream() }.getOrNull(), 2_000_001L)
+                got.close()
+                val complete = gbody != null &&
+                    (gotCode != 206 || contentRangeComplete(gotRange, gbody.size))
+                if (complete && gbody != null) {
+                    val text = playlistTextOf(gbody)
+                    if (text.startsWith("#EXTM3U")) {
+                        val rewritten = rewritePlaylist(text, targetUrl, route.headers)
+                        val bytes = rewritten.toByteArray(StandardCharsets.UTF_8)
+                        if (text.contains("#EXT-X-ENDLIST")) {
+                            if (masterCache.size > 150) masterCache.clear()
+                            masterCache[targetUrl] = bytes
+                        }
+                        serveRangeBytes(ex, bytes, "application/vnd.apple.mpegurl", incomingRange)
+                        return
+                    }
+                    // Suffix said playlist but it isn't one: serve what we
+                    // read, still honoring mpv's Range.
+                    serveRangeBytes(ex, gbody, gct, incomingRange)
+                    return
+                }
+                // Over-cap body or a genuinely partial 206: fall through to
+                // ranged byte passthrough below.
+            }
             val resp = try {
                 // Edges hiccup: one failed segment kills the whole stream in
                 // mpv, while a retry usually sails through (403/404 stay final
@@ -141,8 +197,11 @@ object HlsRelay {
             }
             val body = resp.body
             val ct = resp.header("Content-Type") ?: "application/octet-stream"
-            // A ranged answer is ALWAYS bytes: playlists are never fetched with
-            // Range, and rewriting a partial playlist as a full one corrupts it.
+            // A ranged answer is USUALLY bytes: segments are never rewritten,
+            // and rewriting a partial playlist as a full one corrupts it —
+            // except playlist targets (handled above: mpv ranges its first
+            // read of everything, so a playlist 206 must be rewritten, not
+            // passed through) and the whole-in-206 case handled below.
             // Otherwise a playlist is recognised by CONTENT, not just by
             // headers: some CDNs serve their variant playlists as
             // application/octet-stream (or text/plain) on extensionless URLs.
@@ -159,10 +218,7 @@ object HlsRelay {
             val sniffBytes = if (!ranged && !isDefinitiveMedia(ct)) sniffablePlaylistBytes(resp, targetUrl) else null
             if (sniffBytes != null) {
                 resp.close()
-                val rawText = sniffBytes.toString(StandardCharsets.UTF_8).trimStart()
-                // A UTF-8 BOM defeats the #EXTM3U check (Kotlin's trimStart
-                // does not strip U+FEFF): drop it by code, not by literal.
-                val text = if (rawText.firstOrNull()?.code == 0xFEFF) rawText.drop(1) else rawText
+                val text = playlistTextOf(sniffBytes)
                 if (!text.startsWith("#EXTM3U")) {
                     // Looked sniffable but isn't a playlist (an extensionless
                     // MP4/CDN answer): serve the bytes we already read instead of
@@ -191,6 +247,37 @@ object HlsRelay {
                 ex.sendResponseHeaders(200, bytes.size.toLong())
                 ex.responseBody.use { it.write(bytes) }
                 return
+            }
+            // A 206 that carries the WHOLE body (small CDNs answer a range
+            // probe with the full file in 206 clothing) is sniffable after
+            // all — this is what catches extensionless variant playlists mpv
+            // ranged, which have no .m3u8 suffix for the playlist path above.
+            // A genuinely partial 206 keeps streaming below.
+            if (resp.code == 206 && !isDefinitiveMedia(ct)) {
+                val cr = parseContentRange(resp.header("Content-Range"))
+                if (cr != null && cr.first == 0L && cr.second + 1 == cr.third && cr.third in 1..2_000_000L) {
+                    val total = cr.third
+                    val whole = readCapped(body?.byteStream(), total + 1)
+                    resp.close()
+                    if (whole != null && whole.size == total.toInt()) {
+                        val text = playlistTextOf(whole)
+                        if (text.startsWith("#EXTM3U")) {
+                            val rewritten = rewritePlaylist(text, targetUrl, route.headers)
+                                .toByteArray(StandardCharsets.UTF_8)
+                            if (text.contains("#EXT-X-ENDLIST")) {
+                                if (masterCache.size > 150) masterCache.clear()
+                                masterCache[targetUrl] = rewritten
+                            }
+                            serveRangeBytes(ex, rewritten, "application/vnd.apple.mpegurl", incomingRange)
+                        } else {
+                            serveRangeBytes(ex, whole, ct, incomingRange)
+                        }
+                    } else {
+                        ex.sendResponseHeaders(502, -1)
+                        ex.close()
+                    }
+                    return
+                }
             }
             // Bytes (segments, MP4, keys): pass the upstream status and range
             // headers through so seeks work, then stream without buffering.
@@ -233,6 +320,82 @@ object HlsRelay {
             "${u.scheme}://${u.host}/"
         }.getOrNull() ?: return recorded
         return HashMap(recorded).apply { put("Referer", origin) }
+    }
+
+    /** URL paths that name a playlist (query stripped). Ranged reads of
+     *  these are answered from the rewritten playlist, never raw. */
+    private fun isPlaylistUrl(url: String): Boolean {
+        val path = url.substringBefore('?').substringBefore('#').lowercase()
+        return path.endsWith(".m3u8") || path.endsWith(".m3u") || path.endsWith(".txt")
+    }
+
+    /** Playlist text from raw bytes: whitespace- and BOM-tolerant, so the
+     *  #EXTM3U check can't miss on encoding trivia (Kotlin's trimStart does
+     *  not strip U+FEFF, so it is dropped by code, not by literal). */
+    private fun playlistTextOf(raw: ByteArray): String {
+        val t = raw.toString(StandardCharsets.UTF_8).trimStart()
+        return if (t.firstOrNull()?.code == 0xFEFF) t.drop(1) else t
+    }
+
+    /** Parses `bytes S-E/T`; null when absent or open-ended (`bytes S-E/star`). */
+    private fun parseContentRange(h: String?): Triple<Long, Long, Long>? {
+        val m = Regex("""bytes\s+(\d+)-(\d+)/(\d+)""").find(h ?: "") ?: return null
+        val (s, e, t) = m.destructured
+        return Triple(s.toLongOrNull() ?: return null, e.toLongOrNull() ?: return null, t.toLongOrNull() ?: return null)
+    }
+
+    /** True when a 206's Content-Range proves the body arrived whole
+     *  (`bytes 0-N/N+1`) and matches what was read: sniffable like a 200. */
+    private fun contentRangeComplete(h: String?, bodySize: Int): Boolean {
+        val cr = parseContentRange(h) ?: return false
+        return cr.first == 0L && cr.second + 1 == cr.third &&
+            cr.third == bodySize.toLong() && cr.third in 1..2_000_000L
+    }
+
+    /** Reads at most [cap] bytes; null when the stream is longer (the body
+     *  is bigger than any playlist — don't buffer it, stream it instead). */
+    private fun readCapped(input: java.io.InputStream?, cap: Long): ByteArray? {
+        if (input == null) return ByteArray(0)
+        val out = java.io.ByteArrayOutputStream()
+        val buf = ByteArray(8192)
+        var total = 0L
+        input.use {
+            while (true) {
+                val n = it.read(buf)
+                if (n < 0) break
+                total += n
+                if (total > cap) return null
+                out.write(buf, 0, n)
+            }
+        }
+        return out.toByteArray()
+    }
+
+    /** Answers mpv's `Range` from already-read bytes (rewritten playlists or
+     *  whole-in-206 bodies): 206 + Content-Range when the range fits, 200
+     *  full otherwise — mpv copes with either, while a 416 would stall it. */
+    private fun serveRangeBytes(
+        ex: HttpExchange,
+        bytes: ByteArray,
+        contentType: String,
+        range: String?,
+    ) {
+        ex.responseHeaders.set("Content-Type", contentType)
+        ex.responseHeaders.set("Accept-Ranges", "bytes")
+        val m = range?.let { Regex("""bytes=(\d+)-(\d*)""").find(it.trim()) }
+        val start = m?.groupValues?.getOrNull(1)?.toLongOrNull()
+        if (m != null && start != null && start >= 0 && start < bytes.size) {
+            val end = m.groupValues.getOrNull(2)?.toLongOrNull()
+                ?.takeIf { it >= start }?.coerceAtMost(bytes.size - 1L)
+                ?: (bytes.size - 1L)
+            val len = end - start + 1
+            ex.responseHeaders.set("Content-Range", "bytes $start-$end/${bytes.size}")
+            ex.sendResponseHeaders(206, len)
+            ex.responseBody.use { it.write(bytes, start.toInt(), len.toInt()) }
+            return
+        }
+        ex.sendResponseHeaders(200, bytes.size.toLong())
+        ex.responseBody.use { it.write(bytes) }
     }
 
     /** True for content types that are never playlists: video/audio bytes
