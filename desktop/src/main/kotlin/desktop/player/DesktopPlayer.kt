@@ -113,6 +113,40 @@ object DesktopPlayer {
      */
     private const val DOA_MS = 5_000L
 
+    /**
+     * Video-output profiles, tried in order when mpv dies on arrival.
+     *
+     * "auto" is today's command line. "nohwdec" keeps the GPU output but
+     * decodes on the CPU (a crashing hardware decoder dies here, not on the
+     * stream). "sdl" additionally drops the GPU video output entirely for a
+     * machine whose GPU context creation itself crashes — the reported case
+     * where mpv's log stops inside vo/gpu-next with no stream error. A
+     * profile whose flags this mpv build does not know exits instantly with
+     * an error, which the dead-on-arrival path below reads as "try the next
+     * one" — an unknown flag can never hang or mislead, it only fails fast.
+     */
+    private data class VoProfile(val name: String, val args: List<String>)
+
+    private val VO_PROFILES = listOf(
+        VoProfile("auto", emptyList()),
+        VoProfile("nohwdec", listOf("--hwdec=no")),
+        VoProfile("sdl", listOf("--hwdec=no", "--vo=sdl")),
+    )
+
+    /** The profile this launch should start on: the last one that showed a
+     *  picture on this machine, or "auto" when none has yet. */
+    private fun startVoIdx(): Int {
+        val want = runCatching { desktop.ui.AppShell.app.store.playerVo() }.getOrDefault("auto")
+        return VO_PROFILES.indexOfFirst { it.name == want }.takeIf { it >= 0 } ?: 0
+    }
+
+    /** Remembers a profile that showed a picture, so the next Play starts
+     *  there instead of rediscovering the crash. */
+    private fun persistVo(idx: Int) {
+        val name = VO_PROFILES.getOrNull(idx)?.name ?: return
+        runCatching { desktop.ui.AppShell.app.store.setPlayerVo(name) }
+    }
+
     /** When the current launch's process started (for [DOA_MS]). */
     @Volatile private var launchStartedAt = 0L
 
@@ -269,7 +303,7 @@ object DesktopPlayer {
         runCatching { PlayerWindow.setSources(sources) }
     }
 
-    fun playFile(title: String, path: String) {
+    fun playFile(title: String, path: String, voIdx: Int = -1) {
         onEnded = null
         onPosition = null
         sourceList = emptyList()
@@ -304,6 +338,7 @@ object DesktopPlayer {
             runCatching { ipc?.close() }
             ipc = null
             ipcTarget = openIpcEndpoint()
+            val vo = if (voIdx in VO_PROFILES.indices) voIdx else startVoIdx()
             runCatching { PlayerWindow.parkSurface() }
             // Park the previous stream's window FIRST (it belongs to the old mpv,
             // which is killed below): a killed process can take a moment to let go
@@ -356,6 +391,8 @@ object DesktopPlayer {
                 mpvInputConf()?.let { add("--input-conf=$it") }
                 add("--title=" + title.take(200).replace('\n', ' '))
                 ipcArg()?.let { add(it) }
+                // Same cascade as the stream path (see [VO_PROFILES]).
+                addAll(VO_PROFILES[vo].args)
                 add(file.absolutePath)
             }
             val p = runCatching { ProcessBuilder(args).redirectErrorStream(true).start() }.getOrNull()
@@ -381,8 +418,9 @@ object DesktopPlayer {
             // If the player dies under a live window, recover instead of showing
             // a black rectangle (see PlayerWindow.onPlayerDied).
             PlayerWindow.onPlayerDied = {
-                recoverFromPlayerDeath(title, StreamSource(name = title, url = path), null, 0, path)
+                recoverFromPlayerDeath(title, StreamSource(name = title, url = path), null, 0, path, vo)
             }
+            PlayerWindow.onVideoUp = { persistVo(vo) }
             val localStartedAt = System.currentTimeMillis()
             Thread(
                 {
@@ -395,11 +433,17 @@ object DesktopPlayer {
                         Fx.run { if (proc === p) stopPlayback() }
                     } else if (code != 0 && !p.isAlive) {
                         // Dead-on-arrival even for a local file: the player
-                        // failed to START, so the file is innocent — say that
-                        // instead of a generic error.
+                        // failed to START, so the file is innocent — first the
+                        // next safer video output (see [VO_PROFILES]), and
+                        // only the exhausted cascade says that on screen.
                         val doa = isDeadOnArrival(localStartedAt)
                         Fx.run {
                             if (dialogShown) return@run
+                            if (doa && vo + 1 < VO_PROFILES.size) {
+                                PlayerWindow.setStatus("Trying a safer video output…", busy = true)
+                                playFile(title, path, vo + 1)
+                                return@run
+                            }
                             dialogShown = true
                             showBrowserFallback(
                                 title, path,
@@ -444,13 +488,14 @@ object DesktopPlayer {
         refresh: (() -> StreamSource?)?,
         attemptsLeft: Int,
         failedOver: Boolean = false,
+        voIdx: Int = -1,
     ) {
         // The startup probe blocks (spawns a process and waits): never run it
         // on the FX thread — callers inside Fx.run land here too, so they are
         // offloaded to a launcher thread and the rest runs as before.
         if (javafx.application.Platform.isFxApplicationThread()) {
             Thread(
-                { launchMpv(title, stream, refresh, attemptsLeft, failedOver) },
+                { launchMpv(title, stream, refresh, attemptsLeft, failedOver, voIdx) },
                 "hikari-play-launch",
             ).apply { isDaemon = true; start() }
             return
@@ -489,6 +534,9 @@ object DesktopPlayer {
             ipc = null
             ipcTarget = openIpcEndpoint()
             val gen = ++launchGen
+            // The video-output profile for this attempt: an explicit cascade
+            // step, or the last profile that showed a picture on this machine.
+            val vo = if (voIdx in VO_PROFILES.indices) voIdx else startVoIdx()
             val url = com.hikari.app.net.Http.sanitizeStreamUrl(stream.url)
             val signed = isSignedStreamUrl(url)
             // The app's own player layer comes up FIRST: it is the window the
@@ -602,6 +650,9 @@ object DesktopPlayer {
                     }
                 }
                 if (!hasUA) add("--user-agent=" + com.hikari.app.net.Http.UA)
+                // The cascade step's output flags (none for "auto"). See
+                // [VO_PROFILES]: a dead GPU path is retried safer, not shown.
+                addAll(VO_PROFILES[vo].args)
                 add(playUrl)
             }
             val p = runCatching { ProcessBuilder(args).redirectErrorStream(true).start() }.getOrNull()
@@ -631,7 +682,8 @@ object DesktopPlayer {
             attachPlayerWindow(title)
             // If the player dies under a live window, recover instead of showing
             // a black rectangle (see PlayerWindow.onPlayerDied).
-            PlayerWindow.onPlayerDied = { recoverFromPlayerDeath(title, stream, refresh, attemptsLeft, url) }
+            PlayerWindow.onPlayerDied = { recoverFromPlayerDeath(title, stream, refresh, attemptsLeft, url, vo) }
+            PlayerWindow.onVideoUp = { persistVo(vo) }
             // Only the FIRST explanation per launch shows: the mpv error path and
             // the stream probe both try to explain a dead player, never both.
             dialogShown = false
@@ -662,7 +714,7 @@ object DesktopPlayer {
                             // either away with a silent relaunch.
                             if (myGen != launchGen || proc !== myProc) return@run
                             if (PlayerWindow.messageVisible()) return@run
-                            launchMpv(title, stream, refresh, attemptsLeft, failedOver = true)
+                            launchMpv(title, stream, refresh, attemptsLeft, failedOver = true, voIdx = vo)
                         }
                     },
                     "hikari-play-failover",
@@ -679,7 +731,14 @@ object DesktopPlayer {
                     {
                         val startedAt = System.currentTimeMillis()
                         var saidStillTrying = false
-                        val deadline = startedAt + 45_000
+                        var deadline = startedAt + 45_000
+                        // A stream that is still arriving is slow, not stuck:
+                        // while mpv keeps showing signs of life the deadline
+                        // keeps moving (capped), so a slow CDN can never earn
+                        // a "no picture came up" dialog. The reported "it
+                        // showed Retry, then played by itself" was this watch
+                        // giving up seconds before the picture arrived.
+                        val hardCap = startedAt + 150_000
                         while (System.currentTimeMillis() < deadline) {
                             Thread.sleep(500)
                             if (proc !== p || !p.isAlive) return@Thread
@@ -689,6 +748,18 @@ object DesktopPlayer {
                             // came up" would be a second, wrong reason for the
                             // same thing.
                             if (!PlayerWindow.isEmbedded()) return@Thread
+                            // Still arriving: move the deadline out instead of
+                            // failing. The status line says so, honestly.
+                            if (System.currentTimeMillis() - PlayerWindow.lastProgressAt() < 10_000 &&
+                                deadline < hardCap
+                            ) {
+                                deadline = minOf(System.currentTimeMillis() + 30_000, hardCap)
+                                Fx.run {
+                                    if (proc === p && !PlayerWindow.hasVideo()) {
+                                        PlayerWindow.setStatus("Still opening the stream…", busy = true)
+                                    }
+                                }
+                            }
                             // The file is open and there is still nothing to
                             // show: the wait is over, and it failed.
                             if (PlayerWindow.isLoaded()) break
@@ -733,7 +804,7 @@ object DesktopPlayer {
                                 val fresh = runCatching { refresh() }.getOrNull()
                                 if (fresh != null && fresh.url.isNotBlank()) {
                                     PlayerWindow.setStatus("Still opening the stream…", busy = true)
-                                    launchMpv(title, fresh, refresh, attemptsLeft - 1, failedOver)
+                                    launchMpv(title, fresh, refresh, attemptsLeft - 1, failedOver, voIdx = vo)
                                     return@run
                                 }
                             }
@@ -777,6 +848,20 @@ object DesktopPlayer {
                         // a fresh link for it) can never help, so there is no
                         // silent relaunch here: the reason goes on screen.
                         if (isDeadOnArrival(startedAt)) {
+                            // The player failed to START — but "start" depends
+                            // on the video output: a machine whose GPU path
+                            // crashes gets the next safer profile silently, not
+                            // an error. Only the exhausted cascade explains
+                            // itself on screen. Same URL, same budget: a new
+                            // player configuration is not a stream retry.
+                            if (vo + 1 < VO_PROFILES.size) {
+                                Fx.run {
+                                    if (dialogShown || drainGen != launchGen || proc !== p) return@run
+                                    PlayerWindow.setStatus("Trying a safer video output…", busy = true)
+                                    launchMpv(title, stream, refresh, attemptsLeft, failedOver, vo + 1)
+                                }
+                                return@Thread
+                            }
                             Fx.run {
                                 if (dialogShown || drainGen != launchGen || proc !== p) return@run
                                 dialogShown = true
@@ -1204,6 +1289,7 @@ object DesktopPlayer {
         refresh: (() -> StreamSource?)?,
         attemptsLeft: Int,
         url: String,
+        voIdx: Int = -1,
     ) {
         System.err.println("player: the player process died — attemptsLeft=" + attemptsLeft)
         killPrevious(proc)
@@ -1212,10 +1298,17 @@ object DesktopPlayer {
         runCatching { ipc?.close() }
         ipc = null
         proc = null
+        val vo = if (voIdx in VO_PROFILES.indices) voIdx else startVoIdx()
         // Dead-on-arrival through the pipe path (mpv died before ever showing
-        // a frame): same rule as the drain thread — no silent relaunch, the
-        // startup reason goes on screen with a browser path.
+        // a frame): same rule as the drain thread — first the next safer
+        // video output (see [VO_PROFILES]), and only the exhausted cascade
+        // gets mpv's startup reason on screen with a browser path.
         if (!dialogShown && isDeadOnArrival(launchStartedAt)) {
+            if (vo + 1 < VO_PROFILES.size) {
+                PlayerWindow.setStatus("Trying a safer video output…", busy = true)
+                launchMpv(title, stream, refresh, attemptsLeft, voIdx = vo + 1)
+                return
+            }
             dialogShown = true
             showBrowserFallback(
                 title, url, doaMessage(),
@@ -1235,7 +1328,7 @@ object DesktopPlayer {
             // resetForNewStream), and the next launch's threads ignore this
             // one (see launchGen).
             val fresh = if (refresh != null) runCatching { refresh() }.getOrNull() else null
-            launchMpv(title, fresh ?: stream, refresh, attemptsLeft - 1)
+            launchMpv(title, fresh ?: stream, refresh, attemptsLeft - 1, voIdx = vo)
             return
         }
         if (dialogShown) return

@@ -7,8 +7,10 @@ import com.hikari.app.ui.theme.HikariThemeMode
 import desktop.fx.Fx
 import javafx.geometry.Pos
 import javafx.scene.control.CheckBox
+import javafx.scene.control.Label
 import javafx.scene.control.ScrollPane
 import javafx.scene.layout.HBox
+import javafx.scene.layout.Priority
 import javafx.scene.layout.Region
 import javafx.scene.layout.StackPane
 import javafx.scene.layout.VBox
@@ -61,21 +63,139 @@ class SettingsScreenView {
         }
     }
 
-    /** Settings is folders: one row per area, tapping one goes inside it. */
+    /** Settings is folders: big cards, two per row, like the repo cards — not
+     *  a line-type list. Tapping one goes inside it. */
     private fun folderList(): Region {
-        val rows = FOLDERS.map { (id, title, sub) ->
-            val go = Ui.button(title, ghost = true) { openFolder = id; onShown() }.apply {
-                maxWidth = Double.MAX_VALUE
-            }
-            VBox(2.0,
-                go,
-                Theme.label(sub, size = 11.5, dim = true).apply { isWrapText = true },
-            ).apply { minWidth = 0.0 }
+        val grid = twoColumnGrid()
+        FOLDERS.forEachIndexed { index, (id, title, sub) ->
+            grid.add(folderCard(id, title, sub), index % 2, index / 2)
         }
         return Ui.panel(
             Ui.sectionHeader("Settings", "Pick an area"),
-            *rows.toTypedArray(),
+            grid,
         )
+    }
+
+    /** One big settings folder: letter badge, title, subtitle, chevron. The
+     *  whole card is clickable. Same visual language as the repo cards (see
+     *  ExtensionsScreen.repoCard): `repo-card` body, `x-prov-badge` tile,
+     *  `src-name` title, `src-meta` subtitle. */
+    private fun folderCard(id: String, title: String, sub: String): Region {
+        val badge = StackPane(
+            Label(title.trim().firstOrNull()?.uppercase() ?: "?").apply {
+                styleClass.add("x-prov-initial")
+            },
+        ).apply {
+            styleClass.add("x-prov-badge")
+            alignment = Pos.CENTER
+            minWidth = 46.0; prefWidth = 46.0; maxWidth = 46.0
+            minHeight = 46.0; prefHeight = 46.0; maxHeight = 46.0
+        }
+        val info = VBox(2.0, cardTitle(title), cardDesc(sub)).apply { minWidth = 0.0 }
+        HBox.setHgrow(info, Priority.ALWAYS)
+        val chev = Label("›").apply {
+            styleClass.add("src-meta")
+            style = "-fx-font-size: 22px;"
+        }
+        return HBox(14.0, badge, info, chev).apply {
+            styleClass.add("repo-card")
+            alignment = Pos.CENTER_LEFT
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
+            cursor = javafx.scene.Cursor.HAND
+            setOnMouseClicked { openFolder = id; onShown() }
+        }
+    }
+
+    /** A grid whose two columns always split the width 50/50, so two cards
+     *  share every row at any window width (same as the repo grid). */
+    private fun twoColumnGrid(): javafx.scene.layout.GridPane {
+        val grid = javafx.scene.layout.GridPane().apply {
+            hgap = 10.0
+            vgap = 10.0
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
+        }
+        repeat(2) {
+            grid.columnConstraints.add(
+                javafx.scene.layout.ColumnConstraints().apply {
+                    percentWidth = 50.0
+                    hgrow = Priority.ALWAYS
+                    minWidth = 0.0
+                    maxWidth = Double.MAX_VALUE
+                },
+            )
+        }
+        return grid
+    }
+
+    private fun cardTitle(text: String): Label = Label(text).apply {
+        styleClass.add("src-name")
+        isWrapText = true
+        minWidth = 0.0
+        maxWidth = Double.MAX_VALUE
+    }
+
+    private fun cardDesc(text: String): Label = Label(text).apply {
+        styleClass.add("src-meta")
+        isWrapText = true
+        minWidth = 0.0
+        maxWidth = 620.0
+    }
+
+    /** A full-width setting: title + description on the left, its control on
+     *  the right. Everything inside a folder reads as cards, never lines. */
+    private fun settingCard(title: String, desc: String?, control: Region): Region {
+        val info = if (desc.isNullOrBlank()) VBox(cardTitle(title))
+        else VBox(2.0, cardTitle(title), cardDesc(desc))
+        info.apply { minWidth = 0.0 }
+        HBox.setHgrow(info, Priority.ALWAYS)
+        return HBox(14.0, info, control).apply {
+            styleClass.add("repo-card")
+            alignment = Pos.CENTER_LEFT
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
+        }
+    }
+
+    /** A full-width checkbox setting: the box is the title row, the
+     *  description sits under it. */
+    private fun checkCard(box: CheckBox, desc: String): Region {
+        box.apply {
+            isWrapText = true
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
+        }
+        return VBox(4.0, box, cardDesc(desc)).apply {
+            styleClass.add("repo-card")
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
+        }
+    }
+
+    /** A compact checkbox for 2-column grids (engines, solo providers): just
+     *  the box, free to shrink so two share every row. */
+    private fun miniCheckCard(box: CheckBox): Region {
+        box.apply {
+            isWrapText = true
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
+        }
+        return VBox(box).apply {
+            styleClass.add("repo-card")
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
+        }
+    }
+
+    /** A full-width note card: one or more dim paragraphs, no control. */
+    private fun infoCard(vararg texts: String): Region {
+        val labels = texts.map { cardDesc(it) }.toTypedArray()
+        return VBox(4.0, *labels).apply {
+            styleClass.add("repo-card")
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
+        }
     }
 
     private fun backRow(title: String): Region {
@@ -139,22 +259,23 @@ class SettingsScreenView {
                 "ok",
             )
         }
-        val note = Theme.label(
-            "With direct play, Play tests the first few sources in parallel and starts whichever answers " +
-                "fastest — no picking a server first. With the list first, you choose and late servers keep " +
-                "arriving in the background. Either way every server found stays under Sources (and in the " +
-                "player's Source menu) if you want to change it.",
-            size = 11.5,
-            dim = true,
-        ).apply { isWrapText = true }
-        val scopeNote = Theme.label(
-            "Which extensions a title's server search asks. The provider you opened the title from is " +
-                "always asked first and its servers stay on top; the switches below only ADD more places " +
-                "to look. A stuck provider never blocks the rest — whatever answers shows immediately.",
-            size = 11.5,
-            dim = true,
-        ).apply { isWrapText = true }
-        val rows = mutableListOf<Region>(fastest, showAll, note, scopeNote)
+        val rows = mutableListOf<Region>(
+            checkCard(
+                fastest,
+                "With direct play, Play tests the first few sources in parallel and starts whichever " +
+                    "answers fastest — no picking a server first. Every server found stays under Sources " +
+                    "(and in the player's Source menu) if you want to change it.",
+            ),
+            checkCard(
+                showAll,
+                "With the list first, you choose and late servers keep arriving in the background.",
+            ),
+            infoCard(
+                "Which extensions a title's server search asks. The provider you opened the title from is " +
+                    "always asked first and its servers stay on top; the switches below only ADD more places " +
+                    "to look. A stuck provider never blocks the rest — whatever answers shows immediately.",
+            ),
+        )
         val allBox = CheckBox("Search ALL sources — every installed extension, any engine").apply {
             isSelected = runCatching { app.store.sweepAllSources() }.getOrDefault(false)
         }
@@ -166,10 +287,11 @@ class SettingsScreenView {
                 "ok",
             )
         }
-        rows.add(allBox)
+        rows.add(checkCard(allBox, "One master switch for the whole sweep."))
         val on = runCatching { app.store.sweepEngines() }.getOrDefault(emptySet())
-        SWEEP_ENGINE_ORDER.forEach { type ->
-            val box = CheckBox("Search every ${type.groupLabel} extension").apply {
+        val engineGrid = twoColumnGrid()
+        SWEEP_ENGINE_ORDER.forEachIndexed { index, type ->
+            val box = CheckBox("Every ${type.groupLabel} extension").apply {
                 isSelected = type.name in on
             }
             box.setOnAction {
@@ -179,20 +301,18 @@ class SettingsScreenView {
                     "ok",
                 )
             }
-            rows.add(box)
+            engineGrid.add(miniCheckCard(box), index % 2, index / 2)
         }
+        rows.add(engineGrid)
         val installed = runCatching { app.store.providers() }.getOrDefault(emptyList())
             .sortedBy { it.name.lowercase() }
         if (installed.isNotEmpty()) {
             rows.add(
-                Theme.label(
-                    "Exceptions — stay solo, never search other extensions:",
-                    size = 12.0,
-                    dim = true,
-                ).apply { isWrapText = true },
+                infoCard("Exceptions — stay solo, never search other extensions:"),
             )
             val solo = runCatching { app.store.sweepSoloProviders() }.getOrDefault(emptySet())
-            installed.forEach { cfg ->
+            val soloGrid = twoColumnGrid()
+            installed.forEachIndexed { index, cfg ->
                 val box = CheckBox("${cfg.name} (${cfg.type.groupLabel}) — only its own servers").apply {
                     isSelected = cfg.id in solo
                 }
@@ -204,8 +324,9 @@ class SettingsScreenView {
                         "ok",
                     )
                 }
-                rows.add(box)
+                soloGrid.add(miniCheckCard(box), index % 2, index / 2)
             }
+            rows.add(soloGrid)
         }
         return Ui.panel(
             Ui.sectionHeader("Playback and servers", "What the Play button does and where it looks"),
@@ -228,16 +349,11 @@ class SettingsScreenView {
                 "ok",
             )
         }
-        val note = Theme.label(
-            "Poster keeps the classic vertical cards. Cinema cards are 16:9 and use landscape " +
-                "artwork (TMDB backdrops where available), so rows look right on a wide PC window.",
-            size = 11.5,
-            dim = true,
-        ).apply { isWrapText = true }
+        val note = "Poster keeps the classic vertical cards. Cinema cards are 16:9 and use landscape " +
+            "artwork (TMDB backdrops where available), so rows look right on a wide PC window."
         return Ui.panel(
             Ui.sectionHeader("Home", "How the catalog rows look"),
-            labelled("Catalog layout", seg),
-            note,
+            settingCard("Catalog layout", note, seg),
         )
     }
 
@@ -284,8 +400,8 @@ class SettingsScreenView {
 
         return Ui.panel(
             Ui.sectionHeader("Appearance", "Applies instantly across the whole app"),
-            labelled("Theme", modeRow),
-            labelled("Accent", swatches),
+            settingCard("Theme", "Dark or light — the whole window re-skins at once.", modeRow),
+            settingCard("Accent", "The highlight color for buttons, badges and the active tab.", swatches),
         )
     }
 
@@ -294,11 +410,6 @@ class SettingsScreenView {
             Theme.setMode(mode)
             onShown()
         }
-
-    private fun labelled(text: String, control: Region): Region = HBox(Theme.S4,
-        Theme.label(text, size = 13.0).apply { minWidth = 90.0; styleClass.add("h-dim") },
-        control,
-    ).apply { alignment = Pos.CENTER_LEFT }
 
     private fun browserSection(): Region {
         val useDefault = CheckBox("Use the default desktop user agent in the embedded browser").apply {
@@ -318,8 +429,12 @@ class SettingsScreenView {
 
         return Ui.panel(
             Ui.sectionHeader("Browser", "Some sources only return playable links for a desktop browser"),
-            useDefault,
-            HBox(Theme.S2, custom, Ui.button("Save", primary = true) { save() }).apply { alignment = Pos.CENTER_LEFT },
+            checkCard(useDefault, "Off means the app's own browser identity is sent instead."),
+            settingCard(
+                "Custom user agent",
+                "Optional — overrides the identity above when set.",
+                HBox(Theme.S2, custom, Ui.button("Save", primary = true) { save() }).apply { alignment = Pos.CENTER_LEFT },
+            ),
         )
     }
 
@@ -368,8 +483,18 @@ class SettingsScreenView {
             }
         }
         return Ui.panel(
-            Ui.sectionHeader("Updates", identity),
-            HBox(Theme.S3, check, copyBuild, download, status).apply { alignment = Pos.CENTER_LEFT },
+            Ui.sectionHeader("Updates", "Check for a newer build"),
+            settingCard("Current build", identity, copyBuild),
+            VBox(
+                6.0,
+                cardTitle("Check for updates"),
+                status.apply { isWrapText = true; minWidth = 0.0 },
+                HBox(Theme.S3, check, download).apply { alignment = Pos.CENTER_LEFT },
+            ).apply {
+                styleClass.add("repo-card")
+                minWidth = 0.0
+                maxWidth = Double.MAX_VALUE
+            },
         )
     }
 
@@ -381,19 +506,18 @@ class SettingsScreenView {
      */
     private fun logsSection(): Region {
         val count = com.hikari.app.util.LiveLogs.recentText().count { it == '\n' } + 1
-        val status = Theme.label(
-            "Holding the latest app activity in memory" +
-                (if (count > 1) " ($count lines)" else "") +
-                ". Save it right after something breaks so the reason is still in the buffer.",
-            size = 11.5,
-            dim = true,
-        ).apply { isWrapText = true }
+        val status = "Holding the latest app activity in memory" +
+            (if (count > 1) " ($count lines)" else "") +
+            ". Save it right after something breaks so the reason is still in the buffer."
         val save = Ui.button("Save logs as .txt", primary = true) { saveLogs() }
         val copy = Ui.button("Copy logs", ghost = true) { copyLogs() }
         return Ui.panel(
             Ui.sectionHeader("Logs and diagnostics", "What to send when something breaks"),
-            HBox(Theme.S2, save, copy).apply { alignment = Pos.CENTER_LEFT },
-            status,
+            settingCard(
+                "App activity log",
+                status,
+                HBox(Theme.S2, save, copy).apply { alignment = Pos.CENTER_RIGHT },
+            ),
         )
     }
 
@@ -434,46 +558,60 @@ class SettingsScreenView {
     }
 
     private fun dataSection(): Region {
-        val clearHistory = Ui.button("Clear watch history", icon = Icons.TRASH, ghost = true) {
+        val clearHistory = Ui.button("Clear", icon = Icons.TRASH, ghost = true) {
             app.store.clearHistory()
             AppShell.toast("Watch history cleared", "ok")
         }
-        val openFolder = Ui.button("Open data folder", icon = Icons.FOLDER, ghost = true) {
+        val openFolder = Ui.button("Open", icon = Icons.FOLDER, ghost = true) {
             val dir = app.filesDir
             val ok = runCatching { java.awt.Desktop.getDesktop().open(dir) }.isSuccess
             if (!ok) AppShell.toast("Data folder: ${dir.absolutePath}", "error")
         }
-        val reset = Ui.button("Reset all data", icon = Icons.WARNING, danger = true) {
+        val reset = Ui.button("Reset", icon = Icons.WARNING, danger = true) {
             app.store.reset()
             AppShell.uiScope.launch { app.providers.refresh() }
             AppShell.toast("Cleared. Default providers are re-added on next launch.")
             onShown()
         }
-        val note = Theme.label(
-            "Resetting removes providers, repositories, installed extensions and history from this machine.",
-            size = 11.5,
-            dim = true,
-        ).apply { isWrapText = true }
-
+        val grid = twoColumnGrid()
+        grid.add(
+            settingCard("Watch history", "What you watched, for resume and Continue Watching.", clearHistory),
+            0, 0,
+        )
+        grid.add(
+            settingCard("App data folder", "Providers, extensions and history live here.", openFolder),
+            1, 0,
+        )
+        grid.add(
+            settingCard(
+                "Reset everything",
+                "Removes providers, repositories, installed extensions and history from this machine.",
+                reset,
+            ),
+            0, 1, 2, 1,
+        )
         return Ui.panel(
             Ui.sectionHeader("Data", "Everything is stored locally in the app data folder"),
-            HBox(Theme.S2, clearHistory, openFolder, reset).apply { alignment = Pos.CENTER_LEFT },
-            note,
+            grid,
         )
     }
 
     private fun aboutSection(): Region = Ui.panel(
         Ui.sectionHeader("About"),
-        Theme.label(
-            "Hikari Desktop — one player for every ecosystem: Stremio addons, universal scrapers, " +
-                "CloudStream .cs3 plugins and Hikari extensions.",
-            size = 12.5,
-            dim = true,
-        ).apply { isWrapText = true },
-        Theme.label(app.filesDir.absolutePath, size = 11.0, dim = true).apply {
-            styleClass.add("h-mono")
-            isWrapText = true
-        },
+        settingCard(
+            "Hikari Desktop",
+            "One player for every ecosystem: Stremio addons, universal scrapers, CloudStream .cs3 " +
+                "plugins and Hikari extensions.",
+            Ui.button("Copy data path", ghost = true) {
+                runCatching {
+                    val content = javafx.scene.input.ClipboardContent()
+                    content.putString(app.filesDir.absolutePath)
+                    javafx.scene.input.Clipboard.getSystemClipboard().setContent(content)
+                    AppShell.toast("Data path copied", "ok")
+                }
+            },
+        ),
+        infoCard("Data folder: " + app.filesDir.absolutePath),
     )
 
     private companion object {

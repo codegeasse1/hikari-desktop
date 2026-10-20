@@ -82,6 +82,7 @@ class AppStore(private val dir: File) {
         const val SWEEP_ENGINES = "sweepEngines"
         const val SWEEP_SOLO = "sweepSoloProviders"
         const val SWEEP_SHOW_ALL = "sweepShowAllFirst"
+        const val PLAYER_VO = "playerVo"
     }
 
     /**
@@ -187,6 +188,17 @@ class AppStore(private val dir: File) {
     fun homeLayout(): String = (get(K.HOME_LAYOUT) ?: "poster").lowercase().takeIf { it == "cinema" } ?: "poster"
     fun setHomeLayout(layout: String) {
         put(K.HOME_LAYOUT, if (layout == "poster") "poster" else "cinema")
+    }
+
+    /**
+     * The mpv video-output profile that last managed to show a picture on this
+     * machine ("auto", "nohwdec", "sdl"). The player tries profiles in order
+     * when mpv dies on arrival and remembers the winner here, so a machine
+     * whose GPU output crashes starts right the first time afterwards.
+     */
+    fun playerVo(): String = (get(K.PLAYER_VO) ?: "auto").lowercase()
+    fun setPlayerVo(profile: String) {
+        put(K.PLAYER_VO, profile.lowercase().takeIf { it.isNotBlank() } ?: "auto")
     }
 
     fun translateProvidersFlow(): Flow<Set<String>> = flowOf { translateProviders() }

@@ -366,6 +366,17 @@ object PlayerWindow {
      *  told us anything is wrong — see [ipcWorking]. */
     private var ipcAnswered = false
 
+    /**
+     * When mpv last showed any sign of life (property change or event). The
+     * owner's watchdog extends the wait while this keeps moving: a stream
+     * that is still arriving must never get a "no picture came up" dialog,
+     * however slowly it arrives.
+     */
+    @Volatile private var lastProgressAt = System.currentTimeMillis()
+
+    /** See [lastProgressAt]. Safe from any thread. */
+    fun lastProgressAt(): Long = lastProgressAt
+
     /** True once mpv has the file open (its `file-loaded` event). */
     private var loaded = false
 
@@ -383,6 +394,14 @@ object PlayerWindow {
      */
     @Volatile
     var onPlayerDied: (() -> Unit)? = null
+
+    /**
+     * Fires once per launch when the first real video frame is up. The owner
+     * persists the working video-output profile (see DesktopPlayer): a machine
+     * whose GPU output crashes must start on the safe one next time, not
+     * rediscover the crash on every Play press.
+     */
+    var onVideoUp: (() -> Unit)? = null
 
     /**
      * Installed by the player so that every explanation this layer shows can
@@ -522,6 +541,7 @@ object PlayerWindow {
         sawVideo = false
         loaded = false
         ipcAnswered = false
+        lastProgressAt = System.currentTimeMillis()
         messageBox?.isVisible = false
         messageBox?.isManaged = false
         seekBar?.value = 0.0
@@ -1876,6 +1896,7 @@ object PlayerWindow {
         // user closed it (see [detachIpc] — there should be none left, but a
         // close must not depend on that).
         onPlayerDied = null
+        onVideoUp = null
         runCatching { syncTimer?.stop() }
         syncTimer = null
         runCatching { hideChrome?.stop() }
@@ -2887,6 +2908,7 @@ object PlayerWindow {
      *  everything it touches is hopped to the FX thread. */
     fun onProperty(name: String, value: Any?) {
         ipcAnswered = true
+        lastProgressAt = System.currentTimeMillis()
         when (name) {
             "duration" -> {
                 duration = (value as? Number)?.toDouble() ?: 0.0
@@ -2959,7 +2981,10 @@ object PlayerWindow {
     }
 
     fun onEvent(event: String, data: JSONObject) {
-        if (event != "ipc-closed") ipcAnswered = true
+        if (event != "ipc-closed") {
+            ipcAnswered = true
+            lastProgressAt = System.currentTimeMillis()
+        }
         when (event) {
             // mpv has the file open and is about to render: the wait is over.
             "file-loaded", "playback-restart" -> Fx.run {
@@ -3008,7 +3033,15 @@ object PlayerWindow {
         sawVideo = true
         Fx.run {
             playbackStarted()
+            // A picture that arrives AFTER a failure dialog proves the dialog
+            // wrong: take it down instead of playing behind it (the reported
+            // "it showed Retry, then started playing by itself a second
+            // later, with the error still up"). Direct field read: this runs
+            // on the FX thread, which owns the message box.
+            if (messageBox?.isVisible == true) clearMessage()
+            if (statusIsError) setStatus("")
             safeSync()
+            runCatching { onVideoUp?.invoke() }
         }
     }
 
