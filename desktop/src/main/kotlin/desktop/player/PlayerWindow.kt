@@ -832,8 +832,13 @@ object PlayerWindow {
         embedded = true
         safeSync()
         // The window is up, so the wait for a picture is a wait on mpv, not on
-        // the window manager.
-        if (loadingBox?.isVisible != true && !sawVideo) setStatus("Opening the stream…", busy = true)
+        // the window manager. The spinner overlay goes up too — not just the
+        // status line — or the video area sits black behind "Opening the
+        // stream…" with no sign anything is happening.
+        if (loadingBox?.isVisible != true && !sawVideo) {
+            showLoading("Opening the stream…")
+            setStatus("Opening the stream…", busy = true)
+        }
         return true
     }
 

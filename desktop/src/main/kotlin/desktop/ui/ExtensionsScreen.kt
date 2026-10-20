@@ -105,6 +105,10 @@ class ExtensionsScreenView {
         val description: String? = null,
         val language: String? = null,
         val tags: List<String> = emptyList(),
+        // The extension the repo's index named (".hiki", ".cs3", ".jar", …)
+        // BEFORE the desktop `.hiki`→`.jar` rewrite: each download twin is
+        // verified only against its own hash (see [expectedShaFor]).
+        val listedExt: String? = null,
     )
 
     private val repoData = HashMap<String, RepoData>()
@@ -122,6 +126,11 @@ class ExtensionsScreenView {
     private val repoFetchedAt = HashMap<String, Long>()
 
     private var openRepo: Cs3Repo? = null
+
+    /** The current [renderAll] generation (see [restoreScroll]). Declared with
+     *  the other state — before the init block that renders — so the first
+     *  render already counts. */
+    private var renderGen = 0
 
     /** Per-repo-plugin install outcome, shown right under its row so a failed
      *  install says why where the user is looking. Keyed by plugin URL. */
@@ -257,6 +266,11 @@ class ExtensionsScreenView {
         // move them to the live repo before anything paints, so a stale copy
         // never sits in the list looking like the real thing.
         migrateSnapshotRepos()
+        // Every render gets a generation: stacked restores from a burst of
+        // background completions must not fight each other (or the user) — a
+        // restore from an older generation is simply dropped (see
+        // [restoreScroll]).
+        renderGen++
         // The page is rebuilt into a LIST and swapped in with ONE `setAll`.
         //
         // Clearing the children first collapses the page to zero height for a
@@ -293,35 +307,46 @@ class ExtensionsScreenView {
     }
 
     /**
-     * Where the page was scrolled to, as a NODE plus its offset from the top of
-     * the viewport.
+     * Where the page was scrolled to, as a child INDEX plus its offset from
+     * the top of the viewport.
      *
      * A raw `vvalue` (a 0..1 fraction) is not enough: repainting changes the
      * height of everything above the point the user is reading (an install adds
      * rows, a repo re-render can change every card), and a fraction of a
      * different total is a different place. Anchoring on the child that was at
      * the top of the viewport keeps that child exactly where it was.
+     *
+     * It is an index and not the node because the rebuild detaches every old
+     * child: restoring from a detached node's bounds put the page back to the
+     * top, which is the jump this anchor exists to prevent. [vvalue] is the
+     * user's position at anchor time — if it moved before the restore runs,
+     * the user scrolled meanwhile and wins (see [restoreScroll]).
      */
-    private class ScrollAnchor(val node: Node, val offset: Double)
+    private class ScrollAnchor(val index: Int, val offset: Double, val vvalue: Double)
 
     private fun scrollAnchor(): ScrollAnchor? {
         val vp = root.viewportBounds.height
         if (vp <= 0.0 || content.children.isEmpty()) return null
         val top = root.vvalue * (content.height - vp).coerceAtLeast(0.0)
-        for (child in content.children) {
+        content.children.forEachIndexed { index, child ->
             val b = child.boundsInParent
-            if (b.minY + b.height > top) return ScrollAnchor(child, b.minY - top)
+            if (b.minY + b.height > top) return ScrollAnchor(index, b.minY - top, root.vvalue)
         }
         return null
     }
 
     /** Puts the page back where [scrollAnchor] found it, once the new layout has
      *  been measured (hence the `runLater`: heights are only known after the next
-     *  pulse). */
+     *  pulse). Skipped when a newer render superseded this one ([renderGen]) or
+     *  when the user scrolled meanwhile — either restore would yank the page
+     *  somewhere stale, which is the freeze-fight this guard prevents. */
     private fun restoreScroll(anchor: ScrollAnchor?) {
         val a = anchor ?: return
+        val gen = renderGen
         javafx.application.Platform.runLater {
             runCatching {
+                if (gen != renderGen) return@runCatching
+                if (root.vvalue != a.vvalue) return@runCatching
                 val vp = root.viewportBounds.height
                 if (vp <= 0.0) return@runCatching
                 val max = (content.height - vp).coerceAtLeast(0.0)
@@ -329,7 +354,8 @@ class ExtensionsScreenView {
                     root.vvalue = 0.0
                     return@runCatching
                 }
-                val y = a.node.boundsInParent.minY
+                val node = content.children.getOrNull(a.index) ?: return@runCatching
+                val y = node.boundsInParent.minY
                 root.vvalue = ((y - a.offset) / max).coerceIn(0.0, 1.0)
             }
         }
@@ -570,6 +596,20 @@ class ExtensionsScreenView {
      * initial on a tile. The letter sits BEHIND the picture, so a repo whose
      * avatar cannot load still has an identity instead of a blank box.
      */
+    private fun repoOwnerOf(url: String): String? =
+        Regex("github\\.com/([^/?#]+)", RegexOption.IGNORE_CASE).find(url)?.groupValues?.get(1)
+            ?: Regex("raw\\.githubusercontent\\.com/([^/?#]+)", RegexOption.IGNORE_CASE).find(url)?.groupValues?.get(1)
+            ?: Regex("cdn\\.jsdelivr\\.net/gh/([^/?#@]+)", RegexOption.IGNORE_CASE).find(url)?.groupValues?.get(1)
+
+    /** The repo avatar URL for a repo address, when it names a GitHub owner —
+     *  the same picture [repoAvatar] shows, reused as an extension icon when
+     *  the manifest names none. */
+    private fun repoAvatarUrl(url: String?): String? {
+        if (url.isNullOrBlank()) return null
+        val owner = repoOwnerOf(url.trim())?.takeIf { it.isNotBlank() } ?: return null
+        return "https://github.com/$owner.png"
+    }
+
     private fun repoAvatar(name: String, url: String): javafx.scene.layout.StackPane {
         val initial = Label(name.trim().firstOrNull()?.uppercase() ?: "?").apply {
             styleClass.add("x-prov-initial")
@@ -580,9 +620,7 @@ class ExtensionsScreenView {
             minWidth = 46.0; prefWidth = 46.0; maxWidth = 46.0
             minHeight = 46.0; prefHeight = 46.0; maxHeight = 46.0
         }
-        val owner = Regex("github\\.com/([^/?#]+)", RegexOption.IGNORE_CASE).find(url)?.groupValues?.get(1)
-            ?: Regex("raw\\.githubusercontent\\.com/([^/?#]+)", RegexOption.IGNORE_CASE).find(url)?.groupValues?.get(1)
-            ?: Regex("cdn\\.jsdelivr\\.net/gh/([^/?#@]+)", RegexOption.IGNORE_CASE).find(url)?.groupValues?.get(1)
+        val owner = repoOwnerOf(url)
         if (owner.isNullOrBlank()) return badge
         val art = javafx.scene.image.ImageView().apply {
             isPreserveRatio = false
@@ -1153,8 +1191,10 @@ class ExtensionsScreenView {
     private fun pluginRow(plugin: PluginRef): Region {
         // Reference shape (see the target screenshots): icon · name+language,
         // version · size · repo / description / type tags · Install/Uninstall.
-        // Every manifest extra is optional — blanks collapse to nothing.
-        val icon = extIcon(plugin.name, plugin.iconUrl)
+        // Every manifest extra is optional — blanks collapse to nothing. An
+        // icon-less entry falls back to its repo's avatar, so the card never
+        // blanks for a manifest that names no icon.
+        val icon = extIcon(plugin.name, plugin.iconUrl ?: repoAvatarUrl(openRepo?.url))
         val titleRow = HBox(8.0).apply {
             alignment = Pos.CENTER_LEFT
             minWidth = 0.0
@@ -1606,6 +1646,12 @@ class ExtensionsScreenView {
             var url = p.optString("url")
             if (name.isBlank() || url.isBlank()) continue
             if (baseUrl.isNotBlank()) url = Http.resolveRelativeTo(url, baseUrl)
+            // Record the form the index named BEFORE the desktop rewrite: the
+            // `.jar` twin below is different bytes from this archive, so it
+            // must never be verified against this entry's fileHash (see
+            // [expectedShaFor]).
+            val listedExt = url.substringBefore('?').substringAfterLast('.', "")
+                .let { if (it.isEmpty()) null else ".$it".lowercase() }
             if (url.endsWith(".hiki")) url = url.removeSuffix(".hiki") + ".jar"
             // Icons are very often relative ("icons/x.png"): resolve them
             // against the manifest that named them, or every card blanks.
@@ -1632,6 +1678,7 @@ class ExtensionsScreenView {
                 description = p.optString("description").ifBlank { null },
                 language = p.optString("language").ifBlank { p.optString("lang") }.ifBlank { null },
                 tags = tags,
+                listedExt = listedExt,
             )
         }
         return out
@@ -1932,7 +1979,7 @@ class ExtensionsScreenView {
             RepoKind.NUVIO -> installNuvioPlugin(plugin)
             RepoKind.SKYSTREAM -> installSkyStreamPlugin(plugin)
             RepoKind.ANIYOMI -> installAniyomiPlugin(plugin)
-            else -> installPlugin(plugin.name, plugin.url, plugin.fileHash, plugin.jarHash)
+            else -> installPlugin(plugin.name, plugin.url, plugin.fileHash, plugin.jarHash, plugin.listedExt)
         }
     }
 
@@ -2151,6 +2198,7 @@ class ExtensionsScreenView {
         fileHash: String?,
         jarHash: String?,
         reused: String?,
+        listedExt: String? = null,
     ): RoundOutcome {
         // CloudStream repos publish the same plugin side by side as a
         // dex .cs3 and a JVM .jar (Hikari repos: .hiki/.jar). When the
@@ -2197,11 +2245,15 @@ class ExtensionsScreenView {
             // instead of failing the install (a fast stale mirror used
             // to win, fail verification afterwards, and abandon a
             // candidate whose good copy was one URL away).
-            val want = expectedShaFor(c, fileHash, jarHash)
+            val want = expectedShaFor(c, fileHash, jarHash, listedExt)
             val ok = if (c == reused) true else Http.downloadToRobust(
                 c,
                 dest,
                 verify = { part, _ -> Http.verifyArchiveFile(part, want) },
+                // The expected hash doubles as the cache-buster: any unique
+                // query defeats a stale edge cache, and the right bytes are
+                // also the ones that verify (see Http.withCacheBuster).
+                cacheBuster = want,
             ) { tried, success, reason ->
                 if (!success) {
                     val host = tried.substringAfter("//").substringBefore('/')
@@ -2221,7 +2273,7 @@ class ExtensionsScreenView {
             // file with a 200 — a real extension is always a zip (PK
             // header), and when the repo publishes a sha256 for this
             // build it must match before the file is ever loaded.
-            val verifyFail = verifyDownload(dest, c, fileHash, jarHash)
+            val verifyFail = verifyDownload(dest, c, fileHash, jarHash, listedExt)
             if (verifyFail != null) {
                 attempts.append("${c.substringAfterLast('/').substringBefore('?')} — $verifyFail\n")
                 dest.delete()
@@ -2231,7 +2283,7 @@ class ExtensionsScreenView {
             // so keep them: the next install of this build — after an
             // uninstall, or from another repo that lists it — is then
             // instant, because nothing has to be downloaded at all.
-            ExtCache.put(expectedShaFor(c, fileHash, jarHash), dest)
+            ExtCache.put(expectedShaFor(c, fileHash, jarHash, listedExt), dest)
             // Register the extension from the archive's OWN manifest
             // first. Reading that is one zip entry — no class loading,
             // and therefore no dex→JVM translation — so the install
@@ -2274,12 +2326,25 @@ class ExtensionsScreenView {
      *  mirror loses to a good copy from another instead of failing the install.
      *  A bad candidate falls through to the next one. Every path ends with a
      *  visible status — nothing ever fails silently. */
-    private fun installPlugin(name: String, url: String, fileHash: String? = null, jarHash: String? = null) {
+    private fun installPlugin(
+        name: String,
+        url: String,
+        fileHash: String? = null,
+        jarHash: String? = null,
+        listedExt: String? = null,
+    ) {
         // A second click while the first is still running would download the
         // same file twice and register the provider twice.
         if (busyPlugins.containsKey(url)) return
         var dl = url
         if (dl.endsWith(".hiki")) dl = dl.removeSuffix(".hiki") + ".jar"
+        // The listing form travels with the install: without it the derived
+        // `.jar` twin would be verified against the dex fileHash (see
+        // [expectedShaFor]). Direct-URL installs have no listing — derive the
+        // form from the URL itself.
+        val le = listedExt
+            ?: url.substringBefore('?').substringAfterLast('.', "")
+                .let { if (it.isEmpty()) null else ".$it".lowercase() }
         installErrors.remove(url)
         busyPlugins[url] = "Installing…"
         busySince[url] = System.currentTimeMillis()
@@ -2326,19 +2391,24 @@ class ExtensionsScreenView {
                 // jar must not be "reused" as its dex twin: their hashes
                 // differ, and checking one against the other could only fail).
                 var reusedFor: String? = null
-                if (dest.isFile && dest.length() > 0L && fileHash != null &&
-                    verifyDownload(dest, dl, fileHash, jarHash) == null
+                // Reuse needs a signature that actually names THESE bytes: a
+                // derived `.jar` twin with no published jarHash is
+                // unverifiable (see [expectedShaFor]), so on-disk bytes for it
+                // are re-downloaded, never trusted blindly.
+                val dlWant = expectedShaFor(dl, fileHash, jarHash, le)
+                if (dest.isFile && dest.length() > 0L && dlWant != null &&
+                    verifyDownload(dest, dl, fileHash, jarHash, le) == null
                 ) {
                     reusedFor = dl
                 }
                 if (reusedFor == null) {
                     val keys = siblingCandidates(dl).mapNotNull { c ->
-                        expectedShaFor(c, fileHash, jarHash)?.let { c to it }
+                        expectedShaFor(c, fileHash, jarHash, le)?.let { c to it }
                     }.distinctBy { it.second }
                     for ((candidate, key) in keys) {
                         val cached = ExtCache.file(key) ?: continue
                         val fromCache = runCatching { cached.copyTo(dest, overwrite = true) }.isSuccess &&
-                            verifyDownload(dest, candidate, fileHash, jarHash) == null
+                            verifyDownload(dest, candidate, fileHash, jarHash, le) == null
                         if (fromCache) {
                             reusedFor = candidate
                             System.err.println("install: $name from the extension cache (no download)")
@@ -2357,7 +2427,7 @@ class ExtensionsScreenView {
                 var curJh = jarHash
                 var reuse = reusedFor
                 var refreshed = false
-                var outcome = runInstallRound(name, safeName, dl, dest, curFh, curJh, reuse)
+                var outcome = runInstallRound(name, safeName, dl, dest, curFh, curJh, reuse, le)
                 if (outcome.registered == null && outcome.loadFailure == null) {
                     val u = unanimousServed(outcome.served)
                     if (u != null && unexpectedBy(u, listOf(curFh, curJh))) {
@@ -2375,7 +2445,7 @@ class ExtensionsScreenView {
                             curJh = fresh.second
                             reuse = null
                             refreshed = true
-                            outcome = runInstallRound(name, safeName, dl, dest, curFh, curJh, reuse)
+                            outcome = runInstallRound(name, safeName, dl, dest, curFh, curJh, reuse, le)
                         }
                     }
                 }
@@ -2719,10 +2789,22 @@ class ExtensionsScreenView {
 
     /** The sha256 a repo publishes for this file, or null when it publishes
      *  none (used to look the exact bytes up in the extension cache). */
-    private fun expectedShaFor(url: String, fileHash: String?, jarHash: String?): String? {
+    private fun expectedShaFor(url: String, fileHash: String?, jarHash: String?, listedExt: String? = null): String? {
+        // Each twin is verified ONLY against its own hash: the desktop `.jar`
+        // twin of a listed `.hiki`/`.cs3` archive is different bytes from that
+        // archive, so checking it against the dex fileHash could only fail —
+        // and that failure is what fell back to the dex file and its
+        // unloadable ClassNotFoundException. A `.jar` twin with no published
+        // jarHash is therefore unverifiable (null), never "verified" against
+        // its sibling's hash. listedExt null = an entry from before the
+        // listing form was recorded: the old fallback applies, so old on-disk
+        // caches keep working until they refresh.
+        val clean = url.substringBefore('?').lowercase()
+        val ext = clean.substringAfterLast('.', "")
         val raw = when {
-            url.endsWith(".cs3") || url.endsWith(".hiki") -> fileHash
-            url.endsWith(".jar") -> jarHash ?: fileHash
+            listedExt != null && ext == listedExt.removePrefix(".").lowercase() -> fileHash
+            ext == "jar" -> jarHash ?: if (listedExt == null) fileHash else null
+            ext == "cs3" || ext == "hiki" -> fileHash
             else -> null
         } ?: return null
         val want = raw.removePrefix("sha256-").lowercase()
@@ -2855,7 +2937,7 @@ class ExtensionsScreenView {
      */
     private fun downloadWithStaleIndexRetry(url: String, fileHash: String?, jarHash: String? = null): Pair<Http.PluginDownload, String?> {
         val rejects = java.util.concurrent.ConcurrentLinkedQueue<String>()
-        val first = Http.downloadPluginFile(url, expectedSha = fileHash, rejectLog = rejects)
+        val first = Http.downloadPluginFile(url, expectedSha = fileHash, rejectLog = rejects, cacheBuster = fileHash)
         if (first.bytes != null && first.bytes.isNotEmpty()) return first to fileHash
         val u = unanimousServedLines(rejects)
         if (u == null || !unexpectedBy(u, listOf(fileHash))) return first to fileHash
@@ -2866,7 +2948,7 @@ class ExtensionsScreenView {
         // instead of repeating the same rejections for another full minute.
         if (unexpectedBy(u, listOf(fresh.first, fresh.second))) return first to fileHash
         System.err.println("install: every mirror serves $u… for $url — index refreshed, retrying with its signature")
-        val retry = Http.downloadPluginFile(url, expectedSha = fresh.first)
+        val retry = Http.downloadPluginFile(url, expectedSha = fresh.first, cacheBuster = fresh.first)
         return if (retry.bytes != null && retry.bytes.isNotEmpty()) retry to fresh.first else first to fileHash
     }
 
@@ -2891,8 +2973,14 @@ class ExtensionsScreenView {
      *  string says why it isn't. The check itself lives in
      *  [Http.verifyArchiveFile] — the same check the download walk applies
      *  in-race — so the two can never drift apart. */
-    private fun verifyDownload(dest: File, url: String, fileHash: String?, jarHash: String?): String? =
-        Http.verifyArchiveFile(dest, expectedShaFor(url, fileHash, jarHash))
+    private fun verifyDownload(
+        dest: File,
+        url: String,
+        fileHash: String?,
+        jarHash: String?,
+        listedExt: String? = null,
+    ): String? =
+        Http.verifyArchiveFile(dest, expectedShaFor(url, fileHash, jarHash, listedExt))
 
     /** Registers every provider inside [dest] as its own provider config.
      *  Bundle extensions (a manifest with several mainClass entries) become
@@ -3093,8 +3181,47 @@ class ExtensionsScreenView {
             }
             installedBox.children.add(themed(why, "tiny"))
         } else {
-            list.forEach { installedBox.children.add(installedRow(it)) }
+            // Two-column cards with icons — the same card language as the
+            // repo-plugin rows above (see the target screenshots), not a
+            // one-row list.
+            val icons = pluginIconByStem()
+            val grid = twoColumnGrid()
+            list.forEachIndexed { index, cfg ->
+                grid.add(installedCard(cfg, installedIconFor(cfg, icons)), index % 2, index / 2)
+            }
+            installedBox.children.add(grid)
         }
+    }
+
+    /** File stem of a plugin/source URL ("fkbae" for …/fkbae.hiki): the key
+     *  that matches an installed extension back to its repo listing. */
+    private fun stemOf(url: String): String =
+        url.substringBefore('?').substringAfterLast('/').substringBeforeLast('.').lowercase()
+
+    /** Repo-listed icon per file stem, so installed extensions resolve the
+     *  icon their manifest published even though the installed record keeps
+     *  none. */
+    private fun pluginIconByStem(): Map<String, String> {
+        val out = HashMap<String, String>()
+        for (data in repoData.values) {
+            for (p in data.plugins) {
+                val icon = p.iconUrl
+                if (icon.isNullOrBlank()) continue
+                out.putIfAbsent(stemOf(p.url), icon)
+            }
+        }
+        return out
+    }
+
+    /** The icon for an installed extension: its repo listing's icon by file
+     *  stem, else the source repo's avatar, else the initial tile. */
+    private fun installedIconFor(cfg: ProviderConfig, icons: Map<String, String>): String? {
+        val source = cfg.extra?.substringBefore('|')?.takeIf { it.isNotBlank() }
+            ?: cfg.url.takeIf { it.isNotBlank() }
+        if (source != null) {
+            icons[stemOf(source)]?.let { return it }
+        }
+        return repoAvatarUrl(source)
     }
 
     /**
@@ -3166,51 +3293,7 @@ class ExtensionsScreenView {
             )
         }
 
-        val toggle = CheckBox("Enabled").apply {
-            isSelected = cfg.enabled
-            setOnAction {
-                runCatching { AppShell.app.store.setEnabled(cfg.id, isSelected) }
-                AppShell.uiScope.launch {
-                    AppShell.app.providers.refresh()
-                    Fx.run { refreshHeader() }
-                }
-            }
-        }
-        val reload = Ui.iconButton(Icons.REFRESH, "Reload this extension", 15.0) {
-            AppShell.uiScope.launch {
-                AppShell.app.providers.refresh()
-                // Only what shows provider state is repainted. Rebuilding the
-                // whole screen (every plugin row, every repo card) made "reload
-                // this one extension" as slow as opening the page.
-                Fx.run {
-                    fillInstalled()
-                    refreshHeader()
-                }
-            }
-            AppShell.toast("Reloaded providers")
-        }
-        val remove = Ui.iconButton(Icons.TRASH, "Remove", 15.0) {
-            // Local work only — the store row and the file. The list is repainted
-            // from the store immediately, so the row is gone the moment it is
-            // clicked; the provider-list refresh (which re-instantiates what is
-            // left) runs behind it.
-            runCatching { AppShell.app.store.removeProvider(cfg.id) }
-            if (cfg.url.isNotBlank() && cfg.type in setOf(ProviderType.HIKARI, ProviderType.CS3)) {
-                runCatching { File(cfg.url).delete() }
-            }
-            setStatus("Removed ${cfg.name}")
-            fillInstalled()
-            refreshHeader()
-            AppShell.uiScope.launch {
-                AppShell.app.providers.refresh()
-                Fx.run {
-                    fillInstalled()
-                    refreshHeader()
-                }
-            }
-        }
-
-        val row = HBox(12.0, icon, info, badges, toggle, reload, remove).apply {
+        val row = HBox(12.0, icon, info, badges, installedToggle(cfg), installedReload(), installedRemove(cfg)).apply {
             styleClass.add("src-row")
             alignment = Pos.CENTER_LEFT
         }
@@ -3225,17 +3308,126 @@ class ExtensionsScreenView {
         }
     }
 
+    /** One installed extension as a two-column-grid card: icon · name/source +
+     *  badges on top, its actions below. The same card language as the
+     *  repo-plugin rows (see the target screenshots). */
+    private fun installedCard(cfg: ProviderConfig, iconUrl: String?): Region {
+        val status = AppShell.app.providers.statuses.value.firstOrNull { it.id == cfg.id }
+        val failing = status?.takeIf { !it.loaded }
+        val icon = extIcon(cfg.name, iconUrl)
+        val name = themed(cfg.name, "src-name").apply {
+            isWrapText = true
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
+        }
+        val source = themed(
+            cfg.extra?.substringBefore('|')?.takeIf { it.isNotBlank() }
+                ?: cfg.url.takeIf { it.isNotBlank() }
+                ?: cfg.type.name.lowercase(),
+            "h-mono",
+        ).apply { maxWidth = 420.0; minWidth = 0.0; isWrapText = true }
+        val info = VBox(3.0, name, source).apply { minWidth = 0.0 }
+        HBox.setHgrow(info, Priority.ALWAYS)
+        val badges = VBox(4.0).apply {
+            alignment = Pos.TOP_RIGHT
+            minWidth = 0.0
+            children.add(Ui.badge(kindLabel(cfg.type), if (cfg.type == ProviderType.HIKARI) "badge-accent" else "badge"))
+            children.add(
+                if (failing != null) Ui.badge("not loaded", "badge-danger") else Ui.badge("loaded", "badge-ok")
+            )
+        }
+        val top = HBox(12.0, icon, info, badges).apply {
+            alignment = Pos.CENTER_LEFT
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
+        }
+        val actions = HBox(8.0, installedToggle(cfg), installedReload(), installedRemove(cfg)).apply {
+            alignment = Pos.CENTER_RIGHT
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
+        }
+        val card = VBox(8.0, top, actions).apply {
+            styleClass.add("src-row-card")
+            minWidth = 0.0
+            maxWidth = Double.MAX_VALUE
+        }
+        return if (failing == null || failing.error.isNullOrBlank()) {
+            card
+        } else {
+            VBox(6.0, card, themed("⚠ ${failing.error}", "tiny").apply {
+                styleClass.add("h-danger")
+                isWrapText = true
+                minWidth = 0.0
+            }).apply {
+                styleClass.add("src-row-card")
+                minWidth = 0.0
+                maxWidth = Double.MAX_VALUE
+            }
+        }
+    }
+
+    private fun installedToggle(cfg: ProviderConfig): CheckBox = CheckBox("Enabled").apply {
+        isSelected = cfg.enabled
+        setOnAction {
+            runCatching { AppShell.app.store.setEnabled(cfg.id, isSelected) }
+            AppShell.uiScope.launch {
+                AppShell.app.providers.refresh()
+                Fx.run { refreshHeader() }
+            }
+        }
+    }
+
+    private fun installedReload(): Button = Ui.iconButton(Icons.REFRESH, "Reload this extension", 15.0) {
+        AppShell.uiScope.launch {
+            AppShell.app.providers.refresh()
+            // Only what shows provider state is repainted. Rebuilding the
+            // whole screen (every plugin row, every repo card) made "reload
+            // this one extension" as slow as opening the page.
+            Fx.run {
+                fillInstalled()
+                refreshHeader()
+            }
+        }
+        AppShell.toast("Reloaded providers")
+    }
+
+    private fun installedRemove(cfg: ProviderConfig): Button = Ui.iconButton(Icons.TRASH, "Remove", 15.0) {
+        // Local work only — the store row and the file. The list is repainted
+        // from the store immediately, so the row is gone the moment it is
+        // clicked; the provider-list refresh (which re-instantiates what is
+        // left) runs behind it.
+        runCatching { AppShell.app.store.removeProvider(cfg.id) }
+        if (cfg.url.isNotBlank() && cfg.type in setOf(ProviderType.HIKARI, ProviderType.CS3)) {
+            runCatching { File(cfg.url).delete() }
+        }
+        setStatus("Removed ${cfg.name}")
+        fillInstalled()
+        refreshHeader()
+        AppShell.uiScope.launch {
+            AppShell.app.providers.refresh()
+            Fx.run {
+                fillInstalled()
+                refreshHeader()
+            }
+        }
+    }
+
     // ── misc ────────────────────────────────────────────────────────────────
 
     private fun setStatus(text: String, isError: Boolean = false, busy: Boolean = false) {
-        statusLabel.text = text
+        // The status line is a wrapped label on a long scrolling page: a
+        // multi-thousand-character error wall in it jumps the whole layout
+        // (the row's own error line already carries the full text), so what is
+        // SHOWN is capped — the shell chip carries the same capped text.
+        val shown = if (text.length > 700) text.take(700).trimEnd() + "…" else text
+        statusLabel.text = shown
         statusLabel.styleClass.remove("h-danger")
         if (isError) statusLabel.styleClass.add("h-danger")
         statusLabel.isWrapText = true
         statusLabel.maxWidth = 900.0
         // The status line is part of a long, scrolling page, so the shell's
         // top-bar chip carries the same text where it is always on screen.
-        AppShell.activity(if (busy && !isError) text else null)
+        AppShell.activity(if (busy && !isError) shown else null)
     }
 
     private fun themed(text: String, cls: String): Label = Label(text).apply { styleClass.add(cls) }
@@ -3296,6 +3488,7 @@ class ExtensionsScreenView {
                                 arr.optString(it).takeIf { s -> s.isNotBlank() }
                             }
                         }.orEmpty(),
+                        listedExt = jsonOpt(p, "listedExt"),
                     )
                 )
             }
@@ -3322,6 +3515,7 @@ class ExtensionsScreenView {
                         p.sizeLabel?.let { put("sizeLabel", it) }
                         p.description?.let { put("description", it) }
                         p.language?.let { put("language", it) }
+                        p.listedExt?.let { put("listedExt", it) }
                         if (p.tags.isNotEmpty()) put("tags", JSONArray(p.tags))
                     })
                 }

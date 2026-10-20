@@ -2090,9 +2090,18 @@ object Http {
         }
 
     /** GET on an explicit client (see [noProxyClient]). */
-    private fun getOn(c: OkHttpClient, url: String, headers: Map<String, String> = emptyMap()): Response {
+    private fun getOn(
+        c: OkHttpClient,
+        url: String,
+        headers: Map<String, String> = emptyMap(),
+        noCache: Boolean = false,
+    ): Response {
         val builder = Request.Builder().url(url).header("User-Agent", UA)
         headers.forEach { (k, v) -> builder.header(k, v) }
+        // A stale edge copy must never win a download race: the no-cache
+        // headers go on AFTER the caller's, so they cannot be negotiated away
+        // by a caller that happened to set caching headers.
+        if (noCache) NO_CACHE_HEADERS.forEach { (k, v) -> builder.header(k, v) }
         return execute(c, builder.build())
     }
 
@@ -2412,6 +2421,40 @@ object Http {
         return h.takeIf { it.length == 64 }
     }
 
+    /**
+     * The cache-busting query key: a transparent edge cache on the user's path
+     * can serve last week's `.jar` bytes for the same URL (the index is fresh,
+     * the bytes are not — verified live: index hash == origin hash, served
+     * bytes differ on every host including github.com itself). Any unique query
+     * makes that cache key miss, so the origin's current bytes are served.
+     */
+    private const val CACHE_BUSTER_PARAM = "hikari-v"
+
+    /** Headers that ask every cache on the path (edge, transparent proxy) to
+     *  revalidate instead of serving a stale copy. Merged into the robust
+     *  download walks — not into single-shot metadata GETs, where caching is
+     *  still wanted. */
+    private val NO_CACHE_HEADERS = mapOf("Cache-Control" to "no-cache", "Pragma" to "no-cache")
+
+    /**
+     * [url] with a cache-busting query derived from [buster] (usually the
+     * expected content hash, so the same build busts the same way). Null or
+     * blank [buster] returns the URL unchanged — callers with nothing to name
+     * still get the no-cache headers, just no query.
+     */
+    fun withCacheBuster(url: String, buster: String?): String {
+        val b = buster?.filter { it.isLetterOrDigit() }?.take(16)
+        if (b.isNullOrEmpty()) return url
+        val sep = if (url.contains('?')) '&' else '?'
+        return "$url$sep$CACHE_BUSTER_PARAM=$b"
+    }
+
+    /** Undoes [withCacheBuster]: the URL as the caller named it, for mirror
+     *  memory (a busted winner must still match next call's plain variants)
+     *  and for any string the user might see. */
+    fun stripCacheBuster(url: String): String =
+        url.replace(Regex("[?&]$CACHE_BUSTER_PARAM=[A-Za-z0-9]{1,16}"), "")
+
     /** sha256 hex of [bytes], lowercase. */
     fun sha256Hex(bytes: ByteArray): String = sha256HexOf(bytes)
 
@@ -2726,13 +2769,18 @@ object Http {
         headers: Map<String, String> = emptyMap(),
         verify: ((bytes: ByteArray, servedFrom: String) -> String?)? = null,
         onReject: ((servedFrom: String, reason: String) -> Unit)? = null,
+        cacheBuster: String? = null,
     ): ByteArray? {
         val started = System.currentTimeMillis()
-        val origins = MirrorMemory.order(url, originVariants(url))
-        val mirrors = MirrorMemory.order(url, mirrorVariants(url))
+        // The variants are derived from the plain URL and busted AFTER: the
+        // buster must never leak into variant parsing (a frontdoor wraps the
+        // whole inner URL), and the mirror memory below is keyed by host plus
+        // the plain winner (see [stripCacheBuster]).
+        val origins = MirrorMemory.order(url, originVariants(url)).map { withCacheBuster(it, cacheBuster) }
+        val mirrors = MirrorMemory.order(url, mirrorVariants(url)).map { withCacheBuster(it, cacheBuster) }
         val walk = Walk()
         fun attempt(c: OkHttpClient, u: String, throughProxy: Boolean): ByteArray? {
-            val r = runCatching { getOn(c, u, headers) }
+            val r = runCatching { getOn(c, u, headers, noCache = true) }
             val b = r.getOrNull()?.use { if (it.isSuccessful) it.body?.bytes() else null }
             if (b == null) {
                 walk.record(u, r.exceptionOrNull() ?: Exception("HTTP error for " + u), throughProxy)
@@ -2762,7 +2810,7 @@ object Http {
                 return null
             }
             MirrorMemory.markAlive(u)
-            MirrorMemory.rememberWinner(url, u)
+            MirrorMemory.rememberWinner(url, stripCacheBuster(u))
             return b
         }
         // Authoritative URLs first, mirrors after — a CS3/JAR downloaded from a
@@ -2829,13 +2877,21 @@ object Http {
         headers: Map<String, String> = emptyMap(),
         onProgress: ((Long, Long) -> Unit)? = null,
         verify: ((part: java.io.File, servedFrom: String) -> String?)? = null,
+        cacheBuster: String? = null,
         onAttempt: ((url: String, ok: Boolean, reason: String?) -> Unit)? = null,
     ): Boolean {
         // Authoritative URLs first, CDN/proxy mirrors second (see
         // [mirrorVariants]): an extension install must never "succeed" with a
         // stale or wrong file just because a mirror answered first.
-        val origins = MirrorMemory.order(url, originVariants(url))
-        val ordered = origins + MirrorMemory.order(url, mirrorVariants(url))
+        //
+        // [cacheBuster] (usually the expected content hash) is expanded into a
+        // query on every variant AFTER derivation, plus no-cache headers on
+        // every request (see [withCacheBuster]): a transparent edge cache that
+        // keeps serving last week's bytes for the same URL is exactly the
+        // checksum-mismatch reports this defeats. It sits BEFORE [onAttempt]
+        // so trailing-lambda callers keep binding their lambda to [onAttempt].
+        val origins = MirrorMemory.order(url, originVariants(url)).map { withCacheBuster(it, cacheBuster) }
+        val ordered = origins + MirrorMemory.order(url, mirrorVariants(url)).map { withCacheBuster(it, cacheBuster) }
         // Overall budget: on a black-hole network every mirror costs a full
         // connect timeout; bound the walk so the UI doesn't sit for minutes
         // (the Android app caps installs at 90s for the same reason).
@@ -2848,6 +2904,9 @@ object Http {
         // the window before a single proxy was tried. See RELEASE_ORIGIN_FIRST_MS.
         val releaseAsset = parseGhTarget(normalizeDriveUrl(url.trim())) == null && isGithubUrl(url)
         val originWindow = if (releaseAsset) RELEASE_ORIGIN_FIRST_MS else ORIGIN_FIRST_MS
+        // The no-cache headers ride every raced request (see [withCacheBuster]):
+        // the caller's headers still win on any key they set themselves.
+        val raceHeaders = NO_CACHE_HEADERS + headers
         sweepParts(dest)
         // A certificate rejection is not worth walking the rest of the ladder
         // for: the TLS-1.2 pass, the direct route and the mirrors all present
@@ -2866,7 +2925,7 @@ object Http {
             }
             onAttempt?.invoke(u, ok, why)
         }
-        if (raceDownload(origins, dest, headers, onProgress, counting, deadline, null, originWindow, url, verify = verify)) return true
+        if (raceDownload(origins, dest, raceHeaders, onProgress, counting, deadline, null, originWindow, url, verify = verify)) return true
         if (certRejected) {
             System.err.println("downloadToRobust: every candidate was rejected by the certificate store — stopping")
             return false
@@ -2878,7 +2937,7 @@ object Http {
         // where the connect hangs instead of failing) turn every install into a
         // one-minute spinner. A slow-but-working origin is not lost by that —
         // it is in this wave too, and this wave is the long one.
-        if (raceDownload(ordered, dest, headers, onProgress, counting, deadline, null, MAIN_RACE_MS, url, verify = verify)) return true
+        if (raceDownload(ordered, dest, raceHeaders, onProgress, counting, deadline, null, MAIN_RACE_MS, url, verify = verify)) return true
         if (certRejected) {
             System.err.println("downloadToRobust: every candidate was rejected by the certificate store — stopping")
             return false
@@ -2887,9 +2946,9 @@ object Http {
         // with TLS pinned to 1.2 ([rescueClient]) — the two desktop
         // misconfigurations where every request fails while the browser works.
         if (systemProxyInUse() &&
-            raceDownload(ordered, dest, headers, onProgress, counting, deadline, noProxyClient, RESCUE_RACE_MS, url, "(no proxy)", verify)
+            raceDownload(ordered, dest, raceHeaders, onProgress, counting, deadline, noProxyClient, RESCUE_RACE_MS, url, "(no proxy)", verify)
         ) return true
-        if (raceDownload(ordered, dest, headers, onProgress, counting, deadline, rescueClient, RESCUE_RACE_MS, url, "(TLS 1.2)", verify)) return true
+        if (raceDownload(ordered, dest, raceHeaders, onProgress, counting, deadline, rescueClient, RESCUE_RACE_MS, url, "(TLS 1.2)", verify)) return true
         // Every in-JVM stack has now failed. Hand the SAME candidate list to the
         // OS's own HTTP client — Schannel + the Windows certificate store, i.e.
         // the browser's TLS stack, running in a process of its own (see
@@ -3049,7 +3108,7 @@ object Http {
             return false
         }
         onAttempt?.invoke(from, true, note.ifBlank { null })
-        if (rememberFor != null) MirrorMemory.rememberWinner(rememberFor, from)
+        if (rememberFor != null) MirrorMemory.rememberWinner(rememberFor, stripCacheBuster(from))
         // Losers may still be mid-write: remove what's already on disk, and let
         // a sweep a minute later catch anything that lands after this returns.
         staging.values.forEach { p -> if (p.absolutePath != part.absolutePath) runCatching { p.delete() } }
@@ -3157,12 +3216,18 @@ object Http {
                         "\$ProgressPreference = 'SilentlyContinue'; " +
                         "\$wc = New-Object Net.WebClient; " +
                         "\$wc.Headers.Add('User-Agent', '" + UA.replace("'", "''") + "'); " +
+                        // The OS stack is the last resort against stale edge
+                        // copies too: ask every cache on the path to revalidate.
+                        "\$wc.Headers.Add('Cache-Control', 'no-cache'); " +
+                        "\$wc.Headers.Add('Pragma', 'no-cache'); " +
                         "\$wc.DownloadFile('" + safeUrl + "', '" + safeOut + "')",
                 )
             } else {
                 listOf(
                     tool, "-fsSL", "--ssl-no-revoke", "--connect-timeout", "8",
-                    "--max-time", "90", "-A", UA, "-o", tmp.absolutePath, url,
+                    "--max-time", "90", "-A", UA,
+                    "-H", "Cache-Control: no-cache", "-H", "Pragma: no-cache",
+                    "-o", tmp.absolutePath, url,
                 )
             }
             val p = ProcessBuilder(cmd).redirectErrorStream(true).start()
@@ -3455,6 +3520,7 @@ object Http {
         headers: Map<String, String> = emptyMap(),
         expectedSha: String? = null,
         rejectLog: MutableCollection<String>? = null,
+        cacheBuster: String? = null,
     ): PluginDownload {
         // The repo's sha256 rides into the byte walk itself (see
         // [fetchBytesRobust]): a stale mirror copy loses the race instead of
@@ -3471,11 +3537,11 @@ object Http {
                     log.add(u.substringAfter("//").substringBefore('/') + " — " + reason.take(160))
                 }
             }
-        val direct = runCatching { fetchBytesRobust(url, headers, verify, onReject) }.getOrNull()
+        val direct = runCatching { fetchBytesRobust(url, headers, verify, onReject, cacheBuster) }.getOrNull()
         if (direct != null && direct.isNotEmpty()) return PluginDownload(direct, url, null)
         val repaired = runCatching { repairGithubFileUrl(url) }.getOrNull()
         if (repaired != null) {
-            val bytes = runCatching { fetchBytesRobust(repaired, headers, verify, onReject) }.getOrNull()
+            val bytes = runCatching { fetchBytesRobust(repaired, headers, verify, onReject, cacheBuster) }.getOrNull()
             if (bytes != null && bytes.isNotEmpty()) {
                 return PluginDownload(bytes, repaired, "the file had moved in its repository — fetched from $repaired")
             }

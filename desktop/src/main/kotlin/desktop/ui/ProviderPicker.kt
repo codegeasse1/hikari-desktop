@@ -1,6 +1,7 @@
 package desktop.ui
 
 import com.hikari.app.data.ProviderConfig
+import com.hikari.app.net.Http
 import javafx.geometry.Insets
 import javafx.geometry.Pos
 import javafx.scene.control.Button
@@ -306,12 +307,44 @@ class ProviderPicker(private val onPick: () -> Unit) {
 
     private fun subLabelFor(p: ProviderConfig): Label {
         val cached = countCache[p.id]
-        return Label(
-            if (cached != null) "$cached catalog${if (cached == 1) "" else "s"}" else "…"
-        ).apply {
+        return Label(countText(p, cached)).apply {
             styleClass.add("x-pd-sub2")
             countLabels[p.id] = this
         }
+    }
+
+    /**
+     * Where a provider comes from, as read on its card: engine + short
+     * source ("Hikari · owner/repo"). A card that names only the provider
+     * cannot tell two same-named providers from different repos apart — the
+     * origin is what does.
+     */
+    private fun originText(p: ProviderConfig): String {
+        val engine = Ui.providerEngineLabel(p.type)
+        val src = sourceText(p)
+        return if (src.isNullOrBlank()) engine else "$engine · $src"
+    }
+
+    /** The short source behind a provider: its install URL's owner/repo for
+     *  GitHub addresses (see Http.repoDisplayName), the host otherwise. Null
+     *  when the provider records no URL at all (built-ins). */
+    private fun sourceText(p: ProviderConfig): String? {
+        val raw = p.extra?.substringBefore('|')?.trim().orEmpty()
+        val cand = when {
+            raw.startsWith("http://") || raw.startsWith("https://") -> raw
+            p.url.startsWith("http://") || p.url.startsWith("https://") -> p.url
+            else -> return null
+        }
+        return Http.repoDisplayName(cand).takeIf { it.isNotBlank() }
+    }
+
+    /** The card's sub-line: origin plus the catalog count once it has been
+     *  counted in the background (see [ensureCounts]). */
+    private fun countText(p: ProviderConfig, n: Int?): String {
+        val base = originText(p)
+        if (n == null) return base
+        val tail = "$n catalog${if (n == 1) "" else "s"}"
+        return "$base · $tail"
     }
 
     private fun providerCard(p: ProviderConfig): HBox {
@@ -463,7 +496,7 @@ class ProviderPicker(private val onPick: () -> Unit) {
         val sub = subLabelFor(p)
         // Installed-but-disabled providers are offered too (with a mark):
         // adding one enables it, so the feed can mix in anything installed.
-        if (!p.enabled) sub.text = (if (sub.text.isBlank() || sub.text == "…") "" else sub.text + " · ") + "disabled"
+        if (!p.enabled) sub.text = "${sub.text} · disabled"
         val texts = VBox(3.0, name, sub).apply { minWidth = 0.0 }
         HBox.setHgrow(texts, Priority.ALWAYS)
         val add = Button().apply {
@@ -510,7 +543,11 @@ class ProviderPicker(private val onPick: () -> Unit) {
                     countCache[p.id] = n
                     val label = countLabels[p.id]
                     if (label != null) {
-                        val text = "$n catalog${if (n == 1) "" else "s"}"
+                        // Recompose the whole sub-line (origin + count): the
+                        // row may have been rebuilt since, and the "disabled"
+                        // mark must survive the count landing.
+                        val cfg = providers.firstOrNull { it.id == p.id } ?: p
+                        val text = countText(cfg, n) + (if (cfg.enabled) "" else " · disabled")
                         desktop.fx.Fx.run { label.text = text }
                     }
                 }

@@ -1,6 +1,7 @@
 package com.hikari.app.hiki
 
 import android.content.Context
+import com.hikari.app.cs3.DexJar
 import com.hikari.ext.HikariProvider
 import org.json.JSONArray
 import org.json.JSONObject
@@ -12,7 +13,10 @@ import java.net.URLClassLoader
  * Loads compiled Hikari extensions. Desktop extensions ship as plain JVM JARs
  * (the same jar the Android build dexes with d8 before packaging as .hiki),
  * so a URLClassLoader opens them directly and the parent loader resolves the
- * com.hikari.ext API classes.
+ * com.hikari.ext API classes. A `.hiki` dex archive that reaches this loader
+ * (the install's `.jar`-twin fallback) is translated to JVM bytecode first via
+ * [DexJar] — without that the archive opens fine and every class in it throws
+ * ClassNotFoundException.
  *
  * manifest.json keys:
  *   { "name": "My Extension", "version": 1,
@@ -75,7 +79,16 @@ object HikariPluginManager {
         }
 
         val classLoader = try {
-            URLClassLoader(arrayOf(file.toURI().toURL()), context.classLoader)
+            // A `.hiki` archive holds DEX bytecode (classes.dex), which a
+            // URLClassLoader can OPEN but whose classes can never LOAD — the
+            // confusing ClassNotFoundException the catalog showed for every
+            // dex install. Translate it to a JVM jar first, exactly like
+            // Cs3PluginManager does (see DexJar.toJvmJarUrlOrNull); a plain
+            // jar comes back unchanged, so this is a no-op for JVM builds.
+            val jvmFile = runCatching {
+                DexJar.toJvmJarUrlOrNull(file)?.let { File(it.toURI()) }
+            }.getOrNull() ?: file
+            URLClassLoader(arrayOf(jvmFile.toURI().toURL()), context.classLoader)
         } catch (e: Throwable) {
             record("URLClassLoader", e)
             lastError = errors.toString().trim().ifBlank { "Could not open ${file.name}" }

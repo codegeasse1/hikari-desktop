@@ -62,6 +62,11 @@ object Ui {
             danger -> styleClass.add("btn-danger")
             ghost -> styleClass.add("btn-ghost")
         }
+        // A button is never squeezed below what its own label needs: a
+        // squeezed button draws "…" instead of its action ("Install" became
+        // "…"), and the parent is the one that must scroll or wrap. Callers
+        // that need a fixed size still set their own min/max afterwards.
+        minWidth = Region.USE_PREF_SIZE
         if (icon != null) graphic = Icons.of(icon, 16.0)
         if (onClick != null) setOnAction { onClick() }
     }
@@ -169,6 +174,10 @@ object Ui {
     fun badge(text: String, kind: String = "badge"): Label = Label(text).apply {
         styleClass.add("badge")
         styleClass.addAll(kind.split(" "))
+        // Same rule as [button]: a squeezed badge draws "…" ("signed" became
+        // "si…"), so a badge keeps its full label and the row lays out around
+        // it instead.
+        minWidth = Region.USE_PREF_SIZE
     }
 
     fun sectionHeader(title: String, subtitle: String? = null, trailing: Node? = null): HBox {
