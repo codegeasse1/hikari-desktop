@@ -75,13 +75,17 @@ object HlsRelay {
             val method = ex.requestMethod ?: "GET"
             val isHead = method.equals("HEAD", ignoreCase = true)
             val incomingRange = ex.requestHeaders.getFirst("Range")
-            // Single-use playlists are cached: the player re-opens the master
-            // (and often the variant) after the first read, and the token URL
-            // 403s on a second fetch — serve the cached (rewritten) copy.
-            // A ranged re-request is a SEEK, never a playlist re-read, so the
-            // cache only answers full GETs.
-            if (!isHead && incomingRange.isNullOrBlank()) {
-                masterCache[key]?.let { cached ->
+            // Single-use playlists are cached BY UPSTREAM URL, not by relay
+            // key: every cascade relaunch mints a fresh key (k4, k5, …) for
+            // the same stream, so a per-key cache re-burns the upstream
+            // playlist fetch on every step (and a single-use token with it).
+            // The cached bytes are rewritten to flat /x/<seg> relay URLs
+            // registered in the global maps, so they stay valid for every
+            // later launch. A ranged re-request is a SEEK, never a playlist
+            // re-read, so the cache only answers full GETs — and only
+            // playlist-path requests (segments are bytes, never cached).
+            if (!isHead && incomingRange.isNullOrBlank() && parts.size == 1) {
+                masterCache[route.url]?.let { cached ->
                     ex.responseHeaders.set("Content-Type", "application/vnd.apple.mpegurl")
                     ex.responseHeaders.set("Accept-Ranges", "bytes")
                     ex.sendResponseHeaders(200, cached.size.toLong())
@@ -139,23 +143,34 @@ object HlsRelay {
             val ct = resp.header("Content-Type") ?: "application/octet-stream"
             // A ranged answer is ALWAYS bytes: playlists are never fetched with
             // Range, and rewriting a partial playlist as a full one corrupts it.
-            // Otherwise only treat the answer as a playlist when it really is
-            // one — the old `text/plain OR url contains .m3u8` rule rewrote raw
-            // .ts bytes served as text/plain into garbage, which is a silent
-            // stuck-loading with no error.
+            // Otherwise a playlist is recognised by CONTENT, not just by
+            // headers: some CDNs serve their variant playlists as
+            // application/octet-stream (or text/plain) on extensionless URLs.
+            // The old gate (playlist content-type OR .m3u8 path) let those
+            // through as RAW BYTES — mpv then parsed the ORIGINAL absolute
+            // segment URLs and fetched them straight from the CDN, without
+            // the provider's Referer, on a path the relay exists to keep it
+            // off (observed: mpv opening a tx.doudou520 .ts directly and
+            // dying mid-open). When the answer is not definitively media and
+            // is small enough to be a playlist, buffer it and sniff for
+            // #EXTM3U (BOM-tolerant); anything else falls through to the byte
+            // path below with the bytes already read.
             val ranged = !incomingRange.isNullOrBlank() || resp.code == 206
-            if (!ranged && isPlaylistAnswer(ct, targetUrl, resp.header("Content-Length"))) {
-                val text = body?.string() ?: ""
+            val sniffBytes = if (!ranged && !isDefinitiveMedia(ct)) sniffablePlaylistBytes(resp, targetUrl) else null
+            if (sniffBytes != null) {
                 resp.close()
-                if (!text.trimStart().startsWith("#EXTM3U")) {
-                    // Looked like a playlist URL but isn't one (an extensionless
+                val rawText = sniffBytes.toString(StandardCharsets.UTF_8).trimStart()
+                // A UTF-8 BOM defeats the #EXTM3U check (Kotlin's trimStart
+                // does not strip U+FEFF): drop it by code, not by literal.
+                val text = if (rawText.firstOrNull()?.code == 0xFEFF) rawText.drop(1) else rawText
+                if (!text.startsWith("#EXTM3U")) {
+                    // Looked sniffable but isn't a playlist (an extensionless
                     // MP4/CDN answer): serve the bytes we already read instead of
                     // handing mpv an empty playlist.
-                    val bytes = text.toByteArray(StandardCharsets.UTF_8)
                     ex.responseHeaders.set("Content-Type", ct)
                     ex.responseHeaders.set("Accept-Ranges", "bytes")
-                    ex.sendResponseHeaders(200, bytes.size.toLong())
-                    ex.responseBody.use { it.write(bytes) }
+                    ex.sendResponseHeaders(200, sniffBytes.size.toLong())
+                    ex.responseBody.use { it.write(sniffBytes) }
                     return
                 }
                 val rewritten = rewritePlaylist(text, targetUrl, route.headers)
@@ -165,10 +180,11 @@ object HlsRelay {
                 // playlist (no ENDLIST) keeps growing — caching it freezes the
                 // stream at whatever segments existed on the first read, so it
                 // is always re-fetched. The map is bounded: routes accumulate
-                // over a session and must not grow without limit.
+                // over a session and must not grow without limit. Keyed by
+                // upstream URL so cascade relaunches share it (see above).
                 if (text.contains("#EXT-X-ENDLIST")) {
                     if (masterCache.size > 150) masterCache.clear()
-                    masterCache[key] = bytes
+                    masterCache[targetUrl] = bytes
                 }
                 ex.responseHeaders.set("Content-Type", "application/vnd.apple.mpegurl")
                 ex.responseHeaders.set("Accept-Ranges", "bytes")
@@ -204,8 +220,6 @@ object HlsRelay {
         }
     }
 
-    /** True when the upstream answer should be parsed as an HLS playlist. */
-
     /**
      * The headers a relay fetch goes out with: the provider's own headers,
      * plus a browser UA when it recorded none, plus a Referer derived from
@@ -221,21 +235,35 @@ object HlsRelay {
         return HashMap(recorded).apply { put("Referer", origin) }
     }
 
-    private fun isPlaylistAnswer(ct: String, targetUrl: String, contentLength: String?): Boolean {
+    /** True for content types that are never playlists: video/audio bytes
+     *  always stream, whatever the URL path says. Everything else (playlist
+     *  types, text, octet-stream, missing) is sniffed by content when small
+     *  (see [sniffablePlaylistBytes]). */
+    private fun isDefinitiveMedia(ct: String): Boolean {
         val c = ct.lowercase()
-        if (c.contains("mpegurl") || c.contains("x-mpegurl") || c.contains("hls")) return true
-        if (c.startsWith("video/") || c.startsWith("audio/")) return false
-        if (c.contains("mp2t") || c.contains("mp4") || c.contains("webm") || c.contains("matroska")) return false
+        return c.startsWith("video/") || c.startsWith("audio/") ||
+            c.contains("mp2t") || c.contains("mp4") || c.contains("webm") || c.contains("matroska")
+    }
+
+    /** The response body buffered for playlist sniffing, or null when the
+     *  answer must stream as bytes unseen. Small answers are always
+     *  bufferable (playlists are kilobytes); a large or unknown-length
+     *  opaque stream (octet-stream, chunked) keeps streaming rather than
+     *  risk buffering gigabytes as text. */
+    private fun sniffablePlaylistBytes(resp: okhttp3.Response, targetUrl: String): ByteArray? {
+        val len = resp.header("Content-Length")?.toLongOrNull() ?: -1L
+        if (len in 0..2_000_000L) return resp.body?.bytes() ?: ByteArray(0)
+        if (len >= 0L) return null
+        // Unknown length: only buffer what smells like a playlist (a
+        // playlist URL, or a textual content type). A chunked media segment
+        // must keep streaming.
+        val ct = (resp.header("Content-Type") ?: "").lowercase()
         val path = targetUrl.substringBefore('?').substringBefore('#').lowercase()
-        val looksPlaylist = path.endsWith(".m3u8") || path.endsWith(".m3u") || path.endsWith(".txt")
-        if (looksPlaylist) {
-            // A playlist URL with a huge body is a mislabelled segment — don't
-            // buffer gigabytes as text. Playlists are kilobytes.
-            val len = contentLength?.toLongOrNull() ?: -1L
-            if (len > 2_000_000L) return false
-            return true
-        }
-        return false
+        val looksPlaylistPath = path.endsWith(".m3u8") || path.endsWith(".m3u") || path.endsWith(".txt")
+        val textual = ct.contains("mpegurl") || ct.contains("x-mpegurl") || ct.contains("hls") ||
+            ct.startsWith("text/") || ct.contains("json") || ct.contains("xml") || ct.isBlank()
+        if (!looksPlaylistPath && !textual) return null
+        return resp.body?.bytes() ?: ByteArray(0)
     }
 
     /** Routes one absolute media URL back through the relay. */

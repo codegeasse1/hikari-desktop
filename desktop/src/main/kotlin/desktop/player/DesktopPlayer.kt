@@ -142,15 +142,20 @@ object DesktopPlayer {
         VoProfile("direct3d", listOf("--hwdec=no", "--vo=direct3d")),
     )
 
-    /** The profile this launch should start on: the last one that showed a
-     *  picture on this machine, or "auto" when none has yet. */
+    /** The profile this launch should start on: the last one that started a
+     *  working player on this machine (window adopted), or "auto" when none
+     *  has yet. */
     private fun startVoIdx(): Int {
         val want = runCatching { desktop.ui.AppShell.app.store.playerVo() }.getOrDefault("auto")
         return VO_PROFILES.indexOfFirst { it.name == want }.takeIf { it >= 0 } ?: 0
     }
 
-    /** Remembers a profile that showed a picture, so the next Play starts
-     *  there instead of rediscovering the crash. */
+    /** Remembers a profile whose player started fine (its window was
+     *  adopted), so the next Play starts there instead of rediscovering the
+     *  crash. A profile is remembered on ADOPTION, not on first picture: on
+     *  a machine where nothing has ever produced a frame yet, the profile
+     *  that at least starts is still the best next guess — otherwise every
+     *  Play press re-burns the whole cascade of crashes first. */
     private fun persistVo(idx: Int) {
         val name = VO_PROFILES.getOrNull(idx)?.name ?: return
         runCatching { desktop.ui.AppShell.app.store.setPlayerVo(name) }
@@ -473,7 +478,11 @@ object DesktopPlayer {
                 PlayerWindow.attachProcess(
                     p.pid(),
                     onFailed = { onAdoptionFailed() },
-                    onAdopted = { onAdopted() },
+                    // An adopted window means this video output WORKS on this
+                    // machine: remember the profile now, not on first picture
+                    // (see [persistVo]) — a cascade step that starts but never
+                    // plays must still win over re-burning the crashes above it.
+                    onAdopted = { persistVo(vo); onAdopted() },
                 )
             }
             attachPlayerWindow(title)
@@ -600,7 +609,7 @@ object DesktopPlayer {
             ipcTarget = openIpcEndpoint()
             val gen = ++launchGen
             // The video-output profile for this attempt: an explicit cascade
-            // step, or the last profile that showed a picture on this machine.
+            // step, or the last profile that started a working player on this machine.
             val vo = if (voIdx in VO_PROFILES.indices) voIdx else startVoIdx()
             val url = com.hikari.app.net.Http.sanitizeStreamUrl(stream.url)
             val signed = isSignedStreamUrl(url)
@@ -741,7 +750,11 @@ object DesktopPlayer {
                 PlayerWindow.attachProcess(
                     p.pid(),
                     onFailed = { onAdoptionFailed() },
-                    onAdopted = { onAdopted() },
+                    // An adopted window means this video output WORKS on this
+                    // machine: remember the profile now, not on first picture
+                    // (see [persistVo]) — a cascade step that starts but never
+                    // plays must still win over re-burning the crashes above it.
+                    onAdopted = { persistVo(vo); onAdopted() },
                 )
             }
             attachPlayerWindow(title)
@@ -1146,8 +1159,7 @@ object DesktopPlayer {
         val logFile = lastMpvLog
             ?: File(System.getProperty("user.home"), ".hikari/mpv.log")
         val tail = runCatching {
-            logFile.readLines()
-                .takeLast(12).joinToString("\n").trim()
+            usefulLogLines(logFile.readLines(), 12).joinToString("\n").trim()
         }.getOrDefault("").take(1200)
         return buildString {
             append("The video player (mpv) closed immediately without playing anything — ")
@@ -1302,12 +1314,39 @@ object DesktopPlayer {
         append('\n').append(tailOf(File(dir, "hikari-player.log"), 20))
     }
 
-    /** The last [lines] of a log file, as a titled block. */
+    /** The last [lines] of a log file, as a titled block — with mpv's
+     *  thousands of `watch_later` state-path lines filtered out, so the
+     *  block shows what actually happened instead of 60 lines of spam. */
     private fun tailOf(file: File, lines: Int): String {
         val all = runCatching { file.readLines() }.getOrNull()
             ?: return "--- " + file.name + ": not written (" + file.absolutePath + ") ---"
-        return "--- " + file.name + " (last " + minOf(lines, all.size) + " of " + all.size + " lines) ---\n" +
-            all.takeLast(lines).joinToString("\n")
+        val useful = usefulLogLines(all, lines)
+        return "--- " + file.name + " (" + useful.size + " most useful of " + all.size + " lines) ---\n" +
+            useful.joinToString("\n")
+    }
+
+    /** mpv prints thousands of `watch_later` state-path lines per launch, so
+     *  the last N raw lines of its log are always that spam: every pasted
+     *  report — and the DOA dialog — showed nothing but noise while the real
+     *  error scrolled above it. Reports and dialogs instead show the last
+     *  non-noise lines, plus any error-looking lines wherever they sit. */
+    private fun isNoiseLogLine(l: String): Boolean {
+        val t = l.lowercase()
+        return t.contains("watch_later") || t.contains("state path:")
+    }
+
+    private fun usefulLogLines(all: List<String>, keep: Int): List<String> {
+        if (all.isEmpty()) return all
+        val tail = all.filter { !isNoiseLogLine(it) }.takeLast(keep)
+        val errs = all.filter { l ->
+            if (isNoiseLogLine(l)) return@filter false
+            val t = l.lowercase()
+            t.contains("[e]") || t.contains("[f]") || t.contains("error") ||
+                t.contains("fail") || t.contains("403") || t.contains("404") ||
+                t.contains("not found") || t.contains("no protocol") ||
+                t.contains("unsupported") || t.contains("exiting")
+        }.takeLast(keep)
+        return (errs + tail).distinct().takeLast(keep)
     }
 
     /** Writes the report next to the app's other logs, then copies it. */
