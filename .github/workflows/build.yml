@@ -125,22 +125,29 @@ jobs:
 
       - name: Bundle mpv player (video engine)
         if: always()
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
           mpv_url="https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20260814/mpv-x86_64-20260814-git-7b8915bc1d.7z"
           if ! curl -fsSL -o mpv.7z "$mpv_url"; then
             echo "pinned mpv build is unavailable - resolving the newest release asset"
-            mpv_url=$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest" | grep -o '"browser_download_url": *"[^"]*mpv-x86_64-[^"]*\.7z"' | head -n 1 | cut -d'"' -f4)
+            mpv_url=$(curl -fsSL "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest" | grep -o '"browser_download_url": *"[^"]*mpv-x86_64-[^"]*\.7z"' | head -n 1 | cut -d'"' -f4)
             echo "newest: $mpv_url"
-            [ -n "$mpv_url" ]
-            curl -fsSL -o mpv.7z "$mpv_url"curl -fsSL -o mpv.7z "$mpv_url"
+            curl -fsSL -o mpv.7z "$mpv_url"
           fi
           7z x -bso0 -bsp0 -ompv-tmp mpv.7z
           mkdir -p jpackage-input/mpv
           cp -r mpv-tmp/* jpackage-input/mpv/
           echo "mpv bundled:"; ls jpackage-input/mpv | head -40
+          # A bundle without a STARTABLE mpv ships a player that dies on every
+          # video (dead-on-arrival) — fail the build here instead of the user.
+          if [ ! -f jpackage-input/mpv/mpv.exe ]; then
+            echo "::error::mpv.exe missing from the bundle (7z layout changed?)"
+            exit 1
+          fi
+          if ! jpackage-input/mpv/mpv.exe --version --no-config | head -3; then
+            echo "::error::bundled mpv cannot start on a clean runner"
+            exit 1
+          fi
         shell: bash
 
       - name: Package exe (app image)

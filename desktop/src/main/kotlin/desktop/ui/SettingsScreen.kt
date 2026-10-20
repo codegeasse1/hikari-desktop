@@ -28,21 +28,32 @@ class SettingsScreenView {
 
     private val app = HikariApp.instance
 
+    /** Set by [AppShell.openSettingsLogs] to jump straight into the log folder. */
+    var revealLogsOnShown: Boolean = false
+
+    /** The open folder, or null for the folder list. */
+    private var openFolder: String? = null
+
+    private var pendingScrollBottom: Boolean = false
+
     fun onShown() {
-        val children = mutableListOf<Region>(
-            playbackSection(),
-            homeSection(),
-            appearanceSection(),
-            browserSection(),
-            updatesSection(),
-            logsSection(),
-            dataSection(),
-            aboutSection(),
-        )
-        crashSection()?.let { children.add(1, it) }
-        body.children.setAll(children)
         if (revealLogsOnShown) {
             revealLogsOnShown = false
+            openFolder = F_LOGS
+            pendingScrollBottom = true
+        }
+        val children = mutableListOf<Region>()
+        val folder = openFolder
+        if (folder == null) {
+            crashSection()?.let { children.add(it) }
+            children.add(folderList())
+        } else {
+            children.add(backRow(folderTitle(folder)))
+            children.add(folderBody(folder))
+        }
+        body.children.setAll(children)
+        if (pendingScrollBottom) {
+            pendingScrollBottom = false
             javafx.application.Platform.runLater {
                 runCatching { root.vvalue = 1.0 }
                 AppShell.toast("Logs and diagnostics — save and share the .txt when reporting an issue", "ok")
@@ -50,8 +61,47 @@ class SettingsScreenView {
         }
     }
 
-    /** Set by [AppShell.openSettingsLogs] to jump straight to the log section. */
-    var revealLogsOnShown: Boolean = false
+    /** Settings is folders: one row per area, tapping one goes inside it. */
+    private fun folderList(): Region {
+        val rows = FOLDERS.map { (id, title, sub) ->
+            val go = Ui.button(title, ghost = true) { openFolder = id; onShown() }.apply {
+                maxWidth = Double.MAX_VALUE
+            }
+            VBox(2.0,
+                go,
+                Theme.label(sub, size = 11.5, dim = true).apply { isWrapText = true },
+            ).apply { minWidth = 0.0 }
+        }
+        return Ui.panel(
+            Ui.sectionHeader("Settings", "Pick an area"),
+            *rows.toTypedArray(),
+        )
+    }
+
+    private fun backRow(title: String): Region {
+        val back = Ui.button("Back", icon = Icons.CHEVRON_LEFT, ghost = true) {
+            openFolder = null
+            onShown()
+        }
+        val head = HBox(10.0, back, Theme.label(title, size = 16.0, bold = true).apply {
+            isWrapText = true
+        }).apply { alignment = Pos.CENTER_LEFT }
+        return head
+    }
+
+    private fun folderTitle(id: String): String =
+        FOLDERS.firstOrNull { it.first == id }?.second ?: "Settings"
+
+    private fun folderBody(id: String): Region = when (id) {
+        F_PLAYBACK -> playbackSection()
+        F_HOME -> homeSection()
+        F_APPEARANCE -> appearanceSection()
+        F_BROWSER -> browserSection()
+        F_UPDATES -> updatesSection()
+        F_LOGS -> logsSection()
+        F_DATA -> dataSection()
+        else -> aboutSection()
+    }
 
     /**
      * Playback behaviour + server scope.
@@ -427,6 +477,26 @@ class SettingsScreenView {
     )
 
     private companion object {
+        const val F_PLAYBACK = "playback"
+        const val F_HOME = "home"
+        const val F_APPEARANCE = "appearance"
+        const val F_BROWSER = "browser"
+        const val F_UPDATES = "updates"
+        const val F_LOGS = "logs"
+        const val F_DATA = "data"
+        const val F_ABOUT = "about"
+
+        /** Folders on the Settings front page, in display order. */
+        val FOLDERS = listOf(
+            Triple(F_PLAYBACK, "Playback and servers", "What the Play button does and where it looks"),
+            Triple(F_HOME, "Home", "How the catalog rows look"),
+            Triple(F_APPEARANCE, "Appearance", "Applies instantly across the whole app"),
+            Triple(F_BROWSER, "Browser", "Some sources only return playable links for a desktop browser"),
+            Triple(F_UPDATES, "Updates", "Check for a newer build"),
+            Triple(F_LOGS, "Logs and diagnostics", "What to send when something breaks"),
+            Triple(F_DATA, "Data", "Everything is stored locally in the app data folder"),
+            Triple(F_ABOUT, "About", "Version and install details"),
+        )
         /** Engine families the server scope can fan out to, in display order. */
         val SWEEP_ENGINE_ORDER = listOf(
             ProviderType.CS3,

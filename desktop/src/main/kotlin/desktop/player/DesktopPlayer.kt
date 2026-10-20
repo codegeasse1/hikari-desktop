@@ -99,6 +99,31 @@ object DesktopPlayer {
      */
     @Volatile private var launchGen = 0
 
+    /**
+     * Death classification (the core of the player rework).
+     *
+     * A launch that dies inside [DOA_MS] of start without ever showing a frame
+     * is DEAD ON ARRIVAL: the bundled player failed to START, so the stream is
+     * innocent — fetching a fresh link or silently relaunching the same command
+     * can never help, and doing it anyway is the "Retry flashes, then it plays
+     * by itself / pipe stopped" loop. DOA gets mpv's own startup reason and a
+     * browser path, never a relaunch. A launch that dies AFTER playing (or
+     * after living past the window) died on the STREAM: that one gets the
+     * fresh-link relaunch, exactly like before.
+     */
+    private const val DOA_MS = 5_000L
+
+    /** When the current launch's process started (for [DOA_MS]). */
+    @Volatile private var launchStartedAt = 0L
+
+    /**
+     * mpv startup probe, refreshed at most once a minute: `mpv --version
+     * --no-config` must print and exit 0. When the bundled binary cannot even
+     * do that, every launch would be dead-on-arrival — fail fast with the
+     * reason instead of entering the retry loop. Null = never probed.
+     */
+    @Volatile private var mpvProbe: Pair<Long, String?>? = null
+
     /** The exact command line the current player was launched with, and what it
      *  was asked to play. Kept for the player report — "which flags did it
      *  actually get" is the first question about a player that misbehaves. */
@@ -264,6 +289,16 @@ object DesktopPlayer {
                 showBrowserFallback(title, path, "The video player (mpv) wasn't found next to the app — re-download the latest release.")
                 return@run
             }
+            // Cached probe only (never block the UI thread here): when a
+            // stream launch already proved mpv broken this minute, say so now
+            // instead of dying on the file too. Fresh failures are caught by
+            // the dead-on-arrival message in the drain thread below.
+            val now = System.currentTimeMillis()
+            val cachedErr = mpvProbe?.takeIf { now - it.first < 60_000L }?.second
+            if (cachedErr != null) {
+                showBrowserFallback(title, path, brokenPlayerMessage(cachedErr))
+                return@run
+            }
             ipcTarget = openIpcEndpoint()
             runCatching { PlayerWindow.parkSurface() }
             // Park the previous stream's window FIRST (it belongs to the old mpv,
@@ -344,6 +379,7 @@ object DesktopPlayer {
             PlayerWindow.onPlayerDied = {
                 recoverFromPlayerDeath(title, StreamSource(name = title, url = path), null, 0, path)
             }
+            val localStartedAt = System.currentTimeMillis()
             Thread(
                 {
                     runCatching { p.inputStream.bufferedReader().forEachLine { } }
@@ -354,12 +390,17 @@ object DesktopPlayer {
                     if (code == 0 && !p.isAlive) {
                         Fx.run { if (proc === p) stopPlayback() }
                     } else if (code != 0 && !p.isAlive) {
+                        // Dead-on-arrival even for a local file: the player
+                        // failed to START, so the file is innocent — say that
+                        // instead of a generic error.
+                        val doa = isDeadOnArrival(localStartedAt)
                         Fx.run {
                             if (dialogShown) return@run
                             dialogShown = true
                             showBrowserFallback(
                                 title, path,
-                                "The player closed with an error while opening the downloaded file.",
+                                if (doa) doaMessage()
+                                else "The player closed with an error while opening the downloaded file.",
                             )
                         }
                     }
@@ -400,16 +441,45 @@ object DesktopPlayer {
         attemptsLeft: Int,
         failedOver: Boolean = false,
     ) {
+        // The startup probe blocks (spawns a process and waits): never run it
+        // on the FX thread — callers inside Fx.run land here too, so they are
+        // offloaded to a launcher thread and the rest runs as before.
+        if (javafx.application.Platform.isFxApplicationThread()) {
+            Thread(
+                { launchMpv(title, stream, refresh, attemptsLeft, failedOver) },
+                "hikari-play-launch",
+            ).apply { isDaemon = true; start() }
+            return
+        }
+        val mpv = findMpv()
+        if (mpv == null) {
+            val url = com.hikari.app.net.Http.sanitizeStreamUrl(stream.url)
+            Fx.run {
+                showBrowserFallback(title, url,
+                    "The video player (mpv) wasn't found next to the app — re-download the latest release.")
+            }
+            return
+        }
+        // Startup probe: a bundled mpv that cannot even print its version
+        // would die on every launch (dead-on-arrival, always) — say so now
+        // with its reason instead of entering the retry loop.
+        val probeErr = probeMpv(mpv, force = false)
+        if (probeErr != null) {
+            val url = com.hikari.app.net.Http.sanitizeStreamUrl(stream.url)
+            Fx.run {
+                showBrowserFallback(title, url, brokenPlayerMessage(probeErr), retry = {
+                    // User-initiated: re-probe (an antivirus lock can clear)
+                    // and try the same stream once more.
+                    val err2 = probeMpv(mpv, force = true)
+                    if (err2 != null) showBrowserFallback(title, url, brokenPlayerMessage(err2))
+                    else launchMpv(title, stream, refresh, 1)
+                })
+            }
+            return
+        }
         Fx.run {
             ipcTarget = openIpcEndpoint()
             val gen = ++launchGen
-            val mpv = findMpv()
-            if (mpv == null) {
-                val url = com.hikari.app.net.Http.sanitizeStreamUrl(stream.url)
-                showBrowserFallback(title, url,
-                    "The video player (mpv) wasn't found next to the app — re-download the latest release.")
-                return@run
-            }
             val url = com.hikari.app.net.Http.sanitizeStreamUrl(stream.url)
             val signed = isSignedStreamUrl(url)
             // The app's own player layer comes up FIRST: it is the window the
@@ -535,6 +605,7 @@ object DesktopPlayer {
             lastStreamUrl = url
             killPrevious(proc)
             proc = p
+            launchStartedAt = System.currentTimeMillis()
             // Adopt mpv's window and glue it over the video area (see
             // PlayerWindow/WinShell). Off the FX thread: mpv creates its window
             // a moment after launch. A window that turns up late is still
@@ -691,6 +762,27 @@ object DesktopPlayer {
                     if (code != 0 && !p.isAlive) {
                         val tailText = tail.toString()
                         val forbidden = tailText.contains("403")
+                        // Dead-on-arrival: died within moments of start without
+                        // ever showing a frame — the PLAYER failed to start, not
+                        // the stream. Relaunching the same command (or fetching
+                        // a fresh link for it) can never help, so there is no
+                        // silent relaunch here: the reason goes on screen.
+                        if (isDeadOnArrival(startedAt)) {
+                            Fx.run {
+                                if (dialogShown || drainGen != launchGen || proc !== p) return@run
+                                dialogShown = true
+                                showBrowserFallback(
+                                    title, url, doaMessage(),
+                                    retry = refresh?.let { r ->
+                                        {
+                                            val f = runCatching { r() }.getOrNull()
+                                            if (f != null && f.url.isNotBlank()) launchMpv(title, f, r, 1)
+                                        }
+                                    },
+                                )
+                            }
+                            return@Thread
+                        }
                         // A dead link is fetched FRESH and relaunched silently —
                         // for ANY failure with a refresh available, not just
                         // signed/403 ones: an error dialog for a link that was
@@ -830,6 +922,84 @@ object DesktopPlayer {
     /** The bundled player, located by [Mpv] (shared with the download engine's
      *  remux step, which needs the same binary). */
     private fun findMpv(): File? = Mpv.exe()
+
+    /**
+     * Runs `mpv --version --no-config` and returns null when the bundled
+     * player starts fine, or the reason it doesn't. Cached for a minute (a
+     * healthy `--version` answers in milliseconds; a wedged one must not
+     * stall every Play press). Never call on the FX thread — it blocks.
+     */
+    private fun probeMpv(mpv: File, force: Boolean): String? {
+        val now = System.currentTimeMillis()
+        if (!force) {
+            val cached = mpvProbe
+            if (cached != null && now - cached.first < 60_000L) return cached.second
+        }
+        val err: String? = runCatching {
+            val p = ProcessBuilder(listOf(mpv.absolutePath, "--version", "--no-config"))
+                .redirectErrorStream(true).start()
+            val out = StringBuilder()
+            val drain = Thread({
+                runCatching {
+                    p.inputStream.bufferedReader().forEachLine {
+                        if (out.length < 2000) out.append(it).append('\n')
+                    }
+                }
+            }, "hikari-mpv-probe-drain").apply { isDaemon = true; start() }
+            val finished = p.waitFor(15, java.util.concurrent.TimeUnit.SECONDS)
+            runCatching { drain.join(2_000) }
+            if (!finished) {
+                runCatching { p.destroyForcibly() }
+                return@runCatching "mpv did not answer within 15 seconds (wedged or blocked on this machine)"
+            }
+            val code = runCatching { p.exitValue() }.getOrDefault(-1)
+            val text = out.toString()
+            if (code != 0 || !text.contains("mpv", ignoreCase = true)) {
+                val tail = text.trim().lineSequence().filter { it.isNotBlank() }
+                    .toList().takeLast(3).joinToString(" | ").take(400)
+                return@runCatching "mpv exited with code $code" +
+                    (if (tail.isNotBlank()) ": $tail" else " and printed nothing")
+            }
+            null
+        }.getOrElse { t ->
+            "couldn't start mpv at all: ${t.message ?: t.javaClass.simpleName}"
+        }
+        mpvProbe = now to err
+        if (err != null) System.err.println("player: mpv probe failed — $err")
+        return err
+    }
+
+    /** True when the launch that started at [startedAt] died before it could
+     *  ever show a frame: the player failed to START, not the stream. */
+    private fun isDeadOnArrival(startedAt: Long): Boolean {
+        if (startedAt <= 0L) return false
+        if (System.currentTimeMillis() - startedAt >= DOA_MS) return false
+        return !sawVideoNow()
+    }
+
+    private fun sawVideoNow(): Boolean =
+        runCatching { Fx.runBlock { PlayerWindow.hasVideo() } ?: false }.getOrDefault(false)
+
+    /** The DOA explanation: names the player (not the stream) and carries
+     *  mpv's own last error lines, so the report writes itself. */
+    private fun doaMessage(): String {
+        val tail = runCatching {
+            File(System.getProperty("user.home"), ".hikari/mpv.log").readLines()
+                .takeLast(12).joinToString("\n").trim()
+        }.getOrDefault("").take(1200)
+        return buildString {
+            append("The video player (mpv) closed immediately without playing anything — ")
+            append("it failed to START, so this is the player, not the stream: ")
+            append("another source would fail the exact same way.")
+            if (tail.isNotBlank()) append("\n\nmpv's own error:\n").append(tail)
+            append("\n\nOpen it in your browser instead, or copy the player report?")
+        }.toString()
+    }
+
+    private fun brokenPlayerMessage(probeErr: String): String =
+        "The bundled video player (mpv) can't start on this machine: $probeErr. " +
+            "No source can play until it can — re-download the latest release, " +
+            "or open this one in your browser instead?"
 
     /** For the debug log: show a string with every non-ASCII character as a
      *  \\uXXXX escape, so a lookalike separator (e.g. a yen sign instead of a
@@ -1020,6 +1190,22 @@ object DesktopPlayer {
         System.err.println("player: the player process died — attemptsLeft=" + attemptsLeft)
         killPrevious(proc)
         proc = null
+        // Dead-on-arrival through the pipe path (mpv died before ever showing
+        // a frame): same rule as the drain thread — no silent relaunch, the
+        // startup reason goes on screen with a browser path.
+        if (!dialogShown && isDeadOnArrival(launchStartedAt)) {
+            dialogShown = true
+            showBrowserFallback(
+                title, url, doaMessage(),
+                retry = refresh?.let { r ->
+                    {
+                        val f = runCatching { r() }.getOrNull()
+                        if (f != null && f.url.isNotBlank()) launchMpv(title, f, r, 1)
+                    }
+                },
+            )
+            return
+        }
         if (attemptsLeft > 0 && !dialogShown) {
             // Auto-recovery only while no failure is on screen: relaunching
             // under a shown dialog is the "Retry flashes, then it plays by

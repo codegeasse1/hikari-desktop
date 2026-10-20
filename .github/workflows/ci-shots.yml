@@ -81,6 +81,16 @@ jobs:
           mkdir -p jpackage-input/mpv
           cp -r mpv-tmp/* jpackage-input/mpv/
           echo "mpv bundled:"; ls jpackage-input/mpv | head -40
+          # A bundle without a STARTABLE mpv ships a player that dies on every
+          # video (dead-on-arrival) — fail the build here instead of the user.
+          if [ ! -f jpackage-input/mpv/mpv.exe ]; then
+            echo "::error::mpv.exe missing from the bundle (7z layout changed?)"
+            exit 1
+          fi
+          if ! jpackage-input/mpv/mpv.exe --version --no-config | head -3; then
+            echo "::error::bundled mpv cannot start on a clean runner"
+            exit 1
+          fi
         shell: bash
 
       - name: Extension install self-test (release assets, mirrors, the OS TLS stack)
