@@ -172,6 +172,9 @@ data class StreamSource(
     val ytId: String? = null,
     /** True when the URL should be opened in a browser (externalUrl), not the player. */
     val externalUrl: Boolean = false,
+    /** Which installed provider served this source (set by the sweep's [tag]).
+     *  The detail screen sorts the origin provider's own servers first. */
+    val providerId: String = "",
 )
 
 data class CatalogRef(

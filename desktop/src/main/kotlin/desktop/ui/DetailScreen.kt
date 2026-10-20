@@ -107,6 +107,8 @@ class DetailScreenView(private val item: MediaItem) {
 
     private var pendingPlay = false
     private var pendingDownload = false
+    /** "Show all servers first" is on and Play is waiting on the lookup. */
+    private var pendingList = false
     private var favourite = false
 
     /** When the playback position was last written to history (mpv reports it
@@ -190,6 +192,19 @@ class DetailScreenView(private val item: MediaItem) {
         maxWidth = 580.0
         minWidth = 0.0
     }
+    /** The full synopsis text; the visible label shows a 2-line clamp of it. */
+    private var overviewFull: String = ""
+    private var overviewExpanded: Boolean = false
+    private val overviewMore = Button("More").apply {
+        styleClass.add("x-overview-more")
+        isFocusTraversable = false
+        isVisible = false
+        isManaged = false
+        setOnAction {
+            overviewExpanded = !overviewExpanded
+            renderOverview()
+        }
+    }
     /** TMDB/IMDb rating pills — filled once [TmdbDetails] resolves the title. */
     private val heroRatings = HBox(8.0).apply {
         alignment = Pos.CENTER_LEFT
@@ -217,7 +232,7 @@ class DetailScreenView(private val item: MediaItem) {
     private val heroActions = HBox(10.0, playButton, bookmarkButton, downloadButton).apply {
         alignment = Pos.CENTER_LEFT
     }
-    private val heroBody = VBox(10.0, heroOver, heroLogo, heroTitle, heroMetaRow, heroRatings, heroOverview, heroActions).apply {
+    private val heroBody = VBox(10.0, heroOver, heroLogo, heroTitle, heroMetaRow, heroRatings, heroOverview, overviewMore, heroActions).apply {
         alignment = Pos.BOTTOM_LEFT
         minWidth = 0.0
         maxWidth = 660.0
@@ -615,8 +630,10 @@ class DetailScreenView(private val item: MediaItem) {
         heroLogo.isVisible = false
         heroLogo.isManaged = false
         renderMeta(m, null)
-        heroOverview.text = m.overview?.let { htmlToPlain(it) }?.takeIf { it.isNotBlank() }
+        overviewFull = m.overview?.let { htmlToPlain(it) }?.takeIf { it.isNotBlank() }
             ?: "No synopsis available for this title."
+        overviewExpanded = false
+        renderOverview()
         // TMDB artwork owns the banner: it is painted the moment it lands
         // (see [renderEnrich]), never the provider's own low-quality art. The
         // provider art is only the fallback when TMDB has nothing for the
@@ -627,6 +644,26 @@ class DetailScreenView(private val item: MediaItem) {
         favourite = runCatching { AppShell.app.store.favorites().any { it.uniqueId == m.uniqueId } }.getOrDefault(false)
         refreshFavourite()
         updatePlayLabel()
+    }
+
+    /**
+     * The synopsis clamp: at most ~2 lines with a More button, never the full
+     * wall of text. Expanding shows everything; picking More again collapses.
+     */
+    private fun renderOverview() {
+        val full = overviewFull
+        if (overviewExpanded || full.length <= OVERVIEW_CLAMP) {
+            heroOverview.text = full
+            overviewMore.isVisible = false
+            overviewMore.isManaged = false
+        } else {
+            val cut = full.take(OVERVIEW_CLAMP).trimEnd()
+            val atWord = cut.lastIndexOf(' ').takeIf { it > OVERVIEW_CLAMP - 40 } ?: cut.length
+            heroOverview.text = cut.take(atWord).trimEnd() + "…"
+            overviewMore.text = "More"
+            overviewMore.isVisible = true
+            overviewMore.isManaged = true
+        }
     }
 
     private fun renderMeta(m: MediaItem, d: TmdbDetails.Details?) {
@@ -831,17 +868,22 @@ class DetailScreenView(private val item: MediaItem) {
         discBar.progress = -1.0
         discRoot.isVisible = true
         discRoot.isManaged = true
+        // The discovery screen is a full takeover: only the top bar's Back
+        // button stays, the whole side rail hides until it resolves.
+        AppShell.setRailVisible(false)
         Ui.fadeIn(discRoot, 220.0)
     }
 
     private fun hideDiscovery() {
         discRoot.isVisible = false
         discRoot.isManaged = false
+        AppShell.setRailVisible(true)
     }
 
     private fun cancelDiscovery() {
         pendingPlay = false
         pendingDownload = false
+        pendingList = false
         sweepPoll?.cancel()
         hideDiscovery()
     }
@@ -1238,9 +1280,11 @@ class DetailScreenView(private val item: MediaItem) {
         // A provider with no synopsis borrows TMDB's — the banner never shows
         // "No synopsis available" when the database has the real text.
         if (d.overview.isNotBlank() &&
-            (heroOverview.text.isBlank() || heroOverview.text.startsWith("No synopsis"))
+            (overviewFull.isBlank() || overviewFull.startsWith("No synopsis"))
         ) {
-            heroOverview.text = d.overview
+            overviewFull = d.overview
+            overviewExpanded = false
+            renderOverview()
         }
         val pills = ArrayList<Node>()
         if (d.imdbRating > 0.0 || d.imdbId.isNotBlank()) {
@@ -1612,7 +1656,7 @@ class DetailScreenView(private val item: MediaItem) {
         return false
     }
 
-    private fun openSourceDialog(ep: Episode) {
+    private fun openSourceDialog(ep: Episode?) {
         srcDlgEp = ep
         srcDlgBlurred = false
         srcDlgBg.effect = null
@@ -1632,12 +1676,12 @@ class DetailScreenView(private val item: MediaItem) {
             srcDlgTitle.isVisible = true
             srcDlgTitle.isManaged = true
         }
-        srcDlgPill.text = if (meta.type == MediaType.SERIES) {
+        srcDlgPill.text = if (meta.type == MediaType.SERIES && ep != null) {
             "S${ep.season}:E${ep.number} • " + (ep.name?.takeIf { it.isNotBlank() } ?: "Episode ${ep.number}")
         } else {
             meta.title
         }
-        srcDlgSub.text = if (meta.type == MediaType.SERIES) {
+        srcDlgSub.text = if (meta.type == MediaType.SERIES && ep != null) {
             "S${ep.season} • Episode ${ep.number}" + (ep.name?.takeIf { it.isNotBlank() }?.let { " — $it" } ?: "")
         } else {
             meta.title
@@ -1655,7 +1699,9 @@ class DetailScreenView(private val item: MediaItem) {
     }
 
     private fun renderDialogRows() {
-        val ep = srcDlgEp ?: return
+        // Movies carry no episode (null key); series need the chosen one.
+        val ep = srcDlgEp
+        if (meta.type == MediaType.SERIES && ep == null) return
         if (streams.isEmpty()) {
             val errors = AppShell.app.repository.sweepErrors(meta, ep)
             val running = AppShell.app.repository.sweepRunning(meta, ep)
@@ -1709,15 +1755,17 @@ class DetailScreenView(private val item: MediaItem) {
     private fun loadStreams() {
         sweepPoll?.cancel()
         val ep = selectedEpisode
+        applySweepPrefs()
         if (srcDlgRoot.isVisible) renderDialogRows()
         scope.launch {
             val list = runCatching { AppShell.app.repository.streamsFor(meta, ep) }
                 .getOrElse { t ->
                     Fx.run {
-                        if (pendingPlay || pendingDownload) {
+                        if (pendingPlay || pendingDownload || pendingList) {
                             hideDiscovery()
                             pendingPlay = false
                             pendingDownload = false
+                            pendingList = false
                             AppShell.toast("Stream lookup failed: ${t.message ?: "unknown error"}", "error")
                         }
                         if (srcDlgRoot.isVisible) renderDialogRows()
@@ -1725,10 +1773,18 @@ class DetailScreenView(private val item: MediaItem) {
                     emptyList()
                 }
             Fx.run {
-                streams = list
+                streams = sortStreams(list)
                 if (srcDlgRoot.isVisible) renderDialogRows()
-                if (pendingPlay) {
-                    if (list.isEmpty()) {
+                if (pendingList) {
+                    pendingList = false
+                    hideDiscovery()
+                    if (streams.isEmpty()) {
+                        AppShell.toast("No playable source found for this title", "error")
+                    } else {
+                        openListFor(streams)
+                    }
+                } else if (pendingPlay) {
+                    if (streams.isEmpty()) {
                         pendingPlay = false
                         hideDiscovery()
                         AppShell.toast("No playable source found for this title", "error")
@@ -1736,7 +1792,7 @@ class DetailScreenView(private val item: MediaItem) {
                         // Play straight away: the race starts as soon as the
                         // sources land, instead of waiting for a click.
                         discStatus2.text = "Discovering high-speed playback sources…"
-                        playBest(list)
+                        playBest(streams)
                     }
                 }
                 if (pendingDownload) {
@@ -1760,7 +1816,7 @@ class DetailScreenView(private val item: MediaItem) {
                 val running = repo.sweepRunning(meta, ep)
                 if (all.size > streams.size) {
                     Fx.run {
-                        streams = all
+                        streams = sortStreams(all)
                         if (srcDlgRoot.isVisible) renderDialogRows()
                         // The player is open on this title: give it the new
                         // servers too, so its Source menu can move to one of them
@@ -1842,13 +1898,48 @@ class DetailScreenView(private val item: MediaItem) {
         DetailScreenTestSeam.playPresses.incrementAndGet()
         val list = streams
         if (list.isNotEmpty()) {
-            playBest(list)
+            // "Show all servers first" opens the list; otherwise Play starts
+            // the best server immediately (late servers still land in Sources).
+            if (showAllFirst()) openListFor(list) else playBest(list)
         } else {
             // Nothing looked up yet: the discovery screen opens while the
-            // sweep runs, and the fastest source starts the moment it lands.
-            pendingPlay = true
+            // sweep runs. Direct mode auto-plays the moment a server lands;
+            // list mode opens the server list instead.
+            if (showAllFirst()) pendingList = true else pendingPlay = true
             showDiscovery()
             loadStreams()
+        }
+    }
+
+    /** Pushes the saved server scope into the sweep before every lookup. */
+    private fun applySweepPrefs() {
+        runCatching {
+            val store = AppShell.app.store
+            AppShell.app.repository.configureSweep(
+                store.sweepAllSources(),
+                store.sweepEngines(),
+                store.sweepSoloProviders(),
+            )
+        }
+    }
+
+    private fun showAllFirst(): Boolean =
+        runCatching { AppShell.app.store.sweepShowAllFirst() }.getOrDefault(false)
+
+    /** The origin provider's own servers first, everything else in the order
+     *  it arrived (the sort is stable, so late servers append below). */
+    private fun sortStreams(list: List<StreamSource>): List<StreamSource> =
+        list.sortedWith(compareBy { it.providerId.isNotBlank() && it.providerId != meta.providerId })
+
+    /** Opens the server list for the Play button in "show all" mode. */
+    private fun openListFor(list: List<StreamSource>) {
+        streams = sortStreams(list)
+        val ep = selectedEpisode
+        if (meta.type == MediaType.SERIES) {
+            if (ep != null) openSourceDialog(ep)
+            else AppShell.toast("Pick an episode first", "error")
+        } else {
+            openSourceDialog(null)
         }
     }
 
@@ -2109,6 +2200,9 @@ class DetailScreenView(private val item: MediaItem) {
 
         /** Cards rendered per "page" before the pager moves on. */
         const val EPISODE_PAGE = 30
+
+        /** Characters shown before the synopsis clamp cuts in (~2 lines). */
+        const val OVERVIEW_CLAMP = 220
 
         const val EP_CARD_W = 300.0
         const val EP_STILL_H = 168.0

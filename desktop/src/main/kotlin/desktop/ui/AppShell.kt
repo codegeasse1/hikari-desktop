@@ -3,6 +3,7 @@ package desktop.ui
 import com.hikari.app.HikariApp
 import com.hikari.app.data.MediaItem
 import com.hikari.app.ui.theme.HikariThemeMode
+import desktop.fx.Fx
 import javafx.geometry.Insets
 import javafx.geometry.Pos
 import javafx.scene.Node
@@ -62,6 +63,8 @@ object AppShell {
     private lateinit var activityLabel: Label
     private lateinit var playerLayer: StackPane
     private lateinit var windowStage: javafx.stage.Stage
+    /** The floating side-rail dock, so discovery can take it over. */
+    private var railHost: Region? = null
     private var currentScreen: Screen = Screen.Home
     private val backStack = java.util.ArrayDeque<Screen>()
 
@@ -93,7 +96,7 @@ object AppShell {
 
         val body = BorderPane().apply {
             styleClass.add("app-root")
-            left = sidebar()
+            left = sidebar().also { railHost = it }
             top = topbar()
             center = StackPane(centerStack, overlay)
         }
@@ -412,6 +415,9 @@ object AppShell {
             while (backStack.size > 24) backStack.pollFirst()
         }
         currentScreen = screen
+        // A takeover state (source discovery) hides the side rail; leaving its
+        // screen must never leave the rail hidden behind.
+        setRailVisible(true)
         // An overlay closer belongs to the screen that registered it: leaving
         // the detail screen must not leave its closer behind.
         if (screen !is Screen.Detail) detailCloser = null
@@ -473,6 +479,25 @@ object AppShell {
 
     fun openDetail(item: MediaItem) {
         show(Screen.Detail(item))
+    }
+
+    /**
+     * Discovery and other full-takeover states hide the side rail so only the
+     * top bar's Back button stays on screen. Restored when they resolve.
+     */
+    fun setRailVisible(visible: Boolean) {
+        Fx.run {
+            railHost?.let {
+                it.isVisible = visible
+                it.isManaged = visible
+            }
+        }
+    }
+
+    /** Jumps straight to Settings → Logs and diagnostics (Home's Logs button). */
+    fun openSettingsLogs() {
+        settingsScreen.revealLogsOnShown = true
+        show(Screen.Settings)
     }
 
     fun goHome() {

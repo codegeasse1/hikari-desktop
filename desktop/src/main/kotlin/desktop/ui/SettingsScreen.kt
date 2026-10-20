@@ -1,6 +1,7 @@
 package desktop.ui
 
 import com.hikari.app.HikariApp
+import com.hikari.app.data.ProviderType
 import com.hikari.app.net.Updater
 import com.hikari.app.ui.theme.HikariThemeMode
 import desktop.fx.Fx
@@ -34,19 +35,36 @@ class SettingsScreenView {
             appearanceSection(),
             browserSection(),
             updatesSection(),
+            logsSection(),
             dataSection(),
             aboutSection(),
         )
         crashSection()?.let { children.add(1, it) }
         body.children.setAll(children)
+        if (revealLogsOnShown) {
+            revealLogsOnShown = false
+            javafx.application.Platform.runLater {
+                runCatching { root.vvalue = 1.0 }
+                AppShell.toast("Logs and diagnostics — save and share the .txt when reporting an issue", "ok")
+            }
+        }
     }
 
+    /** Set by [AppShell.openSettingsLogs] to jump straight to the log section. */
+    var revealLogsOnShown: Boolean = false
+
     /**
-     * Playback behaviour. The one setting here is the answer to "why do I have
-     * to choose a server before anything plays?": with it on (the default),
-     * Play picks the fastest server that answers and starts it immediately —
-     * every server the title offered is still in the player's Source menu, so
-     * switching to another one is a single click from inside playback.
+     * Playback behaviour + server scope.
+     *
+     * "Play straight away" (default on) picks the fastest server that answers
+     * and starts it — every server found is still in the player's Source menu.
+     * "Show all servers first" instead opens the server list so the user picks
+     * every time; late servers keep arriving in the background either way.
+     *
+     * The scope toggles decide WHICH extensions a title's server sweep asks:
+     * the origin's own engine is always included, the per-engine switches add
+     * more families, and the master switch asks every installed extension.
+     * Providers marked solo stay solo — their titles never fan out.
      */
     private fun playbackSection(): Region {
         val fastest = CheckBox("Play straight away — pick the fastest working server for me").apply {
@@ -60,25 +78,95 @@ class SettingsScreenView {
                 "ok",
             )
         }
+        val showAll = CheckBox("Show all servers first — let me pick one every time").apply {
+            isSelected = runCatching { app.store.sweepShowAllFirst() }.getOrDefault(false)
+        }
+        showAll.setOnAction {
+            runCatching { app.store.setSweepShowAllFirst(showAll.isSelected) }
+            AppShell.toast(
+                if (showAll.isSelected) "Play opens the server list first"
+                else "Play starts directly and lists the rest in Sources",
+                "ok",
+            )
+        }
         val note = Theme.label(
-            "With this on, Play tests the first few sources in parallel and starts whichever answers " +
-                "fastest — no picking a server first. Servers that are blocked or slow for your network " +
-                "lose the race, not your patience. Everything found is still listed under Sources (and in " +
-                "the player's Source menu) if you want to change it.",
+            "With direct play, Play tests the first few sources in parallel and starts whichever answers " +
+                "fastest — no picking a server first. With the list first, you choose and late servers keep " +
+                "arriving in the background. Either way every server found stays under Sources (and in the " +
+                "player's Source menu) if you want to change it.",
             size = 11.5,
             dim = true,
         ).apply { isWrapText = true }
+        val scopeNote = Theme.label(
+            "Which extensions a title's server search asks. The provider you opened the title from is " +
+                "always asked first and its servers stay on top; the switches below only ADD more places " +
+                "to look. A stuck provider never blocks the rest — whatever answers shows immediately.",
+            size = 11.5,
+            dim = true,
+        ).apply { isWrapText = true }
+        val rows = mutableListOf<Region>(fastest, showAll, note, scopeNote)
+        val allBox = CheckBox("Search ALL sources — every installed extension, any engine").apply {
+            isSelected = runCatching { app.store.sweepAllSources() }.getOrDefault(false)
+        }
+        allBox.setOnAction {
+            runCatching { app.store.setSweepAllSources(allBox.isSelected) }
+            AppShell.toast(
+                if (allBox.isSelected) "Server search covers every installed extension"
+                else "Server search follows the per-engine switches",
+                "ok",
+            )
+        }
+        rows.add(allBox)
+        val on = runCatching { app.store.sweepEngines() }.getOrDefault(emptySet())
+        SWEEP_ENGINE_ORDER.forEach { type ->
+            val box = CheckBox("Search every ${type.groupLabel} extension").apply {
+                isSelected = type.name in on
+            }
+            box.setOnAction {
+                runCatching { app.store.setSweepEngine(type.name, box.isSelected) }
+                AppShell.toast(
+                    (if (box.isSelected) "Also searching " else "No longer searching ") + type.groupLabel + " extensions",
+                    "ok",
+                )
+            }
+            rows.add(box)
+        }
+        val installed = runCatching { app.store.providers() }.getOrDefault(emptyList())
+            .sortedBy { it.name.lowercase() }
+        if (installed.isNotEmpty()) {
+            rows.add(
+                Theme.label(
+                    "Exceptions — stay solo, never search other extensions:",
+                    size = 12.0,
+                    dim = true,
+                ).apply { isWrapText = true },
+            )
+            val solo = runCatching { app.store.sweepSoloProviders() }.getOrDefault(emptySet())
+            installed.forEach { cfg ->
+                val box = CheckBox("${cfg.name} (${cfg.type.groupLabel}) — only its own servers").apply {
+                    isSelected = cfg.id in solo
+                }
+                box.setOnAction {
+                    runCatching { app.store.setSweepSoloProvider(cfg.id, box.isSelected) }
+                    AppShell.toast(
+                        if (box.isSelected) "${cfg.name} stays solo from now on"
+                        else "${cfg.name} can be rescued by other extensions again",
+                        "ok",
+                    )
+                }
+                rows.add(box)
+            }
+        }
         return Ui.panel(
-            Ui.sectionHeader("Playback", "What the Play button does"),
-            fastest,
-            note,
+            Ui.sectionHeader("Playback and servers", "What the Play button does and where it looks"),
+            *rows.toTypedArray(),
         )
     }
 
     /**
-     * Home catalog layout: cinema (16:9 landscape cards, the default — the
-     * right shape for a PC window, fed by high-quality TMDB backdrop art) or
-     * poster (classic vertical 2:3 posters). Applies on the next Home load.
+     * Home catalog layout: poster (classic vertical 2:3 posters, the default)
+     * or cinema (16:9 landscape cards, fed by high-quality TMDB backdrop art).
+     * Applies on the next Home load.
      */
     private fun homeSection(): Region {
         val current = app.store.homeLayout()
@@ -91,9 +179,8 @@ class SettingsScreenView {
             )
         }
         val note = Theme.label(
-            "Cinema cards are 16:9 and use landscape artwork (TMDB backdrops where " +
-                "available), so rows look right on a wide PC window. Poster keeps " +
-                "the classic vertical cards.",
+            "Poster keeps the classic vertical cards. Cinema cards are 16:9 and use landscape " +
+                "artwork (TMDB backdrops where available), so rows look right on a wide PC window.",
             size = 11.5,
             dim = true,
         ).apply { isWrapText = true }
@@ -236,6 +323,66 @@ class SettingsScreenView {
         )
     }
 
+    /**
+     * Logs and diagnostics: the in-memory log buffer ([LiveLogs]) the whole
+     * app writes to — catalog loads, stream lookups, installs — saved as a
+     * plain .txt the user can keep or share when reporting an issue. Home's
+     * Logs button jumps straight here (see [AppShell.openSettingsLogs]).
+     */
+    private fun logsSection(): Region {
+        val count = com.hikari.app.util.LiveLogs.recentText().count { it == '\n' } + 1
+        val status = Theme.label(
+            "Holding the latest app activity in memory" +
+                (if (count > 1) " ($count lines)" else "") +
+                ". Save it right after something breaks so the reason is still in the buffer.",
+            size = 11.5,
+            dim = true,
+        ).apply { isWrapText = true }
+        val save = Ui.button("Save logs as .txt", primary = true) { saveLogs() }
+        val copy = Ui.button("Copy logs", ghost = true) { copyLogs() }
+        return Ui.panel(
+            Ui.sectionHeader("Logs and diagnostics", "What to send when something breaks"),
+            HBox(Theme.S2, save, copy).apply { alignment = Pos.CENTER_LEFT },
+            status,
+        )
+    }
+
+    private fun logFileText(): String {
+        val identity = "Hikari Desktop v" + desktop.Build.VERSION +
+            " (" + desktop.Build.DATE + ", " + desktop.Build.COMMIT + ")"
+        return buildString {
+            appendLine(identity)
+            appendLine("Saved: " + java.time.LocalDateTime.now())
+            appendLine()
+            append(com.hikari.app.util.LiveLogs.recentText(10_000))
+            if (isBlank()) append("(no logs captured yet)")
+            appendLine()
+        }.toString()
+    }
+
+    private fun saveLogs() {
+        val dlg = javafx.stage.FileChooser().apply {
+            title = "Save Hikari logs"
+            val stamp = java.time.LocalDateTime.now().toString().replace(':', '-').take(19)
+            initialFileName = "hikari-logs-$stamp.txt"
+            extensionFilters.add(javafx.stage.FileChooser.ExtensionFilter("Text files", "*.txt"))
+        }
+        val file = runCatching { dlg.showSaveDialog(AppShell.stage) }.getOrNull() ?: return
+        val ok = runCatching { file.writeText(logFileText()) }.isSuccess
+        AppShell.toast(if (ok) "Logs saved: ${file.name}" else "Could not write ${file.absolutePath}", if (ok) "ok" else "error")
+    }
+
+    private fun copyLogs() {
+        runCatching {
+            val content = javafx.scene.input.ClipboardContent()
+            content.putString(logFileText())
+            javafx.scene.input.Clipboard.getSystemClipboard().setContent(content)
+            AppShell.toast("Logs copied — paste them wherever you report the issue", "ok")
+        }.onFailure {
+            AppShell.toast("Could not copy the logs", "error")
+        }
+    }
+
     private fun dataSection(): Region {
         val clearHistory = Ui.button("Clear watch history", icon = Icons.TRASH, ghost = true) {
             app.store.clearHistory()
@@ -280,6 +427,16 @@ class SettingsScreenView {
     )
 
     private companion object {
+        /** Engine families the server scope can fan out to, in display order. */
+        val SWEEP_ENGINE_ORDER = listOf(
+            ProviderType.CS3,
+            ProviderType.HIKARI,
+            ProviderType.NUVIO,
+            ProviderType.SKYSTREAM,
+            ProviderType.ANIYOMI,
+            ProviderType.STREMIO,
+            ProviderType.IPTV,
+        )
         val ACCENT_SWATCHES = listOf(
             "violet" to "#a970ff",
             "blue" to "#4d8dff",

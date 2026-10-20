@@ -78,6 +78,10 @@ class AppStore(private val dir: File) {
         const val DL_CONCURRENCY = "downloadConcurrency"
         const val DL_TO_FOLDER = "downloadToFolder"
         const val PLAY_FASTEST = "playFastest"
+        const val SWEEP_ALL = "sweepAllSources"
+        const val SWEEP_ENGINES = "sweepEngines"
+        const val SWEEP_SOLO = "sweepSoloProviders"
+        const val SWEEP_SHOW_ALL = "sweepShowAllFirst"
     }
 
     /**
@@ -93,6 +97,49 @@ class AppStore(private val dir: File) {
 
     fun setPlayFastest(value: Boolean) {
         put(K.PLAY_FASTEST, value)
+    }
+
+    /**
+     * Server sweep scope (Settings → Playback and servers).
+     *
+     * - [sweepAllSources]: one master switch — when on, a title's servers are
+     *   asked from EVERY enabled provider no matter the engine.
+     * - [sweepEngines]: extra engine families to include by title, as
+     *   [ProviderType] names (e.g. "CS3", "NUVIO", "HIKARI"). The origin's own
+     *   family is always included; these add MORE families to the title waves.
+     * - [sweepSoloProviders]: provider ids that stay solo — a title opened
+     *   from one of these never fans out to other providers, only its own
+     *   servers are shown (e.g. 51CG/MRDS when the user excludes them).
+     * - [sweepShowAllFirst]: "show all servers first" instead of playing
+     *   directly — Play opens the server list and the user picks one, while
+     *   late servers keep arriving in the background.
+     */
+    fun sweepAllSources(): Boolean = (get(K.SWEEP_ALL) ?: "false").toBoolean()
+
+    fun setSweepAllSources(value: Boolean) {
+        put(K.SWEEP_ALL, value)
+    }
+
+    fun sweepEngines(): Set<String> = parseStringList(get(K.SWEEP_ENGINES)).toSet()
+
+    fun setSweepEngine(name: String, enabled: Boolean) {
+        val cur = sweepEngines()
+        val next = if (enabled) cur + name else cur - name
+        put(K.SWEEP_ENGINES, encodeStringList(next.toList()))
+    }
+
+    fun sweepSoloProviders(): Set<String> = parseStringList(get(K.SWEEP_SOLO)).toSet()
+
+    fun setSweepSoloProvider(id: String, solo: Boolean) {
+        val cur = sweepSoloProviders()
+        val next = if (solo) cur + id else cur - id
+        put(K.SWEEP_SOLO, encodeStringList(next.toList()))
+    }
+
+    fun sweepShowAllFirst(): Boolean = (get(K.SWEEP_SHOW_ALL) ?: "false").toBoolean()
+
+    fun setSweepShowAllFirst(value: Boolean) {
+        put(K.SWEEP_SHOW_ALL, value)
     }
 
     fun downloadConcurrency(): Int =
@@ -132,12 +179,12 @@ class AppStore(private val dir: File) {
     }
 
     /**
-     * Home catalog layout: "cinema" (16:9 landscape cards, the default — the
-     * right shape for a PC window and for backdrop art) or "poster" (the
-     * classic vertical 2:3 posters). See Settings → Home and [HomeScreenView].
+     * Home catalog layout: "poster" (classic vertical 2:3 posters, the
+     * default) or "cinema" (16:9 landscape cards, fed by high-quality TMDB
+     * backdrop art). See Settings → Home and [HomeScreenView].
      */
     fun homeLayoutFlow(): Flow<String> = flowOf { homeLayout() }
-    fun homeLayout(): String = (get(K.HOME_LAYOUT) ?: "cinema").lowercase().takeIf { it == "poster" } ?: "cinema"
+    fun homeLayout(): String = (get(K.HOME_LAYOUT) ?: "poster").lowercase().takeIf { it == "cinema" } ?: "poster"
     fun setHomeLayout(layout: String) {
         put(K.HOME_LAYOUT, if (layout == "poster") "poster" else "cinema")
     }

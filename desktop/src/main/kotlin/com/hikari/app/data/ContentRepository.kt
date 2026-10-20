@@ -280,6 +280,45 @@ class ContentRepository(private val manager: ProviderManager) {
         item.uniqueId + "|" + (episode?.id ?: "")
 
     /**
+     * Server-sweep scope, from Settings → Playback and servers (see
+     * [AppStore.sweepAllSources]). The detail screen pushes the saved
+     * settings here before every lookup via [configureSweep]; when nothing
+     * was ever pushed the sweep behaves conservatively (origin + its own
+     * engine family, no cross-engine fan-out).
+     */
+    @Volatile
+    private var sweepAll: Boolean = false
+
+    /** Extra engine families to include, as [ProviderType] names. */
+    @Volatile
+    private var sweepEngines: Set<String> = emptySet()
+
+    /** Provider ids that stay solo — their titles never fan out. */
+    @Volatile
+    private var sweepSolo: Set<String> = emptySet()
+
+    fun configureSweep(allSources: Boolean, engines: Set<String>, soloProviders: Set<String>) {
+        sweepAll = allSources
+        sweepEngines = engines
+        sweepSolo = soloProviders
+    }
+
+    /** Engines whose ids are per-site slugs (never interchangeable). */
+    private fun isScraperFamily(t: ProviderType?): Boolean = when (t) {
+        ProviderType.CS3, ProviderType.HIKARI, ProviderType.NUVIO,
+        ProviderType.ANIYOMI, ProviderType.SKYSTREAM, ProviderType.UNIVERSAL -> true
+        else -> false
+    }
+
+    private fun engineAllowed(t: ProviderType, originType: ProviderType?): Boolean {
+        if (sweepAll) return true
+        if (t == originType || (t == ProviderType.HIKARI && originType == ProviderType.UNIVERSAL) ||
+            (t == ProviderType.UNIVERSAL && originType == ProviderType.HIKARI)
+        ) return true
+        return t.name in sweepEngines
+    }
+
+    /**
      * The servers found so far for a title/episode, without waiting for
      * anything: a sweep keeps running after [streamsFor] has already returned
      * (playback starts on the first server, not on the slowest extension), and
@@ -353,30 +392,56 @@ class ContentRepository(private val manager: ProviderManager) {
         if (enabled.isEmpty()) return
         val origin = manager.byId(item.providerId)
         val originType = origin?.config?.type
+        val solo = item.providerId in sweepSolo
 
-        // ── wave 1: the origin's engine family, same id ─────────────────────
-        val family = enabled.filter { originType != null && it.config.type == originType }
-        askAll(family, item, episode, sweep)
-
-        // ── wave 2: the same family, by TITLE ───────────────────────────────
-        if (sweep.snapshot().isEmpty()) {
-            askAllByTitle(family, item, episode, sweep)
+        // ── wave 1: the origin, by its own id ─────────────────────────────
+        // Scraper families (CloudStream/Hikari/Nuvio/…) use per-site slugs, so
+        // asking the whole family with the origin's id only produces doomed
+        // lookups that hang their full budget (the "No playable source" with a
+        // healthy catalog). Only Stremio-style ids are interchangeable, so only
+        // that family keeps the old same-id fan-out; scrapers ask the origin
+        // alone, first, with nothing queued ahead of it.
+        if (isScraperFamily(originType)) {
+            if (origin != null) askAll(listOf(origin), item, episode, sweep)
+            else {
+                val family = enabled.filter { it.config.type == originType }
+                askAll(family, item, episode, sweep)
+            }
+        } else {
+            val family = enabled.filter { originType != null && it.config.type == originType }
+            askAll(family, item, episode, sweep)
         }
 
-        // ── wave 3: every other engine, by TITLE ────────────────────────────
-        if (sweep.snapshot().isEmpty()) {
+        // ── wave 2: the allowed families, by TITLE ─────────────────────────
+        // Solo-exception providers (e.g. 51CG/MRDS when the user excludes them)
+        // stop here: only their own servers are ever shown for their titles.
+        if (!solo && sweep.snapshot().isEmpty()) {
+            val sameEngine = enabled.filter {
+                it.config.id != item.providerId && it.config.type == originType &&
+                    engineAllowed(it.config.type, originType)
+            }
+            askAllByTitle(sameEngine, item, episode, sweep)
+        }
+
+        // ── wave 3: every other allowed engine, by TITLE ────────────────────
+        if (!solo && sweep.snapshot().isEmpty()) {
             val others = enabled
-                .filter { it.config.type != originType }
+                .filter { it.config.type != originType && engineAllowed(it.config.type, originType) }
                 .sortedByDescending { it.config.id == item.providerId }
                 .take(CROSS_SWEEP_MAX)
             askAllByTitle(others, item, episode, sweep)
         }
     }
 
-    /** Asks [providers] for the item itself, in parallel, bounded by
-     *  [ProviderGate] (one call per provider at a time, playback on the
-     *  interactive lane so a catalog sweep can never block it) and a
-     *  per-provider budget (longer for HIKARI warm-up, see above). */
+    /** Asks [providers] for the item itself, each on its own coroutine.
+     *
+     *  There is deliberately NO shared semaphore here: one hung provider must
+     *  never hold a permit its siblings wait on (head-of-line blocking — the
+     *  fast origin queued behind four 60s foreign-id lookups while the
+     *  first-source deadline expired). Every provider burns only its own
+     *  per-provider budget on its own [ProviderGate] lane; whatever answers
+     *  lands in the sweep immediately, and the stuck ones keep searching
+     *  silently in the background until their budget runs out. */
     private suspend fun askAll(
         providers: List<ContentProvider>,
         item: MediaItem,
@@ -384,21 +449,18 @@ class ContentRepository(private val manager: ProviderManager) {
         sweep: Sweep,
     ) {
         coroutineScope {
-            val gate = Semaphore(SOURCES_CONCURRENCY)
             providers.map { p ->
                 async {
-                    gate.withPermit {
-                        val budget = if (p.config.type == ProviderType.HIKARI) SOURCE_BUDGET_HIKARI_MS else SOURCE_BUDGET_MS
-                        val found = cancellableCatching {
-                            withTimeoutOrNull(budget) {
-                                com.hikari.app.providers.ProviderGate.withProvider(p.config.id, "fg") {
-                                    p.getStreams(item, episode)
-                                }
-                            }.orEmpty()
-                        }.getOrDefault(emptyList())
-                        if (found.isEmpty()) recordStreamError(p, sweep)
-                        else sweep.add(found.map { tag(it, p, item) })
-                    }
+                    val budget = if (p.config.type == ProviderType.HIKARI) SOURCE_BUDGET_HIKARI_MS else SOURCE_BUDGET_MS
+                    val found = cancellableCatching {
+                        withTimeoutOrNull(budget) {
+                            com.hikari.app.providers.ProviderGate.withProvider(p.config.id, "fg") {
+                                p.getStreams(item, episode)
+                            }
+                        }.orEmpty()
+                    }.getOrDefault(emptyList())
+                    if (found.isEmpty()) recordStreamError(p, sweep)
+                    else sweep.add(found.map { tag(it, p, item) })
                 }
             }.awaitAll()
         }
@@ -422,12 +484,10 @@ class ContentRepository(private val manager: ProviderManager) {
         val query = item.searchTitle
         if (query.isBlank() || providers.isEmpty()) return
         coroutineScope {
-            val gate = Semaphore(SOURCES_CONCURRENCY)
             providers.map { p ->
                 async {
-                    gate.withPermit {
-                        val found = cancellableCatching {
-                            withTimeoutOrNull(TITLE_BUDGET_MS) {
+                    val found = cancellableCatching {
+                        withTimeoutOrNull(TITLE_BUDGET_MS) {
                                 com.hikari.app.providers.ProviderGate.withProvider(p.config.id, "fg") {
                                     // No match on this engine = this engine cannot
                                     // serve the title by name either.
@@ -444,10 +504,9 @@ class ContentRepository(private val manager: ProviderManager) {
                                     }
                                 }
                             }.orEmpty()
-                        }.getOrDefault(emptyList())
-                        if (found.isEmpty()) recordStreamError(p, sweep)
-                        else sweep.add(found.map { tag(it, p, item) })
-                    }
+                    }.getOrDefault(emptyList())
+                    if (found.isEmpty()) recordStreamError(p, sweep)
+                    else sweep.add(found.map { tag(it, p, item) })
                 }
             }.awaitAll()
         }
@@ -459,6 +518,18 @@ class ContentRepository(private val manager: ProviderManager) {
     private fun bestMatch(item: MediaItem, candidates: List<MediaItem>): MediaItem? {
         if (candidates.isEmpty()) return null
         val want = normalizeTitle(item.searchTitle)
+        // CJK-safe fallback: the normalizer strips everything but a-z0-9, so a
+        // Chinese-only title collapses to almost nothing and can never match.
+        // When the normalized key is too short to be meaningful, compare the
+        // raw lowercase titles by containment instead.
+        if (want.length < 4) {
+            val rawWant = item.searchTitle.trim().lowercase()
+            if (rawWant.length < 2) return null
+            return candidates.firstOrNull { c ->
+                val raw = c.title.trim().lowercase()
+                raw.isNotBlank() && (raw.contains(rawWant) || rawWant.contains(raw))
+            }
+        }
         if (want.isBlank()) return null
         fun score(c: MediaItem): Int {
             val got = normalizeTitle(c.title)
@@ -495,8 +566,11 @@ class ContentRepository(private val manager: ProviderManager) {
     }
 
     private fun tag(source: StreamSource, p: ContentProvider, item: MediaItem): StreamSource =
-        if (p.config.id == item.providerId) source
-        else source.copy(name = p.config.name.trim().ifBlank { "Extension" } + " · " + source.name)
+        if (p.config.id == item.providerId) source.copy(providerId = p.config.id)
+        else source.copy(
+            name = p.config.name.trim().ifBlank { "Extension" } + " · " + source.name,
+            providerId = p.config.id,
+        )
 
     private fun recordStreamError(p: ContentProvider, sweep: Sweep) {
         val why = runCatching { p.lastStreamError() }.getOrNull()

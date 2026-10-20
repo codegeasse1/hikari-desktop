@@ -160,7 +160,7 @@ class HomeScreenView {
         maxWidth = Double.MAX_VALUE
         maxHeight = Double.MAX_VALUE
     }
-    private val logsBtn = Ui.button("Logs", icon = Icons.LIST, ghost = true) { toggleLogs() }
+    private val logsBtn = Ui.button("Logs", icon = Icons.LIST, ghost = true) { AppShell.openSettingsLogs() }
     private val refreshBtn = Ui.button("Refresh", icon = Icons.REFRESH, primary = true) { load(force = true) }
     /**
      * The in-page provider banner: when Home is showing one provider's catalog
@@ -213,7 +213,6 @@ class HomeScreenView {
             statusLabel,
             errorLabel,
             rowsBox,
-            logsScroll,
         )
         heroBox.isVisible = false
         heroBox.isManaged = false
@@ -804,9 +803,8 @@ class HomeScreenView {
     private fun fallback(message: String) {
         if (rowsBox.children.isNotEmpty()) return
         rowsBox.children.setAll(
-            Ui.emptyState(Icons.INFO, message, "Check the logs for the underlying error, then try Refresh.")
+            Ui.emptyState(Icons.INFO, message, "Check Settings → Logs and diagnostics for the reason, then try Refresh.")
         )
-        if (!logsOpen) toggleLogs()
     }
 
     /** Session TMDB art upgrades: uniqueId → landscape backdrop / poster.
