@@ -877,7 +877,9 @@ class DetailScreenView(private val item: MediaItem) {
     private fun hideDiscovery() {
         discRoot.isVisible = false
         discRoot.isManaged = false
-        AppShell.setRailVisible(true)
+        // The detail screen hides the rail for its whole lifetime (see
+        // AppShell.show): resolving discovery must not bring it back.
+        AppShell.setRailVisible(AppShell.current !is Screen.Detail)
     }
 
     private fun cancelDiscovery() {

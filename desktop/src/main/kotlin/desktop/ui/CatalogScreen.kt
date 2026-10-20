@@ -38,7 +38,13 @@ class CatalogScreenView(
             size = 12.5,
             dim = true,
         )
-        grid = PosterGrid(Theme.POSTER_W, onOpen = { AppShell.openDetail(it) })
+        grid = PosterGrid(Theme.POSTER_W, onOpen = {
+            // Click proof in the logs: card opens are the "needs two clicks"
+            // report's deciding fact — this line says whether the first tap
+            // fired at all.
+            System.err.println("ui: catalog card opened " + it.providerId + "/" + it.id)
+            AppShell.openDetail(it)
+        })
         grid.setItems(items)
         loadingRow = Ui.loadingRow("Loading $provider…").apply { isVisible = items.isEmpty(); isManaged = items.isEmpty() }
         emptyNote = Theme.label("", size = 13.0, dim = true).apply {

@@ -181,10 +181,10 @@
     -fx-border-radius: 10;
 }
 
+/* The top bar blends into the page (same background, no divider): the band
+   cut off from the content below is the old "divided" look. */
 .topbar {
-    -fx-background-color: -h-bg-2;
-    -fx-border-color: -h-border;
-    -fx-border-width: 0 0 1 0;
+    -fx-background-color: -h-bg;
     -fx-padding: 0 8 0 4;
     -fx-min-height: 46;
 }
@@ -527,19 +527,12 @@
 .poster-badges { -fx-padding: 8; }
 
 /* ===========================================================================
-   Virtualised poster grid (ListView based)
+   Poster grid (plain wrapping flow — every card is stable, one click opens)
    =========================================================================== */
 
-.poster-grid, .poster-grid .virtual-flow, .poster-grid .clipped-container, .poster-grid .sheet {
-    -fx-background-color: transparent;
-}
-.poster-grid { -fx-padding: 0; -fx-background-insets: 0; }
-.poster-grid .list-cell { -fx-background-color: transparent; -fx-padding: 0 0 18 0; }
-.poster-grid .list-cell:filled:selected,
-.poster-grid .list-cell:filled:selected:hover { -fx-background-color: transparent; }
-.poster-grid .list-cell:filled:hover { -fx-background-color: transparent; }
-.poster-grid .scroll-bar:vertical { -fx-background-color: transparent; }
-.grid-row { -fx-background-color: transparent; }
+.poster-flow, .poster-flow > .viewport { -fx-background-color: transparent; }
+.poster-flow { -fx-padding: 0; -fx-background-insets: 0; }
+.poster-flow .scroll-bar:vertical { -fx-background-color: transparent; }
 
 .poster-rail { -fx-background-color: transparent; }
 .poster-rail .viewport { -fx-background-color: transparent; }

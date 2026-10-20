@@ -226,23 +226,15 @@ object AppShell {
         nav(Screen.Downloads, Icons.DOWNLOAD, "Downloads")
         nav(Screen.History, Icons.HISTORY, "History")
 
-        box.children.add(Region().apply {
-            styleClass.add("x-side-sep")
-            minHeight = 1.0
-            maxHeight = 1.0
-            HBox.setMargin(this, Insets(8.0, 16.0, 8.0, 16.0))
-        })
+        // One compact group, rail-style: the pill hugs its buttons and floats
+        // vertically centered instead of stretching top-to-bottom — the
+        // full-height stretch with a spacer is the old "tab bar" look.
         nav(Screen.Extensions, Icons.EXTENSIONS, "Extensions")
         nav(Screen.Settings, Icons.SETTINGS, "Settings")
 
-        val grow = Region().apply { VBox.setVgrow(this, Priority.ALWAYS) }
-        box.children.add(grow)
-        // Floating pill dock (reference shot 775): the rail floats off the
-        // window edges with a gap all round instead of docking flush
-        // full-height — same buttons, detached pill.
-        VBox.setVgrow(box, Priority.ALWAYS)
         return VBox(box).apply {
             styleClass.add("x-side-float")
+            alignment = Pos.CENTER
             padding = Insets(12.0, 0.0, 12.0, 12.0)
             minWidth = 92.0
             prefWidth = 92.0
@@ -417,15 +409,24 @@ object AppShell {
      */
     var catalogView: CatalogScreenView? = null
 
+    /** Last loaded rows per provider: returning (Back) to a catalog whose
+     *  Screen snapshot predates its load must show these instantly — never
+     *  Loading forever. Written on every successful load, read when a
+     *  Catalog screen arrives with an empty snapshot. */
+    val lastCatalog = mutableMapOf<String, List<MediaItem>>()
+
     fun show(screen: Screen, remember: Boolean = true) {
         if (remember && screen != currentScreen) {
             backStack.addLast(currentScreen)
             while (backStack.size > 24) backStack.pollFirst()
         }
         currentScreen = screen
-        // A takeover state (source discovery) hides the side rail; leaving its
-        // screen must never leave the rail hidden behind.
-        setRailVisible(true)
+        // Takeover states own the chrome: the detail screen and source
+        // discovery hide the side rail so only the top bar's Back button
+        // stays — every other screen brings it back. (Discovery manages
+        // itself while it is up; leaving any screen must never leave the
+        // rail hidden behind.)
+        setRailVisible(screen !is Screen.Detail)
         // An overlay closer belongs to the screen that registered it: leaving
         // the detail screen must not leave its closer behind.
         if (screen !is Screen.Detail) detailCloser = null
@@ -457,7 +458,10 @@ object AppShell {
             is Screen.Extensions -> extensionsScreen.onShown()
             is Screen.Settings -> settingsScreen.onShown()
             is Screen.Detail -> Unit
-            is Screen.Catalog -> Unit
+            // A Catalog screen from the back stack carries the snapshot from
+            // when it was first opened (usually empty): the Explore page
+            // refills it from the last load, or reloads when there is none.
+            is Screen.Catalog -> exploreScreen.onCatalogShown(screen)
         }
         refreshNav()
     }
@@ -489,6 +493,9 @@ object AppShell {
     }
 
     fun openDetail(item: MediaItem) {
+        // Navigation proof in the logs, next to the card-open line: the pair
+        // says whether a tap fired, and whether it navigated.
+        System.err.println("ui: openDetail " + item.providerId + "/" + item.id + " '" + item.title.take(60) + "'")
         show(Screen.Detail(item))
     }
 
@@ -525,8 +532,14 @@ object AppShell {
         is Screen.Extensions -> extensionsScreen.root
         is Screen.Settings -> settingsScreen.root
         is Screen.Detail -> DetailScreenView(screen.item).root
-        is Screen.Catalog -> CatalogScreenView(screen.title, screen.provider, screen.items)
-            .also { catalogView = it }.root
+        // A back-stack snapshot usually predates its load (empty): show the
+        // last loaded rows instantly instead of Loading forever — the
+        // Explore page tops them up or reloads when they arrive (see
+        // [ExploreScreenView.onCatalogShown]).
+        is Screen.Catalog -> CatalogScreenView(
+            screen.title, screen.provider,
+            screen.items.takeIf { it.isNotEmpty() } ?: lastCatalog[screen.provider] ?: emptyList(),
+        ).also { catalogView = it }.root
     }
 
     private fun titleFor(screen: Screen): String = when (screen) {

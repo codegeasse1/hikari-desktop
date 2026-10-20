@@ -33,6 +33,31 @@ class ExploreScreenView {
     /** Newest tap wins: an older load must never fill a newer page. */
     private var catalogGen = 0
 
+    /** The provider whose catalog is (or was last) on screen: Back lands on
+     *  a snapshot that predates its load, and this is what reloads it. */
+    private var lastProvider: ProviderConfig? = null
+
+    /**
+     * A Catalog screen just showed with whatever snapshot it carries. Fresh
+     * navigation brings its own rows; a back-stack return brings an empty
+     * one — refill it from the last load, or reload the provider when even
+     * that is missing, so Back never sticks on Loading.
+     */
+    fun onCatalogShown(s: Screen.Catalog) {
+        if (s.items.isNotEmpty()) {
+            AppShell.lastCatalog[s.provider] = s.items
+            return
+        }
+        val cached = AppShell.lastCatalog[s.provider]
+        if (!cached.isNullOrEmpty()) {
+            AppShell.catalogView?.setItems(cached)
+            return
+        }
+        val p = lastProvider
+        if (p != null && p.name == s.provider) openCatalog(p)
+        else AppShell.catalogView?.setItems(emptyList())
+    }
+
     fun onShown() {
         render()
     }
@@ -105,6 +130,7 @@ class ExploreScreenView {
      */
     private fun openCatalog(p: ProviderConfig) {
         catalogJob?.cancel()
+        lastProvider = p
         val gen = ++catalogGen
         // Navigate first, load second: the screen is up before a single
         // packet is awaited.
@@ -123,8 +149,16 @@ class ExploreScreenView {
             } catch (t: kotlinx.coroutines.TimeoutCancellationException) {
                 desktop.fx.Fx.run {
                     if (gen == catalogGen) {
-                        AppShell.catalogView?.setItems(emptyList())
-                        AppShell.toast("“${p.name}” took too long to answer — try again.", "error")
+                        // A stale load beats an empty screen: show last rows
+                        // with the warning instead of a dead "no rows" page.
+                        val stale = AppShell.lastCatalog[p.name]
+                        if (!stale.isNullOrEmpty()) {
+                            AppShell.catalogView?.setItems(stale)
+                            AppShell.toast("“${p.name}” took too long to answer — showing last loaded rows.", "error")
+                        } else {
+                            AppShell.catalogView?.setItems(emptyList())
+                            AppShell.toast("“${p.name}” took too long to answer — try again.", "error")
+                        }
                     }
                 }
                 return@launch
@@ -133,14 +167,23 @@ class ExploreScreenView {
             } catch (t: Throwable) {
                 desktop.fx.Fx.run {
                     if (gen == catalogGen) {
-                        AppShell.catalogView?.setItems(emptyList())
-                        AppShell.toast("Couldn't open “${p.name}” (${t.message ?: t.javaClass.simpleName}).", "error")
+                        val stale = AppShell.lastCatalog[p.name]
+                        if (!stale.isNullOrEmpty()) {
+                            AppShell.catalogView?.setItems(stale)
+                            AppShell.toast("Couldn't refresh “${p.name}” — showing last loaded rows.", "error")
+                        } else {
+                            AppShell.catalogView?.setItems(emptyList())
+                            AppShell.toast("Couldn't open “${p.name}” (${t.message ?: t.javaClass.simpleName}).", "error")
+                        }
                     }
                 }
                 return@launch
             }
             desktop.fx.Fx.run {
-                if (gen == catalogGen) AppShell.catalogView?.setItems(items)
+                if (gen == catalogGen) {
+                    if (items.isNotEmpty()) AppShell.lastCatalog[p.name] = items
+                    AppShell.catalogView?.setItems(items)
+                }
             }
         }
     }
