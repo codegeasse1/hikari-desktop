@@ -90,7 +90,9 @@ object TmdbDetails {
         return coroutineScope {
             val detailsD = async { TmdbResolver.apiGet(base, emptyMap()) }
             val creditsD = async { TmdbResolver.apiGet("$base/credits", emptyMap()) }
-            val imagesD = async { TmdbResolver.apiGet("$base/images", mapOf("include_image_language" to "en,null")) }
+            // No language filter: a zh-tagged donghua backdrop beats a provider
+            // thumbnail, and the parsers prefer English/unflagged art first.
+            val imagesD = async { TmdbResolver.apiGet("$base/images", emptyMap()) }
             val videosD = async { TmdbResolver.apiGet("$base/videos", emptyMap()) }
             val certD = async {
                 if (resolved.mediaType == "tv") TmdbResolver.apiGet("$base/content_ratings", emptyMap())
@@ -212,13 +214,21 @@ object TmdbDetails {
 
     private fun parseBackdrops(images: JSONObject?): List<String> {
         val arr = images?.optJSONArray("backdrops") ?: return emptyList()
-        val paths = ArrayList<Pair<Double, String>>()
+        val pref = ArrayList<Pair<Double, String>>()
+        val rest = ArrayList<Pair<Double, String>>()
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
             val p = o.optString("file_path")
-            if (p.isNotBlank()) paths.add(o.optDouble("vote_average", 0.0) to p)
+            if (p.isBlank()) continue
+            // English/unflagged art first (what the banner wants), then art in
+            // any language: a zh-tagged donghua backdrop still beats a
+            // provider thumbnail stretched over the hero.
+            val lang = o.optString("iso_639_1")
+            val slot = if (lang == "en" || lang.isBlank() || lang == "null") pref else rest
+            slot.add(o.optDouble("vote_average", 0.0) to p)
         }
-        return paths.sortedByDescending { it.first }.take(8).mapNotNull { img(it.second, "w1280") }
+        return (pref.sortedByDescending { it.first } + rest.sortedByDescending { it.first })
+            .take(8).mapNotNull { img(it.second, "w1280") }
     }
 
     private fun parseLogo(images: JSONObject?): String? {        val arr = images?.optJSONArray("logos") ?: return null
@@ -236,13 +246,18 @@ object TmdbDetails {
 
     private fun parsePosters(images: JSONObject?): List<String> {
         val arr = images?.optJSONArray("posters") ?: return emptyList()
-        val paths = ArrayList<Pair<Double, String>>()
+        val pref = ArrayList<Pair<Double, String>>()
+        val rest = ArrayList<Pair<Double, String>>()
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
             val p = o.optString("file_path")
-            if (p.isNotBlank()) paths.add(o.optDouble("vote_average", 0.0) to p)
+            if (p.isBlank()) continue
+            val lang = o.optString("iso_639_1")
+            val slot = if (lang == "en" || lang.isBlank() || lang == "null") pref else rest
+            slot.add(o.optDouble("vote_average", 0.0) to p)
         }
-        return paths.sortedByDescending { it.first }.take(4).mapNotNull { img(it.second, "w500") }
+        return (pref.sortedByDescending { it.first } + rest.sortedByDescending { it.first })
+            .take(4).mapNotNull { img(it.second, "w500") }
     }
 
     private fun parseTrailers(videos: JSONObject?): List<Trailer> {

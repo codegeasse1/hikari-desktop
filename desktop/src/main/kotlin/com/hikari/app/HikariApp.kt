@@ -133,6 +133,22 @@ class HikariApp : Application() {
     }
 
     private fun installCrashHandler() {
+        // A native crash (mpv/JNA/V8 segfault) never reaches the handler
+        // below — the JVM dies with an hs_err_pid file in the working dir
+        // instead, and the next launch looks innocent. Sweep the newest one
+        // into the crash pipeline so it surfaces in Settings like a Java
+        // crash and rides along in the saved diagnostics.
+        runCatching {
+            val dir = File(System.getProperty("user.dir").orEmpty()).takeIf { it.isDirectory } ?: return@runCatching
+            val newest = dir.listFiles { f -> f.isFile && f.name.startsWith("hs_err_pid") }
+                ?.maxByOrNull { it.lastModified() }
+            if (newest != null && newest.length() > 0) {
+                val head = newest.readText().take(1600)
+                File(cacheDir, "crash.log").writeText("[${desktop.Build.DATE}] native crash (${newest.name}):\n$head")
+                System.err.println("Previous run died natively: " + newest.name + " (kept as crash.log)")
+                runCatching { newest.delete() }
+            }
+        }
         runCatching {
             val file = File(cacheDir, "crash.log")
             if (file.exists()) {

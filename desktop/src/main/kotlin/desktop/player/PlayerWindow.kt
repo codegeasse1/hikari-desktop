@@ -263,6 +263,15 @@ object PlayerWindow {
      *  [warnSeekRefused]): holding the arrow key must not stack it. */
     @Volatile private var lastSeekWarnAt = 0L
 
+    /** A skip asked for while the picture was not up yet: sent the moment
+     *  playback starts instead of dying in the echo window (see
+     *  [playbackStarted]). Absolute seconds; null means none. */
+    @Volatile private var queuedSeekSecs: Double? = null
+
+    /** Arrow-key skips pressed before the duration was known (no fraction can
+     *  be computed yet): applied as one relative skip on start. */
+    @Volatile private var pendingSeekDelta = 0.0
+
     /** One daemon thread for seek verifications, so holding the arrow key
      *  cannot pile a thread per repeat (see [sendSeekChecked]). */
     private val seekVerifier: java.util.concurrent.ExecutorService =
@@ -556,6 +565,14 @@ object PlayerWindow {
         lastPosition = 0L
         scrubbing = false
         paused = false
+        // The queue belongs to the previous stream: a skip banked while it
+        // loaded must never fire into the next title (and a stale echo must
+        // never snap the new bar back to the old picture's position).
+        queuedSeekSecs = null
+        pendingSeekDelta = 0.0
+        seekPendingSecs = null
+        lastReportedSecs = 0.0
+        seekEchoGen++
         // A new stream starts with its chrome up: the loading overlay is the only
         // thing on screen and the bars are what say so.
         chromeVisible = true
@@ -1906,6 +1923,10 @@ object PlayerWindow {
     private fun closeInternal() {
         teardown = true
         seekEchoGen++
+        seekPendingSecs = null
+        queuedSeekSecs = null
+        pendingSeekDelta = 0.0
+        lastReportedSecs = 0.0
         // A report copied after the close must not describe a live player:
         // the note, the chip and the refusal all belonged to the finished
         // launch. The adoption trace is kept (it is history), but its clock
@@ -2804,7 +2825,17 @@ object PlayerWindow {
      */
     private fun seekBy(delta: Double) {
         val d = duration
-        if (d <= 0) return
+        if (d <= 0) {
+            // No length yet (still loading): bank the skip and apply it on
+            // start — dropping it is the "forward does nothing until the
+            // video loads" report.
+            pendingSeekDelta = (pendingSeekDelta + delta).coerceIn(-3600.0, 3600.0)
+            setStatus(
+                if (delta >= 0) "Skipping forward once the video loads." else "Skipping back once the video loads.",
+                busy = true,
+            )
+            return
+        }
         // Same guard as [seekTo]: without a control channel the skip keys and
         // buttons must say so instead of moving a bar that snaps back.
         val h = ipc ?: run {
@@ -2836,17 +2867,22 @@ object PlayerWindow {
                 runCatching { Thread.sleep(SEEK_ECHO_MS) }
                 Fx.run {
                     if (seekEchoGen == gen && seekPendingSecs != null) {
+                        val target = seekPendingSecs
                         seekPendingSecs = null
                         val d = duration
                         val frac = if (d > 0) (lastReportedSecs / d).coerceIn(0.0, 1.0) else 0.0
                         lastPosition = (lastReportedSecs * 1000).toLong()
                         if (!scrubbing) seekBar?.value = frac
                         renderTime()
-                        // The window closed with the picture unmoved from where
-                        // it was when the seek was sent: the seek never landed,
-                        // and the bar just snapped back. Say so instead of
-                        // leaving "forward does nothing" a mystery.
-                        if (kotlin.math.abs(lastReportedSecs - seekFromSecs) < 0.5) warnSeekRefused()
+                        if (kotlin.math.abs(lastReportedSecs - seekFromSecs) < 0.5) {
+                            if (target != null && loadingBox?.isVisible == true) {
+                                // Still loading: the seek was never refused, it
+                                // was early — hold it for the start instead of
+                                // warning (see [queuedSeekSecs]).
+                                queuedSeekSecs = target
+                                setStatus("Still loading — the skip applies when the video starts.", busy = true)
+                            } else warnSeekRefused()
+                        }
                     }
                 }
             },
@@ -3160,6 +3196,18 @@ object PlayerWindow {
         // The picture is up: the bars have said what they had to say, and the
         // countdown to getting out of the way starts now.
         pokeChrome()
+        // Skips banked while the picture was down (see [queuedSeekSecs],
+        // [pendingSeekDelta]): an absolute skip wins over banked relative
+        // ones — firing both would double-skip.
+        val hasIpc = ipc != null
+        val q = queuedSeekSecs
+        queuedSeekSecs = null
+        val pd = pendingSeekDelta
+        pendingSeekDelta = 0.0
+        if (hasIpc && duration > 0) {
+            if (q != null) seekTo((q / duration).coerceIn(0.0, 1.0))
+            else if (pd != 0.0) seekBy(pd)
+        }
     }
 
     private fun renderTime() {

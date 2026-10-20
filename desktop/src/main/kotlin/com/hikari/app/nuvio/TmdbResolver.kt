@@ -6,6 +6,9 @@ import com.hikari.app.data.MediaType
 import com.hikari.app.data.TmdbMeta
 import com.hikari.app.net.Http
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -326,21 +329,39 @@ object TmdbResolver {
             } else {
                 ""
             }
-            for (key in API_KEYS) {
-                val params = LinkedHashMap<String, String>(query)
-                if (lang.isNotBlank()) params["language"] = lang
-                params["api_key"] = key
-                val qs = params.entries.joinToString("&") { (k, v) ->
-                    "${java.net.URLEncoder.encode(k, "UTF-8")}=${java.net.URLEncoder.encode(v, "UTF-8")}"
+            // TMDB answers ~40 requests per 10s window: the home screen fans
+            // out dozens of lookups at once (hero + art upgrades), and an
+            // unthrottled burst comes back 429 for most of them — which used to
+            // read as "TMDB has no art for this title" and left provider
+            // thumbnails everywhere. Four at a time stay under the limit; one
+            // delayed retry covers the stragglers the window still clips.
+            tmdbGate.withPermit { tryKeys(path, query, lang) }
+                ?: run {
+                    delay(2_000L)
+                    tmdbGate.withPermit { tryKeys(path, query, lang) }
                 }
-                val url = "$API_BASE$path?$qs"
-                val text = Http.getString(url, mapOf("Accept" to "application/json")) ?: continue
-                val obj = runCatching { JSONObject(text) }.getOrNull() ?: continue
-                if (obj.optString("status_message").contains("Invalid API key", true)) continue
-                return@withContext obj
-            }
-            null
         }
+
+    /** TMDB request gate shared by every lookup (see [apiGet]). */
+    private val tmdbGate = Semaphore(4)
+
+    /** One attempt across the API keys. Null when nothing answered. */
+    private fun tryKeys(path: String, query: Map<String, String>, lang: String): JSONObject? {
+        for (key in API_KEYS) {
+            val params = LinkedHashMap<String, String>(query)
+            if (lang.isNotBlank()) params["language"] = lang
+            params["api_key"] = key
+            val qs = params.entries.joinToString("&") { (k, v) ->
+                "${java.net.URLEncoder.encode(k, "UTF-8")}=${java.net.URLEncoder.encode(v, "UTF-8")}"
+            }
+            val url = "$API_BASE$path?$qs"
+            val text = Http.getString(url, mapOf("Accept" to "application/json")) ?: continue
+            val obj = runCatching { JSONObject(text) }.getOrNull() ?: continue
+            if (obj.optString("status_message").contains("Invalid API key", true)) continue
+            return obj
+        }
+        return null
+    }
 
     // ---- tiny disk cache (survives restarts; bounded) ----
 

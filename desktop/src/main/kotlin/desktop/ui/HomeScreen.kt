@@ -105,7 +105,10 @@ class HomeScreenView {
     private var heroTimer: Timeline? = null
     /** Enriched TMDB data per hero item, so ratings/logos survive rotation. */
     private val heroEnrich = HashMap<String, TmdbDetails.Details?>()
-    private var heroEnrichStarted = HashSet<String>()
+    /** Last TMDB attempt per hero item: a miss (rate limit, network blip) must
+     *  not pin the provider art for the session — the rotation re-attempts
+     *  past the cooldown, so the hero self-heals to TMDB art by itself. */
+    private var heroEnrichStarted = HashMap<String, Long>()
 
     /** providerId → name, filled on every load so the hero can name the source
      *  of the title it is featuring without re-reading the store. */
@@ -421,11 +424,18 @@ class HomeScreenView {
 
     /** Ratings + logo resolve in the background: the banner never waits on them. */
     private fun enrichHero(item: MediaItem) {
-        if (heroEnrichStarted.contains(item.uniqueId)) return
-        heroEnrichStarted.add(item.uniqueId)
+        // Successes never re-resolve; misses retry past a cooldown (the hero
+        // calls this on every rotation, which is what drives the retry).
+        if (heroEnrich.containsKey(item.uniqueId)) return
+        val now = System.currentTimeMillis()
+        if (now - (heroEnrichStarted[item.uniqueId] ?: 0L) < 60_000L) return
+        heroEnrichStarted[item.uniqueId] = now
         AppShell.uiScope.launch {
             val d = runCatching { TmdbDetails.load(item) }.getOrNull()
-            heroEnrich[item.uniqueId] = d
+            // Only successes are recorded: a null must stay re-resolvable past
+            // the cooldown above (a null entry would satisfy containsKey and
+            // pin the provider art again).
+            if (d != null) heroEnrich[item.uniqueId] = d
             Fx.run {
                 if (d?.overview?.isNotBlank() == true && heroDesc.text.isBlank()) {
                     heroDesc.text = d.overview

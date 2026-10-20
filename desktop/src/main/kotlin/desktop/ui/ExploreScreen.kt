@@ -1,5 +1,6 @@
 package desktop.ui
 
+import com.hikari.app.data.MediaItem
 import com.hikari.app.data.ProviderConfig
 import com.hikari.app.data.ProviderType
 import javafx.geometry.Insets
@@ -151,48 +152,53 @@ class ExploreScreenView {
             // budget, and a timeout names the provider instead of silence.
             // A newer tap cancels this job, and a navigation away clears the
             // view — either way a late answer fills nothing.
-            val items = try {
-                kotlinx.coroutines.withTimeout(20_000L) {
-                    val rows = AppShell.app.repository.homeRows(providerId = p.id)
-                    rows.flatMap { it.items }.distinctBy { it.uniqueId }.take(150)
-                }
-            } catch (t: kotlinx.coroutines.TimeoutCancellationException) {
-                desktop.fx.Fx.run {
-                    if (gen == catalogGen) {
-                        // A stale load beats an empty screen: show last rows
-                        // with the warning instead of a dead "no rows" page.
-                        val stale = AppShell.lastCatalog[p.name]
-                        if (!stale.isNullOrEmpty()) {
-                            AppShell.catalogView?.setItems(stale)
-                            AppShell.toast("“${p.name}” took too long to answer — showing last loaded rows.", "error")
-                        } else {
-                            AppShell.catalogView?.setItems(emptyList())
-                            AppShell.toast("“${p.name}” took too long to answer — try again.", "error")
-                        }
+            //
+            // Two attempts, not one: the FIRST call pays the extension's cold
+            // start (init + first network round-trips) and can outrun even a
+            // generous budget, while the second answers from warm caches —
+            // exactly the reported "first open says too-slow, Back and reopen
+            // loads". Only timeouts retry; a hard error is final at once.
+            var loaded: List<MediaItem>? = null
+            var fail: Throwable? = null
+            for (attempt in 0..1) {
+                try {
+                    loaded = kotlinx.coroutines.withTimeout(if (attempt == 0) 20_000L else 45_000L) {
+                        val rows = AppShell.app.repository.homeRows(providerId = p.id)
+                        rows.flatMap { it.items }.distinctBy { it.uniqueId }.take(150)
                     }
+                    fail = null
+                    break
+                } catch (t: kotlinx.coroutines.TimeoutCancellationException) {
+                    fail = t
+                } catch (t: kotlinx.coroutines.CancellationException) {
+                    throw t
+                } catch (t: Throwable) {
+                    fail = t
+                    break
                 }
-                return@launch
-            } catch (t: kotlinx.coroutines.CancellationException) {
-                throw t
-            } catch (t: Throwable) {
-                desktop.fx.Fx.run {
-                    if (gen == catalogGen) {
-                        val stale = AppShell.lastCatalog[p.name]
-                        if (!stale.isNullOrEmpty()) {
-                            AppShell.catalogView?.setItems(stale)
-                            AppShell.toast("Couldn't refresh “${p.name}” — showing last loaded rows.", "error")
-                        } else {
-                            AppShell.catalogView?.setItems(emptyList())
-                            AppShell.toast("Couldn't open “${p.name}” (${t.message ?: t.javaClass.simpleName}).", "error")
-                        }
-                    }
-                }
-                return@launch
             }
+            val rows = loaded
+            val problem = fail
             desktop.fx.Fx.run {
-                if (gen == catalogGen) {
-                    if (items.isNotEmpty()) AppShell.lastCatalog[p.name] = items
-                    AppShell.catalogView?.setItems(items)
+                if (gen != catalogGen) return@run
+                if (rows != null) {
+                    if (rows.isNotEmpty()) AppShell.lastCatalog[p.name] = rows
+                    AppShell.catalogView?.setItems(rows)
+                    return@run
+                }
+                // A stale load beats an empty screen: show last rows with the
+                // warning instead of a dead "no rows" page.
+                val stale = AppShell.lastCatalog[p.name]
+                if (!stale.isNullOrEmpty()) {
+                    AppShell.catalogView?.setItems(stale)
+                    AppShell.toast("Couldn't refresh “${p.name}” — showing last loaded rows.", "error")
+                } else {
+                    AppShell.catalogView?.setItems(emptyList())
+                    if (problem is kotlinx.coroutines.TimeoutCancellationException) {
+                        AppShell.toast("“${p.name}” took too long to answer — try again.", "error")
+                    } else {
+                        AppShell.toast("Couldn't open “${p.name}” (${problem?.message ?: problem?.javaClass?.simpleName}).", "error")
+                    }
                 }
             }
         }
