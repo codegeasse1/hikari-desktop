@@ -29,7 +29,7 @@ import java.util.concurrent.atomic.AtomicLong
  * mpv answers a request with `request_id`, and pushes `event`/`property-change`
  * messages unsolicited, so one reader thread fans everything out.
  */
-class MpvIpc(private val target: String, private val windowsPipe: Boolean) {
+class MpvIpc(val target: String, private val windowsPipe: Boolean) {
 
     /** Property changes and events, delivered on the reader thread. */
     @Volatile

@@ -499,6 +499,9 @@ object PlayerWindow {
             // …and when it can, the bars leave the layout and float on top of
             // the picture (see [overlaysOn]) so the video fills the window.
             if (canEmbed && floatBarsEnabled) useOverlayBars() else releaseOverlayBars()
+            // The new launch owns new channels: the old ones die with the old
+            // mpv, and their death must not be heard as this launch's death.
+            detachIpc()
             resetForNewStream()
             refreshOverlay()
             canEmbed
@@ -562,6 +565,21 @@ object PlayerWindow {
 
     /** True once mpv reported the file as loaded. */
     fun isLoaded(): Boolean = loaded
+
+    /**
+     * Drops the previous launch's control channel, if any.
+     *
+     * A replaced handle must be CLOSED, never left wired: its death arrives as
+     * `ipc-closed` on this shared layer and would "recover" (kill + relaunch)
+     * whatever launch replaced it — the player that restarts by itself, and a
+     * report whose command log names a pipe from two launches ago. Called from
+     * [open], so every launch starts with no channel from the last one.
+     */
+    fun detachIpc() {
+        val old = ipc
+        ipc = null
+        runCatching { old?.close() }
+    }
 
     /** Live status text — "Starting the player…", why a stream died. It shows as
      *  a chip in the top strip that is absent while there is nothing to say, so
@@ -1846,6 +1864,18 @@ object PlayerWindow {
     private fun closeInternal() {
         teardown = true
         seekEchoGen++
+        // A report copied after the close must not describe a live player:
+        // the note, the chip and the refusal all belonged to the finished
+        // launch. The adoption trace is kept (it is history), but its clock
+        // stops so "watched for" does not keep growing after the close.
+        ownWindowNoteUp = false
+        lastStatus = ""
+        adoptRefusal = ""
+        adoptStartedAt = 0L
+        // A leaked handle dying later must not resurrect playback after the
+        // user closed it (see [detachIpc] — there should be none left, but a
+        // close must not depend on that).
+        onPlayerDied = null
         runCatching { syncTimer?.stop() }
         syncTimer = null
         runCatching { hideChrome?.stop() }
@@ -2827,8 +2857,14 @@ object PlayerWindow {
     /** Hands the IPC channel over once mpv's pipe is up. */
     fun attachIpc(handle: MpvIpc) {
         ipc = handle
-        handle.onProperty = { name, value -> runCatching { onProperty(name, value) } }
-        handle.onEvent = { event, data -> runCatching { onEvent(event, data) } }
+        // A replaced handle is still alive until it is closed below, and its
+        // reader thread can deliver one last death notice on the way out — it
+        // must never be mistaken for news about THIS launch. Only the current
+        // handle's callbacks run; a stale one is already detached (see
+        // [detachIpc]) and its remains are dropped here as well.
+        val mine = handle
+        handle.onProperty = { name, value -> if (mine === ipc) runCatching { onProperty(name, value) } }
+        handle.onEvent = { event, data -> if (mine === ipc) runCatching { onEvent(event, data) } }
         val observations = listOf(
             "time-pos" to 1L,
             "duration" to 2L,

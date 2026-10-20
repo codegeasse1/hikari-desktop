@@ -299,6 +299,10 @@ object DesktopPlayer {
                 showBrowserFallback(title, path, brokenPlayerMessage(cachedErr))
                 return@run
             }
+            // Same ownership rule as the stream path below: the old channel
+            // dies with the old player, never into this launch.
+            runCatching { ipc?.close() }
+            ipc = null
             ipcTarget = openIpcEndpoint()
             runCatching { PlayerWindow.parkSurface() }
             // Park the previous stream's window FIRST (it belongs to the old mpv,
@@ -478,6 +482,11 @@ object DesktopPlayer {
             return
         }
         Fx.run {
+            // A previous launch's control channel must not survive into this
+            // one: its death arrives as `ipc-closed` on the shared layer and
+            // would "recover" (kill + relaunch) the player that just started.
+            runCatching { ipc?.close() }
+            ipc = null
             ipcTarget = openIpcEndpoint()
             val gen = ++launchGen
             val url = com.hikari.app.net.Http.sanitizeStreamUrl(stream.url)
@@ -1116,7 +1125,16 @@ object DesktopPlayer {
         val p = proc
         append("mpv process: ").append(if (p == null) "none" else "pid=" + p.pid() + " alive=" + p.isAlive)
             .append('\n')
-        append("ipc: ").append(if (ipc == null) "not connected" else "connected").append('\n')
+        // Liveness, not just presence: a kept handle to a dead pipe used to
+        // read as "connected" while naming a pipe from two launches ago. The
+        // endpoint line says which pipe THIS launch was given, so a mismatch
+        // between the two is visible instead of mysterious.
+        val h = ipc
+        append("ipc: ").append(
+            if (h == null) "none"
+            else "connected (" + h.target + ", alive=" + h.isAlive() + ")",
+        ).append('\n')
+        append("ipc endpoint for this launch: ").append(ipcTarget ?: "none").append('\n')
         if (lastArgs.isNotEmpty()) {
             append("commands (one per line, as mpv received them):\n")
             lastArgs.forEach { append("  ").append(it).append('\n') }
@@ -1189,6 +1207,10 @@ object DesktopPlayer {
     ) {
         System.err.println("player: the player process died — attemptsLeft=" + attemptsLeft)
         killPrevious(proc)
+        // The dead launch's channel dies with it (see [killMpv]): the next
+        // launch opens its own, and this one's `ipc-closed` must not chase it.
+        runCatching { ipc?.close() }
+        ipc = null
         proc = null
         // Dead-on-arrival through the pipe path (mpv died before ever showing
         // a frame): same rule as the drain thread — no silent relaunch, the
@@ -1279,6 +1301,10 @@ object DesktopPlayer {
                     runCatching { client.close() }
                     Fx.run {
                         if (proc === mine) {
+                            // No channel for this launch: say so, and forget
+                            // any older one — the report must never call a
+                            // dead launch's pipe "connected".
+                            ipc = null
                             PlayerWindow.setStatus(
                                 "Couldn't reach the player's control channel — video plays, controls are unavailable.",
                                 isError = true,
@@ -1296,7 +1322,9 @@ object DesktopPlayer {
                 Fx.run {
                     if (proc !== mine) {
                         runCatching { client.close() }
-                        ipc = null
+                        // Only our own handle: a newer launch may already have
+                        // attached its channel while this block was queued.
+                        if (ipc === client) ipc = null
                         return@run
                     }
                     PlayerWindow.attachIpc(client)
@@ -1350,6 +1378,11 @@ object DesktopPlayer {
      *  outright; the wait is what turns "I asked it to stop" into "it is gone",
      *  and the forcible fallback covers a wedged one. */
     private fun killMpv() {
+        // Forgetting the process means forgetting its channel too: a handle
+        // to a dead pipe reads as "connected" in the report and its death
+        // notice would "recover" the next launch.
+        runCatching { ipc?.close() }
+        ipc = null
         val p = proc
         proc = null
         ipcTarget = null
