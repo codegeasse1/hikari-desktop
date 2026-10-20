@@ -125,6 +125,8 @@ jobs:
 
       - name: Bundle mpv player (video engine)
         if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
           mpv_url="https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20260814/mpv-x86_64-20260814-git-7b8915bc1d.7z"
@@ -132,7 +134,8 @@ jobs:
             echo "pinned mpv build is unavailable - resolving the newest release asset"
             mpv_url=$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest" | grep -o '"browser_download_url": *"[^"]*mpv-x86_64-[^"]*\.7z"' | head -n 1 | cut -d'"' -f4)
             echo "newest: $mpv_url"
-            curl -fsSL -o mpv.7z "$mpv_url"
+            [ -n "$mpv_url" ]
+            curl -fsSL -o mpv.7z "$mpv_url"curl -fsSL -o mpv.7z "$mpv_url"
           fi
           7z x -bso0 -bsp0 -ompv-tmp mpv.7z
           mkdir -p jpackage-input/mpv
