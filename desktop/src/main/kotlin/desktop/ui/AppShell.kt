@@ -409,6 +409,14 @@ object AppShell {
      */
     var detailCloser: (() -> Boolean)? = null
 
+    /**
+     * The live catalog view, when one is on screen: the Browse page fills it
+     * the moment the provider's rows arrive (see ExploreScreen.openCatalog).
+     * Cleared on every navigation away, so a late load never fills a screen
+     * the user already left.
+     */
+    var catalogView: CatalogScreenView? = null
+
     fun show(screen: Screen, remember: Boolean = true) {
         if (remember && screen != currentScreen) {
             backStack.addLast(currentScreen)
@@ -421,6 +429,9 @@ object AppShell {
         // An overlay closer belongs to the screen that registered it: leaving
         // the detail screen must not leave its closer behind.
         if (screen !is Screen.Detail) detailCloser = null
+        // The live catalog view belongs to its screen the same way: a load
+        // finishing after the user left must find nothing to fill.
+        if (screen !is Screen.Catalog) catalogView = null
         Theme.refresh()
         val node = try {
             viewFor(screen)
@@ -514,7 +525,8 @@ object AppShell {
         is Screen.Extensions -> extensionsScreen.root
         is Screen.Settings -> settingsScreen.root
         is Screen.Detail -> DetailScreenView(screen.item).root
-        is Screen.Catalog -> CatalogScreenView(screen.title, screen.provider, screen.items).root
+        is Screen.Catalog -> CatalogScreenView(screen.title, screen.provider, screen.items)
+            .also { catalogView = it }.root
     }
 
     private fun titleFor(screen: Screen): String = when (screen) {

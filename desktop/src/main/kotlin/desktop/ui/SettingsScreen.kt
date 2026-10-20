@@ -310,22 +310,37 @@ class SettingsScreenView {
             rows.add(
                 infoCard("Exceptions — stay solo, never search other extensions:"),
             )
-            val solo = runCatching { app.store.sweepSoloProviders() }.getOrDefault(emptySet())
+            // A user with hundreds of extensions cannot scroll to the one
+            // they want: the list filters as they type, in place, without
+            // leaving the page or losing the boxes already ticked.
+            val filter = Ui.field("Search extensions…", width = 420.0)
+            rows.add(filter)
             val soloGrid = twoColumnGrid()
-            installed.forEachIndexed { index, cfg ->
-                val box = CheckBox("${cfg.name} (${cfg.type.groupLabel}) — only its own servers").apply {
-                    isSelected = cfg.id in solo
-                }
-                box.setOnAction {
-                    runCatching { app.store.setSweepSoloProvider(cfg.id, box.isSelected) }
-                    AppShell.toast(
-                        if (box.isSelected) "${cfg.name} stays solo from now on"
-                        else "${cfg.name} can be rescued by other extensions again",
-                        "ok",
-                    )
-                }
-                soloGrid.add(miniCheckCard(box), index % 2, index / 2)
+            fun renderSolo(query: String) {
+                soloGrid.children.clear()
+                // Re-read every render: boxes ticked before the keystroke
+                // must still read ticked after it.
+                val current = runCatching { app.store.sweepSoloProviders() }.getOrDefault(emptySet())
+                val q = query.trim().lowercase()
+                installed
+                    .filter { q.isBlank() || it.name.lowercase().contains(q) || it.id.lowercase().contains(q) }
+                    .forEachIndexed { index, cfg ->
+                        val box = CheckBox("${cfg.name} (${cfg.type.groupLabel}) — only its own servers").apply {
+                            isSelected = cfg.id in current
+                        }
+                        box.setOnAction {
+                            runCatching { app.store.setSweepSoloProvider(cfg.id, box.isSelected) }
+                            AppShell.toast(
+                                if (box.isSelected) "${cfg.name} stays solo from now on"
+                                else "${cfg.name} can be rescued by other extensions again",
+                                "ok",
+                            )
+                        }
+                        soloGrid.add(miniCheckCard(box), index % 2, index / 2)
+                    }
             }
+            filter.textProperty().addListener { _, _, nv -> renderSolo(nv ?: "") }
+            renderSolo("")
             rows.add(soloGrid)
         }
         return Ui.panel(

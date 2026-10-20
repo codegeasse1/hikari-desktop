@@ -30,6 +30,9 @@ class ExploreScreenView {
     val root: ScrollPane = Ui.vScroll(body)
     private var catalogJob: Job? = null
 
+    /** Newest tap wins: an older load must never fill a newer page. */
+    private var catalogGen = 0
+
     fun onShown() {
         render()
     }
@@ -95,16 +98,23 @@ class ExploreScreenView {
     }
 
     /**
-     * Loads this provider's catalogs and opens them as their own page — the
-     * provider's catalogue, not a Home that merely has it selected.
+     * Opens this provider's catalog page INSTANTLY — the page (with its
+     * loading row) is the first thing the tap does, and the catalog lands
+     * into it when it arrives. Waiting for the network BEFORE navigating is
+     * what left users staring at a "Loading X…" toast for 10 seconds.
      */
     private fun openCatalog(p: ProviderConfig) {
         catalogJob?.cancel()
-        AppShell.toast("Loading ${p.name}…")
+        val gen = ++catalogGen
+        // Navigate first, load second: the screen is up before a single
+        // packet is awaited.
+        AppShell.show(Screen.Catalog(p.name, p.name, emptyList()))
         catalogJob = AppShell.uiScope.launch {
-            // A provider whose catalog fetch hangs used to leave this toast up
+            // A provider whose catalog fetch hangs used to leave the wait up
             // forever ("opening X…" that never opens): the load has a hard
             // budget, and a timeout names the provider instead of silence.
+            // A newer tap cancels this job, and a navigation away clears the
+            // view — either way a late answer fills nothing.
             val items = try {
                 kotlinx.coroutines.withTimeout(20_000L) {
                     val rows = AppShell.app.repository.homeRows(providerId = p.id)
@@ -112,23 +122,25 @@ class ExploreScreenView {
                 }
             } catch (t: kotlinx.coroutines.TimeoutCancellationException) {
                 desktop.fx.Fx.run {
-                    AppShell.toast("“${p.name}” took too long to answer — try again.", "error")
+                    if (gen == catalogGen) {
+                        AppShell.catalogView?.setItems(emptyList())
+                        AppShell.toast("“${p.name}” took too long to answer — try again.", "error")
+                    }
                 }
                 return@launch
             } catch (t: kotlinx.coroutines.CancellationException) {
                 throw t
             } catch (t: Throwable) {
                 desktop.fx.Fx.run {
-                    AppShell.toast("Couldn't open “${p.name}” (${t.message ?: t.javaClass.simpleName}).", "error")
+                    if (gen == catalogGen) {
+                        AppShell.catalogView?.setItems(emptyList())
+                        AppShell.toast("Couldn't open “${p.name}” (${t.message ?: t.javaClass.simpleName}).", "error")
+                    }
                 }
                 return@launch
             }
             desktop.fx.Fx.run {
-                if (items.isEmpty()) {
-                    AppShell.toast("“${p.name}” returned no catalog rows — open the logs for the reason.", "error")
-                } else {
-                    AppShell.show(Screen.Catalog(p.name, p.name, items))
-                }
+                if (gen == catalogGen) AppShell.catalogView?.setItems(items)
             }
         }
     }

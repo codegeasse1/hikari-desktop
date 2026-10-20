@@ -25,20 +25,56 @@ class CatalogScreenView(
         maxHeight = Double.MAX_VALUE
     }
 
+    private lateinit var grid: PosterGrid
+    private lateinit var count: javafx.scene.control.Label
+    private lateinit var loadingRow: HBox
+    private lateinit var emptyNote: javafx.scene.control.Label
+
     init {
         val back = Ui.button("Back", icon = Icons.CHEVRON_LEFT, ghost = true) { AppShell.back() }
         val heading = Theme.label(title, size = 21.0, bold = true)
-        val count = Theme.label(
-            "${items.size} title${if (items.size == 1) "" else "s"} · $provider",
+        count = Theme.label(
+            if (items.isEmpty()) "Loading…" else "${items.size} title${if (items.size == 1) "" else "s"} · $provider",
             size = 12.5,
             dim = true,
         )
-        val grid = PosterGrid(Theme.POSTER_W, onOpen = { AppShell.openDetail(it) })
+        grid = PosterGrid(Theme.POSTER_W, onOpen = { AppShell.openDetail(it) })
         grid.setItems(items)
+        loadingRow = Ui.loadingRow("Loading $provider…").apply { isVisible = items.isEmpty(); isManaged = items.isEmpty() }
+        emptyNote = Theme.label("", size = 13.0, dim = true).apply {
+            isWrapText = true
+            isVisible = false
+            isManaged = false
+        }
         root.children.addAll(
             HBox(12.0, back, heading, count).apply { alignment = Pos.CENTER_LEFT },
+            loadingRow,
+            emptyNote,
             grid.root,
         )
         VBox.setVgrow(grid.root, Priority.ALWAYS)
+    }
+
+    /**
+     * Fills the grid after the fact: the Browse page navigates here FIRST
+     * (instantly, with the loading row up) and the catalog lands when it
+     * arrives — tapping a provider never stares at a toast for 10 seconds.
+     */
+    fun setItems(items: List<MediaItem>) {
+        desktop.fx.Fx.run {
+            grid.setItems(items)
+            loadingRow.isVisible = false
+            loadingRow.isManaged = false
+            if (items.isEmpty()) {
+                emptyNote.text = "“$provider” returned no catalog rows — open the logs for the reason."
+                emptyNote.isVisible = true
+                emptyNote.isManaged = true
+                count.text = "No titles · $provider"
+            } else {
+                emptyNote.isVisible = false
+                emptyNote.isManaged = false
+                count.text = "${items.size} title${if (items.size == 1) "" else "s"} · $provider"
+            }
+        }
     }
 }

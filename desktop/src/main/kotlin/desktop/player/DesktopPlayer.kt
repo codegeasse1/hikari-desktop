@@ -116,21 +116,30 @@ object DesktopPlayer {
     /**
      * Video-output profiles, tried in order when mpv dies on arrival.
      *
-     * "auto" is today's command line. "nohwdec" keeps the GPU output but
-     * decodes on the CPU (a crashing hardware decoder dies here, not on the
-     * stream). "sdl" additionally drops the GPU video output entirely for a
-     * machine whose GPU context creation itself crashes — the reported case
-     * where mpv's log stops inside vo/gpu-next with no stream error. A
-     * profile whose flags this mpv build does not know exits instantly with
-     * an error, which the dead-on-arrival path below reads as "try the next
-     * one" — an unknown flag can never hang or mislead, it only fails fast.
+     * GROUND TRUTH, not guesses: the bundled mpv's own binary (shinchiro
+     * winbuild 20261020, the build CI ships) was strings-scanned. `vo_sdl`
+     * and `SDL_CreateWindow` are ABSENT — there is no SDL driver, so a
+     * `--vo=sdl` step dies with "Video output sdl not found" (observed in
+     * a user report). Present and confirmed: `gpu-next`, `gpu-context`,
+     * `angle-d3d11` with `angle-d3d11-warp` (choices no/yes), and a
+     * `direct3d` (D3D9) renderer driven by the inbox d3d9.dll. So:
+     * "auto" is today's command line; "nohwdec" keeps the GPU output but
+     * decodes on the CPU; "angle" forces the ANGLE backend instead of
+     * native d3d11; "warp" runs ANGLE on Microsoft's WARP software device
+     * (no functioning GPU needed at all); "direct3d" falls back to the
+     * ancient, rock-stable D3D9 renderer. A profile whose flags this mpv
+     * build does not know exits instantly with an error, which the
+     * dead-on-arrival path reads as "try the next one" — an unknown flag
+     * can never hang or mislead, it only fails fast.
      */
     private data class VoProfile(val name: String, val args: List<String>)
 
     private val VO_PROFILES = listOf(
         VoProfile("auto", emptyList()),
         VoProfile("nohwdec", listOf("--hwdec=no")),
-        VoProfile("sdl", listOf("--hwdec=no", "--vo=sdl")),
+        VoProfile("angle", listOf("--hwdec=no", "--gpu-context=angle")),
+        VoProfile("warp", listOf("--hwdec=no", "--gpu-context=angle", "--angle-d3d11-warp=yes")),
+        VoProfile("direct3d", listOf("--hwdec=no", "--vo=direct3d")),
     )
 
     /** The profile this launch should start on: the last one that showed a
@@ -157,6 +166,57 @@ object DesktopPlayer {
      * reason instead of entering the retry loop. Null = never probed.
      */
     @Volatile private var mpvProbe: Pair<Long, String?>? = null
+
+    /**
+     * mpv's log file for the CURRENT launch only. Every launch gets its own
+     * file (mpv-<n>.log, latest 8 kept) because one shared mpv.log let the
+     * cascade overwrite the reason the earlier step died — the report could
+     * only ever show the last attempt's last lines.
+     */
+    @Volatile private var lastMpvLog: File? = null
+    private val mpvLogSeq = java.util.concurrent.atomic.AtomicInteger(0)
+
+    private fun nextMpvLog(dir: File): File {
+        val f = File(dir, "mpv-" + mpvLogSeq.incrementAndGet() + ".log")
+        lastMpvLog = f
+        runCatching {
+            dir.listFiles { _, name -> name.startsWith("mpv-") && name.endsWith(".log") }
+                ?.sortedByDescending { it.lastModified() }
+                ?.drop(8)
+                ?.forEach { runCatching { it.delete() } }
+        }
+        return f
+    }
+
+    /**
+     * `mpv --vo=help` output for THIS mpv binary, probed in the background
+     * (never the FX thread — it spawns a process) and cached an hour. The
+     * exact video outputs the binary ships, printed into every player
+     * report, so the cascade never guesses a driver again.
+     */
+    @Volatile private var voHelp: Pair<Long, String?>? = null
+
+    private fun refreshVoHelp(mpv: File) {
+        val now = System.currentTimeMillis()
+        val cached = voHelp
+        if (cached != null && now - cached.first < 3_600_000L) return
+        val text = runCatching {
+            val p = ProcessBuilder(listOf(mpv.absolutePath, "--vo=help", "--no-config"))
+                .redirectErrorStream(true).start()
+            val sb = StringBuilder()
+            val drain = Thread({
+                runCatching {
+                    p.inputStream.bufferedReader().forEachLine {
+                        if (sb.length < 1500) sb.append(it).append('\n')
+                    }
+                }
+            }, "hikari-vo-help").apply { isDaemon = true; start() }
+            p.waitFor(15, java.util.concurrent.TimeUnit.SECONDS)
+            runCatching { drain.join(2_000) }
+            sb.toString().trim().take(1500)
+        }.getOrNull()?.takeIf { it.isNotBlank() }
+        voHelp = now to text
+    }
 
     /** The exact command line the current player was launched with, and what it
      *  was asked to play. Kept for the player report — "which flags did it
@@ -391,6 +451,8 @@ object DesktopPlayer {
                 mpvInputConf()?.let { add("--input-conf=$it") }
                 add("--title=" + title.take(200).replace('\n', ' '))
                 ipcArg()?.let { add(it) }
+                val logDir = File(System.getProperty("user.home"), ".hikari").apply { mkdirs() }
+                add("--log-file=${nextMpvLog(logDir).absolutePath}")
                 // Same cascade as the stream path (see [VO_PROFILES]).
                 addAll(VO_PROFILES[vo].args)
                 add(file.absolutePath)
@@ -513,6 +575,9 @@ object DesktopPlayer {
         // would die on every launch (dead-on-arrival, always) — say so now
         // with its reason instead of entering the retry loop.
         val probeErr = probeMpv(mpv, force = false)
+        // Off the FX thread here (see the offload above), so this is the
+        // place to refresh the capability probe the report carries.
+        if (probeErr == null) refreshVoHelp(mpv)
         if (probeErr != null) {
             val url = com.hikari.app.net.Http.sanitizeStreamUrl(stream.url)
             Fx.run {
@@ -636,7 +701,7 @@ object DesktopPlayer {
                 add("--demuxer-readahead-secs=2")
                 add("--title=" + title.take(200).replace('\n', ' '))
                 val logDir2 = logDir
-                add("--log-file=${File(logDir2, "mpv.log").absolutePath}")
+                add("--log-file=${nextMpvLog(logDir2).absolutePath}")
                 ipcArg()?.let { add(it) }
                 // Providers may ship stream headers (Referer/Cookie/UA) their
                 // CDN validates — hand them straight to mpv. If no User-Agent is
@@ -1075,10 +1140,13 @@ object DesktopPlayer {
         runCatching { Fx.runBlock { PlayerWindow.hasVideo() } ?: false }.getOrDefault(false)
 
     /** The DOA explanation: names the player (not the stream) and carries
-     *  mpv's own last error lines, so the report writes itself. */
+     *  mpv's own last error lines — from THIS launch's log file, so the
+     *  cascade cannot overwrite the reason before it is read. */
     private fun doaMessage(): String {
+        val logFile = lastMpvLog
+            ?: File(System.getProperty("user.home"), ".hikari/mpv.log")
         val tail = runCatching {
-            File(System.getProperty("user.home"), ".hikari/mpv.log").readLines()
+            logFile.readLines()
                 .takeLast(12).joinToString("\n").trim()
         }.getOrDefault("").take(1200)
         return buildString {
@@ -1220,13 +1288,17 @@ object DesktopPlayer {
             else "connected (" + h.target + ", alive=" + h.isAlive() + ")",
         ).append('\n')
         append("ipc endpoint for this launch: ").append(ipcTarget ?: "none").append('\n')
+        // The exact video outputs this mpv binary ships — probed on the
+        // machine itself, so a missing driver is a fact, not a guess.
+        append("mpv video outputs (--vo=help):\n")
+        append("  ").append(voHelp?.second?.take(800)?.replace("\n", "\n  ") ?: "(not probed yet — play something once)").append('\n')
         if (lastArgs.isNotEmpty()) {
             append("commands (one per line, as mpv received them):\n")
             lastArgs.forEach { append("  ").append(it).append('\n') }
         }
         append('\n').append(PlayerWindow.windowReport())
         val dir = File(System.getProperty("user.home"), ".hikari")
-        append('\n').append(tailOf(File(dir, "mpv.log"), 60))
+        append('\n').append(tailOf(lastMpvLog ?: File(dir, "mpv.log"), 60))
         append('\n').append(tailOf(File(dir, "hikari-player.log"), 20))
     }
 
