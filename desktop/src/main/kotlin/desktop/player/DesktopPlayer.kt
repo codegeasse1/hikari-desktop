@@ -838,9 +838,20 @@ object DesktopPlayer {
                                     }
                                 }
                             }
-                            // The file is open and there is still nothing to
-                            // show: the wait is over, and it failed.
-                            if (PlayerWindow.isLoaded()) break
+                            // The file being open is NOT failure: HLS opens its
+                            // playlist in ~2s and fetches media segments after
+                            // that (Dailymotion: playlists first, media from
+                            // ~2.8s), so breaking here is the "Retry flashes,
+                            // then it plays by itself in 3-5s" bug. Keep waiting
+                            // while bytes arrive (the deadline extends above);
+                            // the dialog below only runs after a true stall.
+                            if (PlayerWindow.isLoaded() && !PlayerWindow.ipcWorking()) {
+                                Fx.run {
+                                    if (proc === p && !PlayerWindow.hasVideo()) {
+                                        PlayerWindow.setStatus("Still opening the stream…", busy = true)
+                                    }
+                                }
+                            }
                             // A player that has not answered a single IPC message
                             // is not evidence of a broken stream: on a machine
                             // whose GPU falls back to software, mpv spends this
@@ -878,7 +889,14 @@ object DesktopPlayer {
                             // A visible failure message always wins over this:
                             // relaunching under it is the "Retry flashes, then
                             // it plays by itself" dance.
-                            if (refresh != null && attemptsLeft > 0 && !PlayerWindow.messageVisible()) {
+                            // Silent fresh-link retry only after 10s of true
+                            // silence: relaunching while the first mpv is about
+                            // to show its first frame murders a healthy stream
+                            // and restarts the 3-5s wait (the other half of the
+                            // Retry-then-plays-by-itself dance).
+                            if (refresh != null && attemptsLeft > 0 && !PlayerWindow.messageVisible() &&
+                                System.currentTimeMillis() - PlayerWindow.lastProgressAt() >= 10_000
+                            ) {
                                 val fresh = runCatching { refresh() }.getOrNull()
                                 if (fresh != null && fresh.url.isNotBlank()) {
                                     PlayerWindow.setStatus("Still opening the stream…", busy = true)

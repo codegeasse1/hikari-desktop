@@ -53,6 +53,10 @@ object PosterCard {
             fitHeight = height
             isPreserveRatio = false
             isSmooth = true
+            // Scrolling hundreds of posters re-rasters every frame without
+            // this; caching the raster makes rails/grids glide.
+            isCache = true
+            cacheHint = javafx.scene.CacheHint.SPEED
             styleClass.add("poster-img")
             clip = Rectangle(width, height).apply {
                 arcWidth = RADIUS * 2

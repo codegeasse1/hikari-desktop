@@ -72,6 +72,10 @@ object HlsRelay {
                 ex.close()
                 return
             }
+            // The stream is arriving: keep the player's watchdog out of the
+            // failure dialog while playlists/segments flow (slow CDN = slow,
+            // not stuck). Never allowed to break serving.
+            runCatching { PlayerWindow.progressTick() }
             val method = ex.requestMethod ?: "GET"
             val isHead = method.equals("HEAD", ignoreCase = true)
             val incomingRange = ex.requestHeaders.getFirst("Range")

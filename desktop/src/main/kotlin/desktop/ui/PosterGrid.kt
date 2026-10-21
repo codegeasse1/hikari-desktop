@@ -46,22 +46,55 @@ class PosterGrid(
 
     private var all: List<MediaItem> = emptyList()
 
+    /** Batches of cards added per pulse; superseded fills abort via [fillGen]. */
+    private var fillGen = 0
+
     val root: Region = scroll
 
     fun setItems(items: List<MediaItem>) {
+        fillGen++
+        val myGen = fillGen
         all = items
-        flow.children.setAll(items.map { item ->
-            PosterCard.make(
-                item = item,
-                onOpen = onOpen,
-                width = cardWidth,
-                progress = progressFor?.invoke(item),
-                onMore = onMore,
-            )
-        })
+        if (items.size <= 36) {
+            flow.children.setAll(items.map { item ->
+                PosterCard.make(
+                    item = item,
+                    onOpen = onOpen,
+                    width = cardWidth,
+                    progress = progressFor?.invoke(item),
+                    onMore = onMore,
+                )
+            })
+            return
+        }
+        // Heavy grids are painted in small batches across pulses: building 150
+        // cards in one setAll freezes the window (the scroll/click lag), while
+        // 24-card chunks keep the UI at full frame rate. Generation-guarded so
+        // a quick navigate-away never fills a dead page.
+        flow.children.clear()
+        var idx = 0
+        fun pump() {
+            if (myGen != fillGen) return
+            val end = minOf(idx + 24, items.size)
+            if (idx >= end) return
+            val chunk = items.subList(idx, end).map { item ->
+                PosterCard.make(
+                    item = item,
+                    onOpen = onOpen,
+                    width = cardWidth,
+                    progress = progressFor?.invoke(item),
+                    onMore = onMore,
+                )
+            }
+            flow.children.addAll(chunk)
+            idx = end
+            if (idx < items.size) javafx.application.Platform.runLater { pump() }
+        }
+        pump()
     }
 
     fun clear() {
+        fillGen++
         all = emptyList()
         flow.children.clear()
     }

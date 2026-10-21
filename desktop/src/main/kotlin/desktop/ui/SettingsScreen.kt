@@ -339,7 +339,15 @@ class SettingsScreenView {
                         soloGrid.add(miniCheckCard(box), index % 2, index / 2)
                     }
             }
-            filter.textProperty().addListener { _, _, nv -> renderSolo(nv ?: "") }
+            // Rebuilding the grid on every keystroke janks with hundreds of
+            // extensions installed; 180ms of quiet before filtering keeps
+            // typing at full frame rate with no lost ticks.
+            val soloDebounce = javafx.animation.PauseTransition(javafx.util.Duration.millis(180.0))
+            soloDebounce.setOnFinished { renderSolo(filter.text ?: "") }
+            filter.textProperty().addListener { _, _, _ ->
+                soloDebounce.stop()
+                soloDebounce.playFromStart()
+            }
             renderSolo("")
             rows.add(soloGrid)
         }

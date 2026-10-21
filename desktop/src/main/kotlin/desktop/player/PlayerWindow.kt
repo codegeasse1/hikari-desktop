@@ -408,6 +408,13 @@ object PlayerWindow {
     /** See [lastProgressAt]. Safe from any thread. */
     fun lastProgressAt(): Long = lastProgressAt
 
+    /** Bumps the watchdog's liveness clock from outside mpv IPC — the HLS relay
+     *  calls this on every playlist/segment serve, so a stream that is still
+     *  arriving over a slow CDN never earns a "no picture came up" dialog. */
+    fun progressTick() {
+        lastProgressAt = System.currentTimeMillis()
+    }
+
     /** True once mpv has the file open (its `file-loaded` event). */
     private var loaded = false
 
@@ -460,6 +467,13 @@ object PlayerWindow {
      *  report — "the bar floats over the picture" says nothing about whether it
      *  floats as a BAR or as a panel over the whole video. */
     private val overlayNotes = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /** Cached native handles for the two floating-bar stages, keyed by stage
+     *  title. `windowByTitle` enumerates every top-level window, so calling it
+     *  twice per 120ms tick is pure jitter; the handle is validated with
+     *  `windowExists` and re-looked-up only when gone (a hidden Stage destroys
+     *  its native window, so hides clear the entry — see [hideOverlay]). */
+    private val overlayHwndCache = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     /** The last thing the status chip said — read off the FX thread by
      *  [windowReport]. */
@@ -1116,7 +1130,13 @@ object PlayerWindow {
         val st = stage ?: return null
         if (!st.isShowing) return null
         val title = st.title ?: return null
-        return runCatching { WinShell.windowByTitle(title) }.getOrNull()
+        overlayHwndCache[title]?.let { cached ->
+            if (WinShell.windowExists(cached)) return cached
+            overlayHwndCache.remove(title)
+        }
+        return runCatching { WinShell.windowByTitle(title) }.getOrNull()?.also {
+            overlayHwndCache[title] = it
+        }
     }
 
     /**
@@ -1244,6 +1264,7 @@ object PlayerWindow {
 
     private fun hideOverlay(stage: Stage?) {
         val st = stage ?: return
+        runCatching { st.title?.let { overlayHwndCache.remove(it) } }
         runCatching { if (st.isShowing) st.hide() }
     }
 
@@ -2081,12 +2102,14 @@ object PlayerWindow {
      */
     private fun pollPointer() {
         if (!mounted) return
+        // One cursor sample per tick: the old code sampled twice (here plus
+        // inside pointerInWindow), doubling the Win32 calls on the 120ms timer.
         val p = WinShell.cursorPos()
         if (p != null) {
             val moved = p[0] != lastCursorX || p[1] != lastCursorY
             lastCursorX = p[0]
             lastCursorY = p[1]
-            if (moved && pointerInWindow()) pokeChrome()
+            if (moved && pointerInWindowAt(p)) pokeChrome()
         }
         // A click on the picture is swallowed by mpv's window, so it is noticed
         // here: while the bars are away, the first click brings them back rather
@@ -2094,14 +2117,21 @@ object PlayerWindow {
         val down = WinShell.leftButtonDown() ?: return
         val pressed = down && !leftWasDown
         leftWasDown = down
-        if (pressed && !chromeVisible && pointerInWindow()) pokeChrome()
+        val cur = WinShell.cursorPos()
+        if (pressed && !chromeVisible && cur != null && pointerInWindowAt(cur)) pokeChrome()
     }
 
     /** True while the pointer is inside the app's own window. */
     private fun pointerInWindow(): Boolean {
+        val p = WinShell.cursorPos() ?: return false
+        return pointerInWindowAt(p)
+    }
+
+    /** Same as [pointerInWindow] but reuses the tick's cursor sample instead of
+     *  sampling Win32 a second time per tick. */
+    private fun pointerInWindowAt(p: IntArray): Boolean {
         val owner = ownerHwnd ?: return false
         val r = WinShell.windowRect(owner) ?: return false
-        val p = WinShell.cursorPos() ?: return false
         return p[0] >= r[0] && p[1] >= r[1] && p[0] < r[0] + r[2] && p[1] < r[1] + r[3]
     }
 

@@ -25,7 +25,7 @@ import java.util.concurrent.ConcurrentHashMap
 object ImageLoader {
 
     private val mem = object : LinkedHashMap<String, Image>(128, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Image>?): Boolean = size > 160
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Image>?): Boolean = size > 256
     }
 
     private val diskDir: File by lazy {
@@ -33,6 +33,8 @@ object ImageLoader {
     }
 
     private val inFlight = mutableMapOf<String, MutableList<(Image?) -> Unit>>()
+
+    private val ioScope = kotlinx.coroutines.CoroutineScope(Dispatchers.IO + kotlinx.coroutines.SupervisorJob())
 
     /** Cap on simultaneous network image fetches — Home renders hundreds of
      *  posters at once and firing them all concurrently starves the IO pool
@@ -68,7 +70,7 @@ object ImageLoader {
         val pending = inFlight.getOrPut(key) { mutableListOf() }
         pending.add(onReady)
         if (pending.size > 1) return
-        kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
+        ioScope.launch {
             val img = runCatching {
                 gate.acquire()
                 try {
