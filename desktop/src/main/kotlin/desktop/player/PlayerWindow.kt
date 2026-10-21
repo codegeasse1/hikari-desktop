@@ -256,6 +256,11 @@ object PlayerWindow {
      *  window closes with the picture unmoved, the seek never landed. */
     @Volatile private var seekFromSecs = 0.0
 
+    /** The picture's report when the echo window (re-)armed: re-arming needs
+     *  the picture to be ADVANCING (a frozen picture means the seek will never
+     *  land), and this is what advancement is measured against. */
+    @Volatile private var echoBaseSecs = 0.0
+
     /** Invalidates stale reply-checked seeks; see [sendSeekChecked]. */
     @Volatile private var seekVerifyGen = 0
 
@@ -2979,6 +2984,7 @@ object PlayerWindow {
     /** Starts the window in which reports of the pre-seek position are ignored. */
     private fun armSeekEcho(targetSecs: Double) {
         seekPendingSecs = targetSecs
+        echoBaseSecs = lastReportedSecs
         seekPendingUntil = System.currentTimeMillis() + SEEK_ECHO_MS
         val gen = ++seekEchoGen
         Thread(
@@ -3000,20 +3006,21 @@ object PlayerWindow {
     }
 
     /**
-     * Evaluates one echo window on the FX thread: true = settled (snapped back
-     * or landed or superseded), false = re-armed for another window (only when
-     * [rearm] and the stream is still arriving).
+     * Evaluates one echo window on the FX thread: true = settled, false =
+     * re-armed for one more window (only when [rearm] and the picture is
+     * actually ADVANCING — a slow stream keeps delivering while the seek
+     * executes, but a frozen picture means the seek will never land).
+     *
+     * Settling ALWAYS re-syncs the bar and clock to the last report first, so
+     * a seek that never lands can never leave them lying about the position.
      */
     private fun settleSeekEcho(gen: Int, rearm: Boolean): Boolean = Fx.runBlock {
         if (seekEchoGen != gen || seekPendingSecs == null) return@runBlock true
         val target = seekPendingSecs
-        if (kotlin.math.abs(lastReportedSecs - seekFromSecs) >= 0.5) {
-            // The picture moved: the seek landed (displayedPosition already
-            // shows it). Nothing to snap back.
-            seekPendingSecs = null
-            return@runBlock true
-        }
-        if (rearm && target != null && System.currentTimeMillis() - lastProgressAt() < 10_000) {
+        val unmoved = kotlin.math.abs(lastReportedSecs - seekFromSecs) < 0.5
+        val advancing = kotlin.math.abs(lastReportedSecs - echoBaseSecs) >= 0.5
+        if (rearm && target != null && unmoved && advancing) {
+            echoBaseSecs = lastReportedSecs
             seekPendingUntil = System.currentTimeMillis() + SEEK_ECHO_MS
             return@runBlock false
         }
@@ -3023,13 +3030,15 @@ object PlayerWindow {
         lastPosition = (lastReportedSecs * 1000).toLong()
         if (!scrubbing) seekBar?.value = frac
         renderTime()
-        if (target != null && loadingBox?.isVisible == true) {
-            // Still loading: the seek was never refused, it
-            // was early — hold it for the start instead of
-            // warning (see [queuedSeekSecs]).
-            queuedSeekSecs = target
-            setStatus("Still loading — the skip applies when the video starts.", busy = true)
-        } else warnSeekRefused()
+        if (unmoved) {
+            if (target != null && loadingBox?.isVisible == true) {
+                // Still loading: the seek was never refused, it
+                // was early — hold it for the start instead of
+                // warning (see [queuedSeekSecs]).
+                queuedSeekSecs = target
+                setStatus("Still loading — the skip applies when the video starts.", busy = true)
+            } else warnSeekRefused()
+        }
         true
     }
 
