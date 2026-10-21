@@ -102,6 +102,17 @@ class HomeScreenView {
     }
     private var heroItems: List<MediaItem> = emptyList()
     private var heroIndex = 0
+    /** Item the hero action buttons were built for: enrich-triggered repaints
+     *  must not rebuild (and re-wire) the buttons mid-click — a rebuild
+     *  between press and release eats the tap (same for the dots below). */
+    private var heroActionsFor: String? = null
+    /** (size, selected) the dots were built for — same no-rebuild rule. */
+    private var heroDotsFor: Pair<Int, Int>? = null
+    /** In-place artwork repaints per home card (see PosterCard.onArtRefresh):
+     *  upgrades swap the image inside its fixed frame instead of rebuilding
+     *  the row, so they can never eat a click either. Boolean = cinema card
+     *  (landscape art first) vs poster card (poster first). */
+    private val artRepaints = HashMap<String, Pair<(String) -> Unit, Boolean>>()
     private var heroTimer: Timeline? = null
     /** Enriched TMDB data per hero item, so ratings/logos survive rotation. */
     private val heroEnrich = HashMap<String, TmdbDetails.Details?>()
@@ -381,8 +392,11 @@ class HomeScreenView {
                 if (img != null && myGen == heroGen) crossfadeHero(img)
             }, w = 1920, h = 1080)
         }
-        heroActions.children.setAll(
-            Ui.isolateClicks(Button("Watch Now").apply {
+        // Buttons are rebuilt only when the featured title changes: an
+        // enrich-triggered repaint must never re-wire them mid-click.
+        if (heroActionsFor != item.uniqueId) {
+            heroActions.children.setAll(
+                Ui.isolateClicks(Button("Watch Now").apply {
                 styleClass.add("x-watch")
                 // Belt and suspenders: the class owns the hover, but the
                 // white-button identity is inline so it can never come out
@@ -395,14 +409,22 @@ class HomeScreenView {
             Ui.isolateClicks(Ui.button("Add to list", icon = Icons.PLUS, ghost = true) {
                 addToLibrary(item)
             }.apply { styleClass.add("x-glass-btn") }),
-        )
-        heroDots.children.setAll(heroItems.mapIndexed { index, _ ->
-            Ui.isolateClicks(Region().apply {
-                styleClass.add("x-hero-dot")
-                if (index == heroIndex) styleClass.add("x-hero-dot-sel")
-                setOnMouseClicked { heroIndex = index; showHero() }
+            )
+            heroActionsFor = item.uniqueId
+        }
+        // Same rule for the dots: the selected dot is re-marked without
+        // rebuilding the row when nothing structural changed.
+        val dotsKey = heroItems.size to heroIndex
+        if (heroDotsFor != dotsKey) {
+            heroDots.children.setAll(heroItems.mapIndexed { index, _ ->
+                Ui.isolateClicks(Region().apply {
+                    styleClass.add("x-hero-dot")
+                    if (index == heroIndex) styleClass.add("x-hero-dot-sel")
+                    setOnMouseClicked { heroIndex = index; showHero() }
+                })
             })
-        })
+            heroDotsFor = dotsKey
+        }
         enrichHero(item)
     }
 
@@ -875,8 +897,24 @@ class HomeScreenView {
                         changed = true
                     }
                 }
-                if (changed && rowsRendered) {
-                    rowsBox.children.setAll(lastRows.map { buildRow(it) })
+                // In-place swap inside each card's fixed frame (the repaint
+                // hook from [buildRow]) — the old code rebuilt every row
+                // here, and a rebuild landing between press and release ate
+                // the click. No node is added or removed now.
+                if (changed) {
+                    for ((id, b, p) in hits) {
+                        val (repaint, wide) = artRepaints[id] ?: continue
+                        // Same pick as PosterCard.make (backdrop-first for
+                        // cinema, poster-first otherwise) so the in-place swap
+                        // shows exactly what a rebuild would have.
+                        val url = if (wide) {
+                            if (b.isNullOrBlank()) p else b
+                        } else {
+                            if (p.isNullOrBlank()) b else p
+                        }
+                        if (url.isNullOrBlank()) continue
+                        runCatching { repaint(url) }
+                    }
                 }
             }
         }
@@ -891,10 +929,13 @@ class HomeScreenView {
         }
         row.items.forEach { raw ->
             val item = withUpgrade(raw)
+            // The repaint hook keeps this card upgradable in place (see
+            // [upgradeArt]): same node for life, so upgrades never eat clicks.
+            val refreshHook: (((String) -> Unit) -> Unit) = { repaint -> artRepaints[item.uniqueId] = repaint to cinema }
             cards.children.add(
                 if (cinema) PosterCard.make(item, onOpen = { AppShell.openDetail(it) },
-                    width = CINEMA_W, height = CINEMA_H, wide = true)
-                else PosterCard.make(item, onOpen = { AppShell.openDetail(it) })
+                    width = CINEMA_W, height = CINEMA_H, wide = true, onArtRefresh = refreshHook)
+                else PosterCard.make(item, onOpen = { AppShell.openDetail(it) }, onArtRefresh = refreshHook)
             )
         }
         val scroll = Ui.rail(cards)

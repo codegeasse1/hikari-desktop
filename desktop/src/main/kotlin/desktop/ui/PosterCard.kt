@@ -47,6 +47,12 @@ object PosterCard {
          *  blurry smeared look — the backdrop is already the right shape and
          *  usually the higher-resolution file too. */
         wide: Boolean = false,
+        /** Receives a repaint closure for this card's artwork. The home rows
+         *  keep it per uniqueId and invoke it with upgraded (TMDB/AniList)
+         *  art when it lands — the image swaps in place inside its fixed-size
+         *  frame instead of rebuilding the row, so an upgrade can never land
+         *  mid-click and eat it. Null for every other caller (unchanged). */
+        onArtRefresh: (((String) -> Unit) -> Unit)? = null,
     ): VBox {
         val image = ImageView().apply {
             fitWidth = width
@@ -75,6 +81,15 @@ object PosterCard {
             w = (width * 2).toInt(),
             h = (height * 2).toInt(),
         )
+        onArtRefresh?.invoke { url ->
+            if (url.isBlank()) return@invoke
+            desktop.img.ImageLoader.loadAsync(
+                url,
+                onReady = { img -> Ui.coverImage(image, img, width, height) },
+                w = (width * 2).toInt(),
+                h = (height * 2).toInt(),
+            )
+        }
 
         val scrim = Region().apply {
             styleClass.add("poster-scrim")

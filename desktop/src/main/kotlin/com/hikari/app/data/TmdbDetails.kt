@@ -88,12 +88,13 @@ object TmdbDetails {
         // Donghua/anime: AniList+Bangumi know these titles natively, TMDB's
         // search index is live-action-first ("Big Brother" = the sitcom on
         // TMDB, the donghua on AniList). Anime candidates try the anime DBs
-        // first; a confident hit wins outright so a wrong-but-close TMDB name
-        // match can never overwrite it. Everyone else goes TMDB as before.
-        if (DonghuaDetails.isAnimeCandidate(item)) {
-            runCatching { DonghuaDetails.load(item) }.getOrNull()?.let { return it }
-        }
-        val resolved = TmdbResolver.resolve(item) ?: return null
+        // first AND gate the TMDB match on animation genres, so a
+        // wrong-but-close TMDB name match can never overwrite the donghua —
+        // and when nothing animated matches anywhere, the provider art shows
+        // instead of a confident-looking wrong title.
+        val wantAnime = DonghuaDetails.isAnimeCandidate(item)
+        val anime = if (wantAnime) runCatching { DonghuaDetails.load(item) }.getOrNull() else null
+        val resolved = TmdbResolver.resolve(item) ?: return anime
         val base = "/${resolved.mediaType}/${resolved.tmdbId}"
         return coroutineScope {
             val detailsD = async { TmdbResolver.apiGet(base, emptyMap()) }
@@ -106,7 +107,13 @@ object TmdbDetails {
                 if (resolved.mediaType == "tv") TmdbResolver.apiGet("$base/content_ratings", emptyMap())
                 else TmdbResolver.apiGet("$base/release_dates", emptyMap())
             }
-            val details = detailsD.await() ?: return@coroutineScope null
+            val details = detailsD.await() ?: return@coroutineScope anime
+            // A TMDB match for an anime candidate must itself be animation:
+            // otherwise it is a live-action name collision (the Big Brother
+            // sitcom) and the anime result — or nothing, i.e. honest provider
+            // art — wins. Empty genre lists get the benefit of the doubt
+            // (obscure entries often carry no genres at all).
+            if (wantAnime && isLiveAction(details)) return@coroutineScope anime
             val tmdbRating = details.optDouble("vote_average", 0.0)
             val tmdbVotes = details.optInt("vote_count", 0)
             var imdbId = details.optString("imdb_id").takeIf { it.startsWith("tt") }.orEmpty()
@@ -118,9 +125,12 @@ object TmdbDetails {
             val cast = parseCast(creditsD.await())
             val crew = parseCrew(creditsD.await())
             val studios = parseStudios(details)
-            val backdrops = parseBackdrops(imagesD.await())
+            // Anime fallback art fills TMDB gaps (a correct-but-artless TMDB
+            // match still makes a pixelated hero): the title is verified
+            // animation above, so its AniList/Bangumi banner is its own art.
+            val backdrops = parseBackdrops(imagesD.await()).ifEmpty { anime?.backdrops.orEmpty() }
             val logo = parseLogo(imagesD.await())
-            val posters = parsePosters(imagesD.await())
+            val posters = parsePosters(imagesD.await()).ifEmpty { anime?.posters.orEmpty() }
             val trailers = parseTrailers(videosD.await())
             val certification = parseCertification(certD.await(), resolved.mediaType)
             val runtime = parseRuntime(details, resolved.mediaType)
@@ -147,6 +157,22 @@ object TmdbDetails {
                 posters = posters,
             )
         }
+    }
+
+    /**
+     * True when a TMDB details object is definitely NOT animation (non-empty
+     * genre list with no Animation entry). Null/empty genres mean "unknown",
+     * never "live action".
+     */
+    private fun isLiveAction(details: JSONObject): Boolean {
+        val arr = details.optJSONArray("genres") ?: return false
+        if (arr.length() == 0) return false
+        for (i in 0 until arr.length()) {
+            val g = arr.optJSONObject(i) ?: continue
+            if (g.optInt("id", -1) == 16) return false
+            if (g.optString("name").equals("Animation", ignoreCase = true)) return false
+        }
+        return true
     }
 
     /** Season stills/titles/overviews for the episode cards (one call per season). */

@@ -572,6 +572,15 @@ object PlayerWindow {
         }
     }
 
+    /** Drops banked skips — called only when the user starts a genuinely NEW
+     *  title (see DesktopPlayer.play/playFile). Same-stream relaunches keep
+     *  them, so a silent retry or video-output cascade never eats a seek the
+     *  user already asked for. */
+    fun clearBankedSeeks() {
+        queuedSeekSecs = null
+        pendingSeekDelta = 0.0
+    }
+
     /** Clears everything that belongs to the previous stream and puts the
      *  loading overlay back up, so the reused layer starts from a clean state. */
     private fun resetForNewStream() {
@@ -579,14 +588,22 @@ object PlayerWindow {
         lastPosition = 0L
         scrubbing = false
         paused = false
-        // The queue belongs to the previous stream: a skip banked while it
-        // loaded must never fire into the next title (and a stale echo must
-        // never snap the new bar back to the old picture's position).
-        queuedSeekSecs = null
-        pendingSeekDelta = 0.0
+        // Banked skips SURVIVE this reset on purpose: it runs on every launch,
+        // including silent retries and video-output cascades for the SAME
+        // stream — wiping the queue here was the "seek, relaunch, seek lost,
+        // bar snaps back" loop. A genuinely new title clears them explicitly
+        // (see [clearBankedSeeks], called by the owner's play paths); closing
+        // drops them (see [closeInternal]). In-flight echo/verification belong
+        // to the dead mpv and die with it, so a stale check answering after
+        // the relaunch can neither warn nor snap the new bar back.
+        // An in-flight seek (bar on its target, echo armed) is re-banked, not
+        // dropped: the replacement mpv fires it again from playback start, so
+        // a relaunch mid-seek delays the skip instead of snapping it back.
+        seekPendingSecs?.let { queuedSeekSecs = it }
         seekPendingSecs = null
         lastReportedSecs = 0.0
         seekEchoGen++
+        seekVerifyGen++
         // A new stream starts with its chrome up: the loading overlay is the only
         // thing on screen and the bars are what say so.
         chromeVisible = true
@@ -2490,17 +2507,38 @@ object PlayerWindow {
             menu,
             Ui.tooltip(active?.name?.takeIf { it.isNotBlank() } ?: "Pick another source / server"),
         )
+        // Additive updates only while the set is unchanged: the sweep delivers
+        // servers in the background WHILE the user may have this menu open —
+        // rebuilding the item list between press and release eats the tap
+        // ("server needs two clicks, first click does nothing"). Existing
+        // items are never touched; arrivals rebuild once (new identity), and
+        // the check-mark just moves between paints.
+        val wantIds = sources.map { it.name }
+        val haveIds = menu.items.map { it.userData as? String }
+        if (haveIds == wantIds) {
+            menu.items.forEach { item ->
+                item.graphic =
+                    if ((item.userData as? String) == currentSourceName) Icons.of(Icons.CHECK, 13.0) else null
+            }
+            return
+        }
         if (sources.size <= 1) {
             // Still shown: a one-source title shows WHAT is playing, which is
             // worth a button (and the menu is simply short).
             menu.items.setAll(
-                *sources.map { s -> MenuItem(s.name.ifBlank { s.url.take(60) }).apply { isDisable = true } }.toTypedArray()
+                *sources.map { s ->
+                    MenuItem(s.name.ifBlank { s.url.take(60) }).apply {
+                        userData = s.name
+                        isDisable = true
+                    }
+                }.toTypedArray()
             )
             return
         }
         menu.items.setAll(
             *sources.map { s ->
                 MenuItem(s.name.ifBlank { s.url.take(60) }).apply {
+                    userData = s.name
                     if (s.name == currentSourceName) graphic = Icons.of(Icons.CHECK, 13.0)
                     setOnAction { pickSource(s) }
                 }
@@ -2855,15 +2893,23 @@ object PlayerWindow {
      */
     private fun seekBy(delta: Double) {
         val d = duration
-        if (d <= 0) {
-            // No length yet (still loading): bank the skip and apply it on
-            // start — dropping it is the "forward does nothing until the
-            // video loads" report.
+        if (d <= 0 && (ipc == null || lastReportedSecs <= 0.0)) {
+            // No length and no position yet (still loading): bank the skip and
+            // apply it on start — dropping it is the "forward does nothing
+            // until the video loads" report.
             pendingSeekDelta = (pendingSeekDelta + delta).coerceIn(-3600.0, 3600.0)
             setStatus(
                 if (delta >= 0) "Skipping forward once the video loads." else "Skipping back once the video loads.",
                 busy = true,
             )
+            return
+        }
+        if (d <= 0) {
+            // Duration-less stream (live-ish HLS) with a known position: seek
+            // absolute from the picture's own report instead of banking
+            // forever — banking without a duration never fires.
+            pendingSeekDelta = (pendingSeekDelta + delta).coerceIn(-3600.0, 3600.0)
+            flushBankedSeeks()
             return
         }
         // Same guard as [seekTo]: without a control channel the skip keys and
@@ -2887,6 +2933,49 @@ object PlayerWindow {
         sendSeekChecked(h, pos)
     }
 
+    /**
+     * Sends whatever skips are banked (see [queuedSeekSecs]/[pendingSeekDelta]).
+     *
+     * The SINGLE place banked seeks leave the layer: playback start, fresh
+     * position reports, and duration-less seeks all funnel through here, so a
+     * relaunch or a missing duration can never strand them again. An absolute
+     * skip wins over banked relative ones — firing both would double-skip.
+     * Safe to call when nothing is banked (a no-op) or with no channel (keeps
+     * them banked for the next chance).
+     */
+    private fun flushBankedSeeks() {
+        val h = ipc ?: return
+        val q = queuedSeekSecs
+        if (q != null) {
+            queuedSeekSecs = null
+            pendingSeekDelta = 0.0
+            sendAbsoluteSeek(h, q)
+            return
+        }
+        val pd = pendingSeekDelta
+        if (pd != 0.0 && lastReportedSecs > 0.0) {
+            pendingSeekDelta = 0.0
+            sendAbsoluteSeek(h, (lastReportedSecs + pd).coerceAtLeast(0.0))
+        }
+    }
+
+    /**
+     * One absolute seek through the echo-suppressing path: moves the readout,
+     * arms the echo window, and verifies the reply (see [sendSeekChecked]).
+     * The bar fraction only moves when a duration is known; duration-less
+     * streams show it through position reports instead.
+     */
+    private fun sendAbsoluteSeek(h: MpvIpc, pos: Double) {
+        val target = pos.coerceAtLeast(0.0)
+        val d = duration
+        lastPosition = (target * 1000).toLong()
+        renderTime()
+        if (d > 0 && !scrubbing) seekBar?.value = (target / d).coerceIn(0.0, 1.0)
+        seekFromSecs = lastReportedSecs
+        armSeekEcho(target)
+        sendSeekChecked(h, target)
+    }
+
     /** Starts the window in which reports of the pre-seek position are ignored. */
     private fun armSeekEcho(targetSecs: Double) {
         seekPendingSecs = targetSecs
@@ -2895,29 +2984,53 @@ object PlayerWindow {
         Thread(
             {
                 runCatching { Thread.sleep(SEEK_ECHO_MS) }
-                Fx.run {
-                    if (seekEchoGen == gen && seekPendingSecs != null) {
-                        val target = seekPendingSecs
-                        seekPendingSecs = null
-                        val d = duration
-                        val frac = if (d > 0) (lastReportedSecs / d).coerceIn(0.0, 1.0) else 0.0
-                        lastPosition = (lastReportedSecs * 1000).toLong()
-                        if (!scrubbing) seekBar?.value = frac
-                        renderTime()
-                        if (kotlin.math.abs(lastReportedSecs - seekFromSecs) < 0.5) {
-                            if (target != null && loadingBox?.isVisible == true) {
-                                // Still loading: the seek was never refused, it
-                                // was early — hold it for the start instead of
-                                // warning (see [queuedSeekSecs]).
-                                queuedSeekSecs = target
-                                setStatus("Still loading — the skip applies when the video starts.", busy = true)
-                            } else warnSeekRefused()
-                        }
-                    }
+                // Slow streams need longer than one window to move the picture
+                // (an HLS seek fetches new segments first): while bytes are
+                // still arriving, the first expiry re-arms for exactly one more
+                // window instead of snapping back a seek that was about to
+                // land. The second expiry settles it for real, so a genuinely
+                // refused seek is still reported — just never prematurely.
+                if (!settleSeekEcho(gen, rearm = true)) {
+                    runCatching { Thread.sleep(SEEK_ECHO_MS) }
+                    settleSeekEcho(gen, rearm = false)
                 }
             },
             "hikari-seek-echo",
         ).apply { isDaemon = true; start() }
+    }
+
+    /**
+     * Evaluates one echo window on the FX thread: true = settled (snapped back
+     * or landed or superseded), false = re-armed for another window (only when
+     * [rearm] and the stream is still arriving).
+     */
+    private fun settleSeekEcho(gen: Int, rearm: Boolean): Boolean = Fx.runBlock {
+        if (seekEchoGen != gen || seekPendingSecs == null) return@runBlock true
+        val target = seekPendingSecs
+        if (kotlin.math.abs(lastReportedSecs - seekFromSecs) >= 0.5) {
+            // The picture moved: the seek landed (displayedPosition already
+            // shows it). Nothing to snap back.
+            seekPendingSecs = null
+            return@runBlock true
+        }
+        if (rearm && target != null && System.currentTimeMillis() - lastProgressAt() < 10_000) {
+            seekPendingUntil = System.currentTimeMillis() + SEEK_ECHO_MS
+            return@runBlock false
+        }
+        seekPendingSecs = null
+        val d = duration
+        val frac = if (d > 0) (lastReportedSecs / d).coerceIn(0.0, 1.0) else 0.0
+        lastPosition = (lastReportedSecs * 1000).toLong()
+        if (!scrubbing) seekBar?.value = frac
+        renderTime()
+        if (target != null && loadingBox?.isVisible == true) {
+            // Still loading: the seek was never refused, it
+            // was early — hold it for the start instead of
+            // warning (see [queuedSeekSecs]).
+            queuedSeekSecs = target
+            setStatus("Still loading — the skip applies when the video starts.", busy = true)
+        } else warnSeekRefused()
+        true
     }
 
     /**
@@ -3106,6 +3219,11 @@ object PlayerWindow {
                     // instant-start as above, for streams whose duration arrives
                     // late (or never, on live HLS).
                     if (loadingBox?.isVisible == true) playbackStarted()
+                    // A banked skip may be waiting on exactly this: the first
+                    // position report after a relaunch, or on a duration-less
+                    // stream. Flushing here (not just at playback start) is
+                    // what keeps it from being stranded.
+                    flushBankedSeeks()
                 }
                 onPosition?.invoke(shownMs, (duration * 1000).toLong())
             }
@@ -3227,17 +3345,10 @@ object PlayerWindow {
         // countdown to getting out of the way starts now.
         pokeChrome()
         // Skips banked while the picture was down (see [queuedSeekSecs],
-        // [pendingSeekDelta]): an absolute skip wins over banked relative
-        // ones — firing both would double-skip.
-        val hasIpc = ipc != null
-        val q = queuedSeekSecs
-        queuedSeekSecs = null
-        val pd = pendingSeekDelta
-        pendingSeekDelta = 0.0
-        if (hasIpc && duration > 0) {
-            if (q != null) seekTo((q / duration).coerceIn(0.0, 1.0))
-            else if (pd != 0.0) seekBy(pd)
-        }
+        // [pendingSeekDelta]) all leave through [flushBankedSeeks] — whether or
+        // not a duration is known yet — so a banked skip can never be stranded
+        // by a duration-less stream or a relaunch again.
+        flushBankedSeeks()
     }
 
     private fun renderTime() {

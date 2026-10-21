@@ -343,8 +343,15 @@ object DesktopPlayer {
             }
             return
         }
+        // New title, not a relaunch: last title's banked skips die here —
+        // same-stream relaunches (below) keep them so a retry never eats a seek.
+        PlayerWindow.clearBankedSeeks()
         launchMpv(title, stream, refresh, attemptsLeft = 2)
     }
+
+    // NOTE for future edits: this is the ONLY new-title stream entry. Every
+    // other launchMpv caller is a same-stream relaunch (failover, silent
+    // retry, video-output cascade) and must NOT clear banked seeks.
 
     /**
      * Plays a file already on this machine — a finished download. Neither the
@@ -369,6 +376,9 @@ object DesktopPlayer {
     }
 
     fun playFile(title: String, path: String, voIdx: Int = -1) {
+        // New title, not a relaunch: last title's banked skips die here (see
+        // PlayerWindow.clearBankedSeeks) — same-stream relaunches keep them.
+        PlayerWindow.clearBankedSeeks()
         onEnded = null
         onPosition = null
         sourceList = emptyList()

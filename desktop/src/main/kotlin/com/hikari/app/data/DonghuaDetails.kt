@@ -1,9 +1,11 @@
 package com.hikari.app.data
 
 import com.hikari.app.net.Http
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Anime/donghua metadata fallback for titles TMDB mistranslates.
@@ -30,9 +32,31 @@ object DonghuaDetails {
         return p.contains("anime") || p.contains("donghua")
     }
 
-    suspend fun load(item: MediaItem): TmdbDetails.Details? = withContext(Dispatchers.IO) {
-        runCatching { fromAniList(item) }.getOrNull()
-            ?: runCatching { fromBangumi(item) }.getOrNull()
+    /** Single-flight guard (same shape as TmdbResolver's): the home hero and
+     *  the art upgrade resolve the same titles at once, and without this each
+     *  one fires its own AniList/Bangumi burst — duplicate traffic that burns
+     *  rate-limit budget and turns hits into misses (provider art again). */
+    private val inflight = ConcurrentHashMap<String, CompletableDeferred<TmdbDetails.Details?>>()
+
+    suspend fun load(item: MediaItem): TmdbDetails.Details? {
+        val key = item.providerId.lowercase() + "|" + item.type + "|" +
+            item.searchTitle.lowercase() + "|" + (item.year ?: 0)
+        inflight[key]?.let { return it.await() }
+        val deferred = CompletableDeferred<TmdbDetails.Details?>()
+        inflight[key] = deferred
+        try {
+            val r = withContext(Dispatchers.IO) {
+                runCatching { fromAniList(item) }.getOrNull()
+                    ?: runCatching { fromBangumi(item) }.getOrNull()
+            }
+            deferred.complete(r)
+            return r
+        } catch (t: Throwable) {
+            deferred.complete(null)
+            throw t
+        } finally {
+            inflight.remove(key)
+        }
     }
 
     // ── AniList ──────────────────────────────────────────────────────────
