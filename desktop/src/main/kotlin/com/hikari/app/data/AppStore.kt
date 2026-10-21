@@ -478,6 +478,10 @@ class AppStore(private val dir: File) {
     fun clearHistory() {
         put(K.HISTORY, "[]")
     }
+    fun removeHistory(uniqueKey: String) {
+        val next = history().filter { it.uniqueKey != uniqueKey }
+        put(K.HISTORY, encodeHistory(next))
+    }
 
     fun historyPausedFlow(): Flow<Boolean> = flowOf { historyPaused() }
     fun historyPaused(): Boolean = (get(K.HISTORY_PAUSED) ?: "false").toBoolean()

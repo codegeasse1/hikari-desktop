@@ -85,6 +85,14 @@ object TmdbDetails {
     }
 
     private suspend fun loadNetwork(item: MediaItem): Details? {
+        // Donghua/anime: AniList+Bangumi know these titles natively, TMDB's
+        // search index is live-action-first ("Big Brother" = the sitcom on
+        // TMDB, the donghua on AniList). Anime candidates try the anime DBs
+        // first; a confident hit wins outright so a wrong-but-close TMDB name
+        // match can never overwrite it. Everyone else goes TMDB as before.
+        if (DonghuaDetails.isAnimeCandidate(item)) {
+            runCatching { DonghuaDetails.load(item) }.getOrNull()?.let { return it }
+        }
         val resolved = TmdbResolver.resolve(item) ?: return null
         val base = "/${resolved.mediaType}/${resolved.tmdbId}"
         return coroutineScope {

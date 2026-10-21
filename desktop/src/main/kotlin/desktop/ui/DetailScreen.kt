@@ -1299,7 +1299,14 @@ class DetailScreenView(private val item: MediaItem) {
         }
         if (d.tmdbRating > 0.0) {
             val votes = if (d.tmdbVotes > 0) " (" + formatVotes(d.tmdbVotes) + ")" else ""
-            pills.add(themed("TMDB %.1f%s".format(d.tmdbRating, votes), "x-pill-tmdb"))
+            // Donghua fallback shares the Details shape: label the score by
+            // the DB it actually came from, never "TMDB" for AniList data.
+            val label = when {
+                d.tmdbId.startsWith("anilist:") -> "AniList %.1f%s".format(d.tmdbRating, votes)
+                d.tmdbId.startsWith("bangumi:") -> "Bangumi %.1f%s".format(d.tmdbRating, votes)
+                else -> "TMDB %.1f%s".format(d.tmdbRating, votes)
+            }
+            pills.add(themed(label, "x-pill-tmdb"))
         }
         heroRatings.children.setAll(pills)
         heroRatings.isVisible = pills.isNotEmpty()
@@ -1336,6 +1343,10 @@ class DetailScreenView(private val item: MediaItem) {
     private fun loadSeasonStills() {
         val d = enrich ?: return
         if (d.mediaType != "tv") return
+        // Donghua fallback ids ("anilist:123") are not TMDB ids: asking TMDB
+        // for their seasons would 404 and waste the call.
+        if (d.tmdbId.startsWith("anilist:") || d.tmdbId.startsWith("bangumi:")) return
+        if (d.tmdbId.toLongOrNull() == null) return
         if (stillsSeason == currentSeason) return
         stillsSeason = currentSeason
         scope.launch {
