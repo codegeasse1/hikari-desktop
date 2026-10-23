@@ -615,12 +615,12 @@ class ContentRepository(private val manager: ProviderManager) {
             it.config.enabled && it.config.id != item.providerId && it.config.type == ProviderType.STREMIO
         }
         val ordered = listOfNotNull(manager.byId(item.providerId)) + others
-        for (p in ordered) {
-            val eps = (withTimeoutOrNull(12_000) {
-                cancellableCatching { p.getEpisodes(item) }.getOrNull() ?: emptyList()
-            }) ?: emptyList()
-            if (eps.isNotEmpty()) return@withContext translateEpisodes(item.providerId, eps)
-        }
+       for (p in ordered) {
+           val eps = (withTimeoutOrNull(12_000) {
+               cancellableCatching { p.getEpisodes(item) }.getOrNull() ?: emptyList()
+           }) ?: emptyList()
+            if (eps.isNotEmpty()) return@withContext applySeasonHint(item, translateEpisodes(item.providerId, eps))
+       }
         null
     }
 
@@ -681,4 +681,37 @@ class ContentRepository(private val manager: ProviderManager) {
         }
         return if (anyChanged) out else eps
     }
+
+    /**
+     * Providers list one season per catalog entry ("Jade Dynasty Season 4" IS
+     * the season-4 entry) but their episode APIs carry no season number, so
+     * every episode arrives tagged season 1 and the detail screen prints
+     * "Season 1" with a "Play S1 E1" button for Season 4 content. When the
+     * whole list is season 1 and the title (else the overview) names its
+     * season outright, retag to that season — pills, counts and Play labels
+     * follow automatically. Lists that already carry seasons are untouched,
+     * so real multi-season providers never change.
+     */
+    private fun applySeasonHint(item: MediaItem, eps: List<Episode>): List<Episode> {
+        if (eps.isEmpty() || eps.any { it.season != 1 }) return eps
+        val n = seasonHintFromText(item.title)
+            ?: item.overview?.let { seasonHintFromText(it) }
+        val season = n?.takeIf { it in 2..60 } ?: return eps
+        return eps.map { it.copy(season = season) }
+    }
+
+    /** First season number named outright ("Season 4", "S4", "Part 2"), else null. */
+    private fun seasonHintFromText(text: String): Int? {
+        for (p in seasonHintPatterns) {
+            val n = p.find(text)?.groupValues?.getOrNull(1)?.toIntOrNull()
+            if (n != null) return n
+        }
+        return null
+    }
+
+    private val seasonHintPatterns = listOf(
+        Regex("""(?i)\bseason\s*0?(\d{1,2})\b"""),
+        Regex("""(?:^|[\s\-_:\(\[])[sS]0?(\d{1,2})\b"""),
+        Regex("""(?i)\bpart\s*0?(\d{1,2})\b"""),
+    )
 }

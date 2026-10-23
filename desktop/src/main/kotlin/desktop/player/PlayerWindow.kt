@@ -338,6 +338,15 @@ object PlayerWindow {
     private var loadingBox: VBox? = null
 
     private var duration = 0.0
+    /**
+     * The largest duration this stream has reported. HLS durations wobble as
+     * the playlist loads — a bogus small report used as the clamp/divisor
+     * parks the bar at the END and turns every arrow-key skip into "jump to
+     * the end, snap back, nothing moves". Bar and seek maths use
+     * [mathDuration] (the peak), so a shrinking report can never collapse the
+     * bar; reset per launch (see [resetForNewStream], [closeInternal]).
+     */
+    @Volatile private var durationPeakSecs = 0.0
     private var scrubbing = false
     private var lastPosition = 0L
     private var volume = 100.0
@@ -445,6 +454,18 @@ object PlayerWindow {
      * rediscover the crash on every Play press.
      */
     var onVideoUp: (() -> Unit)? = null
+
+    /**
+     * Called (once, on the FX thread) when a transport command proves the pipe
+     * is DEAD — a seek/pause whose reply never comes AND a live probe that
+     * also fails — with the position the player should resume at. The owner
+     * restarts the same stream there on a fresh process/link, instead of
+     * leaving every control (play, space, clicks) talking to a wedged mpv.
+     * A merely REFUSED seek (pipe alive) never reaches this — it keeps the
+     * honest "the stream refused the seek" line.
+     */
+    @Volatile
+    var onPlayerStalled: ((targetSecs: Double) -> Unit)? = null
 
     /**
      * Installed by the player so that every explanation this layer shows can
@@ -590,6 +611,7 @@ object PlayerWindow {
      *  loading overlay back up, so the reused layer starts from a clean state. */
     private fun resetForNewStream() {
         duration = 0.0
+        durationPeakSecs = 0.0
         lastPosition = 0L
         scrubbing = false
         paused = false
@@ -1558,6 +1580,10 @@ object PlayerWindow {
         val seek = Slider(0.0, 1.0, 0.0).apply {
             styleClass.add("player-seek")
             isDisable = true
+            // Arrow keys belong to the app's own seek handler (see [handleKey]):
+            // a focusable slider would ALSO move natively, double-driving the
+            // bar on every skip.
+            isFocusTraversable = false
             // The wrapper below owns the pointer. A Slider's skin only reacts
             // inside its own thin track, consumes the drag, and leaves the rest of
             // the row inert — so "click the bar to skip" landed on nothing unless
@@ -1983,6 +2009,7 @@ object PlayerWindow {
         // close must not depend on that).
         onPlayerDied = null
         onVideoUp = null
+        onPlayerStalled = null
         runCatching { syncTimer?.stop() }
         syncTimer = null
         runCatching { hideChrome?.stop() }
@@ -2015,6 +2042,7 @@ object PlayerWindow {
         runCatching { AppShell.stage }.getOrNull()?.let { leaveFullscreen(it) }
         overlayUp = true
         duration = 0.0
+        durationPeakSecs = 0.0
         scrubbing = false
         paused = false
     }
@@ -2360,7 +2388,7 @@ object PlayerWindow {
     /** A seek through the same path the bar uses, for a runner whose pointer
      *  cannot be aimed at a 22px row. */
     fun seekToFraction(fraction: Double): Boolean = Fx.runBlock {
-        if (duration <= 0.0) return@runBlock false
+        if (mathDuration() <= 0.0) return@runBlock false
         scrubbing = false
         seekTo(fraction)
         true
@@ -2768,6 +2796,20 @@ object PlayerWindow {
                     Fx.run {
                         setStatus("Couldn't reach the player to pause — try again.", isError = true)
                     }
+                    // The toggle never landed: probe (off the FX thread, like
+                    // everything here) whether the pipe itself is dead. A
+                    // merely busy pipe keeps the retry line above; a dead one
+                    // restarts where the picture is instead of leaving
+                    // play/space/clicks talking to a wedged mpv.
+                    val hadContact = ipcWorking() || isLoaded()
+                    val dead = hadContact &&
+                        runCatching { h.getProperty("pause") }.getOrNull() == null
+                    if (dead) {
+                        Fx.run {
+                            setStatus("The player stopped responding — restarting where you left off…", busy = true)
+                            onPlayerStalled?.invoke(lastReportedSecs)
+                        }
+                    }
                 }
             },
             "hikari-pause",
@@ -2800,6 +2842,12 @@ object PlayerWindow {
     }
 
     // ── seeking ─────────────────────────────────────────────────────────────
+
+    /**
+     * Duration to do bar/seek maths with (see [durationPeakSecs]): the peak,
+     * never a shrunken mid-load report.
+     */
+    private fun mathDuration(): Double = kotlin.math.max(duration, durationPeakSecs)
 
     /**
      * Paints the played-fill on the slider skin's own `.track` node: an inline
@@ -2860,7 +2908,7 @@ object PlayerWindow {
 
     /** Moves the readout to where the bar is, without telling mpv yet. */
     private fun previewScrub() {
-        val d = duration
+        val d = mathDuration()
         if (d <= 0) return
         lastPosition = ((seekBar?.value ?: 0.0) * d * 1000).toLong()
         renderTime()
@@ -2872,7 +2920,7 @@ object PlayerWindow {
      * really is where it was asked to go (see [seekPendingSecs]).
      */
     private fun seekTo(fraction: Double) {
-        val d = duration
+        val d = mathDuration()
         if (d <= 0) return
         // No control channel, no seek: moving the bar and the readout and then
         // snapping back when the echo window expires is exactly the reported
@@ -2897,7 +2945,7 @@ object PlayerWindow {
      * flick the bar back for a frame for exactly the same reason.
      */
     private fun seekBy(delta: Double) {
-        val d = duration
+        val d = mathDuration()
         if (d <= 0 && (ipc == null || lastReportedSecs <= 0.0)) {
             // No length and no position yet (still loading): bank the skip and
             // apply it on start — dropping it is the "forward does nothing
@@ -2927,8 +2975,10 @@ object PlayerWindow {
         // readout can still hold an un-landed seek target, and stacking
         // arrow-key skips onto that walks the bar somewhere the picture never
         // was (a skip from a stale readout is the "forward jumps to the end
-        // and comes back" report).
-        val base = if (seekPendingSecs != null) lastPosition / 1000.0 else lastReportedSecs
+        // and comes back" report). While paused the readout IS the base: no
+        // reports arrive (the picture is frozen by definition), so stacking
+        // onto the frozen report would jump the bar backwards on every press.
+        val base = if (seekPendingSecs != null || paused) lastPosition / 1000.0 else lastReportedSecs
         val pos = (base + delta).coerceIn(0.0, d)
         lastPosition = (pos * 1000).toLong()
         renderTime()
@@ -2972,7 +3022,7 @@ object PlayerWindow {
      */
     private fun sendAbsoluteSeek(h: MpvIpc, pos: Double) {
         val target = pos.coerceAtLeast(0.0)
-        val d = duration
+        val d = mathDuration()
         lastPosition = (target * 1000).toLong()
         renderTime()
         if (d > 0 && !scrubbing) seekBar?.value = (target / d).coerceIn(0.0, 1.0)
@@ -3019,13 +3069,24 @@ object PlayerWindow {
         val target = seekPendingSecs
         val unmoved = kotlin.math.abs(lastReportedSecs - seekFromSecs) < 0.5
         val advancing = kotlin.math.abs(lastReportedSecs - echoBaseSecs) >= 0.5
+        if (target != null && unmoved && paused) {
+            // Seeks while paused can never be confirmed from reports — the
+            // picture is frozen by definition — so a frozen picture must not
+            // read as a refused seek. Hold the bar on the target
+            // optimistically (no snap-back, no warning); unpausing reveals
+            // the truth, and a genuinely refused seek self-corrects on the
+            // first report after resume. A wedged pipe is a different case
+            // and restarts via [onPlayerStalled] (see [sendSeekChecked]).
+            seekPendingSecs = null
+            return@runBlock true
+        }
         if (rearm && target != null && unmoved && advancing) {
             echoBaseSecs = lastReportedSecs
             seekPendingUntil = System.currentTimeMillis() + SEEK_ECHO_MS
             return@runBlock false
         }
         seekPendingSecs = null
-        val d = duration
+        val d = mathDuration()
         val frac = if (d > 0) (lastReportedSecs / d).coerceIn(0.0, 1.0) else 0.0
         lastPosition = (lastReportedSecs * 1000).toLong()
         if (!scrubbing) seekBar?.value = frac
@@ -3062,7 +3123,26 @@ object PlayerWindow {
             val err = reply?.optString("error").orEmpty()
             if (reply == null || (err.isNotEmpty() && err != "success")) {
                 System.err.println("seek: unanswered/refused seek " + pos + " (" + err.ifBlank { "no reply" } + ")")
-                Fx.run { if (gen == seekVerifyGen) warnSeekRefused() }
+                // Refused (pipe alive) vs wedged (pipe dead): only a live
+                // probe tells them apart, and it blocks, so it stays on this
+                // verifier thread — never the FX thread. A pipe that never
+                // answered anything yet is "still starting", not dead.
+                val hadContact = ipcWorking() || isLoaded()
+                val pipeDead = hadContact &&
+                    runCatching { h.getProperty("time-pos") }.getOrNull() == null &&
+                    gen == seekVerifyGen
+                Fx.run {
+                    if (gen != seekVerifyGen) return@run
+                    if (pipeDead) {
+                        setStatus("The player stopped responding — restarting at the new position…", busy = true)
+                        onPlayerStalled?.invoke(pos)
+                    } else if (!paused) {
+                        warnSeekRefused()
+                    }
+                    // While paused a refused seek keeps the bar on its target
+                    // (see [settleSeekEcho]): the freeze is expected, not a
+                    // refusal worth warning about.
+                }
             }
         }
     }
@@ -3087,7 +3167,7 @@ object PlayerWindow {
      * disagree.
      */
     private fun displayedPosition(reportedSecs: Double): Pair<Long, Double> {
-        val d = duration
+        val d = mathDuration()
         val target = seekPendingSecs
         if (target != null) {
             val landed = kotlin.math.abs(reportedSecs - target) <= SEEK_ECHO_TOLERANCE_SECS
@@ -3200,8 +3280,9 @@ object PlayerWindow {
         when (name) {
             "duration" -> {
                 duration = (value as? Number)?.toDouble() ?: 0.0
+                if (duration > durationPeakSecs) durationPeakSecs = duration
                 Fx.run {
-                    seekBar?.isDisable = duration <= 0.0
+                    seekBar?.isDisable = mathDuration() <= 0.0
                     renderTime()
                     // The file is open and mpv knows its length: the wait is
                     // over even if the first video frame (and its
@@ -3222,7 +3303,7 @@ object PlayerWindow {
                 val (shownMs, shownFraction) = displayedPosition(reported)
                 Fx.run {
                     lastPosition = shownMs
-                    if (!scrubbing && duration > 0) seekBar?.value = shownFraction
+                    if (!scrubbing && mathDuration() > 0) seekBar?.value = shownFraction
                     renderTime()
                     // Position advancing means the demuxer is delivering: same
                     // instant-start as above, for streams whose duration arrives
@@ -3234,7 +3315,7 @@ object PlayerWindow {
                     // what keeps it from being stranded.
                     flushBankedSeeks()
                 }
-                onPosition?.invoke(shownMs, (duration * 1000).toLong())
+                onPosition?.invoke(shownMs, (mathDuration() * 1000).toLong())
             }
             "pause" -> {
                 paused = value == true
@@ -3362,7 +3443,7 @@ object PlayerWindow {
 
     private fun renderTime() {
         timeLabel?.text = clock(lastPosition / 1000)
-        totalLabel?.text = "/ " + clock(duration.toLong())
+        totalLabel?.text = "/ " + clock(mathDuration().toLong())
     }
 
     /**

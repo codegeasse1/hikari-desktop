@@ -501,6 +501,9 @@ object DesktopPlayer {
             PlayerWindow.onPlayerDied = {
                 recoverFromPlayerDeath(title, StreamSource(name = title, url = path), null, 0, path, vo)
             }
+            // Local files have no stream to restart at a position: a stall
+            // here must never relaunch a stale stream entry.
+            PlayerWindow.onPlayerStalled = null
             PlayerWindow.onVideoUp = { persistVo(vo) }
             val localStartedAt = System.currentTimeMillis()
             Thread(
@@ -570,13 +573,16 @@ object DesktopPlayer {
         attemptsLeft: Int,
         failedOver: Boolean = false,
         voIdx: Int = -1,
+        /** Resume position for a position-preserving restart (see [restartAtPosition]).
+         *  Null = start at the beginning, as before. */
+        startPosSecs: Double? = null,
     ) {
         // The startup probe blocks (spawns a process and waits): never run it
         // on the FX thread — callers inside Fx.run land here too, so they are
         // offloaded to a launcher thread and the rest runs as before.
         if (javafx.application.Platform.isFxApplicationThread()) {
             Thread(
-                { launchMpv(title, stream, refresh, attemptsLeft, failedOver, voIdx) },
+                { launchMpv(title, stream, refresh, attemptsLeft, failedOver, voIdx, startPosSecs) },
                 "hikari-play-launch",
             ).apply { isDaemon = true; start() }
             return
@@ -718,6 +724,11 @@ object DesktopPlayer {
                 // buffer it will never need for the first frame.
                 add("--network-timeout=20")
                 add("--demuxer-readahead-secs=2")
+                // Position-preserving restart (see [restartAtPosition]): the
+                // fresh demuxer opens AT the failed position, so no seek has
+                // to land on a wedged pipe. Skipped near zero — a restart at
+                // 0.4s is a restart at the beginning.
+                startPosSecs?.takeIf { it > 1.0 }?.let { add("--start=" + it.toLong()) }
                 add("--title=" + title.take(200).replace('\n', ' '))
                 val logDir2 = logDir
                 add("--log-file=${nextMpvLog(logDir2).absolutePath}")
@@ -771,6 +782,14 @@ object DesktopPlayer {
             // If the player dies under a live window, recover instead of showing
             // a black rectangle (see PlayerWindow.onPlayerDied).
             PlayerWindow.onPlayerDied = { recoverFromPlayerDeath(title, stream, refresh, attemptsLeft, url, vo) }
+            // A wedged control pipe (a seek/pause that killed the demuxer)
+            // restarts the SAME stream at the failed position on a fresh
+            // process and a fresh link — never dead controls (see
+            // [restartAtPosition]). Generation-guarded there, like every
+            // other relaunch.
+            PlayerWindow.onPlayerStalled = { target ->
+                restartAtPosition(title, stream, refresh, attemptsLeft, failedOver, vo, url, target, gen)
+            }
             PlayerWindow.onVideoUp = { persistVo(vo) }
             // Only the FIRST explanation per launch shows: the mpv error path and
             // the stream probe both try to explain a dead player, never both.
@@ -1422,6 +1441,45 @@ object DesktopPlayer {
      * expire and a dead CDN edge usually has a sibling server. Failing that, the
      * layer gets the explanation and a Retry button — never a black window.
      */
+    /**
+     * Position-preserving restart after the control pipe goes dead mid-stream
+     * (a seek or pause that wedged the demuxer on a stalled segment fetch):
+     * the wedged process is killed and the same stream relaunches AT the
+     * failed position on a fresh signed link, instead of leaving play, space
+     * and clicks talking to a dead pipe until the user closes the player.
+     * Attempts-bounded like every other relaunch — an exhausted budget
+     * explains itself on screen instead of looping.
+     */
+    private fun restartAtPosition(
+        title: String,
+        stream: StreamSource,
+        refresh: (() -> StreamSource?)?,
+        attemptsLeft: Int,
+        failedOver: Boolean,
+        voIdx: Int,
+        url: String,
+        targetSecs: Double,
+        gen: Int,
+    ) {
+        if (gen != launchGen) return
+        if (attemptsLeft <= 0) {
+            Fx.run {
+                if (gen != launchGen) return@run
+                PlayerWindow.setStatus("The player stopped responding — close and reopen the stream.", isError = true)
+            }
+            return
+        }
+        System.err.println("player: control pipe dead mid-stream — restarting at " + targetSecs + "s")
+        killPrevious(proc)
+        runCatching { ipc?.close() }
+        ipc = null
+        proc = null
+        // Signed links die in seconds: restart on a fresh one, like every
+        // other relaunch (see [recoverFromPlayerDeath]).
+        val fresh = runCatching { refresh?.invoke() }.getOrNull()
+        launchMpv(title, fresh ?: stream, refresh, attemptsLeft - 1, failedOver, voIdx, startPosSecs = targetSecs)
+    }
+
     private fun recoverFromPlayerDeath(
         title: String,
         stream: StreamSource,

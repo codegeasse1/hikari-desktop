@@ -122,11 +122,16 @@ class HikariProviderAdapter(override val config: ProviderConfig) : ContentProvid
         if (item.type == MediaType.MOVIE) return null
         return runCatching { p.getEpisodes(item.toExt()) }.getOrNull()?.map { ep ->
             val base = ep.name ?: "Episode ${ep.number}"
+            // The extension's own season must survive: dropping it (always
+            // season 1 downstream) is what prints "Season 1" for Season 4
+            // entries. Extensions without season info default to 1 already.
+            val season = if (ep.season >= 1) ep.season else 1
             Episode(
                 number = ep.number,
                 id = ep.id,
-                name = if (ep.season > 1) "S${ep.season} E${ep.number} · $base" else base,
+                name = if (season > 1) "S${season} E${ep.number} · $base" else base,
                 image = ep.image,
+                season = season,
             )
         }
     }
