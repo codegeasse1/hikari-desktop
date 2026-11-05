@@ -257,7 +257,11 @@ class MpvIpc(val target: String, private val windowsPipe: Boolean) {
     }
 
     fun getProperty(name: String): Any? =
-        command(1_500L, "get_property", name)?.opt("data")?.takeIf { it !== JSONObject.NULL }
+        command(2_500L, "get_property", name)
+
+    /** Patient read for health checks (stall watchdog): never fail a stream on one slow reply. */
+    fun getPropertyPatient(name: String, timeoutMs: Long = 4_000L): Any? =
+        command(timeoutMs, "get_property", name)?.opt("data")?.takeIf { it !== JSONObject.NULL }
 
     fun getPropertyString(name: String): String? = getProperty(name)?.toString()?.takeIf { it != "null" }
 

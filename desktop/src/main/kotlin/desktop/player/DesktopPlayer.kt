@@ -857,7 +857,7 @@ object DesktopPlayer {
                             if (!PlayerWindow.isEmbedded()) return@Thread
                             // Still arriving: move the deadline out instead of
                             // failing. The status line says so, honestly.
-                            if (System.currentTimeMillis() - PlayerWindow.lastProgressAt() < 10_000 &&
+                            if (System.currentTimeMillis() - PlayerWindow.lastProgressAt() < 20_000 &&
                                 deadline < hardCap
                             ) {
                                 deadline = minOf(System.currentTimeMillis() + 30_000, hardCap)
@@ -924,7 +924,7 @@ object DesktopPlayer {
                             // and restarts the 3-5s wait (the other half of the
                             // Retry-then-plays-by-itself dance).
                             if (refresh != null && attemptsLeft > 0 && !PlayerWindow.messageVisible() &&
-                                System.currentTimeMillis() - PlayerWindow.lastProgressAt() >= 10_000
+                                System.currentTimeMillis() - PlayerWindow.lastProgressAt() >= 20_000
                             ) {
                                 val fresh = runCatching { refresh() }.getOrNull()
                                 if (fresh != null && fresh.url.isNotBlank()) {

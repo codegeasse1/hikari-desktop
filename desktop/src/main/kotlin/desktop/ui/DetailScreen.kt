@@ -641,8 +641,12 @@ class DetailScreenView(private val item: MediaItem) {
         bgUrls = emptyList()
         bgIndex = 0
         bgTimer?.stop()
-        favourite = runCatching { AppShell.app.store.favorites().any { it.uniqueId == m.uniqueId } }.getOrDefault(false)
+        favourite = false
         refreshFavourite()
+        scope.launch {
+            val fav = runCatching { AppShell.app.store.favorites().any { it.uniqueId == m.uniqueId } }.getOrDefault(false)
+            Fx.run { favourite = fav; refreshFavourite() }
+        }
         updatePlayLabel()
     }
 

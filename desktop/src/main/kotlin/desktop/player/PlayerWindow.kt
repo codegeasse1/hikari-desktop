@@ -2807,9 +2807,13 @@ object PlayerWindow {
                             setStatus("Couldn't reach the player to pause — try again.", isError = true)
                         }
                     }
+                    // One slow reply is NOT death (mpv stalls its pipe while building output):
+                    // confirm with a patient second probe before restarting, so a transient
+                    // hiccup shows "try again" instead of tearing down a healthy stream.
                     val hadContact = ipcWorking() || isLoaded()
-                    val dead = hadContact &&
-                        runCatching { h.getProperty("pause") }.getOrNull() == null
+                    val first = runCatching { h.getPropertyPatient("pause") }.getOrNull()
+                    val dead = hadContact && first == null &&
+                        runCatching { h.getPropertyPatient("pause") }.getOrNull() == null
                     if (dead) {
                         Fx.run {
                             setStatus("The player stopped responding — restarting where you left off…", busy = true)
@@ -3144,13 +3148,16 @@ object PlayerWindow {
                 // answered anything yet is "still starting", not dead.
                 val hadContact = ipcWorking() || isLoaded()
                 val pipeDead = hadContact &&
-                    runCatching { h.getProperty("time-pos") }.getOrNull() == null &&
+                    runCatching { h.getPropertyPatient("time-pos", 3_000L) }.getOrNull() == null &&
                     gen == seekVerifyGen
                 Fx.run {
                     if (gen != seekVerifyGen) return@run
                     if (pipeDead) {
-                        setStatus("The player stopped responding — restarting at the new position…", busy = true)
-                        onPlayerStalled?.invoke(pos)
+                        // A mid-stream pipe stall must not tear the stream down on one
+                        // timeout: hold the bar on target and let the 20s watchdog
+                        // (DesktopPlayer) decide. Instant restart here is what caused
+                        // the "pipe dead mid-stream — restarting at 236s" loop.
+                        if (!paused) warnSeekRefused()
                     } else if (!paused) {
                         warnSeekRefused()
                     }

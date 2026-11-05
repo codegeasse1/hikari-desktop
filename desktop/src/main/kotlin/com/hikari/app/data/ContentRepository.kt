@@ -107,8 +107,16 @@ class ContentRepository(private val manager: ProviderManager) {
         // every installed extension at once froze/crashed the app on any
         // machine, however powerful.
         val allProviders = wanted.isNullOrEmpty()
-        val useProviders = if (allProviders) active.take(8) else active
-        val catalogsLimit = if (allProviders) 1 else 10
+        // All-providers Home used to ask only the FIRST 8 providers' FIRST catalog:
+        // one blank catalog (e.g. a provider returning a single '' row) erased the
+        // whole provider, and 8 slow/broken providers erased Home entirely.
+        // Ask up to 12 providers x up to 3 catalogs, skipping blank refs, so one
+        // bad catalog never blanks a provider and 8 bad providers never blank Home.
+        val useProviders = if (allProviders) {
+            val cachedIds = runCatching { synchronized(rowCache) { rowCache.keys.toSet() } }.getOrDefault(emptySet())
+            active.sortedByDescending { p -> cachedIds.any { it.startsWith(p.config.id + "|") } }.take(12)
+        } else active
+        val catalogsLimit = if (allProviders) 3 else 10
         val itemsLimit = 20
         // GLOBAL gates shared by ALL providers (not per-provider): with dozens
         // of installed extensions, per-provider limits multiplied into hundreds
@@ -123,8 +131,9 @@ class ContentRepository(private val manager: ProviderManager) {
                 async {
                     cancellableCatching {
                         providerGate.withPermit {
-                            withTimeoutOrNull(180_000) {
+                            withTimeoutOrNull(30_000) {
                                 val catalogs = p.catalogs()
+                                    .filter { it.id.isNotBlank() || it.name.isNotBlank() }
                                     .distinctBy { it.type to it.id }
                                     .take(catalogsLimit)
                                 coroutineScope {
@@ -137,7 +146,7 @@ class ContentRepository(private val manager: ProviderManager) {
                                                     onRow(cached.row)
                                                     return@async cached.row
                                                 }
-                                                val items = withTimeoutOrNull(120_000) {
+                                                val items = withTimeoutOrNull(25_000) {
                                                     cancellableCatching { p.getCatalog(c, 1) }.getOrDefault(emptyList())
                                                 }.orEmpty().distinctBy { it.uniqueId }.take(itemsLimit)
                                                 if (items.isEmpty()) null

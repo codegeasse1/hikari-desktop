@@ -325,10 +325,9 @@ class HomeScreenView {
         heroBox.isVisible = true
         heroBox.isManaged = true
         showHero()
-        // Warm the TMDB data for the whole rotation up front, so stepping to
-        // the next hero already has its high-quality backdrop (see [showHero])
-        // instead of painting the provider art and swapping seconds later.
-        heroItems.forEach { enrichHero(it) }
+        // Enrich the CURRENT hero now; the rest enrich lazily on step (see stepHero).
+        // Warming all 8 upfront fired 8 TMDB lookups per Home load and janked low-end machines.
+        heroItems.firstOrNull()?.let { enrichHero(it) }
         heroTimer?.stop()
         heroTimer = Timeline(
             KeyFrame(Duration.seconds(9.0), javafx.event.EventHandler<javafx.event.ActionEvent> { stepHero(1) }),
@@ -390,7 +389,7 @@ class HomeScreenView {
         if (!art.isNullOrBlank()) {
             desktop.img.ImageLoader.loadAsync(art, onReady = { img ->
                 if (img != null && myGen == heroGen) crossfadeHero(img)
-            }, w = 1920, h = 1080)
+            }, w = 1280, h = 720)
         }
         // Buttons are rebuilt only when the featured title changes: an
         // enrich-triggered repaint must never re-wire them mid-click.
@@ -754,6 +753,7 @@ class HomeScreenView {
 
     /** The first catalog that lands supplies the hero. */
     private var heroSeeded = false
+    @Volatile private var cachedLayout: String? = null
 
     private fun render(rows: List<CatalogRow>, filterId: String?, chosen: String? = null, filterIds: Set<String>? = null) {
         statusLabel.text = ""
@@ -867,7 +867,7 @@ class HomeScreenView {
         val missing = rows.flatMap { it.items }
             .filter { it.backdropUrl.isNullOrBlank() && !artUpgrades.containsKey(it.uniqueId) }
             .distinctBy { it.uniqueId }
-            .take(24)
+            .take(12)
         if (missing.isEmpty()) return
         AppShell.uiScope.launch {
             val gate = Semaphore(3)
@@ -921,7 +921,8 @@ class HomeScreenView {
     }
 
     private fun buildRow(row: CatalogRow): Region {
-        val cinema = runCatching { AppShell.app.store.homeLayout() }.getOrDefault("cinema") == "cinema"
+        val layout = cachedLayout ?: runCatching { AppShell.app.store.homeLayout() }.getOrDefault("cinema").also { cachedLayout = it }
+        val cinema = layout == "cinema"
         val cards = HBox(Theme.S4).apply {
             alignment = Pos.TOP_LEFT
             padding = Insets(Theme.S1, Theme.S1, Theme.S2, Theme.S1)

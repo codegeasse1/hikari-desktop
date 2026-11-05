@@ -85,7 +85,7 @@ class HikariProviderAdapter(override val config: ProviderConfig) : ContentProvid
             return@withContext emptyList()
         }
         try {
-            p.catalogs().also { list ->
+            p.catalogs().filter { it.id.isNotBlank() || it.name.isNotBlank() }.also { list ->
                 if (list.isEmpty()) {
                     val dexErr = com.hikari.app.cs3.DexJar.lastError
                     com.hikari.app.util.LiveLogs.warn("catalog/${config.name}",

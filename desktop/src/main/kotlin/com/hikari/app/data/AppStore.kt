@@ -30,10 +30,23 @@ class AppStore(private val dir: File) {
         }
     }
 
+    private val saver = java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "hikari-store-save").apply { isDaemon = true } }
+    @Volatile private var saveQueued = false
     private fun save() {
+        // Disk writes used to run on the CALLER thread — usually the FX thread —
+        // so every favorite/history/theme toggle cost a file write + JSON
+        // serialize mid-frame. Version bumps instantly (Flows update now); the
+        // file lands coalesced on a daemon thread. A JVM exit before the flush
+        // loses at most the last ~300ms of toggles, which reload as defaults.
+        version.value++
         synchronized(lock) {
-            runCatching { file.parentFile?.mkdirs(); file.writeText(json.toString()) }
-            version.value++
+            if (saveQueued) return
+            saveQueued = true
+        }
+        saver.execute {
+            runCatching { Thread.sleep(250L) }
+            val snapshot: String = synchronized(lock) { saveQueued = false; json.toString() }
+            runCatching { file.parentFile?.mkdirs(); file.writeText(snapshot) }
         }
     }
 
