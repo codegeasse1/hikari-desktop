@@ -61,7 +61,25 @@ class PosterGrid(
      */
     fun setItems(items: List<MediaItem>) {
         all = items
-        flow.children.setAll(items.map { item ->
+        if (items.size <= 60) {
+            flow.children.setAll(items.map { item ->
+                PosterCard.make(
+                    item = item,
+                    onOpen = onOpen,
+                    width = cardWidth,
+                    progress = progressFor?.invoke(item),
+                    onMore = onMore,
+                )
+            })
+            return
+        }
+        // Chunked mount for 120fps feel: first 60 paint instantly (open/back
+        // feels instant), the rest append off the critical path so scroll
+        // stays fluid and the FX pulse never blocks on 150 cards at once.
+        // Images still stream in async in fixed frames, so no reflow jank.
+        val first = items.take(60)
+        val rest = items.drop(60)
+        flow.children.setAll(first.map { item ->
             PosterCard.make(
                 item = item,
                 onOpen = onOpen,
@@ -70,6 +88,24 @@ class PosterGrid(
                 onMore = onMore,
             )
         })
+        var idx = 0
+        fun pump() {
+            if (idx >= rest.size) return
+            val end = minOf(idx + 40, rest.size)
+            val chunk = rest.subList(idx, end).map { item ->
+                PosterCard.make(
+                    item = item,
+                    onOpen = onOpen,
+                    width = cardWidth,
+                    progress = progressFor?.invoke(item),
+                    onMore = onMore,
+                )
+            }
+            flow.children.addAll(chunk)
+            idx = end
+            if (idx < rest.size) javafx.application.Platform.runLater { pump() }
+        }
+        javafx.application.Platform.runLater { pump() }
     }
 
     fun clear() {

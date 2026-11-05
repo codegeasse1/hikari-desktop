@@ -24,8 +24,8 @@ import java.util.concurrent.ConcurrentHashMap
  */
 object ImageLoader {
 
-    private val mem = object : LinkedHashMap<String, Image>(256, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Image>?): Boolean = size > 512
+    private val mem = object : LinkedHashMap<String, Image>(512, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Image>?): Boolean = size > 1024
     }
 
     private val diskDir: File by lazy {
@@ -39,7 +39,7 @@ object ImageLoader {
     /** Cap on simultaneous network image fetches — Home renders hundreds of
      *  posters at once and firing them all concurrently starves the IO pool
      *  and makes the UI lag on weak networks. */
-    private val gate = java.util.concurrent.Semaphore(8)
+    private val gate = java.util.concurrent.Semaphore(10)
 
     /** Hosts that 403 any image request carrying a Referer (verified in the
      *  Android app: same-origin referer => 403, bare request => 200). */

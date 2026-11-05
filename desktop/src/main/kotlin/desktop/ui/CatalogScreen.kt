@@ -72,7 +72,7 @@ class CatalogScreenView(
             loadingRow.isVisible = false
             loadingRow.isManaged = false
             if (items.isEmpty()) {
-                emptyNote.text = "“$provider” returned no catalog rows — open the logs for the reason."
+                emptyNote.text = "“$provider” returned no catalog rows — open the logs for the reason. Try Search above, or Extensions → update this extension."
                 emptyNote.isVisible = true
                 emptyNote.isManaged = true
                 count.text = "No titles · $provider"

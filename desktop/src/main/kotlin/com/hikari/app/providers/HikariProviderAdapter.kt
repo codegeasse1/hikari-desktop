@@ -77,15 +77,25 @@ class HikariProviderAdapter(override val config: ProviderConfig) : ContentProvid
     override suspend fun catalogs(): List<CatalogRef> = withContext(Dispatchers.IO) {
         val p = awaitProvider()
         if (p == null) {
+            val file = runCatching { java.io.File(config.url) }.getOrNull()
+            val exists = file?.exists() == true
+            val idx = config.extra?.substringAfterLast('|')?.toIntOrNull() ?: 0
+            val hikiCount = if (exists && file != null) runCatching { com.hikari.app.hiki.HikariPluginManager.providersFor(com.hikari.app.HikariApp.instance, file).size }.getOrNull() else null
             val err = com.hikari.app.hiki.HikariPluginManager.lastError
                 ?: com.hikari.app.cs3.Cs3PluginManager.lastError
             lastErr = "extension still loading — try again in a moment"
             com.hikari.app.util.LiveLogs.error("catalog/${config.name}",
-                "HIKARI provider did not resolve — no catalog rows. ${err ?: "no error captured"}")
+                "HIKARI provider did not resolve — no catalog rows. fileExists="+exists+" index="+idx+" hikiProviders="+(hikiCount?.toString() ?: "?")+" extra="+config.extra+" url="+config.url+" err="+(err ?: "no error captured"))
             return@withContext emptyList()
         }
         try {
-            p.catalogs().filter { it.id.isNotBlank() || it.name.isNotBlank() }.also { list ->
+            val raw = p.catalogs()
+            if (raw.isEmpty()) {
+                com.hikari.app.util.LiveLogs.warn("catalog/${config.name}",
+                    "HIKARI catalogs() empty for mainUrl="+p.mainUrl+" — using fallback Home catalog")
+                return@withContext listOf(CatalogRef(config.id, com.hikari.app.data.MediaType.SERIES, p.mainUrl, "Home"))
+            }
+            raw.filter { it.id.isNotBlank() || it.name.isNotBlank() }.also { list ->
                 if (list.isEmpty()) {
                     val dexErr = com.hikari.app.cs3.DexJar.lastError
                     com.hikari.app.util.LiveLogs.warn("catalog/${config.name}",

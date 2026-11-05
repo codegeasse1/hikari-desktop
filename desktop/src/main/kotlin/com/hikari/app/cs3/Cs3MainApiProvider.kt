@@ -248,7 +248,18 @@ class Cs3MainApiProvider(override val config: ProviderConfig) : ContentProvider 
         // CloudStream's MainPageData field order is (name, data, horizontalImages),
         // so use the fields explicitly — destructuring (url, label) would swap them
         // and getMainPage would then try to fetch the catalog's *name* as the URL.
-        mp.map { page ->
+        val clean = mp.filter { it.name.isNotBlank() || it.data.isNotBlank() }
+        if (clean.isEmpty()) {
+            // Desktop-only blank mainPage (plugin load raced, stale cached jar, or
+            // site moved) used to erase the whole provider ("no catalog rows")
+            // while Android (fresh plugin) showed rows. Synthesize a Home
+            // catalog from mainUrl so getMainPage is still attempted instead of
+            // dead-ending the UI. getCatalog logs the real parse reason.
+            com.hikari.app.util.LiveLogs.warn("catalog/"+config.name,
+                "mainPage blank/empty ("+mp.size+" row(s)) for mainUrl="+a.mainUrl+" — using fallback Home catalog")
+            return@withContext listOf(CatalogRef(config.id, catalogType(), a.mainUrl, "Home"))
+        }
+        clean.map { page ->
             CatalogRef(config.id, catalogType(), page.data, page.name.ifBlank { page.data })
         }
     }

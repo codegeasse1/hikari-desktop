@@ -107,7 +107,7 @@ object HikariPluginManager {
                     // loader, and reporting it as one is what showed the user
                     // "manifest.json has no mainClass" for a .cs3 file whose real
                     // problem was somewhere else entirely.
-                    if (root.has("pluginClassName")) return emptyList()
+                    if (root.has("pluginClassName")) { lastError = "Not a HIKARI extension (CloudStream plugin \"" + file.name + "\") — install it as a CS3 extension instead"; return emptyList() }
                     throw RuntimeException("manifest.json has no mainClass")
                 }
                 is JSONArray -> (0 until mc.length()).mapNotNull { mc.optString(it).ifBlank { null } }
