@@ -2110,9 +2110,14 @@ class DetailScreenView(private val item: MediaItem) {
             "${meta.title} — ${source.name}",
             source,
             refresh = {
-                runCatching {
-                    kotlinx.coroutines.runBlocking { AppShell.app.repository.streamsFor(meta, ep) }
-                }.getOrNull()?.firstOrNull()
+                // Never block the FX thread for a network refetch: retry buttons
+                // run on FX, while silent retries run on a launcher thread.
+                if (javafx.application.Platform.isFxApplicationThread()) source
+                else runCatching {
+                    kotlinx.coroutines.runBlocking {
+                        kotlinx.coroutines.withTimeoutOrNull(15_000L) { AppShell.app.repository.streamsFor(meta, ep) }
+                    }
+                }.getOrNull()?.firstOrNull() ?: source
             },
             // The player's own bar drives playback over mpv's IPC, so the
             // screen hands it the two things it alone knows: what comes next,

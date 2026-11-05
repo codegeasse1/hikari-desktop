@@ -68,14 +68,17 @@ object AppShell {
     private var currentScreen: Screen = Screen.Home
     private val backStack = java.util.ArrayDeque<Screen>()
 
-    private val homeScreen = HomeScreenView()
-    private val exploreScreen = ExploreScreenView()
-    private val searchScreen = SearchScreenView()
-    private val historyScreen = HistoryScreenView()
-    private val libraryScreen = LibraryScreenView()
-    private val downloadsScreen = DownloadsScreenView()
-    private val extensionsScreen = ExtensionsScreenView()
-    private val settingsScreen = SettingsScreenView()
+    // Lazy: building all 8 screens upfront on the FX thread delayed the first
+    // frame by seconds (each constructs hundreds of nodes). Home builds at
+    // launch; the rest build on first navigation, so clicks feel instant.
+    private val homeScreen by lazy { HomeScreenView() }
+    private val exploreScreen by lazy { ExploreScreenView() }
+    private val searchScreen by lazy { SearchScreenView() }
+    private val historyScreen by lazy { HistoryScreenView() }
+    private val libraryScreen by lazy { LibraryScreenView() }
+    private val downloadsScreen by lazy { DownloadsScreenView() }
+    private val extensionsScreen by lazy { ExtensionsScreenView() }
+    private val settingsScreen by lazy { SettingsScreenView() }
 
     fun create(stage: javafx.stage.Stage): Region {
         windowStage = stage

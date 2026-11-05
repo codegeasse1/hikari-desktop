@@ -177,6 +177,8 @@ object PlayerWindow {
     private var ipc: MpvIpc? = null
     private var syncTimer: Timeline? = null
     private var keyFilter: EventHandler<KeyEvent>? = null
+    @Volatile private var toggleGen = 0
+    @Volatile private var lastToggleAt = 0L
 
     private val videoArea = StackPane().apply {
         styleClass.add("player-video")
@@ -2764,14 +2766,15 @@ object PlayerWindow {
     }
 
     /**
-     * Pauses or resumes, and makes sure it actually happened.
+     * Pauses or resumes, optimistically and idempotently.
      *
-     * A single `cycle pause` is what this used to be, and it is not enough: the
-     * click that paused worked and the next one did nothing, because a dropped
-     * or stale command is invisible to a fire-and-forget post. So the current
-     * value is read from mpv first, the toggle is sent, and if the value has not
-     * moved the intent is stated outright (`set pause <the opposite>`). Whatever
-     * happens is written into the command log the player report carries.
+     * The old read-modify-cycle (read pause, send cycle, sleep 400ms, re-read,
+     * maybe send set) raced with itself: two quick clicks interleaved their
+     * reads and both sent the same cycle, ending where they started. It also
+     * held a worker thread for 2-4s per click while the UI showed nothing.
+     * Now the intent is explicit (set pause <want>), the button flips instantly,
+     * and a short verification (800ms) repairs a dropped command. Stale
+     * verifications from an earlier click are dropped by generation.
      */
     private fun togglePause() {
         val h = ipc
@@ -2779,28 +2782,31 @@ object PlayerWindow {
             setStatus("The player's control channel is not connected — controls are unavailable.", isError = true)
             return
         }
+        val now = System.currentTimeMillis()
+        if (now - lastToggleAt < 120L) return
+        lastToggleAt = now
+        val gen = ++toggleGen
+        val want = !paused
+        // Optimistic: answer the click on this frame; mpv confirms via property.
+        paused = want
+        Fx.run {
+            if (gen == toggleGen) {
+                playButton?.graphic = Icons.of(if (want) Icons.PLAY else Icons.PAUSE, 20.0)
+                if (want) runCatching { hideChrome?.stop() } else scheduleChromeHide()
+                applyChrome()
+            }
+        }
         Thread(
             {
-                val before = runCatching { h.getProperty("pause")?.toString() }.getOrNull()
-                var ok = h.command(2_000L, "cycle", "pause") != null
-                if (!ok) ok = h.command(2_000L, "cycle", "pause") != null
-                if (before != null) {
-                    Thread.sleep(400L)
-                    val after = runCatching { h.getProperty("pause")?.toString() }.getOrNull()
-                    if (after != null && after == before) {
-                        val want = before != "true"
-                        h.command(2_000L, "set_property", "pause", want)
-                    }
-                }
+                var ok = h.command(1_200L, "set_property", "pause", want) != null
+                if (!ok) ok = h.command(1_200L, "set_property", "pause", want) != null
+                if (gen != toggleGen) return@Thread
                 if (!ok) {
                     Fx.run {
-                        setStatus("Couldn't reach the player to pause — try again.", isError = true)
+                        if (gen == toggleGen) {
+                            setStatus("Couldn't reach the player to pause — try again.", isError = true)
+                        }
                     }
-                    // The toggle never landed: probe (off the FX thread, like
-                    // everything here) whether the pipe itself is dead. A
-                    // merely busy pipe keeps the retry line above; a dead one
-                    // restarts where the picture is instead of leaving
-                    // play/space/clicks talking to a wedged mpv.
                     val hadContact = ipcWorking() || isLoaded()
                     val dead = hadContact &&
                         runCatching { h.getProperty("pause") }.getOrNull() == null
@@ -2810,6 +2816,15 @@ object PlayerWindow {
                             onPlayerStalled?.invoke(lastReportedSecs)
                         }
                     }
+                    return@Thread
+                }
+                // Fast verify: mpv echoes pause via property-change within ~200ms.
+                // Only repair if the echo disagrees after a short window.
+                runCatching { Thread.sleep(350L) }
+                if (gen != toggleGen) return@Thread
+                val echoed = runCatching { h.getProperty("pause")?.toString() }.getOrNull()
+                if (echoed != null && (echoed == "true") != want) {
+                    h.command(1_200L, "set_property", "pause", want)
                 }
             },
             "hikari-pause",
@@ -3118,7 +3133,7 @@ object PlayerWindow {
     private fun sendSeekChecked(h: MpvIpc, pos: Double) {
         val gen = ++seekVerifyGen
         seekVerifier.execute {
-            val reply = runCatching { h.command(3_500L, "seek", pos, "absolute") }.getOrNull()
+            val reply = runCatching { h.command(1_800L, "seek", pos, "absolute") }.getOrNull()
             if (gen != seekVerifyGen) return@execute
             val err = reply?.optString("error").orEmpty()
             if (reply == null || (err.isNotEmpty() && err != "success")) {
@@ -3186,12 +3201,48 @@ object PlayerWindow {
 
     /** While the player is up it owns the keyboard: the app's own shortcuts
      *  (Ctrl+1…4, Ctrl+K, Escape-to-go-back) must not fire behind it. */
+    private var keysSceneHooked: javafx.scene.Scene? = null
     private fun installKeys() {
-        if (keyFilter != null) return
-        val scene = runCatching { AppShell.playerHost.scene }.getOrNull() ?: return
+        if (keyFilter != null) {
+            // Scene may have arrived after the first attempt: re-attach there.
+            val cur = runCatching { AppShell.playerHost.scene }.getOrNull()
+            if (cur != null && cur !== keysSceneHooked) {
+                runCatching { keysSceneHooked?.removeEventFilter(KeyEvent.KEY_PRESSED, keyFilter) }
+                runCatching { cur.addEventFilter(KeyEvent.KEY_PRESSED, keyFilter) }
+                keysSceneHooked = cur
+            }
+            runCatching { root?.requestFocus() }
+            return
+        }
+        val scene = runCatching { AppShell.playerHost.scene }.getOrNull()
+        if (scene == null) {
+            // The layer is mounted before its scene exists on first launch:
+            // hook the scene as soon as it arrives instead of losing keys.
+            runCatching {
+                AppShell.playerHost.sceneProperty().addListener { _, _, nv ->
+                    if (nv != null && keyFilter == null) installKeys()
+                }
+            }
+            return
+        }
         val filter = EventHandler<KeyEvent> { e -> runCatching { handleKey(e) } }
         scene.addEventFilter(KeyEvent.KEY_PRESSED, filter)
         keyFilter = filter
+        keysSceneHooked = scene
+        // Re-install if the window ever swaps scenes; keep focus on the layer
+        // so Space/arrows reach the player instead of a focused button/slider.
+        runCatching {
+            AppShell.playerHost.sceneProperty().addListener { _, ov, nv ->
+                if (ov !== nv && keyFilter != null) {
+                    runCatching { ov?.removeEventFilter(KeyEvent.KEY_PRESSED, keyFilter) }
+                    if (nv != null) {
+                        runCatching { nv.addEventFilter(KeyEvent.KEY_PRESSED, keyFilter) }
+                        keysSceneHooked = nv
+                    }
+                }
+            }
+        }
+        runCatching { root?.requestFocus() }
     }
 
     private fun uninstallKeys() {

@@ -335,7 +335,7 @@ object Ui {
 
     // ---- transitions --------------------------------------------------------
 
-    fun fadeIn(node: Node, millis: Double = 180.0) {
+    fun fadeIn(node: Node, millis: Double = 90.0) {
         node.opacity = 0.0
         FadeTransition(Duration.millis(millis), node).apply {
             toValue = 1.0

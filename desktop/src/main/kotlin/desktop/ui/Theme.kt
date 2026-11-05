@@ -115,19 +115,29 @@ object Theme {
             ?: HikariThemeMode.DARK
         accent = prefs.get("accent", ACCENTS.first()).takeIf { it in ACCENTS } ?: ACCENTS.first()
         applyClasses()
+        lastAppliedMode = mode
+        lastAppliedAccent = accent
         fill = javafx.scene.paint.Color.web(if (mode == HikariThemeMode.LIGHT) "#eff1f7" else if (mode == HikariThemeMode.AMOLED) "#000000" else BG)
     }
 
     fun scene(root: javafx.scene.Parent): Scene = style(Scene(root))
 
+    @Volatile private var lastAppliedMode: HikariThemeMode? = null
+    @Volatile private var lastAppliedAccent: String? = null
     /** Re-reads the persisted theme + accent and applies them to the live scene. */
     fun refresh() {
         mode = runCatching { HikariApp.instance.store.theme() }
             .getOrNull()
             ?.let { HikariThemeMode.fromKey(it) }
             ?: mode
+        // Navigation used to re-apply CSS classes + fill on every click even when
+        // nothing changed: class churn forces a full CSS pass and reads as a
+        // 2-3s stall on low-end machines. Skip when already applied.
+        if (mode == lastAppliedMode && accent == lastAppliedAccent && currentScene != null) return
         applyClasses()
         currentScene?.fill = javafx.scene.paint.Color.web(if (mode == HikariThemeMode.LIGHT) "#eff1f7" else if (mode == HikariThemeMode.AMOLED) "#000000" else BG)
+        lastAppliedMode = mode
+        lastAppliedAccent = accent
     }
 
     fun setMode(next: HikariThemeMode) {

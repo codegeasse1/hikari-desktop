@@ -241,7 +241,7 @@ class MpvIpc(val target: String, private val windowsPipe: Boolean) {
     }
 
     fun setProperty(name: String, value: Any) {
-        command(2_000L, "set_property", name, value)
+        command(1_200L, "set_property", name, value)
     }
 
     /** Fire-and-forget command (seek during a scrub must not queue up replies). */
@@ -253,11 +253,11 @@ class MpvIpc(val target: String, private val windowsPipe: Boolean) {
     }
 
     fun observe(name: String, id: Long) {
-        command(2_000L, "observe_property", id, name)
+        command(1_500L, "observe_property", id, name)
     }
 
     fun getProperty(name: String): Any? =
-        command(2_500L, "get_property", name)?.opt("data")?.takeIf { it !== JSONObject.NULL }
+        command(1_500L, "get_property", name)?.opt("data")?.takeIf { it !== JSONObject.NULL }
 
     fun getPropertyString(name: String): String? = getProperty(name)?.toString()?.takeIf { it != "null" }
 
