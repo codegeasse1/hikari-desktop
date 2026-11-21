@@ -284,7 +284,14 @@ object Ui {
         Theme.label(text, size = 12.5, dim = true),
     ).apply { alignment = Pos.CENTER_LEFT }
 
-    /** A shimmering placeholder block; [w]/[h] are fixed, so grids don't jump when content lands. */
+    /** A placeholder block; [w]/[h] are fixed, so grids don't jump when content lands.
+     *
+     *  Deliberately STATIC: this used to be a shimmer (one shared timeline
+     *  driving the opacity of every skeleton), but that kept the FX pulse
+     *  dirty at 60fps the whole time placeholders were on screen — and the
+     *  timeline was never stopped, so it repainted the scene forever after.
+     *  On low-end machines that alone read as 1fps mouse lag with Windows
+     *  offering to kill the app. A flat block costs nothing. */
     fun skeleton(w: Double, h: Double, radius: Double = 10.0): Region = Region().apply {
         prefWidth = w
         prefHeight = h
@@ -294,33 +301,6 @@ object Ui {
         maxHeight = h
         styleClass.add("skeleton")
         style = "-fx-background-radius: ${radius}px;"
-        ensureShimmer()
-        opacityProperty().bind(shimmer)
-    }
-
-    /**
-     * One shimmer value shared by every skeleton.
-     *
-     * Each skeleton used to own an INDEFINITE `Timeline`, and nothing stopped it
-     * when the skeleton left the scene — so every catalog load leaked a dozen
-     * full-rate animations that kept running forever. After a few refreshes the
-     * FX pulse was saturated, which shows up as dropped input: clicks that need
-     * two or three attempts. A single timeline driving a shared property costs
-     * one animation no matter how many placeholders are on screen.
-     */
-    private val shimmer = javafx.beans.property.SimpleDoubleProperty(0.86)
-    private var shimmerTimeline: Timeline? = null
-
-    private fun ensureShimmer() {
-        if (shimmerTimeline != null) return
-        shimmerTimeline = Timeline(
-            KeyFrame(Duration.ZERO, KeyValue(shimmer, 0.86, Interpolator.EASE_BOTH)),
-            KeyFrame(Duration.seconds(1.1), KeyValue(shimmer, 0.40, Interpolator.EASE_BOTH)),
-        ).apply {
-            cycleCount = Timeline.INDEFINITE
-            setAutoReverse(true)
-            play()
-        }
     }
 
     fun posterSkeleton(): VBox = VBox(Theme.S2,

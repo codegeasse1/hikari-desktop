@@ -18,6 +18,16 @@ import okhttp3.ResponseBody.Companion.toResponseBody
  * the rendered HTML is served back to the plugin as a normal 200 response.
  */
 class WebViewFallbackInterceptor : Interceptor {
+    companion object {
+        /** At most 2 concurrent real-browser WAF passes: every pass holds the
+         *  single shared WebEngine for up to 30s, and a Home load can surface
+         *  dozens of challenged requests at once. Queued passes used to pile
+         *  up for minutes, starving the OkHttp pool (catalogs timing out as
+         *  "no rows") while each poll round-tripped the FX thread. Over the
+         *  cap the raw challenge page goes back to the plugin immediately. */
+        private val browserPasses = java.util.concurrent.Semaphore(2)
+    }
+
     override fun intercept(chain: Interceptor.Chain): Response {
         val request = chain.request()
         val response = chain.proceed(request)
@@ -33,18 +43,26 @@ class WebViewFallbackInterceptor : Interceptor {
             if (!ct.contains("html")) return response
             val peek = response.peekBody(200 * 1024).bytes()
             if (!FxWebView.isChallengeHtml(String(peek, Charsets.UTF_8))) return response
-            // A real browser can usually beat the challenge — render the page.
+            // A real browser can usually beat the challenge — render the page,
+            // unless two passes are already running (see browserPasses).
             val url = request.url.toString()
-            com.hikari.app.util.LiveLogs.warn(
-                "waf",
-                "Challenge/bot-check page (HTTP $code, ${ct}, ${peek.size} bytes) for $url — re-fetching in a real browser…"
-            )
-            val rendered = runCatching {
-                Fx.runBlock {
-                    runCatching { FxWebView.setUserAgent(HikariApp.instance.effectiveWebViewUa()) }
-                }
-                FxWebView.renderedHtml(url, 30_000)
-            }.getOrNull()
+            if (!browserPasses.tryAcquire()) {
+                com.hikari.app.util.LiveLogs.warn(
+                    "waf",
+                    "Challenge page for $url but the browser is busy (2 passes running) — serving raw page."
+                )
+                return response
+            }
+            val rendered = try {
+                runCatching {
+                    Fx.runBlock {
+                        runCatching { FxWebView.setUserAgent(HikariApp.instance.effectiveWebViewUa()) }
+                    }
+                    FxWebView.renderedHtml(url, 30_000)
+                }.getOrNull()
+            } finally {
+                browserPasses.release()
+            }
             if (rendered.isNullOrBlank()) {
                 response.close()
                 com.hikari.app.util.LiveLogs.error(

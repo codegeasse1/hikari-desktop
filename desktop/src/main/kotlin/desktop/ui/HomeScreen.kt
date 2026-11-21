@@ -398,7 +398,7 @@ class HomeScreenView {
         if (!art.isNullOrBlank()) {
             desktop.img.ImageLoader.loadAsync(art, onReady = { img ->
                 if (img != null && myGen == heroGen) crossfadeHero(img)
-            }, w = 1280, h = 720)
+            }, w = 960, h = 540)
         }
         // Buttons are rebuilt only when the featured title changes: an
         // enrich-triggered repaint must never re-wire them mid-click.
@@ -476,26 +476,25 @@ class HomeScreenView {
         }
     }
 
+    /** Instant hero swap, no crossfade: fading a full-bleed ~1000px ImageView
+     *  re-composites the whole window every frame for 600ms — during scroll
+     *  that was a visible hitch every 9s (the rotation period). A cut is
+     *  free and reads the same on a rotating banner. */
     private fun crossfadeHero(img: javafx.scene.image.Image) {
-        paintHeroBg()
         if (heroFgA) {
             heroArtB = img
             Ui.coverImageTop(heroBgB, img, heroStack.width, heroStack.height)
-            Ui.fade(heroBgB, 1.0, 600.0)
+            heroBgB.opacity = 1.0
+            heroBgA.opacity = 0.0
+            heroArtA = img
             heroFgA = false
-            javafx.animation.Timeline(
-                javafx.animation.KeyFrame(Duration.millis(650.0),
-                    javafx.event.EventHandler<javafx.event.ActionEvent> { heroBgA.opacity = 0.0; heroArtA = img }),
-            ).play()
         } else {
             heroArtA = img
             Ui.coverImageTop(heroBgA, img, heroStack.width, heroStack.height)
-            Ui.fade(heroBgA, 1.0, 600.0)
+            heroBgA.opacity = 1.0
+            heroBgB.opacity = 0.0
+            heroArtB = img
             heroFgA = true
-            javafx.animation.Timeline(
-                javafx.animation.KeyFrame(Duration.millis(650.0),
-                    javafx.event.EventHandler<javafx.event.ActionEvent> { heroBgB.opacity = 0.0; heroArtB = img }),
-            ).play()
         }
     }
 
@@ -570,7 +569,7 @@ class HomeScreenView {
         if (!e.posterUrl.isNullOrBlank()) {
             desktop.img.ImageLoader.loadAsync(e.posterUrl, onReady = { img ->
                 if (img != null) Ui.coverImage(art, img, CW_W, CW_H)
-            }, w = 640, h = 360)
+            }, w = CW_W.toInt(), h = CW_H.toInt())
         }
         val scrim = Region().apply { styleClass.add("x-cw-scrim"); isMouseTransparent = true }
         val title = Theme.label(e.title, size = 14.5, bold = true).apply {
@@ -937,9 +936,10 @@ class HomeScreenView {
             padding = Insets(Theme.S1, Theme.S1, Theme.S2, Theme.S1)
             minWidth = 0.0
         }
-        // Cap visible cards: 20 full poster nodes per rail x 10 rails = 200
-        // image loads at once. 14 is plenty for a rail (rest via View All).
-        row.items.take(14).forEach { raw ->
+        // Cap visible cards: 10 full poster nodes per rail — 14 used to pin
+        // ~140 textures plus the hero and scroll degraded to 1fps on
+        // low-end machines (the rest is one click away via View All).
+        row.items.take(10).forEach { raw ->
             val item = withUpgrade(raw)
             // The repaint hook keeps this card upgradable in place (see
             // [upgradeArt]): same node for life, so upgrades never eat clicks.

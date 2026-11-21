@@ -24,10 +24,12 @@ import java.util.concurrent.ConcurrentHashMap
  */
 object ImageLoader {
 
-    private val mem = object : LinkedHashMap<String, Image>(256, 0.75f, true) {
-        // 350 entries max (~poster 340x510 decoded): Home renders hundreds of
-        // cards and a 1024-entry full-res cache OOMs low-end machines.
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Image>?): Boolean = size > 350
+    private val mem = object : LinkedHashMap<String, Image>(128, 0.75f, true) {
+        // 120 entries max (~poster 168x252 decoded): Home renders ~100 cards
+        // and a bigger full-res cache OOMs low-end machines — the old 1024
+        // cache, then 350, still pinned hundreds of MB of textures and the
+        // scroll degraded to 1fps with Windows offering to kill the app.
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Image>?): Boolean = size > 120
     }
 
     private val diskDir: File by lazy {

@@ -3,8 +3,6 @@ package desktop.ui
 import com.hikari.app.data.MediaItem
 import com.hikari.app.data.MediaType
 import javafx.animation.FadeTransition
-import javafx.animation.Interpolator
-import javafx.animation.ScaleTransition
 import javafx.geometry.Pos
 import javafx.scene.Cursor
 import javafx.scene.Node
@@ -59,10 +57,11 @@ object PosterCard {
             fitHeight = height
             isPreserveRatio = false
             isSmooth = true
-            // Scrolling hundreds of posters re-rasters every frame without
-            // this; caching the raster makes rails/grids glide.
-            isCache = true
-            cacheHint = javafx.scene.CacheHint.SPEED
+            // No node cache: caching the raster of every poster (~140 cards on
+            // Home) pins hundreds of MB of textures — scrolling turned into a
+            // 1fps texture-upload slideshow on low-end machines. Plain blits
+            // composite cheaply; the shadow/scale hover costs are gone too.
+            isCache = false
             styleClass.add("poster-img")
             clip = Rectangle(width, height).apply {
                 arcWidth = RADIUS * 2
@@ -78,16 +77,20 @@ object PosterCard {
             // poster, a 1:1 cover) shrank into a letterboxed strip in the
             // middle of the frame — the "poster looks wrong/cropped" report.
             onReady = { img -> Ui.coverImage(image, img, width, height) },
-            w = (width * 2).toInt(),
-            h = (height * 2).toInt(),
+            // 1x decode: the frame shows at `width` device px, and 2x here
+            // meant 4x the pixels (~0.9MP per cinema card x 140 cards) queued
+            // as FX-thread texture uploads — the scroll jank. 1x is crisp at
+            // these sizes; the hero keeps its own high-res load.
+            w = width.toInt(),
+            h = height.toInt(),
         )
         onArtRefresh?.invoke { url ->
             if (url.isBlank()) return@invoke
             desktop.img.ImageLoader.loadAsync(
                 url,
                 onReady = { img -> Ui.coverImage(image, img, width, height) },
-                w = (width * 2).toInt(),
-                h = (height * 2).toInt(),
+                w = width.toInt(),
+                h = height.toInt(),
             )
         }
 
@@ -202,29 +205,15 @@ object PosterCard {
         moreButton?.let { Ui.isolateClicks(it) }
 
         card.setOnMouseEntered {
-            // Reuse + stop previous transitions: fast mouse moves across a rail
-            // used to pile up dozens of running Scale/Fade timelines (one per
-            // enter/exit), which saturated the FX pulse and made rails feel laggy.
-            (card.properties["hikari-scale"] as? ScaleTransition)?.stop()
-            ScaleTransition(Duration.millis(130.0), card).apply {
-                toX = 1.035
-                toY = 1.035
-                interpolator = Interpolator.EASE_OUT
-                card.properties["hikari-scale"] = this
-                play()
-            }
+            // Hover used to run a ScaleTransition on the whole card: scaling a
+            // VBox forces its parent HBox to relayout every frame, and with a
+            // rail of cards under the pointer that meant layout + texture
+            // uploads per frame — part of the 1fps scroll. Hover now only
+            // fades the small overlays (play/more buttons), which is cheap.
             fade(playButton, 1.0)
             moreButton?.let { fade(it, 1.0) }
         }
         card.setOnMouseExited {
-            (card.properties["hikari-scale"] as? ScaleTransition)?.stop()
-            ScaleTransition(Duration.millis(140.0), card).apply {
-                toX = 1.0
-                toY = 1.0
-                interpolator = Interpolator.EASE_OUT
-                card.properties["hikari-scale"] = this
-                play()
-            }
             fade(playButton, 0.0)
             moreButton?.let { fade(it, 0.0) }
         }

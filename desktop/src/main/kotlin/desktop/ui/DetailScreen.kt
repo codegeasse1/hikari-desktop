@@ -155,20 +155,23 @@ class DetailScreenView(private val item: MediaItem) {
         }
     }
 
+    /** Instant swap, no crossfade (see HomeScreen.crossfadeHero): a 700ms
+     *  full-bleed fade re-composites the window every frame. */
     private fun crossfadeHero(img: Image) {
-        paintHeroBg()
         if (heroFgA) {
             heroArtB = img
             Ui.coverImageTop(heroBgB, img, hero.width, hero.height)
-            Ui.fade(heroBgB, 1.0, 700.0)
+            heroBgB.opacity = 1.0
+            heroBgA.opacity = 0.0
+            heroArtA = img
             heroFgA = false
-            Timeline(KeyFrame(Duration.millis(750.0), EventHandler { heroBgA.opacity = 0.0; heroArtA = img })).play()
         } else {
             heroArtA = img
             Ui.coverImageTop(heroBgA, img, hero.width, hero.height)
-            Ui.fade(heroBgA, 1.0, 700.0)
+            heroBgA.opacity = 1.0
+            heroBgB.opacity = 0.0
+            heroArtB = img
             heroFgA = true
-            Timeline(KeyFrame(Duration.millis(750.0), EventHandler { heroBgB.opacity = 0.0; heroArtB = img })).play()
         }
     }
 

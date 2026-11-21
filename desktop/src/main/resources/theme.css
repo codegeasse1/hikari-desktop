@@ -457,7 +457,7 @@
     -fx-border-radius: 12;
     -fx-padding: 14;
 }
-.card:hover { -fx-border-color: -h-border-3; -fx-effect: dropshadow(gaussian, -h-shadow-2, 14, 0, 0, 4); }
+.card:hover { -fx-border-color: -h-border-3; }
 
 .panel {
     -fx-background-color: -h-surface;
@@ -504,7 +504,10 @@
     -fx-border-color: -h-border;
     -fx-border-radius: 16;
 }
-.poster-card:hover .poster-frame { -fx-border-color: -h-accent-line; -fx-effect: dropshadow(gaussian, -h-accent-glow, 26, 0, 0, 8); }
+/* No drop shadow on hover: a gaussian blur over every poster frame is
+   re-rendered in software on each scroll/hover pulse — with ~100 cards on
+   screen that was the 1fps scroll. The border highlight carries the hover. */
+.poster-card:hover .poster-frame { -fx-border-color: -h-accent-line; }
 .poster-img { -fx-background-color: -h-surface-2; -fx-background-radius: 16; }
 .poster-scrim {
     -fx-background-color: linear-gradient(to top, rgba(0,0,0,0.88) 0%, rgba(0,0,0,0.32) 45%, rgba(0,0,0,0.00) 100%);
@@ -604,7 +607,6 @@
     -fx-background-repeat: no-repeat;
     -fx-background-size: cover;
     -fx-background-position: center;
-    -fx-effect: dropshadow(gaussian, -h-shadow-2, 22, 0, 0, 6);
 }
 .detail-scrim {
     -fx-background-color: linear-gradient(to top, rgba(0,0,0,0.92) 0%, rgba(0,0,0,0.55) 45%, rgba(0,0,0,0.10) 100%);
@@ -767,7 +769,6 @@
     -fx-border-color: -h-border;
     -fx-border-width: 1;
     -fx-border-radius: 20;
-    -fx-effect: dropshadow(gaussian, -h-shadow-2, 26, 0, 0, 8);
 }
 /* The featured title's poster — the same artwork the grid thumbnail shows,
    crisp at this size where an upscaled backdrop was blurry. */
@@ -777,7 +778,6 @@
     -fx-border-color: rgba(255,255,255,0.14);
     -fx-border-width: 1;
     -fx-border-radius: 14;
-    -fx-effect: dropshadow(gaussian, -h-shadow-2, 20, 0, 0, 8);
 }
 .hero-scrim-v {
     -fx-background-color: linear-gradient(to top, rgba(6,7,12,0.97) 0%, rgba(6,7,12,0.58) 38%, rgba(6,7,12,0.02) 76%);
@@ -828,7 +828,6 @@
     -fx-max-width: 38; -fx-max-height: 38;
     -fx-padding: 0;
     -fx-cursor: hand;
-    -fx-effect: dropshadow(gaussian, -h-shadow-3, 16, 0, 0, 5);
 }
 .rail-arrow:hover { -fx-background-color: -h-surface-4; -fx-border-color: -h-border-3; }
 .root.light .rail-arrow { -fx-background-color: rgba(255,255,255,0.96); }
@@ -856,7 +855,6 @@
     -fx-border-color: rgba(255,255,255,0.16);
     -fx-border-width: 1;
     -fx-border-radius: 14;
-    -fx-effect: dropshadow(gaussian, -h-shadow-2, 26, 0, 0, 10);
 }
 .d-over { -fx-font-size: 11px; -fx-font-weight: bold; -fx-text-fill: -h-accent; }
 .d-title { -fx-font-size: 32px;   -fx-font-weight: bold; -fx-text-fill: #ffffff; }
@@ -1508,7 +1506,7 @@
 .x-src-count { -fx-text-fill: -h-fg-3; -fx-font-size: 12.5px; }
 .x-ep-bignum { -fx-text-fill: #2a3040; -fx-font-size: 64px; -fx-font-weight: bold; -fx-alignment: center; }
 .x-prov-card { -fx-background-color: -h-bg-2; -fx-background-radius: 16; -fx-border-color: -h-border; -fx-border-radius: 16; -fx-border-width: 1; -fx-cursor: hand; }
-.x-prov-card:hover { -fx-border-color: -h-accent-line; -fx-effect: dropshadow(gaussian, -h-accent-glow, 16, 0.25, 0, 0); }
+.x-prov-card:hover { -fx-border-color: -h-accent-line; }
 .x-prov-badge { -fx-background-color: linear-gradient(to bottom right, -h-accent, -h-accent-2); -fx-background-radius: 14; }
 .x-prov-initial { -fx-text-fill: white; -fx-font-size: 20px; -fx-font-weight: bold; }
 .x-prov-name { -fx-text-fill: -h-fg; }
@@ -1537,7 +1535,7 @@
 .x-pd-scroll > .viewport, .x-pd-col-scroll > .viewport { -fx-background-color: transparent; }
 .x-pd-grid { -fx-background-color: transparent; }
 .x-pd-card { -fx-background-color: -h-surface; -fx-background-radius: 12; -fx-border-color: -h-border; -fx-border-radius: 12; -fx-border-width: 1; -fx-cursor: hand; }
-.x-pd-card:hover { -fx-border-color: -h-accent-line; -fx-effect: dropshadow(gaussian, -h-accent-glow, 14, 0.2, 0, 0); }
+.x-pd-card:hover { -fx-border-color: -h-accent-line; }
 .x-pd-card-sel { -fx-background-color: -h-accent-soft; -fx-border-color: -h-accent-line; }
 .x-pd-badge { -fx-background-color: linear-gradient(to bottom right, -h-accent, -h-accent-2); -fx-background-radius: 12; -fx-min-width: 44; -fx-min-height: 44; -fx-pref-width: 44; -fx-pref-height: 44; -fx-max-width: 44; -fx-max-height: 44; }
 .x-pd-initial { -fx-text-fill: white; -fx-font-size: 18px; -fx-font-weight: bold; }

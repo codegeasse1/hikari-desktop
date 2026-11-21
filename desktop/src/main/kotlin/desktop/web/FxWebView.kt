@@ -23,8 +23,13 @@ object FxWebView {
 
     /** The embedded WebEngine is a single shared resource — every navigation
      *  (rendered HTML, request capture, image capture) is serialized through
-     *  this lock so two callers can't clobber each other's in-flight page. */
-    private val engineLock = Any()
+     *  this lock so two callers can't clobber each other's in-flight page.
+     *  A [ReentrantLock] (not `synchronized`) so the image fallback can
+     *  FAIL FAST when the engine is busy instead of queueing: during a Home
+     *  load dozens of posters can miss plain HTTP at once, and queueing all
+     *  of them behind one 20s engine hold each is what wedged loads (and the
+     *  IO pool behind them) — a blank poster that retries later is cheaper. */
+    private val engineLock = java.util.concurrent.locks.ReentrantLock()
 
     fun ensure() {
         Fx.runBlock {
@@ -59,7 +64,9 @@ object FxWebView {
         }
 
     /** Loads [url] and returns the rendered DOM HTML (null on failure/timeout). */
-    fun renderedHtml(url: String, timeoutMs: Long = 25_000): String? = synchronized(engineLock) {
+    fun renderedHtml(url: String, timeoutMs: Long = 25_000): String? {
+        engineLock.lock()
+        try {
         ensure()
         Fx.runBlock {
             runCatching { engine.load(url) }
@@ -68,12 +75,16 @@ object FxWebView {
         var lastHtml: String? = null
         while (System.currentTimeMillis() < deadline) {
             Thread.sleep(700)
-            val state = Fx.runBlock { loadState() }
+            // ONE FX round-trip per poll: state + DOM in a single block.
+            // Two runBlocks per poll used to double the FX queue traffic from
+            // every in-flight browser pass.
+            val (state, html) = Fx.runBlock {
+                loadState() to runCatching { engine.executeScript("document.documentElement.outerHTML") as String }.getOrNull()
+            }
             if (state == "FAILED") {
                 // keep polling briefly — challenge pages reload and retry
                 continue
             }
-            val html = Fx.runBlock { runCatching { engine.executeScript("document.documentElement.outerHTML") as String }.getOrNull() }
             if (html != null) {
                 lastHtml = html
                 if (!looksLikeChallengePage(html)) return html
@@ -81,6 +92,9 @@ object FxWebView {
             if (System.currentTimeMillis() > deadline - 1200) break
         }
         return lastHtml
+        } finally {
+            engineLock.unlock()
+        }
     }
 
     /**
@@ -92,7 +106,11 @@ object FxWebView {
      * document's origin, so a same-origin canvas is never tainted), drawn to a
      * canvas and returned as a base64 JPEG data URL — null on failure/timeout.
      */
-    fun imageBytes(url: String, timeoutMs: Long = 20_000): ByteArray? = synchronized(engineLock) {
+    fun imageBytes(url: String, timeoutMs: Long = 20_000): ByteArray? {
+        // Fail fast when the engine is busy (a catalog/WAF pass owns it):
+        // posters must never queue 20s holds behind each other — see engineLock.
+        if (!engineLock.tryLock()) return null
+        try {
         ensure()
         Fx.runBlock {
             runCatching { engine.load(url) }
@@ -101,9 +119,9 @@ object FxWebView {
         var emptiesAfterLoad = 0
         while (System.currentTimeMillis() < deadline) {
             Thread.sleep(300)
-            val state = Fx.runBlock { loadState() }
-            val v = Fx.runBlock {
-                runCatching { engine.executeScript(IMAGE_BYTES_JS) as? String }.getOrNull()
+            // ONE FX round-trip per poll (state + pixels together).
+            val (state, v) = Fx.runBlock {
+                loadState() to runCatching { engine.executeScript(IMAGE_BYTES_JS) as? String }.getOrNull()
             }
             if (!v.isNullOrBlank()) {
                 val comma = v.indexOf(',')
@@ -124,6 +142,9 @@ object FxWebView {
             }
         }
         null
+        } finally {
+            engineLock.unlock()
+        }
     }
 
     private val IMAGE_BYTES_JS = """
@@ -164,7 +185,9 @@ object FxWebView {
         additional: List<Regex>,
         script: String?,
         timeoutMs: Long,
-    ): Capture = synchronized(engineLock) {
+    ): Capture {
+        engineLock.lock()
+        try {
         ensure()
         Fx.runBlock {
             runCatching { engine.load(url) }
@@ -193,6 +216,9 @@ object FxWebView {
             requests = (hits + lastAll).distinctBy { it.url },
             cookie = cookie,
         )
+        } finally {
+            engineLock.unlock()
+        }
     }
 
     private fun loadState(): String = runCatching {
