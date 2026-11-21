@@ -34,8 +34,11 @@ object Fx {
     /**
      * Run on the FX thread and block until it completes. Must never be called
      * from the FX thread itself.
+     *
+     * Timeout first so trailing-lambda call sites (`Fx.runBlock { ... }`) keep
+     * working — a function-typed last parameter is what the trailing syntax needs.
      */
-    fun <T> runBlock(block: () -> T, timeoutMs: Long = 5_000L): T {
+    fun <T> runBlock(timeoutMs: Long = 5_000L, block: () -> T): T {
         if (Platform.isFxApplicationThread()) return block()
         val latch = CountDownLatch(1)
         val res = AtomicReference<Result<T>>()
