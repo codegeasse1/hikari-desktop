@@ -176,6 +176,11 @@ object PlayerWindow {
 
     private var ipc: MpvIpc? = null
     private var syncTimer: Timeline? = null
+    // Native z-order enumeration is expensive (EnumWindows across every top-level
+    // window). Geometry is checked every pulse, but stacking only needs a periodic
+    // repair because move/resize/focus events already call glueNow().
+    @Volatile private var lastSurfaceStackCheckAt = 0L
+    private val overlayStackCheckAt = HashMap<String, Long>()
     private var keyFilter: EventHandler<KeyEvent>? = null
     @Volatile private var toggleGen = 0
     @Volatile private var lastToggleAt = 0L
@@ -1041,6 +1046,7 @@ object PlayerWindow {
     private fun releaseSurface() {
         surfaceHwnd = null
         embedded = false
+        lastSurfaceStackCheckAt = 0L
     }
 
     /**
@@ -1274,6 +1280,18 @@ object PlayerWindow {
             if (!dressed && dressOverlay(st)) {
                 if (st === stripStage) stripDressed = true else barDressed = true
             }
+            // Do not enumerate the desktop's z-order 8+ times/sec for each bar.
+            // The native rectangle is cheap to compare; reassert stacking once
+            // per second or immediately when the bar actually moved/resized.
+            val now = System.currentTimeMillis()
+            val title = st.title ?: label
+            val lastStackCheck = overlayStackCheckAt[title] ?: 0L
+            val target = intArrayOf(x, y, w, h)
+            val live = WinShell.windowRect(hwnd)
+            if (live != null && live.contentEquals(target) && now - lastStackCheck < 1_000L) {
+                return@runCatching
+            }
+            overlayStackCheckAt[title] = now
             WinShell.placeAbove(hwnd, video, x, y, w, h)
         }
     }
@@ -1310,7 +1328,12 @@ object PlayerWindow {
 
     private fun hideOverlay(stage: Stage?) {
         val st = stage ?: return
-        runCatching { st.title?.let { overlayHwndCache.remove(it) } }
+        runCatching {
+            st.title?.let {
+                overlayHwndCache.remove(it)
+                overlayStackCheckAt.remove(it)
+            }
+        }
         runCatching { if (st.isShowing) st.hide() }
     }
 
@@ -1354,8 +1377,12 @@ object PlayerWindow {
         val h = (area.height * scale).roundToInt()
         if (w < 16 || h < 16) return
         if (overlayUp) {
-            WinShell.placeWindow(hwnd, WinShell.PARKED_X, WinShell.PARKED_Y, w, h)
-            parkCount++
+            val parked = intArrayOf(WinShell.PARKED_X, WinShell.PARKED_Y, w, h)
+            val liveParked = WinShell.windowRect(hwnd)
+            if (liveParked == null || !liveParked.contentEquals(parked)) {
+                WinShell.placeWindow(hwnd, parked[0], parked[1], parked[2], parked[3])
+                parkCount++
+            }
             lastSyncNote = "parked(overlayUp) " + w + "x" + h + " parks=" + parkCount
             return
         }
@@ -1380,19 +1407,23 @@ object PlayerWindow {
         // GetWindowRect per tick. Caching the last placement would leave the
         // video at whatever size mpv decided on.
         val live = WinShell.windowRect(hwnd)
-        // The picture's window is also kept directly ABOVE the app window. It is
-        // mpv's own top-level window, so Windows raises the app window over it
-        // whenever the app is activated — a click on the app's controls, a
-        // restore, and above all GOING FULL SCREEN — and the player then shows a
-        // black rectangle with working controls while the picture sits
-        // underneath. One SetWindowPos on a tick that already read the rectangle.
-        val stacked = runCatching { WinShell.isAbove(hwnd, owner) }.getOrNull()
+        // EnumWindows-backed z-order checks are costly. Check stacking at most
+        // once per second; every actual geometry change still repairs it now.
+        val now = System.currentTimeMillis()
+        val stackDue = now - lastSurfaceStackCheckAt >= 1_000L
+        val stacked = if (stackDue) {
+            lastSurfaceStackCheckAt = now
+            runCatching { WinShell.isAbove(hwnd, owner) }.getOrNull()
+        } else {
+            true
+        }
         if (live != null && live.contentEquals(target) && stacked == true) {
             lastSyncNote = "already placed " + target.joinToString(",")
             return
         }
         placeCount++
         val moved = WinShell.placeAbove(hwnd, owner, target[0], target[1], target[2], target[3])
+        lastSurfaceStackCheckAt = now
         val liveAfter = WinShell.windowRect(hwnd)
         val took = liveAfter != null && liveAfter[0] == target[0] && liveAfter[1] == target[1] &&
             kotlin.math.abs(liveAfter[2] - target[2]) <= 2 && kotlin.math.abs(liveAfter[3] - target[3]) <= 2
@@ -2798,8 +2829,12 @@ object PlayerWindow {
         }
         Thread(
             {
+                // Key auto-repeat can enqueue several intents while mpv is busy.
+                // Only the newest intent is relevant; discard stale work BEFORE
+                // it touches the IPC pipe.
+                if (gen != toggleGen) return@Thread
                 var ok = h.command(1_200L, "set_property", "pause", want) != null
-                if (!ok) ok = h.command(1_200L, "set_property", "pause", want) != null
+                if (!ok && gen == toggleGen) ok = h.command(1_200L, "set_property", "pause", want) != null
                 if (gen != toggleGen) return@Thread
                 if (!ok) {
                     Fx.run {
@@ -3137,6 +3172,10 @@ object PlayerWindow {
     private fun sendSeekChecked(h: MpvIpc, pos: Double) {
         val gen = ++seekVerifyGen
         seekVerifier.execute {
+            // Repeated arrow-key events used to leave obsolete 1.8s IPC checks
+            // queued behind one another. Skip superseded targets before sending;
+            // only the latest position from a held key needs to reach mpv.
+            if (gen != seekVerifyGen) return@execute
             val reply = runCatching { h.command(1_800L, "seek", pos, "absolute") }.getOrNull()
             if (gen != seekVerifyGen) return@execute
             val err = reply?.optString("error").orEmpty()
@@ -3255,7 +3294,8 @@ object PlayerWindow {
     private fun uninstallKeys() {
         val filter = keyFilter ?: return
         keyFilter = null
-        runCatching { AppShell.playerHost.scene?.removeEventFilter(KeyEvent.KEY_PRESSED, filter) }
+        runCatching { keysSceneHooked?.removeEventFilter(KeyEvent.KEY_PRESSED, filter) }
+        keysSceneHooked = null
     }
 
     private fun handleKey(e: KeyEvent) {
@@ -3287,13 +3327,16 @@ object PlayerWindow {
     private fun setVolume(next: Double) {
         val clamped = next.coerceIn(0.0, 130.0)
         volume = clamped
-        runCatching { ipc?.setProperty("volume", clamped) }
+        // setProperty waits up to 1.2s for mpv. This handler runs on JavaFX's
+        // thread, so a slow player used to freeze the entire desktop UI on every
+        // Up/Down key. post() is non-blocking; the observed property updates UI.
+        runCatching { ipc?.post("set_property", "volume", clamped) }
         // Raising the volume unmutes mpv-side too: without this a volume key
         // after `M` would move a number mpv keeps ignoring while `mute` stays
         // set (muted at 100 looks broken, not loud).
         if (clamped > 0.0 && muted) {
             muted = false
-            runCatching { ipc?.setProperty("mute", false) }
+            runCatching { ipc?.post("set_property", "mute", false) }
         }
         refreshMuteIcon()
         setStatus("Volume ${clamped.roundToInt()}%", busy = false)
