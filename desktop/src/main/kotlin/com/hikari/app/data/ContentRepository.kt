@@ -210,13 +210,10 @@ class ContentRepository(private val manager: ProviderManager) {
                 scope.async {
                     gate.withPermit {
                         val items = cancellableCatching {
-                            // Generous per-provider budget — heavy scrapers (e.g.
-                            // MRDS) fetch several pages AND download/decrypt every
-                            // poster into a data: URI before returning, which can
-                            // take 1-3 minutes on a slow network. CloudStream has
-                            // no such cap, so it shows those results while a short
-                            // cap here used to blank them ("Nothing matched").
-                            withTimeoutOrNull(240_000) { p.search(query, page) } ?: emptyList()
+                            // Fail fast per provider: a hung scraper must not hold
+                            // search for minutes. 20s is ample for a provider to
+                            // prove it has results; slow ones are skipped.
+                            withTimeoutOrNull(20_000) { p.search(query, page) } ?: emptyList()
                         }.getOrDefault(emptyList())
                         aggregate.value = (aggregate.value + items).distinctBy { it.uniqueId }
                     }
@@ -228,7 +225,7 @@ class ContentRepository(private val manager: ProviderManager) {
             var lastEmitted: List<MediaItem>? = null
             while (true) {
                 val allDone = jobs.all { it.isCompleted }
-                val timedOut = System.currentTimeMillis() - started > 250_000
+                val timedOut = System.currentTimeMillis() - started > 30_000
                 if (allDone || timedOut) {
                     emit(translateItems(aggregate.value))
                     break
