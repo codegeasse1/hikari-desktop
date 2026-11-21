@@ -202,20 +202,27 @@ object PosterCard {
         moreButton?.let { Ui.isolateClicks(it) }
 
         card.setOnMouseEntered {
+            // Reuse + stop previous transitions: fast mouse moves across a rail
+            // used to pile up dozens of running Scale/Fade timelines (one per
+            // enter/exit), which saturated the FX pulse and made rails feel laggy.
+            (card.properties["hikari-scale"] as? ScaleTransition)?.stop()
             ScaleTransition(Duration.millis(130.0), card).apply {
                 toX = 1.035
                 toY = 1.035
                 interpolator = Interpolator.EASE_OUT
+                card.properties["hikari-scale"] = this
                 play()
             }
             fade(playButton, 1.0)
             moreButton?.let { fade(it, 1.0) }
         }
         card.setOnMouseExited {
+            (card.properties["hikari-scale"] as? ScaleTransition)?.stop()
             ScaleTransition(Duration.millis(140.0), card).apply {
                 toX = 1.0
                 toY = 1.0
                 interpolator = Interpolator.EASE_OUT
+                card.properties["hikari-scale"] = this
                 play()
             }
             fade(playButton, 0.0)
@@ -226,8 +233,10 @@ object PosterCard {
     }
 
     private fun fade(node: Node, to: Double) {
+        (node.properties["hikari-fade"] as? FadeTransition)?.stop()
         FadeTransition(Duration.millis(140.0), node).apply {
             toValue = to
+            node.properties["hikari-fade"] = this
             play()
         }
     }
