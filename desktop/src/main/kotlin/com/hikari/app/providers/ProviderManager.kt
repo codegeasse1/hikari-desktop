@@ -5,12 +5,18 @@ import com.hikari.app.data.AppStore
 import com.hikari.app.data.ProviderConfig
 import com.hikari.app.data.ProviderType
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 /** One line of truth about a configured provider: did it start, and why not? */
 data class ProviderStatus(
@@ -55,32 +61,40 @@ class ProviderManager(private val store: AppStore) {
             val keys = configs.associateWith { cacheKey(it) }
             // Drop the instances of providers that are gone or have changed.
             instances.keys.retainAll(keys.values.toHashSet())
-            val statuses = mutableListOf<ProviderStatus>()
-            val loaded = configs.mapNotNull { c ->
-                val key = keys.getValue(c)
-                instances[key]?.let { cached ->
-                    statuses += ProviderStatus(c.id, c.name, c.type, loaded = true, error = null)
-                    return@mapNotNull cached
-                }
-                try {
-                    val p = instantiate(c)
-                    if (p == null) {
-                        statuses += ProviderStatus(c.id, c.name, c.type, loaded = false, error = "no provider instance")
-                        null
-                    } else {
-                        instances[key] = p
-                        statuses += ProviderStatus(c.id, c.name, c.type, loaded = true, error = null)
-                        p
+            // Instantiate in parallel (max 4 at once): sequential init made an
+            // extension install feel like a stall long after the download had
+            // finished, because the refresh re-loaded every OTHER extension too.
+            // Each instantiate gets 15s before it is left behind — one wedged
+            // dex/plugin must never block the whole list.
+            val gate = kotlinx.coroutines.sync.Semaphore(4)
+            val results = kotlinx.coroutines.coroutineScope {
+                configs.map { c ->
+                    async {
+                        gate.withPermit {
+                            val key = keys.getValue(c)
+                            instances[key]?.let { cached -> return@async (cached to ProviderStatus(c.id, c.name, c.type, loaded = true, error = null)) }
+                            try {
+                                val p = kotlinx.coroutines.withTimeoutOrNull(15_000L) { instantiate(c) }
+                                if (p == null) {
+                                    null to ProviderStatus(c.id, c.name, c.type, loaded = false, error = "init timed out or no provider instance")
+                                } else {
+                                    instances[key] = p
+                                    p to ProviderStatus(c.id, c.name, c.type, loaded = true, error = null)
+                                }
+                            } catch (t: Throwable) {
+                                if (t is kotlinx.coroutines.CancellationException) throw t
+                                // One broken addon must never blank the whole list — skip it,
+                                // but record WHY so the UI can show it instead of a blank Home.
+                                val msg = t.message?.take(400) ?: t.javaClass.simpleName
+                                System.err.println("Provider init failed for ${c.name} (${c.type}): $t")
+                                null to ProviderStatus(c.id, c.name, c.type, loaded = false, error = msg)
+                            }
+                        }
                     }
-                } catch (t: Throwable) {
-                    // One broken addon must never blank the whole list — skip it,
-                    // but record WHY so the UI can show it instead of a blank Home.
-                    val msg = t.message?.take(400) ?: t.javaClass.simpleName
-                    statuses += ProviderStatus(c.id, c.name, c.type, loaded = false, error = msg)
-                    System.err.println("Provider init failed for ${c.name} (${c.type}): $t")
-                    null
-                }
+                }.awaitAll()
             }
+            val loaded = results.mapNotNull { it.first }
+            val statuses = results.map { it.second }
             _providers.value = loaded
             _statuses.value = statuses
             _initialized.value = true

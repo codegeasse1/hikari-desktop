@@ -35,31 +35,31 @@ class ContentRepository(private val manager: ProviderManager) {
         }
 
     private data class CachedRow(val row: CatalogRow, val at: Long)
-    private val rowCache = HashMap<String, CachedRow>()
+    private val rowCache = java.util.concurrent.ConcurrentHashMap<String, CachedRow>()
     private val ROW_CACHE_TTL_MS = 5 * 60_000L
 
     private companion object {
         /** How long [streamsFor] waits for the FIRST playable source before
          *  handing back what it has. Playback starts on the first server, not on
          *  the slowest extension; the rest of the sweep keeps running. */
-        const val FIRST_SOURCE_WAIT_MS = 14_000L
+        const val FIRST_SOURCE_WAIT_MS = 8_000L
 
         /** Extra first-source wait for HIKARI extensions: their template
          *  re-fetches a remote config + translates every title on first touch,
          *  so the first answer legitimately takes longer than a Stremio
          *  manifest. Without this the lookup timed out while the provider was
          *  still warming up ("No playable source" with a healthy catalog). */
-        const val FIRST_SOURCE_WAIT_HIKARI_MS = 20_000L
+        const val FIRST_SOURCE_WAIT_HIKARI_MS = 12_000L
 
         /** How long one provider gets to answer a stream lookup before it is
          *  left behind by the rest of the family. */
-        const val SOURCE_BUDGET_MS = 40_000L
+        const val SOURCE_BUDGET_MS = 20_000L
 
         /** The same, for HIKARI extensions (see above). */
-        const val SOURCE_BUDGET_HIKARI_MS = 60_000L
+        const val SOURCE_BUDGET_HIKARI_MS = 30_000L
 
         /** The same, for the title-search wave (search + episodes + streams). */
-        const val TITLE_BUDGET_MS = 55_000L
+        const val TITLE_BUDGET_MS = 25_000L
 
         /** Providers asked at the same time in a wave. More than this starves
          *  the shared HTTP pools for no visible gain. */
@@ -113,7 +113,7 @@ class ContentRepository(private val manager: ProviderManager) {
         // Ask up to 12 providers x up to 3 catalogs, skipping blank refs, so one
         // bad catalog never blanks a provider and 8 bad providers never blank Home.
         val useProviders = if (allProviders) {
-            val cachedIds = runCatching { synchronized(rowCache) { rowCache.keys.toSet() } }.getOrDefault(emptySet())
+            val cachedIds = runCatching { rowCache.keys.toSet() }.getOrDefault(emptySet())
             active.sortedByDescending { p -> cachedIds.any { it.startsWith(p.config.id + "|") } }.take(12)
         } else active
         val catalogsLimit = if (allProviders) 3 else 10
@@ -131,7 +131,7 @@ class ContentRepository(private val manager: ProviderManager) {
                 async {
                     cancellableCatching {
                         providerGate.withPermit {
-                            withTimeoutOrNull(30_000) {
+                            withTimeoutOrNull(12_000) {
                                 val catalogs = p.catalogs()
                                     .filter { it.id.isNotBlank() || it.name.isNotBlank() }
                                     .distinctBy { it.type to it.id }
@@ -146,7 +146,7 @@ class ContentRepository(private val manager: ProviderManager) {
                                                     onRow(cached.row)
                                                     return@async cached.row
                                                 }
-                                                val items = withTimeoutOrNull(25_000) {
+                                                val items = withTimeoutOrNull(10_000) {
                                                     cancellableCatching { p.getCatalog(c, 1) }.getOrDefault(emptyList())
                                                 }.orEmpty().distinctBy { it.uniqueId }.take(itemsLimit)
                                                 if (items.isEmpty()) null

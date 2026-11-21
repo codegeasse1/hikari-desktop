@@ -35,7 +35,7 @@ object Fx {
      * Run on the FX thread and block until it completes. Must never be called
      * from the FX thread itself.
      */
-    fun <T> runBlock(block: () -> T): T {
+    fun <T> runBlock(block: () -> T, timeoutMs: Long = 5_000L): T {
         if (Platform.isFxApplicationThread()) return block()
         val latch = CountDownLatch(1)
         val res = AtomicReference<Result<T>>()
@@ -43,7 +43,11 @@ object Fx {
             res.set(runCatching { block() })
             latch.countDown()
         }
-        latch.await()
+        // Never hang forever: if the FX thread is wedged (long layout, modal),
+        // fail fast instead of freezing the caller thread + IO pool with it.
+        if (!latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+            throw java.util.concurrent.TimeoutException("Fx.runBlock timed out after ${timeoutMs}ms")
+        }
         return res.get().getOrThrow()
     }
 

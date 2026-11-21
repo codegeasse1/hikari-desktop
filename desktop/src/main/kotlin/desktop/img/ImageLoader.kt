@@ -24,8 +24,10 @@ import java.util.concurrent.ConcurrentHashMap
  */
 object ImageLoader {
 
-    private val mem = object : LinkedHashMap<String, Image>(512, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Image>?): Boolean = size > 1024
+    private val mem = object : LinkedHashMap<String, Image>(256, 0.75f, true) {
+        // 350 entries max (~poster 340x510 decoded): Home renders hundreds of
+        // cards and a 1024-entry full-res cache OOMs low-end machines.
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Image>?): Boolean = size > 350
     }
 
     private val diskDir: File by lazy {
@@ -39,7 +41,7 @@ object ImageLoader {
     /** Cap on simultaneous network image fetches — Home renders hundreds of
      *  posters at once and firing them all concurrently starves the IO pool
      *  and makes the UI lag on weak networks. */
-    private val gate = java.util.concurrent.Semaphore(10)
+    private val gate = java.util.concurrent.Semaphore(8)
 
     /** Hosts that 403 any image request carrying a Referer (verified in the
      *  Android app: same-origin referer => 403, bare request => 200). */
@@ -94,10 +96,12 @@ object ImageLoader {
                 // Decode DOWNSCALED: a full-res CDN poster can be 1.5-6MB of
                 // pixels; with hundreds of cards that OOMs the app (the crash
                 // on Home). Requesting a small decode bounds total memory.
+                // Unspecified sizes still cap at 480px wide so a 4K backdrop
+                // never explodes the heap when shown as a small card.
                 if (w > 0 && h > 0) {
                     Image(ByteArrayInputStream(bytes), w.toDouble(), h.toDouble(), true, true)
                 } else {
-                    Image(ByteArrayInputStream(bytes))
+                    Image(ByteArrayInputStream(bytes), 480.0, 720.0, true, true)
                 }
             }.getOrNull()
         }

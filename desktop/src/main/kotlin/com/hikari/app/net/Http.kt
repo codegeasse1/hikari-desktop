@@ -38,13 +38,26 @@ object Http {
         // (or a local proxy/VPN must be used), the system ProxySelector and the
         // DoH-first resolver below let the app reach what the user's browser can.
         System.setProperty("java.net.useSystemProxies", "true")
+        // Tight timeouts: Home fires dozens of catalog/stream requests in
+        // parallel — a 20s connect + 30s read lets one black-holed host hold IO
+        // threads and freeze the UI. Fail fast (8s/15s) and let the mirror
+        // ladder / retry pick the working copy instead.
+        val dispatcher = okhttp3.Dispatcher().apply {
+            maxRequests = 64
+            maxRequestsPerHost = 8
+        }
+        val pool = okhttp3.ConnectionPool(32, 5, TimeUnit.MINUTES)
         client = applyConscryptTls(OkHttpClient.Builder())
             .proxySelector(java.net.ProxySelector.getDefault())
             .dns(HikariDns)
             .followRedirects(true)
             .followSslRedirects(true)
-            .connectTimeout(20, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(15, TimeUnit.SECONDS)
+            .callTimeout(25, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(true)
+            .dispatcher(dispatcher)
+            .connectionPool(pool)
             .build()
     }
 
@@ -1150,10 +1163,10 @@ object Http {
      *  mirrors are allowed to answer. A blocked origin usually fails in
      *  milliseconds (connection reset / TLS refusal), so this window is only
      *  ever fully spent on a black-holed host. */
-    private const val ORIGIN_WINDOW_MS = 9_000L
+    private const val ORIGIN_WINDOW_MS = 6_000L
 
     /** How long the mirror wave gets per network pass. */
-    private const val MIRROR_WINDOW_MS = 15_000L
+    private const val MIRROR_WINDOW_MS = 10_000L
 
     /** How many mirror candidates are raced at once. Four covers the realistic
      *  "one CDN + one proxy frontdoor + the origin" spread without hammering a
@@ -1529,10 +1542,10 @@ object Http {
 
     /** Hard cap for a repo fetch so a slow/blocked network fails with a clear
      *  error instead of leaving the UI stuck on "Checking…" for minutes. */
-    private const val REPO_FETCH_DEADLINE_MS = 30_000L
+    private const val REPO_FETCH_DEADLINE_MS = 20_000L
 
     /** Overall budget for one extension download (all mirrors + retries). */
-    private const val DOWNLOAD_BUDGET_MS = 60_000L
+    private const val DOWNLOAD_BUDGET_MS = 45_000L
 
     /** Fetches a repo.json, trying every candidate URL. Only accepts a response
      *  that is actually a JSON object with a "plugins" key — or a CloudStream v2
@@ -2990,8 +3003,8 @@ object Http {
     }
 
     /** How long one wave of raced mirrors may take before the next wave starts. */
-    private const val MAIN_RACE_MS = 45_000L
-    private const val RESCUE_RACE_MS = 20_000L
+    private const val MAIN_RACE_MS = 25_000L
+    private const val RESCUE_RACE_MS = 12_000L
 
     /**
      * How long the AUTHORITATIVE hosts alone get before the mirrors are brought
@@ -3006,7 +3019,7 @@ object Http {
      * the wire, or a connect that failed outright) and it costs a working origin
      * nothing, because the second wave includes the origins again.
      */
-    private const val ORIGIN_FIRST_MS = 12_000L
+    private const val ORIGIN_FIRST_MS = 6_000L
 
     /**
      * The origin window for a RELEASE ASSET, which is much shorter for a
@@ -3214,7 +3227,7 @@ object Http {
 
     /** How long one OS-client attempt may take. curl is a ~50ms process, so a
      *  window this size is only ever spent on a host that is black-holing. */
-    private const val OS_WINDOW_MS = 25_000L
+    private const val OS_WINDOW_MS = 12_000L
 
     /** How many candidate URLs are handed to the OS client at once. */
     private const val OS_PARALLELISM = 4
