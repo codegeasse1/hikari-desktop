@@ -4,6 +4,7 @@ import com.hikari.app.cs3.Cs3MainApiProvider
 import com.hikari.app.data.AppStore
 import com.hikari.app.data.ProviderConfig
 import com.hikari.app.data.ProviderType
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -66,15 +67,15 @@ class ProviderManager(private val store: AppStore) {
             // finished, because the refresh re-loaded every OTHER extension too.
             // Each instantiate gets 15s before it is left behind — one wedged
             // dex/plugin must never block the whole list.
-            val gate = kotlinx.coroutines.sync.Semaphore(4)
-            val results = kotlinx.coroutines.coroutineScope {
+            val gate = Semaphore(4)
+            val results = coroutineScope {
                 configs.map { c ->
                     async {
                         gate.withPermit {
                             val key = keys.getValue(c)
                             instances[key]?.let { cached -> return@async (cached to ProviderStatus(c.id, c.name, c.type, loaded = true, error = null)) }
                             try {
-                                val p = kotlinx.coroutines.withTimeoutOrNull(15_000L) { instantiate(c) }
+                                val p = withTimeoutOrNull(15_000L) { instantiate(c) }
                                 if (p == null) {
                                     null to ProviderStatus(c.id, c.name, c.type, loaded = false, error = "init timed out or no provider instance")
                                 } else {
@@ -82,7 +83,7 @@ class ProviderManager(private val store: AppStore) {
                                     p to ProviderStatus(c.id, c.name, c.type, loaded = true, error = null)
                                 }
                             } catch (t: Throwable) {
-                                if (t is kotlinx.coroutines.CancellationException) throw t
+                                if (t is CancellationException) throw t
                                 // One broken addon must never blank the whole list — skip it,
                                 // but record WHY so the UI can show it instead of a blank Home.
                                 val msg = t.message?.take(400) ?: t.javaClass.simpleName
