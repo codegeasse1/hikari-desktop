@@ -66,7 +66,7 @@ object FxWebView {
     /** Loads [url] and returns the rendered DOM HTML (null on failure/timeout). */
     fun renderedHtml(url: String, timeoutMs: Long = 25_000): String? {
         engineLock.lock()
-        try {
+        return try {
         ensure()
         Fx.runBlock {
             runCatching { engine.load(url) }
@@ -91,7 +91,7 @@ object FxWebView {
             }
             if (System.currentTimeMillis() > deadline - 1200) break
         }
-        return lastHtml
+        lastHtml
         } finally {
             engineLock.unlock()
         }
@@ -110,7 +110,7 @@ object FxWebView {
         // Fail fast when the engine is busy (a catalog/WAF pass owns it):
         // posters must never queue 20s holds behind each other — see engineLock.
         if (!engineLock.tryLock()) return null
-        try {
+        return try {
         ensure()
         Fx.runBlock {
             runCatching { engine.load(url) }
@@ -187,7 +187,7 @@ object FxWebView {
         timeoutMs: Long,
     ): Capture {
         engineLock.lock()
-        try {
+        return try {
         ensure()
         Fx.runBlock {
             runCatching { engine.load(url) }
