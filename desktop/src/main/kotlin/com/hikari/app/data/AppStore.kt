@@ -55,7 +55,16 @@ class AppStore(private val dir: File) {
         saver.execute {
             runCatching { Thread.sleep(250L) }
             val snapshot: String = synchronized(lock) { saveQueued = false; json.toString() }
-            runCatching { file.parentFile?.mkdirs(); file.writeText(snapshot) }
+            runCatching {
+                file.parentFile?.mkdirs()
+                // Atomic write: crash mid-save must never truncate hikari.json.
+                val tmp = File(file.parentFile, file.name + ".tmp")
+                tmp.writeText(snapshot)
+                if (!tmp.renameTo(file)) {
+                    file.delete()
+                    tmp.renameTo(file)
+                }
+            }
         }
     }
 
