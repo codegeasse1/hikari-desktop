@@ -12,7 +12,6 @@ import com.hikari.app.data.SubtitleSource
 import com.hikari.app.net.Http
 import com.hikari.app.providers.ContentProvider
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
@@ -170,12 +169,10 @@ class NuvioScraper(override val config: ProviderConfig) : ContentProvider {
         // home screen has to list providers anyway, so the DataStore value is
         // hot by the time any catalog row is rendered.)
         val ordinal = runCatching {
-            runBlocking {
-                HikariApp.instance.store.providers()
-                    .filter { it.type == ProviderType.NUVIO && nicheOf(it.name) == niche }
-                    .sortedBy { it.name.lowercase() }
-                    .indexOfFirst { it.id == config.id }
-            }
+            HikariApp.instance.store.providers()
+                .filter { it.type == ProviderType.NUVIO && nicheOf(it.name) == niche }
+                .sortedBy { it.name.lowercase() }
+                .indexOfFirst { it.id == config.id }
         }.getOrDefault(-1)
         val offset = if (ordinal >= 0) ordinal else h
         when (niche) {

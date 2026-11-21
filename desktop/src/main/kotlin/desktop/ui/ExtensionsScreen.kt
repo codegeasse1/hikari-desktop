@@ -29,8 +29,14 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Extensions: everything that feeds the app content.
@@ -1527,25 +1533,46 @@ class ExtensionsScreenView {
         val fileName = manifestFileName(kind)
         val candidates = manifestCandidates(url, fileName)
         if (candidates.isEmpty()) return Result.failure(Exception("Enter a repo URL"))
-        var last: Throwable? = null
-        for (candidate in candidates) {
-            onStep?.invoke("Fetching $fileName…")
-            val text = Http.fetchStringRobust(candidate).getOrNull()
-            if (text == null) {
-                last = Exception("Could not fetch $candidate")
-                continue
-            }
-            if (kind == RepoKind.ANIYOMI) {
-                val arr = runCatching { JSONArray(text) }.getOrNull()
-                if (arr != null && arr.length() > 0) return Result.success(Manifest(candidate, null, arr))
-                last = Exception("Invalid $fileName — expected a JSON array of extensions")
-            } else {
-                val root = runCatching { JSONObject(text) }.getOrNull()
-                if (root != null) return Result.success(Manifest(candidate, root, null))
-                last = Exception("Invalid $fileName")
-            }
+        onStep?.invoke("Fetching $fileName… (${candidates.size} locations)")
+        // Race all candidate locations in parallel: sequential tries made one
+        // black-holed URL cost the whole catalogue (each fetchStringRobust runs
+        // its own mirror ladder). First valid manifest wins, 20s overall cap.
+        // Blocking (callers run on IO/setup threads), so a small executor + futures.
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(minOf(candidates.size, 4)) { r ->
+            Thread(r, "hikari-manifest-race").apply { isDaemon = true }
         }
-        return Result.failure(last ?: Exception("No candidate URL served $fileName"))
+        try {
+            val futures = candidates.map { candidate ->
+                pool.submit<Manifest?> {
+                    val text = Http.fetchStringRobust(candidate).getOrNull() ?: return@submit null
+                    if (kind == RepoKind.ANIYOMI) {
+                        val arr = runCatching { JSONArray(text) }.getOrNull()
+                        if (arr != null && arr.length() > 0) Manifest(candidate, null, arr) else null
+                    } else {
+                        val root = runCatching { JSONObject(text) }.getOrNull()
+                        if (root != null) Manifest(candidate, root, null) else null
+                    }
+                }
+            }
+            val deadline = System.currentTimeMillis() + 20_000L
+            while (System.currentTimeMillis() < deadline) {
+                for (f in futures) {
+                    if (f.isDone) {
+                        val got = runCatching { f.get() }.getOrNull()
+                        if (got != null) {
+                            futures.forEach { runCatching { it.cancel(true) } }
+                            return Result.success(got)
+                        }
+                    }
+                }
+                if (futures.all { it.isDone }) break
+                try { Thread.sleep(50L) } catch (_: InterruptedException) { break }
+            }
+            futures.forEach { runCatching { it.cancel(true) } }
+        } finally {
+            pool.shutdownNow()
+        }
+        return Result.failure(Exception("No candidate URL served $fileName — check the URL and network, then Try again"))
     }
 
     /** Reads a repo's plugin list for its [kind]: an Aniyomi index array, a
@@ -1598,24 +1625,27 @@ class ExtensionsScreenView {
                     }
                 }
                 fun addList(listUrl: String) {
+                    if (listUrl.isBlank()) return
                     val text = Http.fetchStringRobust(listUrl).getOrNull() ?: return
                     addSky(runCatching { JSONArray(text) }.getOrNull())
                 }
                 addSky(root.optJSONArray("plugins"))
+                // Bound nested fetches: an unbounded repo-of-repos fan-out turns
+                // one catalogue open into dozens of mirror-ladder races.
                 root.optJSONArray("pluginLists")?.let { lists ->
-                    for (i in 0 until lists.length()) {
+                    for (i in 0 until minOf(lists.length(), 5)) {
                         addList(lists.optString(i))
                     }
                 }
                 root.optJSONArray("repos")?.let { nested ->
-                    for (i in 0 until nested.length()) {
+                    for (i in 0 until minOf(nested.length(), 5)) {
                         val nestedUrl = nested.optString(i).trim()
                         if (nestedUrl.isBlank()) continue
                         val nestedText = Http.fetchStringRobust(nestedUrl).getOrNull() ?: continue
                         val nestedRoot = runCatching { JSONObject(nestedText) }.getOrNull() ?: continue
                         addSky(nestedRoot.optJSONArray("plugins"))
                         nestedRoot.optJSONArray("pluginLists")?.let { lists ->
-                            for (j in 0 until lists.length()) addList(lists.optString(j))
+                            for (j in 0 until minOf(lists.length(), 5)) addList(lists.optString(j))
                         }
                     }
                 }

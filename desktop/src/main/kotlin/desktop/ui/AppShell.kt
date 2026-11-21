@@ -419,9 +419,16 @@ object AppShell {
     val lastCatalog = mutableMapOf<String, List<MediaItem>>()
 
     fun show(screen: Screen, remember: Boolean = true) {
-        if (remember && screen != currentScreen) {
-            backStack.addLast(currentScreen)
+        val leaving = currentScreen
+        if (remember && screen != leaving) {
+            backStack.addLast(leaving)
             while (backStack.size > 24) backStack.pollFirst()
+        }
+        // Stop background work on the screen being left (hero auto-rotate,
+        // pending loads). Without this the home timer kept stepping a detached
+        // hero and its image loads while the user was elsewhere.
+        if (leaving is Screen.Home && screen !is Screen.Home) {
+            runCatching { homeScreen.onHidden() }
         }
         currentScreen = screen
         // Takeover states own the chrome: the detail screen and source

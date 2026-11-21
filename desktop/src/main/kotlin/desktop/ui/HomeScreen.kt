@@ -245,7 +245,16 @@ class HomeScreenView {
     }
 
     fun onShown() {
+        heroTimer?.play()
         load()
+    }
+
+    fun onHidden() {
+        // Stop the auto-rotate when leaving: AppShell swaps centerStack children
+        // without clearing the scene, so the scene listener never fires and the
+        // timer kept stepping a detached hero (CPU + image loads in background).
+        heroTimer?.pause()
+        loadJob?.cancel()
     }
 
     /** A provider Explore asked for while we were elsewhere. Consumed on the
@@ -928,7 +937,9 @@ class HomeScreenView {
             padding = Insets(Theme.S1, Theme.S1, Theme.S2, Theme.S1)
             minWidth = 0.0
         }
-        row.items.forEach { raw ->
+        // Cap visible cards: 20 full poster nodes per rail x 10 rails = 200
+        // image loads at once. 14 is plenty for a rail (rest via View All).
+        row.items.take(14).forEach { raw ->
             val item = withUpgrade(raw)
             // The repaint hook keeps this card upgradable in place (see
             // [upgradeArt]): same node for life, so upgrades never eat clicks.
@@ -970,7 +981,7 @@ class HomeScreenView {
     private fun themed(text: String, cls: String): Label = Label(text).apply { styleClass.add(cls) }
 
     private companion object {
-        const val HERO_H = 440.0
+        const val HERO_H = 380.0
         const val CW_W = 320.0
         const val CW_H = 180.0
         /** Cinema card frame: 16:9, the PC-friendly home layout (default). */
