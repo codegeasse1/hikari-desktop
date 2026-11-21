@@ -285,7 +285,17 @@ object ImageLoader {
     }
 
     private fun writeDisk(disk: File, bytes: ByteArray) {
-        runCatching { disk.parentFile?.mkdirs(); disk.writeBytes(bytes) }
+        runCatching {
+            disk.parentFile?.mkdirs(); disk.writeBytes(bytes)
+            // Bound disk growth: posters accumulate fast (thousands of files).
+            // Prune oldest when over 500MB or 2000 files so the cache never
+            // fills the disk on long use.
+            val dir = disk.parentFile ?: return@runCatching
+            val files = dir.listFiles() ?: return@runCatching
+            if (files.size > 2000 || files.sumOf { it.length() } > 500L * 1024L * 1024L) {
+                files.sortedBy { it.lastModified() }.take(files.size / 5 + 1).forEach { runCatching { it.delete() } }
+            }
+        }
     }
 
     /** Real image magic bytes — a WAF challenge page served with 200 to a bot

@@ -2119,7 +2119,7 @@ class DetailScreenView(private val item: MediaItem) {
                 if (javafx.application.Platform.isFxApplicationThread()) source
                 else runCatching {
                     kotlinx.coroutines.runBlocking {
-                        kotlinx.coroutines.withTimeoutOrNull(15_000L) { AppShell.app.repository.streamsFor(meta, ep) }
+                        kotlinx.coroutines.withTimeoutOrNull(8_000L) { AppShell.app.repository.streamsFor(meta, ep) }
                     }
                 }.getOrNull()?.firstOrNull() ?: source
             },

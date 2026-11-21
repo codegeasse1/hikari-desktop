@@ -25,7 +25,16 @@ class AppStore(private val dir: File) {
     init {
         synchronized(lock) {
             if (file.exists()) {
-                runCatching { json = JSONObject(file.readText()) }.onFailure { file.delete() }
+                runCatching { json = JSONObject(file.readText()) }.onFailure {
+                    // Never delete user data on a corrupt write: keep a timestamped
+                    // backup so favorites/history survive a crash mid-save.
+                    runCatching {
+                        val bak = File(dir, "hikari.json.corrupt-${System.currentTimeMillis()}.bak")
+                        file.copyTo(bak, overwrite = true)
+                    }
+                    runCatching { file.delete() }
+                    json = JSONObject()
+                }
             }
         }
     }
