@@ -162,7 +162,7 @@ class ExploreScreenView {
             var fail: Throwable? = null
             for (attempt in 0..1) {
                 try {
-                    loaded = kotlinx.coroutines.withTimeout(if (attempt == 0) 20_000L else 45_000L) {
+                    loaded = kotlinx.coroutines.withTimeout(if (attempt == 0) 12_000L else 20_000L) {
                         val rows = AppShell.app.repository.homeRows(providerId = p.id)
                         rows.flatMap { it.items }.distinctBy { it.uniqueId }.take(150)
                     }
