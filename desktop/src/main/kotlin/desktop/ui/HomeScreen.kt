@@ -936,10 +936,9 @@ class HomeScreenView {
             padding = Insets(Theme.S1, Theme.S1, Theme.S2, Theme.S1)
             minWidth = 0.0
         }
-        // Cap visible cards: 10 full poster nodes per rail — 14 used to pin
-        // ~140 textures plus the hero and scroll degraded to 1fps on
-        // low-end machines (the rest is one click away via View All).
-        row.items.take(10).forEach { raw ->
+        // Keep each non-virtualized rail small. The complete catalog remains
+        // available through View All; Home prioritizes scroll responsiveness.
+        row.items.take(8).forEach { raw ->
             val item = withUpgrade(raw)
             // The repaint hook keeps this card upgradable in place (see
             // [upgradeArt]): same node for life, so upgrades never eat clicks.
