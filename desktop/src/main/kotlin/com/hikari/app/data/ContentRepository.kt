@@ -110,14 +110,16 @@ class ContentRepository(private val manager: ProviderManager) {
         // All-providers Home used to ask only the FIRST 8 providers' FIRST catalog:
         // one blank catalog (e.g. a provider returning a single '' row) erased the
         // whole provider, and 8 slow/broken providers erased Home entirely.
-        // Ask up to 12 providers x up to 3 catalogs, skipping blank refs, so one
-        // bad catalog never blanks a provider and 8 bad providers never blank Home.
+        // Keep the all-provider feed deliberately small: the desktop Home uses a
+        // non-virtualized JavaFX ScrollPane, so every returned row becomes live
+        // scene-graph nodes. Six providers x two catalogs bounds first-paint
+        // work while the full provider list remains available in Explore.
         val useProviders = if (allProviders) {
             val cachedIds = runCatching { rowCache.keys.toSet() }.getOrDefault(emptySet())
-            active.sortedByDescending { p -> cachedIds.any { it.startsWith(p.config.id + "|") } }.take(12)
+            active.sortedByDescending { p -> cachedIds.any { it.startsWith(p.config.id + "|") } }.take(6)
         } else active
-        val catalogsLimit = if (allProviders) 3 else 10
-        val itemsLimit = 20
+        val catalogsLimit = if (allProviders) 2 else 8
+        val itemsLimit = 12
         // GLOBAL gates shared by ALL providers (not per-provider): with dozens
         // of installed extensions, per-provider limits multiplied into hundreds
         // of concurrent network requests which saturated the IO pool and froze
