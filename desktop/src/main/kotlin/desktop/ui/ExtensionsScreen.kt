@@ -2,6 +2,7 @@ package desktop.ui
 
 import com.hikari.app.HikariApp
 import com.hikari.app.cs3.Cs3PluginManager
+import com.hikari.app.cs3.DexJar
 import com.hikari.app.data.Cs3Repo
 import com.hikari.app.data.ProviderConfig
 import com.hikari.app.data.ProviderType
@@ -99,6 +100,10 @@ class ExtensionsScreenView {
         val url: String,
         val fileHash: String?,
         val jarHash: String?,
+        // Pre-compiled JVM build published next to the dex archive
+        // (CloudStream repos: `jarUrl`). Installing it mounts with a plain
+        // class load — no dex translation — so it is the sub-second path.
+        val jarUrl: String? = null,
         val iconUrl: String? = null,
         val version: String? = null,
         val sizeLabel: String? = null,
@@ -1677,6 +1682,16 @@ class ExtensionsScreenView {
             val listedExt = url.substringBefore('?').substringAfterLast('.', "")
                 .let { if (it.isEmpty()) null else ".$it".lowercase() }
             if (url.endsWith(".hiki")) url = url.removeSuffix(".hiki") + ".jar"
+            // CloudStream repos publish a pre-compiled JVM build next to the
+            // dex archive (`jarUrl`): it mounts with a plain class load, so
+            // installing it skips the seconds-long dex translation entirely —
+            // the same reason installs feel instant in the reference desktop
+            // port. The dex archive stays the fallback twin (see
+            // [siblingCandidates]) and each twin still verifies against its
+            // own hash (see [expectedShaFor]).
+            var jarUrl = p.optString("jarUrl").ifBlank { null }
+            if (baseUrl.isNotBlank()) jarUrl = jarUrl?.let { Http.resolveRelativeTo(it, baseUrl) }
+            if (url.substringBefore('?').lowercase().endsWith(".cs3") && !jarUrl.isNullOrBlank()) url = jarUrl
             // Icons are very often relative ("icons/x.png"): resolve them
             // against the manifest that named them, or every card blanks.
             val rawIcon = p.optString("iconUrl").ifBlank { p.optString("icon") }
@@ -1696,6 +1711,7 @@ class ExtensionsScreenView {
                 url = url,
                 fileHash = p.optString("fileHash").ifBlank { null },
                 jarHash = p.optString("jarHash").ifBlank { null },
+                jarUrl = jarUrl,
                 iconUrl = icon,
                 version = p.optString("version").ifBlank { null },
                 sizeLabel = sizeLabel,
@@ -2316,7 +2332,15 @@ class ExtensionsScreenView {
             // dex plugin, runs behind it and reconciles what was
             // registered (see [finishSetup]).
             val planned = registerFromManifest(name, safeName, dest, dl)
-            if (planned != null) {
+            // JVM bytecode mounts with a plain class load (milliseconds, the
+            // reference port's `-jvm.jar` path): do it here, inline, so the
+            // install completes the moment the bytes verify instead of
+            // parking the row on "Finishing setup…". Only a dex archive
+            // whose manifest read fine still takes the background setup
+            // phase below; anything else takes the slow synchronous path
+            // here, exactly as before.
+            val fastMount = planned != null && !DexJar.isDexArchive(dest)
+            if (planned != null && !fastMount) {
                 registered = planned
                 pendingSetup = true
                 break
