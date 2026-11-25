@@ -63,6 +63,7 @@ object WinShell {
         /** Whether a virtual key is currently held down (the high bit of the
          *  result). Used to notice a click on the video surface. */
         fun GetAsyncKeyState(vKey: Int): Short
+        fun GetForegroundWindow(): WinDef.HWND?
 
         /** A window's class name. Declared here rather than used from JNA's
          *  [User32]: this object only needs it for the report, and a name
