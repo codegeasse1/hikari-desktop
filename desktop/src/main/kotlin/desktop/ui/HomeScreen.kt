@@ -872,10 +872,15 @@ class HomeScreenView {
      */
     private fun upgradeArt(rows: List<CatalogRow>) {
         val myGen = gen
+        // Enrich every provider type through the same MediaItem resolver, not
+        // only providers that omit a backdrop. An extension can return a URL
+        // that technically exists but is a tiny thumbnail; TMDB must still
+        // get the chance to replace it. Keep the work bounded and off the FX
+        // thread so Home remains responsive while artwork upgrades arrive.
         val missing = rows.flatMap { it.items }
-            .filter { it.backdropUrl.isNullOrBlank() && !artUpgrades.containsKey(it.uniqueId) }
+            .filter { !artUpgrades.containsKey(it.uniqueId) && !posterUpgrades.containsKey(it.uniqueId) }
             .distinctBy { it.uniqueId }
-            .take(12)
+            .take(24)
         if (missing.isEmpty()) return
         AppShell.uiScope.launch {
             val gate = Semaphore(3)
@@ -936,10 +941,9 @@ class HomeScreenView {
             padding = Insets(Theme.S1, Theme.S1, Theme.S2, Theme.S1)
             minWidth = 0.0
         }
-        // Cap visible cards: 10 full poster nodes per rail — 14 used to pin
-        // ~140 textures plus the hero and scroll degraded to 1fps on
-        // low-end machines (the rest is one click away via View All).
-        row.items.take(10).forEach { raw ->
+        // Keep non-virtualized rails small. The complete catalog remains
+        // available through View All; Home prioritizes scroll responsiveness.
+        row.items.take(8).forEach { raw ->
             val item = withUpgrade(raw)
             // The repaint hook keeps this card upgradable in place (see
             // [upgradeArt]): same node for life, so upgrades never eat clicks.
