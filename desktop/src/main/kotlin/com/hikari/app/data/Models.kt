@@ -1,17 +1,24 @@
 package com.hikari.app.data
 
 enum class ProviderType {
-    STREMIO, UNIVERSAL, CS3, HIKARI, NUVIO, SKYSTREAM, ANIYOMI, IPTV;
+    STREMIO, UNIVERSAL, CS3, HIKARI, NUVIO, SKYSTREAM, ANIYOMI, IPTV,
+    VEGA, MANGA, SORA, ANYMEX, ANYMEX_MANGA, ZANGETSU, FORK_VIDEO;
 
     /** Which section of the player's server chooser a source from this engine
-     *  belongs to, so the picker reads as one group per engine. */
+     * belongs to, so the picker reads as one group per engine. */
     val groupLabel: String
         get() = when (this) {
             STREMIO -> "Stremio"
             NUVIO -> "Nuvio"
+            VEGA -> "Vega"
             CS3 -> "CloudStream"
             SKYSTREAM -> "SkyStream"
             ANIYOMI -> "Aniyomi"
+            MANGA -> "Manga"
+            SORA -> "Sora"
+            ANYMEX, ANYMEX_MANGA -> "Anymex"
+            ZANGETSU -> "Zangetsu"
+            FORK_VIDEO -> "Fork"
             IPTV -> "IPTV"
             HIKARI, UNIVERSAL -> "Hikari"
         }
@@ -25,10 +32,12 @@ data class ProviderConfig(
     val iconUrl: String? = null,
     val enabled: Boolean = true,
     val extra: String? = null,
+    val nsfw: Boolean? = null,
+    val lang: String? = null,
 )
 
 /** A CloudStream-style plugin repository (repo.json → pluginLists → plugin list). */
-enum class RepoKind { CS3, HIKARI, NUVIO, SKYSTREAM, ANIYOMI }
+enum class RepoKind { CS3, HIKARI, NUVIO, SKYSTREAM, ANIYOMI, VEGA, SORA, ANYMEX, LNREADER, ZANGETSU, KOTATSU }
 
 /** A plugin repository, either CloudStream (.cs3) or Hikari (.hiki) style. */
 data class Cs3Repo(
@@ -36,6 +45,7 @@ data class Cs3Repo(
     val name: String,
     val description: String = "",
     val kind: RepoKind = RepoKind.CS3,
+    val iconUrl: String = "",
 )
 
 /** A single installable plugin entry from a CloudStream repository. */
@@ -60,6 +70,11 @@ data class Cs3RepoPlugin(
      *  real entry in `domains`, else the `baseUrl`/`url` host. Null when the
      *  listing names only a placeholder host (see the SkyStream manager). */
     val iconHost: String? = null,
+    val contentKind: String = "",
+    val pluginLang: String? = null,
+    val pkg: String = "",
+    val sourceMeta: String = "",
+    val nsfw: Boolean = false,
 )
 
 /** Per-repo plugin-list loading state shown in the Extensions screen. */
@@ -69,6 +84,33 @@ data class RepoLoadState(
 )
 
 enum class MediaType { MOVIE, SERIES, UNKNOWN }
+
+fun isSiteScraperProviderId(providerId: String): Boolean {
+    val p = providerId.lowercase()
+    return p.startsWith("cs3|") || p.startsWith("hiki|") || p.startsWith("sky|") ||
+        p.startsWith("aniyomi|") || p.startsWith("vega|") || p.startsWith("sora|") ||
+        p.startsWith("anymex|") || p.startsWith("uni|") || p.startsWith("forkvideo|")
+}
+
+fun screenTypeFor(item: MediaItem, episodeCount: Int?): MediaType {
+    if (episodeCount == null || episodeCount <= 0 || !isSiteScraperProviderId(item.providerId)) return item.type
+    return when {
+        episodeCount == 1 && item.type != MediaType.MOVIE -> MediaType.MOVIE
+        episodeCount >= 2 && item.type != MediaType.SERIES -> MediaType.SERIES
+        else -> item.type
+    }
+}
+
+object SingleVideoEvidence {
+    private const val MAX_IDS = 300
+    private val ids = LinkedHashMap<String, Unit>(MAX_IDS, 0.75f, true)
+    @Synchronized fun note(uniqueId: String) {
+        if (uniqueId.isBlank()) return
+        ids[uniqueId] = Unit
+        while (ids.size > MAX_IDS) ids.remove(ids.keys.first())
+    }
+    @Synchronized fun isSingle(uniqueId: String): Boolean = ids.containsKey(uniqueId)
+}
 
 /** A user-added website opened in the ad-free web view. */
 data class Site(
@@ -109,6 +151,11 @@ data class MediaItem(
      * item, whose own [title] already IS the name its sites use.
      */
     val originalTitle: String = "",
+    val rating: Double? = null,
+    val nsfw: Boolean = false,
+    val quality: String? = null,
+    val nextEpisodeDate: String? = null,
+    val metadataSource: String? = null,
 ) {
     val uniqueId: String get() = "$providerId|$type|$id"
 
@@ -133,6 +180,10 @@ data class Episode(
     val image: String? = null,
     /** Season this episode belongs to (1 when a provider has no season info). */
     val season: Int = 1,
+    val overview: String? = null,
+    val released: String? = null,
+    val rating: Double? = null,
+    val runtime: Int? = null,
 )
 
 /** A single watch-history entry — what the user played and where they left off. */
@@ -144,6 +195,8 @@ data class HistoryEntry(
     val posterUrl: String? = null,
     val episodeId: String = "",
     val episodeName: String = "",
+    val episodeNumber: Int = 0,
+    val seasonNumber: Int = 0,
     val positionMs: Long = 0L,
     val durationMs: Long = 0L,
     val watchedAt: Long = 0L,
@@ -152,7 +205,21 @@ data class HistoryEntry(
     val uniqueKey: String get() = "$providerId|$type|$mediaId|$episodeId"
 }
 
-data class SubtitleSource(val lang: String, val url: String)
+data class SubtitleSource(
+    val lang: String,
+    val url: String,
+    val name: String = "",
+    val headers: Map<String, String> = emptyMap(),
+)
+
+data class DrmSpec(
+    val kid: String? = null,
+    val key: String? = null,
+    val uuid: String? = null,
+    val kty: String? = null,
+    val licenseUrl: String? = null,
+    val keyRequestParameters: Map<String, String> = emptyMap(),
+)
 
 data class StreamSource(
     val name: String,
@@ -172,10 +239,26 @@ data class StreamSource(
     val ytId: String? = null,
     /** True when the URL should be opened in a browser (externalUrl), not the player. */
     val externalUrl: Boolean = false,
-    /** Which installed provider served this source (set by the sweep's [tag]).
-     *  The detail screen sorts the origin provider's own servers first. */
+    val drm: DrmSpec? = null,
+    val provider: String = "",
+    /** The installed provider id and display name, used to group and prioritise
+     * the originating provider's servers in the player source picker. */
     val providerId: String = "",
-)
+    val providerName: String = "",
+    val details: String = "",
+    val pageUrl: String = "",
+    val torrentFileHint: String? = null,
+    val torrentFileSize: Long = 0L,
+    val text: String = "",
+) {
+    fun identityKey(): String =
+        infoHash?.takeIf { it.isNotBlank() }?.let { h ->
+            val idx = fileIdx?.let { "i$it" }
+                ?: ("n:" + (torrentFileHint?.trim().orEmpty().ifBlank { name.trim() }.take(120) +
+                    (if (torrentFileSize > 0) "#$torrentFileSize" else "")))
+            "h${h.lowercase()}#$idx"
+        } ?: "u$url"
+}
 
 data class CatalogRef(
     val providerId: String,
