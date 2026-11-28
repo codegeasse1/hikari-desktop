@@ -129,6 +129,10 @@ class ProviderManager(private val store: AppStore) {
         ProviderType.NUVIO -> com.hikari.app.nuvio.NuvioScraper(c)
         ProviderType.ANIYOMI -> com.hikari.app.aniyomi.AniyomiProvider(c)
         ProviderType.IPTV -> com.hikari.app.iptv.IptvProvider(c)
+        // Engines without a desktop provider yet (manga readers, video
+        // forks): configured rows stay inert instead of failing the build
+        // or the whole provider refresh.
+        else -> null
     }
 
     fun byId(id: String): ContentProvider? =

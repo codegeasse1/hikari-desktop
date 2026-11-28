@@ -703,6 +703,9 @@ class ExtensionsScreenView {
         RepoKind.NUVIO -> "NUVIO"
         RepoKind.SKYSTREAM -> "SKYSTREAM"
         RepoKind.ANIYOMI -> "ANIYOMI"
+        // New repo kinds travel with the Android enum (VEGA/SORA/ANYMEX/…):
+        // show their name until they get their own first-class chip.
+        else -> kind.name
     }
 
     private fun repoDisplayName(repo: Cs3Repo): String {

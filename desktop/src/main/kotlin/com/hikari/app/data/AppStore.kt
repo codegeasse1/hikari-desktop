@@ -42,7 +42,7 @@ class AppStore(private val dir: File) {
     private val saver = java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "hikari-store-save").apply { isDaemon = true } }
     @Volatile private var saveQueued = false
     private fun save() {
-        // Disk writes used to run on the CALLER thread — usually the FX thread —
+        // Disk writes used to run on the CALLER thread â usually the FX thread â
         // so every favorite/history/theme toggle cost a file write + JSON
         // serialize mid-frame. Version bumps instantly (Flows update now); the
         // file lands coalesced on a daemon thread. A JVM exit before the flush
@@ -119,6 +119,20 @@ class AppStore(private val dir: File) {
         const val COLLECTIONS = "collections"
         const val CLONE_HOSTS = "cloneHosts"
         const val PROVIDER_KIND_ORDER = "providerKindOrder"
+        const val MDB_ENABLED = "mdbEnabled"
+        const val MDBLIST_API_KEY = "mdblistApiKey"
+        const val MDB_IMDB = "mdbImdb"
+        const val MDB_TMDB = "mdbTmdb"
+        const val MDB_TOMATOES = "mdbTomatoes"
+        const val MDB_METACRITIC = "mdbMetacritic"
+        const val MDB_TRAKT = "mdbTrakt"
+        const val MDB_LETTERBOXD = "mdbLetterboxd"
+        const val MDB_AUDIENCE = "mdbAudience"
+        const val MDB_MAL = "mdbMal"
+        const val EXT_VERIFY_WEBVIEW = "extVerifyWebview"
+        const val DNS_PROVIDER = "dnsProvider"
+        const val CUSTOM_DNS = "customDns"
+        const val LANGUAGE = "appLanguage"
     }
 
     /**
@@ -126,7 +140,7 @@ class AppStore(private val dir: File) {
      * that answers for the title and starts it, instead of the first entry the
      * provider happened to list, and without waiting for the user to choose one.
      * The player's Source menu still lists every server, so a bad pick is one
-     * click from being changed — see [desktop.ui.DetailScreenView].
+     * click from being changed â see [desktop.ui.DetailScreenView].
      */
     fun playFastestFlow(): Flow<Boolean> = flowOf { playFastest() }
 
@@ -137,18 +151,18 @@ class AppStore(private val dir: File) {
     }
 
     /**
-     * Server sweep scope (Settings → Playback and servers).
+     * Server sweep scope (Settings â Playback and servers).
      *
-     * - [sweepAllSources]: one master switch — when on, a title's servers are
+     * - [sweepAllSources]: one master switch â when on, a title's servers are
      *   asked from EVERY enabled provider no matter the engine.
      * - [sweepEngines]: extra engine families to include by title, as
      *   [ProviderType] names (e.g. "CS3", "NUVIO", "HIKARI"). The origin's own
      *   family is always included; these add MORE families to the title waves.
-     * - [sweepSoloProviders]: provider ids that stay solo — a title opened
+     * - [sweepSoloProviders]: provider ids that stay solo â a title opened
      *   from one of these never fans out to other providers, only its own
      *   servers are shown (e.g. 51CG/MRDS when the user excludes them).
      * - [sweepShowAllFirst]: "show all servers first" instead of playing
-     *   directly — Play opens the server list and the user picks one, while
+     *   directly â Play opens the server list and the user picks one, while
      *   late servers keep arriving in the background.
      */
     fun sweepAllSources(): Boolean = (get(K.SWEEP_ALL) ?: "false").toBoolean()
@@ -218,7 +232,7 @@ class AppStore(private val dir: File) {
     /**
      * Home catalog layout: "poster" (classic vertical 2:3 posters, the
      * default) or "cinema" (16:9 landscape cards, fed by high-quality TMDB
-     * backdrop art). See Settings → Home and [HomeScreenView].
+     * backdrop art). See Settings â Home and [HomeScreenView].
      */
     fun homeLayoutFlow(): Flow<String> = flowOf { homeLayout() }
     fun homeLayout(): String = (get(K.HOME_LAYOUT) ?: "poster").lowercase().takeIf { it == "cinema" } ?: "poster"
@@ -434,7 +448,7 @@ class AppStore(private val dir: File) {
     }
 
     /** Locked read-modify-write of the provider list. Rebuilding the list from
-     *  a snapshot read OUTSIDE the lock drops anything installed in between —
+     *  a snapshot read OUTSIDE the lock drops anything installed in between â
      *  which is exactly how an uninstall used to silently remove an extension
      *  the user had just added. */
     fun updateProviders(transform: (List<ProviderConfig>) -> List<ProviderConfig>) {
@@ -456,15 +470,15 @@ class AppStore(private val dir: File) {
     }
 
     fun slowConnectionFlow(): Flow<Boolean> = flowOf { (get(K.SLOW_CONNECTION) ?: "false").toBoolean() }
-    fun slowConnection(): Boolean = slowConnectionFlow().first()
+    fun slowConnection(): Boolean = (get(K.SLOW_CONNECTION) ?: "false").toBoolean()
     fun setSlowConnection(on: Boolean) = put(K.SLOW_CONNECTION, on)
 
     fun nsfwEnabledFlow(): Flow<Boolean> = flowOf { (get(K.NSFW_ENABLED) ?: "true").toBoolean() }
-    fun nsfwEnabled(): Boolean = nsfwEnabledFlow().first()
+    fun nsfwEnabled(): Boolean = (get(K.NSFW_ENABLED) ?: "true").toBoolean()
     fun setNsfwEnabled(on: Boolean) = put(K.NSFW_ENABLED, on)
 
     fun collectionsFlow(): Flow<List<Collection>> = flowOf { parseCollections(get(K.COLLECTIONS)) }
-    fun collections(): List<Collection> = collectionsFlow().first()
+    fun collections(): List<Collection> = parseCollections(get(K.COLLECTIONS))
     fun collection(id: String): Collection? = collections().firstOrNull { it.id == id }
     fun saveCollections(list: List<Collection>) = put(K.COLLECTIONS, encodeCollections(list))
     fun upsertCollection(c: Collection): List<Collection> {
@@ -477,7 +491,7 @@ class AppStore(private val dir: File) {
         prefix + "-" + System.currentTimeMillis().toString(36) + "-" + (1000 + (Math.random() * 8999).toInt())
 
     fun cloneHostsFlow(): Flow<Map<String, CloneEntry>> = flowOf { parseCloneHosts(get(K.CLONE_HOSTS)) }
-    fun cloneHosts(): Map<String, CloneEntry> = cloneHostsFlow().first()
+    fun cloneHosts(): Map<String, CloneEntry> = parseCloneHosts(get(K.CLONE_HOSTS))
     fun saveClone(entry: CloneEntry) {
         val current = cloneHosts().toMutableMap()
         current[entry.id] = entry
@@ -492,8 +506,120 @@ class AppStore(private val dir: File) {
     fun providerKindOrderFlow(): Flow<List<String>> = flowOf {
         get(K.PROVIDER_KIND_ORDER)?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() } ?: emptyList()
     }
-    fun providerKindOrder(): List<String> = providerKindOrderFlow().first()
+    fun providerKindOrder(): List<String> =
+        get(K.PROVIDER_KIND_ORDER)?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() } ?: emptyList()
     fun setProviderKindOrder(keys: List<String>) = put(K.PROVIDER_KIND_ORDER, keys.joinToString(","))
+
+    // ---- Ratings / MDBList (see data/Ratings) ----
+
+    fun mdbEnabledFlow(): Flow<Boolean> = flowOf { mdbEnabled() }
+    fun mdbEnabled(): Boolean = (get(K.MDB_ENABLED) ?: "false").toBoolean()
+    fun setMdbEnabled(value: Boolean) = put(K.MDB_ENABLED, value)
+
+    fun mdbListApiKeyFlow(): Flow<String> = flowOf { mdbListApiKey() }
+    fun mdbListApiKey(): String = get(K.MDBLIST_API_KEY).orEmpty()
+    fun setMdbListApiKey(value: String) = put(K.MDBLIST_API_KEY, value.trim())
+
+    fun mdbProviderFlow(name: String): Flow<Boolean> = flowOf { mdbProvider(name) }
+    fun mdbProvider(name: String): Boolean = when (name) {
+        "imdb" -> get(K.MDB_IMDB)?.toBoolean() ?: true
+        "tmdb" -> get(K.MDB_TMDB)?.toBoolean() ?: true
+        "tomatoes" -> get(K.MDB_TOMATOES)?.toBoolean() ?: true
+        "metacritic" -> get(K.MDB_METACRITIC)?.toBoolean() ?: true
+        "trakt" -> get(K.MDB_TRAKT)?.toBoolean() ?: true
+        "letterboxd" -> get(K.MDB_LETTERBOXD)?.toBoolean() ?: true
+        "audience" -> get(K.MDB_AUDIENCE)?.toBoolean() ?: true
+        "mal" -> get(K.MDB_MAL)?.toBoolean() ?: true
+        else -> true
+    }
+    fun setMdbProvider(name: String, value: Boolean) {
+        val key = when (name) {
+            "imdb" -> K.MDB_IMDB
+            "tmdb" -> K.MDB_TMDB
+            "tomatoes" -> K.MDB_TOMATOES
+            "metacritic" -> K.MDB_METACRITIC
+            "trakt" -> K.MDB_TRAKT
+            "letterboxd" -> K.MDB_LETTERBOXD
+            "audience" -> K.MDB_AUDIENCE
+            "mal" -> K.MDB_MAL
+            else -> return
+        }
+        put(key, value)
+    }
+
+    // ---- Extension verification pages (see net/ExtensionVerifyGuard) ----
+
+    fun extensionVerifyWebviewFlow(): Flow<Boolean> = flowOf { extensionVerifyWebview() }
+    fun extensionVerifyWebview(): Boolean = (get(K.EXT_VERIFY_WEBVIEW) ?: "false").toBoolean()
+    fun setExtensionVerifyWebview(value: Boolean) = put(K.EXT_VERIFY_WEBVIEW, value)
+
+    // ---- Network DNS (see net/NetTuning, net/DnsProviders) ----
+
+    fun dnsProviderFlow(): Flow<String> = flowOf { dnsProvider() }
+    fun dnsProvider(): String = get(K.DNS_PROVIDER).orEmpty().ifBlank { "system" }
+    fun setDnsProvider(key: String) = put(K.DNS_PROVIDER, key)
+
+    fun customDnsFlow(): Flow<String> = flowOf { customDns() }
+    fun customDns(): String = get(K.CUSTOM_DNS).orEmpty()
+    fun setCustomDns(url: String) = put(K.CUSTOM_DNS, url)
+
+    // ---- App language (i18n UI reads this when it lands; stored now) ----
+
+    fun languageFlow(): Flow<String> = flowOf { language() }
+    fun language(): String = get(K.LANGUAGE).orEmpty()
+    fun setLanguage(tag: String) = put(K.LANGUAGE, tag)
+
+    /** The URL a provider row was installed from (its repo manifest entry),
+     *  or "" for rows that did not come from a repo. One-to-one with Android. */
+    fun sourceUrlOf(c: ProviderConfig): String {
+        val extra = c.extra ?: return ""
+        if (!extra.startsWith("http")) return ""
+        return if (c.type == ProviderType.HIKARI) extra.substringBeforeLast('|') else extra
+    }
+
+    // ---- Backup/restore surface (see data/BackupManager) ----
+
+    /** Every stored preference as a typed record. Device-local keys never
+     *  leave the device (see [DeviceLocal]). */
+    fun snapshotPreferences(): List<PrefRecord> = synchronized(lock) {
+        val out = ArrayList<PrefRecord>()
+        val names = json.keys()
+        while (names.hasNext()) {
+            val k = names.next()
+            if (DeviceLocal.contains(k)) continue
+            when (val v = json.opt(k)) {
+                null, JSONObject.NULL -> Unit
+                is String -> out += PrefRecord(k, "s", v)
+                is Boolean -> out += PrefRecord(k, "b", v)
+                is Int, is Long -> out += PrefRecord(k, "l", (v as Number).toLong())
+                is Float, is Double -> out += PrefRecord(k, "d", (v as Number).toDouble())
+                is JSONArray -> out += PrefRecord(k, "ss", (0 until v.length()).map { v.optString(it) })
+                else -> Unit
+            }
+        }
+        out
+    }
+
+    /** Applies backup records through [put] (so flows update and the file is
+     *  written). Returns how many were applied. */
+    fun restorePreferences(records: List<PrefRecord>): Int {
+        var applied = 0
+        for (r in records) {
+            if (DeviceLocal.contains(r.key)) continue
+            val ok = runCatching {
+                when (r.type) {
+                    "s" -> put(r.key, r.value as? String ?: return@runCatching)
+                    "b" -> put(r.key, r.value as? Boolean ?: return@runCatching)
+                    "i", "l" -> put(r.key, (r.value as? Number)?.toLong() ?: return@runCatching)
+                    "f", "d" -> put(r.key, (r.value as? Number)?.toDouble() ?: return@runCatching)
+                    "ss" -> put(r.key, JSONArray(((r.value as? List<*>)?.filterIsInstance<String>()).orEmpty()))
+                    else -> return@runCatching
+                }
+            }.isSuccess
+            if (ok) applied++
+        }
+        return applied
+    }
 
     fun favoritesFlow(): Flow<List<MediaItem>> = flowOf { favorites() }
     fun favorites(): List<MediaItem> = parseMedia(get(K.FAVORITES))
@@ -945,4 +1071,21 @@ class AppStore(private val dir: File) {
             emptyList()
         }
     }
+}
+
+/** One stored preference in a backup file's own terms. */
+data class PrefRecord(
+    val key: String,
+    /** "s" string · "b" boolean · "i"/"l" int/long · "f"/"d" float/double · "ss" strings. */
+    val type: String,
+    val value: Any?,
+)
+
+/** Preference keys that must not leave (or arrive on) another device. The
+ *  desktop keeps no device-bound secrets yet (no app lock, no per-device
+ *  player tuning), so nothing is excluded today — the gate exists so a key
+ *  that must stay local later has one obvious place to be listed. */
+object DeviceLocal {
+    val KEYS: Set<String> = setOf()
+    fun contains(key: String): Boolean = key in KEYS
 }
