@@ -115,6 +115,7 @@ class AppStore(private val dir: File) {
         const val SWEEP_SHOW_ALL = "sweepShowAllFirst"
         const val PLAYER_VO = "playerVo"
         const val NSFW_ENABLED = "nsfwEnabled"
+        const val SLOW_CONNECTION = "slowConnection"
         const val COLLECTIONS = "collections"
         const val CLONE_HOSTS = "cloneHosts"
         const val PROVIDER_KIND_ORDER = "providerKindOrder"
@@ -453,6 +454,10 @@ class AppStore(private val dir: File) {
     private fun saveRepos(list: List<Cs3Repo>) {
         put(K.CS3_REPOS, encodeRepos(list))
     }
+
+    fun slowConnectionFlow(): Flow<Boolean> = flowOf { (get(K.SLOW_CONNECTION) ?: "false").toBoolean() }
+    fun slowConnection(): Boolean = slowConnectionFlow().first()
+    fun setSlowConnection(on: Boolean) = put(K.SLOW_CONNECTION, on)
 
     fun nsfwEnabledFlow(): Flow<Boolean> = flowOf { (get(K.NSFW_ENABLED) ?: "true").toBoolean() }
     fun nsfwEnabled(): Boolean = nsfwEnabledFlow().first()

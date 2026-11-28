@@ -13,6 +13,7 @@ import com.lagradost.nicehttp.Requests
 import com.lagradost.nicehttp.ignoreAllSSLErrors
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import okhttp3.Cache
@@ -58,6 +59,8 @@ class HikariApp : Application() {
             private set
     }
 
+    val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     lateinit var store: AppStore
         private set
     lateinit var providers: ProviderManager
@@ -82,6 +85,9 @@ class HikariApp : Application() {
         installCrashHandler()
         initCloudStream(this)
         store = AppStore(filesDir)
+        runCatching { com.hikari.app.data.NsfwGate.setEnabled(store.nsfwEnabled()) }
+        runCatching { com.hikari.app.data.PerfMode.set(on = false, tvOn = false) }
+        runCatching { com.hikari.app.net.NetTuning.setSlowConnection(store.slowConnection()) }
         providers = ProviderManager(store)
         repository = ContentRepository(providers)
         registerAniyomiSingletons()
