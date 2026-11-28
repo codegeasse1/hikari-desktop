@@ -114,6 +114,10 @@ class AppStore(private val dir: File) {
         const val SWEEP_SOLO = "sweepSoloProviders"
         const val SWEEP_SHOW_ALL = "sweepShowAllFirst"
         const val PLAYER_VO = "playerVo"
+        const val NSFW_ENABLED = "nsfwEnabled"
+        const val COLLECTIONS = "collections"
+        const val CLONE_HOSTS = "cloneHosts"
+        const val PROVIDER_KIND_ORDER = "providerKindOrder"
     }
 
     /**
@@ -450,6 +454,42 @@ class AppStore(private val dir: File) {
         put(K.CS3_REPOS, encodeRepos(list))
     }
 
+    fun nsfwEnabledFlow(): Flow<Boolean> = flowOf { (get(K.NSFW_ENABLED) ?: "true").toBoolean() }
+    fun nsfwEnabled(): Boolean = nsfwEnabledFlow().first()
+    fun setNsfwEnabled(on: Boolean) = put(K.NSFW_ENABLED, on)
+
+    fun collectionsFlow(): Flow<List<Collection>> = flowOf { parseCollections(get(K.COLLECTIONS)) }
+    fun collections(): List<Collection> = collectionsFlow().first()
+    fun collection(id: String): Collection? = collections().firstOrNull { it.id == id }
+    fun saveCollections(list: List<Collection>) = put(K.COLLECTIONS, encodeCollections(list))
+    fun upsertCollection(c: Collection): List<Collection> {
+        val next = collections().filter { it.id != c.id } + c
+        saveCollections(next)
+        return next
+    }
+    fun removeCollection(id: String) = saveCollections(collections().filter { it.id != id })
+    fun newId(prefix: String): String =
+        prefix + "-" + System.currentTimeMillis().toString(36) + "-" + (1000 + (Math.random() * 8999).toInt())
+
+    fun cloneHostsFlow(): Flow<Map<String, CloneEntry>> = flowOf { parseCloneHosts(get(K.CLONE_HOSTS)) }
+    fun cloneHosts(): Map<String, CloneEntry> = cloneHostsFlow().first()
+    fun saveClone(entry: CloneEntry) {
+        val current = cloneHosts().toMutableMap()
+        current[entry.id] = entry
+        put(K.CLONE_HOSTS, encodeCloneHosts(current))
+    }
+    fun removeClone(id: String) {
+        val current = cloneHosts().toMutableMap()
+        current.remove(id)
+        put(K.CLONE_HOSTS, encodeCloneHosts(current))
+    }
+
+    fun providerKindOrderFlow(): Flow<List<String>> = flowOf {
+        get(K.PROVIDER_KIND_ORDER)?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() } ?: emptyList()
+    }
+    fun providerKindOrder(): List<String> = providerKindOrderFlow().first()
+    fun setProviderKindOrder(keys: List<String>) = put(K.PROVIDER_KIND_ORDER, keys.joinToString(","))
+
     fun favoritesFlow(): Flow<List<MediaItem>> = flowOf { favorites() }
     fun favorites(): List<MediaItem> = parseMedia(get(K.FAVORITES))
     fun addFavorite(m: MediaItem) {
@@ -661,6 +701,185 @@ class AppStore(private val dir: File) {
         } catch (e: Exception) {
             emptyList()
         }
+    }
+
+    private fun encodeCollections(list: List<Collection>): String {
+        val arr = JSONArray()
+        for (c in list) {
+            val folders = JSONArray()
+            for (f in c.folders) {
+                val sources = JSONArray()
+                for (s in f.sources) {
+                    sources.put(
+                        JSONObject()
+                            .put("kind", s.kind.name)
+                            .put("title", s.title)
+                            .put("pid", s.providerId)
+                            .put("cid", s.catalogId)
+                            .put("type", s.type.name)
+                            .put("raw", s.rawType)
+                            .put("preset", s.tmdbPreset)
+                            .put("spec", s.tmdbSpec)
+                            .put("items", s.itemsJson)
+                            .put("uid", s.uid)
+                    )
+                }
+                folders.put(
+                    JSONObject()
+                        .put("id", f.id)
+                        .put("name", f.name)
+                        .put("coverKind", f.coverKind)
+                        .put("coverValue", f.coverValue)
+                        .put("tileShape", f.tileShape)
+                        .put("hideTitle", f.hideTitle)
+                        .put("gifAlways", f.gifAlways)
+                        .put("heroBackdrop", f.heroBackdropUrl)
+                        .put("titleLogo", f.titleLogoUrl)
+                        .put("sources", sources)
+                )
+            }
+            arr.put(
+                JSONObject()
+                    .put("id", c.id)
+                    .put("name", c.name)
+                    .put("coverKind", c.coverKind)
+                    .put("coverValue", c.coverValue)
+                    .put("tileShape", c.tileShape)
+                    .put("pinToTop", c.pinToTop)
+                    .put("viewMode", c.viewMode)
+                    .put("showAllTab", c.showAllTab)
+                    .put("backdrop", c.backdropUrl)
+                    .put("folders", folders)
+            )
+        }
+        return arr.toString()
+    }
+
+    private fun parseCollections(s: String?): List<Collection> {
+        if (s.isNullOrBlank()) return emptyList()
+        return try {
+            val arr = JSONArray(s)
+            (0 until arr.length()).mapNotNull { i ->
+                val o = arr.optJSONObject(i) ?: return@mapNotNull null
+                val id = o.optString("id")
+                val name = o.optString("name")
+                if (id.isBlank() || name.isBlank()) return@mapNotNull null
+                val foldersArr = o.optJSONArray("folders")
+                val folders = ArrayList<CollectionFolder>()
+                if (foldersArr != null) {
+                    for (j in 0 until foldersArr.length()) {
+                        val fo = foldersArr.optJSONObject(j) ?: continue
+                        val fid = fo.optString("id")
+                        val fname = fo.optString("name")
+                        if (fid.isBlank() || fname.isBlank()) continue
+                        val sourcesArr = fo.optJSONArray("sources")
+                        val sources = ArrayList<CatalogSource>()
+                        if (sourcesArr != null) {
+                            for (k in 0 until sourcesArr.length()) {
+                                val so = sourcesArr.optJSONObject(k) ?: continue
+                                val kind = runCatching {
+                                    CatalogSourceKind.valueOf(so.optString("kind", "TMDB"))
+                                }.getOrDefault(CatalogSourceKind.TMDB)
+                                val source = CatalogSource(
+                                    kind = kind,
+                                    title = so.optString("title"),
+                                    providerId = so.optString("pid"),
+                                    catalogId = so.optString("cid"),
+                                    type = runCatching { MediaType.valueOf(so.optString("type")) }
+                                        .getOrDefault(MediaType.UNKNOWN),
+                                    rawType = so.optString("raw"),
+                                    tmdbPreset = so.optString("preset"),
+                                    tmdbSpec = so.optString("spec"),
+                                    itemsJson = so.optString("items"),
+                                    uid = so.optString("uid"),
+                                )
+                                val usable = when (kind) {
+                                    CatalogSourceKind.TMDB ->
+                                        TmdbPresets.byKey(source.tmdbPreset) != null ||
+                                            (source.spec?.type != null)
+                                    CatalogSourceKind.ITEMS -> source.itemCount > 0
+                                    CatalogSourceKind.PROVIDER ->
+                                        source.providerId.isNotBlank() &&
+                                            source.catalogId.isNotBlank()
+                                }
+                                if (usable) sources.add(source)
+                            }
+                        }
+                        folders.add(
+                            CollectionFolder(
+                                id = fid,
+                                name = fname,
+                                sources = sources.distinctBy { it.key },
+                                coverKind = CoverKinds.normalize(fo.optString("coverKind")),
+                                coverValue = fo.optString("coverValue"),
+                                tileShape = TileShapes.normalize(fo.optString("tileShape")),
+                                hideTitle = fo.optBoolean("hideTitle", false),
+                                gifAlways = fo.optBoolean("gifAlways", false),
+                                heroBackdropUrl = fo.optString("heroBackdrop"),
+                                titleLogoUrl = fo.optString("titleLogo"),
+                            )
+                        )
+                    }
+                }
+                Collection(
+                    id = id,
+                    name = name,
+                    folders = folders,
+                    coverKind = CoverKinds.normalize(o.optString("coverKind")),
+                    coverValue = o.optString("coverValue"),
+                    tileShape = TileShapes.normalize(o.optString("tileShape")),
+                    pinToTop = o.optBoolean("pinToTop", false),
+                    viewMode = CollectionViewModes.normalize(o.optString("viewMode")),
+                    showAllTab = o.optBoolean("showAllTab", true),
+                    backdropUrl = o.optString("backdrop"),
+                )
+            }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun parseCloneHosts(s: String?): Map<String, CloneEntry> {
+        if (s.isNullOrBlank()) return emptyMap()
+        return try {
+            val o = JSONObject(s)
+            val out = LinkedHashMap<String, CloneEntry>()
+            val ids = o.keys()
+            while (ids.hasNext()) {
+                val id = ids.next()
+                val e = o.optJSONObject(id) ?: continue
+                val hosts = LinkedHashMap<String, String>()
+                val ho = e.optJSONObject("hosts")
+                if (ho != null) {
+                    val hk = ho.keys()
+                    while (hk.hasNext()) {
+                        val k = hk.next()
+                        hosts[k] = ho.optString(k)
+                    }
+                }
+                out[id] = CloneEntry(
+                    id = id,
+                    name = e.optString("name"),
+                    cloneOfId = e.optString("orig"),
+                    mainNew = e.optString("main").takeIf { it.isNotBlank() },
+                    hosts = hosts,
+                )
+            }
+            out
+        } catch (e: Exception) {
+            emptyMap()
+        }
+    }
+
+    private fun encodeCloneHosts(map: Map<String, CloneEntry>): String {
+        val o = JSONObject()
+        for ((id, e) in map) {
+            val hosts = JSONObject()
+            for ((k, v) in e.hosts) hosts.put(k, v)
+            o.put(id, JSONObject().put("name", e.name).put("orig", e.cloneOfId)
+                .put("main", e.mainNew.orEmpty()).put("hosts", hosts))
+        }
+        return o.toString()
     }
 
     private fun encodeMedia(list: List<MediaItem>): String {
