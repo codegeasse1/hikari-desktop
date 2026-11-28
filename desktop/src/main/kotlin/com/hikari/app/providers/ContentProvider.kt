@@ -5,16 +5,32 @@ import com.hikari.app.data.Episode
 import com.hikari.app.data.MediaItem
 import com.hikari.app.data.ProviderConfig
 import com.hikari.app.data.StreamSource
+import android.app.Activity
+import android.content.Context
 
 interface ContentProvider {
     val config: ProviderConfig
 
+    fun adultExtension(): Boolean? = null
+
+    val settingsAvailable: Boolean get() = false
+    val settingsReady: Boolean get() = settingsAvailable
+    fun prepareSettings(): Boolean = settingsAvailable
+    fun rebuildSettings(context: Context): Boolean = prepareSettings()
+    fun openSettings(activity: Activity?): Boolean = false
+
+    val searchOnly: Boolean get() = false
+
     suspend fun catalogs(): List<CatalogRef>
+    suspend fun homeCatalogs(): List<CatalogRef> = catalogs()
+    suspend fun warmDetail(item: MediaItem) {}
     suspend fun getCatalog(ref: CatalogRef, page: Int): List<MediaItem>
     suspend fun search(query: String, page: Int): List<MediaItem>
     suspend fun getMeta(item: MediaItem): MediaItem
     suspend fun getEpisodes(item: MediaItem): List<Episode>?
     suspend fun getStreams(item: MediaItem, episode: Episode?): List<StreamSource>
+
+    fun partialStreams(): List<StreamSource> = emptyList()
 
     /**
      * Why this provider's last [getStreams] call came back empty, or null when
