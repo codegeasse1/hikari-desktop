@@ -24,12 +24,19 @@ import java.util.concurrent.ConcurrentHashMap
  */
 object ImageLoader {
 
-    private val mem = object : LinkedHashMap<String, Image>(128, 0.75f, true) {
-        // 120 entries max (~poster 168x252 decoded): Home renders ~100 cards
-        // and a bigger full-res cache OOMs low-end machines — the old 1024
-        // cache, then 350, still pinned hundreds of MB of textures and the
-        // scroll degraded to 1fps with Windows offering to kill the app.
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Image>?): Boolean = size > 120
+    // Keep the decoded-image cache proportional to the JVM heap. A fixed
+    // 120-image cache is reasonable on a large desktop but can pin too much
+    // native texture + decoded pixel memory on 4 GB machines where the JVM
+    // heap is commonly capped around 1–2 GB.
+    private val maxCachedImages = when {
+        Runtime.getRuntime().maxMemory() <= 2L * 1024 * 1024 * 1024 -> 48
+        Runtime.getRuntime().maxMemory() <= 4L * 1024 * 1024 * 1024 -> 72
+        else -> 120
+    }
+
+    private val mem = object : LinkedHashMap<String, Image>(maxCachedImages, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Image>?): Boolean =
+            size > maxCachedImages
     }
 
     private val diskDir: File by lazy {
@@ -43,7 +50,11 @@ object ImageLoader {
     /** Cap on simultaneous network image fetches — Home renders hundreds of
      *  posters at once and firing them all concurrently starves the IO pool
      *  and makes the UI lag on weak networks. */
-    private val gate = java.util.concurrent.Semaphore(8)
+    // Fewer simultaneous decodes/fetches on low-heap machines avoids
+    // competing network, image conversion and JavaFX texture allocations.
+    private val gate = java.util.concurrent.Semaphore(
+        if (Runtime.getRuntime().maxMemory() <= 2L * 1024 * 1024 * 1024) 4 else 8
+    )
 
     /** Hosts that 403 any image request carrying a Referer (verified in the
      *  Android app: same-origin referer => 403, bare request => 200). */

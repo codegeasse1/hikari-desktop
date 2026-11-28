@@ -67,7 +67,13 @@ class ProviderManager(private val store: AppStore) {
             // finished, because the refresh re-loaded every OTHER extension too.
             // Each instantiate gets 15s before it is left behind — one wedged
             // dex/plugin must never block the whole list.
-            val gate = Semaphore(4)
+            // Plugin initialization can allocate DEX/JVM classes and
+            // retain class loaders. Keep parallel startup conservative on
+            // low-heap machines; faster desktops can still initialize four.
+            val initParallelism = if (
+                Runtime.getRuntime().maxMemory() <= 2L * 1024 * 1024 * 1024
+            ) 2 else 4
+            val gate = Semaphore(initParallelism)
             val results = coroutineScope {
                 configs.map { c ->
                     async {
