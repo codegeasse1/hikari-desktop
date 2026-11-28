@@ -235,12 +235,12 @@ class Cs3MainApiProvider(override val config: ProviderConfig) : ContentProvider 
                 "Reading .mainPage threw: ${t.javaClass.simpleName}: ${t.message}", t)
             emptyList()
         } ?: run {
-            com.hikari.app.util.LiveLogs.warn("catalog/${config.name}", ".mainPage is null for this provider (mainUrl=${a.mainUrl})")
+            com.hikari.app.util.LiveLogs.warn("catalog/${config.name}", ".mainPage is null for this provider (mainUrl=${a.mainUrl}; dex=" + (com.hikari.app.cs3.DexJar.lastError ?: com.hikari.app.cs3.Cs3PluginManager.lastError ?: "no error captured") + ")")
             emptyList()
         }
         if (mp.isEmpty()) {
             com.hikari.app.util.LiveLogs.warn("catalog/${config.name}",
-                "mainPage is EMPTY (0 rows) for mainUrl=${a.mainUrl} — so there are no catalog rows to fetch.")
+                "mainPage is EMPTY (0 rows) for mainUrl=${a.mainUrl} — so there are no catalog rows to fetch. (dex=" + (com.hikari.app.cs3.DexJar.lastError ?: com.hikari.app.cs3.Cs3PluginManager.lastError ?: "no error captured") + ")")
         } else {
             com.hikari.app.util.LiveLogs.log("catalog/${config.name}",
                 "mainPage has ${mp.size} row(s), first='${mp.firstOrNull()?.name}' data='${mp.firstOrNull()?.data}'")

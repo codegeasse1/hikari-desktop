@@ -27,7 +27,7 @@ class NetworkHelper(private val context: Context) {
 
     val cookieJar = AndroidCookieJar()
 
-    private val clientBuilder: OkHttpClient.Builder = OkHttpClient.Builder()
+    private val clientBuilder: OkHttpClient.Builder = com.hikari.app.net.Http.applyConscryptTls(OkHttpClient.Builder()
         .cookieJar(cookieJar)
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
@@ -35,6 +35,7 @@ class NetworkHelper(private val context: Context) {
         .cache(Cache(File(context.cacheDir, "aniyomi_network_cache"), 5L * 1024 * 1024))
         .addInterceptor(UncaughtExceptionInterceptor())
         .addInterceptor(UserAgentInterceptor(::defaultUserAgentProvider))
+            .dns(com.hikari.app.net.HikariDns))
 
     val client: OkHttpClient = clientBuilder
         .addNetworkInterceptor(

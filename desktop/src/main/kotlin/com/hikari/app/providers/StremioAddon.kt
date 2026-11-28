@@ -90,7 +90,7 @@ class StremioAddon(override val config: ProviderConfig) : ContentProvider {
         val headers = mapOf("Accept" to "application/json, text/plain, */*")
         for (u in listOf(url, url.replaceFirst("https://", "http://")).distinct()) {
             for (attempt in 0 until 2) {
-                val body = Http.getString(u, headers)
+                val body = Http.getStringRobust(u, headers)
                 val json = body?.let { runCatching { JSONObject(it) }.getOrNull() }
                 if (json != null) return json
                 if (attempt == 0) {

@@ -321,14 +321,14 @@ object DesktopPlayer {
             return
         }
         if (stream.isMpd || url.endsWith(".mpd")) {
-            Fx.run { showBrowserFallback(title, url, "This stream uses DASH, which the bundled player can't play yet.") }
+            Fx.run { showBrowserFallback(title, url, "This stream uses DASH (.mpd), which the bundled player can't play yet. Pick another server from the list, or open this URL in your browser.") }
             return
         }
         if (stream.isTorrent || stream.infoHash != null) {
             Fx.run {
                 showBrowserFallback(
                     title, url.ifBlank { "magnet stream (infoHash ${stream.infoHash})" },
-                    "This is a torrent stream, which the bundled player can't play yet.",
+                    "This is a torrent stream, which the bundled player can't play yet. Open the magnet in your torrent app, or pick a non-torrent server from the list.",
                 )
             }
             return
@@ -1074,7 +1074,7 @@ object DesktopPlayer {
                                 when (verdict) {
                                     com.hikari.app.net.Http.StreamProbe.DASH -> showBrowserFallback(
                                         title, url,
-                                        "This stream uses DASH, which the bundled player can't play yet.",
+                                        "This stream uses DASH (.mpd), which the bundled player can't play yet. Pick another server from the list, or open this URL in your browser.",
                                     )
                                     com.hikari.app.net.Http.StreamProbe.HTML ->
                                         // A web page usually means the CDN/embed host served an

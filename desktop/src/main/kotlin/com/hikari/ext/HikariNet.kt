@@ -39,7 +39,7 @@ object HikariNet {
     suspend fun getString(url: String, headers: Map<String, String> = emptyMap()): String? =
         withContext(Dispatchers.IO) {
             RemoteConfig.cached(url)?.let { return@withContext it }
-            val body = com.hikari.app.net.Http.getString(url, headers)
+            val body = com.hikari.app.net.Http.getStringRobust(url, headers)
             RemoteConfig.store(url, body)
             body
         }
@@ -128,7 +128,7 @@ object HikariNet {
 
     suspend fun getBytes(url: String, headers: Map<String, String> = emptyMap()): ByteArray? =
         withContext(Dispatchers.IO) {
-            com.hikari.app.net.Http.getBytes(url, headers)
+            com.hikari.app.net.Http.getBytesRobust(url, headers)
         }
 
     /** Full response (status + body) for callers that must see error codes. */

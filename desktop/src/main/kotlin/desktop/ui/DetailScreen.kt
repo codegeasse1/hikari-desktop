@@ -1733,6 +1733,7 @@ class DetailScreenView(private val item: MediaItem) {
                         append("• ${AppShell.app.repository.providerName(id)} — ${why.take(180)}\n")
                     }
                 }
+                append("\n\n" + AppShell.app.repository.sweepScopeSummary())
             }.trim()
             srcDlgStatus.text = if (running) "Discovering streaming sources…" else "No sources found"
             srcDlgCount.text = if (running) "searching…" else "0 SOURCES"
@@ -2122,7 +2123,7 @@ class DetailScreenView(private val item: MediaItem) {
                 if (javafx.application.Platform.isFxApplicationThread()) source
                 else runCatching {
                     kotlinx.coroutines.runBlocking {
-                        kotlinx.coroutines.withTimeoutOrNull(8_000L) { AppShell.app.repository.streamsFor(meta, ep) }
+                        kotlinx.coroutines.withTimeoutOrNull(12_000L) { AppShell.app.repository.streamsFor(meta, ep) } // >= FIRST_SOURCE_WAIT_HIKARI_MS: the expired-link retry must not give up before Hikari-origin sweeps land
                     }
                 }.getOrNull()?.firstOrNull() ?: source
             },

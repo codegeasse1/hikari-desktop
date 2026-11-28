@@ -3041,8 +3041,21 @@ class ExtensionsScreenView {
     private fun registerExtension(name: String, safeName: String, dest: File, sourceUrl: String): String? {
         val hiki = HikariPluginManager.reload(HikariApp.instance, dest)
         if (hiki.isNotEmpty()) {
+            // Prefer a working CS3 duplicate over a dead HIKARI bundle row: several
+            // Anime-bundle sub-entries resolve but return empty catalogs while same-named
+            // CS3 providers serve rows. A HIKARI row shadowed by a same-named CS3 row is
+            // skipped instead of shown side-by-side with it.
+            val cs3Names = AppShell.app.store.providers()
+                .filter { it.type == ProviderType.CS3 }
+                .map { it.name.substringAfterLast("·").trim().lowercase() }.toSet()
+            var skippedHiki = 0
             hiki.forEachIndexed { idx, p ->
                 val display = if (hiki.size > 1) "$name · ${p.name}" else name
+                if (cs3Names.contains(p.name.trim().lowercase())) {
+                    skippedHiki++
+                    System.err.println("registerExtension: skipping HIKARI dup '" + p.name + "' (covered by CS3)")
+                    return@forEachIndexed
+                }
                 AppShell.app.store.addProvider(
                     ProviderConfig(
                         id = "hiki|$safeName|$idx",
@@ -3053,7 +3066,9 @@ class ExtensionsScreenView {
                     )
                 )
             }
-            return "Installed $name (${hiki.size} extension${if (hiki.size > 1) "s" else ""})."
+            val keptHiki = hiki.size - skippedHiki
+            if (keptHiki == 0) return "Installed $name — all ${hiki.size} sub-entries are already covered by working CS3 duplicates."
+            return "Installed $name ($keptHiki extension${if (keptHiki > 1) "s" else ""}${if (skippedHiki > 0) ", $skippedHiki covered by CS3" else ""})."
         }
 
         val cs3 = Cs3PluginManager.reload(HikariApp.instance, dest)

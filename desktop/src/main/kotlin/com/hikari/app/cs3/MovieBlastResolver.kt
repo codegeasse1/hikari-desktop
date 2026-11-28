@@ -56,7 +56,7 @@ object MovieBlastResolver {
             val match = searchMovie(item) ?: return emptyList()
             val id = match.optLong("id")
             if (id <= 0) return emptyList()
-            val body = Http.getString("$BASE/api/media/detail/$id/$TOKEN", apiHeaders)
+            val body = Http.getStringRobust("$BASE/api/media/detail/$id/$TOKEN", apiHeaders)
                 ?: return emptyList()
             buildSources(JSONObject(body))
         } catch (t: Throwable) {
@@ -69,7 +69,7 @@ object MovieBlastResolver {
         // Title goes in the URL PATH — JS encodeURIComponent semantics, so a
         // space must be %20, never URLEncoder's '+'.
         val query = URLEncoder.encode(item.title.trim(), "UTF-8").replace("+", "%20")
-        val body = Http.getString("$BASE/api/search/$query/$TOKEN", searchHeaders)
+        val body = Http.getStringRobust("$BASE/api/search/$query/$TOKEN", searchHeaders)
             ?: return null
         val arr = JSONObject(body).optJSONArray("search") ?: return null
         return findBestMatch(item, arr)

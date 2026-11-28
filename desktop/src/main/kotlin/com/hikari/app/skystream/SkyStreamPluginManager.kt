@@ -56,11 +56,6 @@ object SkyStreamPluginManager {
             "SkyStream official",
             "The official SkyStream plugin repo (Akash's providers)",
         ),
-        Triple(
-            "https://raw.githubusercontent.com/rougegz/SkystreamPlugins/main/repo.json",
-            "Rougegz SkyStream",
-            "Community SkyStream plugins",
-        ),
     )
 
     /**
@@ -69,7 +64,15 @@ object SkyStreamPluginManager {
      * (unlike nuvio, a single SkyStream plugin is a whole site, so a silent
      * bulk install would be hostile). Non-fatal on any failure.
      */
+    /** Default repos known to be dead upstream (HTTP 404 on every mirror) — pruned from saved repos on every seed. */
+    val DEAD_REPO_URLS = setOf(
+        "https://raw.githubusercontent.com/rougegz/SkystreamPlugins/main/repo.json",
+    )
+
     suspend fun seedDefaults(context: Context, store: AppStore) {
+        for (dead in DEAD_REPO_URLS) {
+            runCatching { store.removeCs3Repo(dead) }
+        }
         for ((url, name, desc) in DEFAULT_REPOS) {
             runCatching { store.addCs3Repo(Cs3Repo(url, name, desc, RepoKind.SKYSTREAM)) }
         }

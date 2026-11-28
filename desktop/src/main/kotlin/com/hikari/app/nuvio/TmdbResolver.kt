@@ -236,7 +236,7 @@ object TmdbResolver {
         val q = runCatching {
             java.net.URLEncoder.encode(title.lowercase(), "UTF-8")
         }.getOrNull() ?: return null
-        val text = Http.getString(
+        val text = Http.getStringRobust(
             "https://v3.sg.media-imdb.com/suggestion/h/$q.json",
             mapOf("Accept" to "application/json"),
         ) ?: return null
@@ -357,7 +357,7 @@ object TmdbResolver {
                 "${java.net.URLEncoder.encode(k, "UTF-8")}=${java.net.URLEncoder.encode(v, "UTF-8")}"
             }
             val url = "$API_BASE$path?$qs"
-            val text = Http.getString(url, mapOf("Accept" to "application/json")) ?: continue
+            val text = Http.getStringRobust(url, mapOf("Accept" to "application/json")) ?: continue
             val obj = runCatching { JSONObject(text) }.getOrNull() ?: continue
             if (obj.optString("status_message").contains("Invalid API key", true)) continue
             return obj

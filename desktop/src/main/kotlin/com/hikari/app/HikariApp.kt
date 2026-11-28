@@ -113,18 +113,31 @@ class HikariApp : Application() {
                 }
             }
             runCatching {
+                // Cinemeta is a metadata catalog, NOT a stream source: it declares
+                // no /stream resource, so Stremio-origin titles cannot play until
+                // a playback addon (e.g. Torrentio,
+                // https://torrentio.strem.fun/manifest.json) is added. The old
+                // "YTS (Stremio)" label misled users into expecting YTS streams.
                 if (store.providers().none { it.type == ProviderType.STREMIO }) {
                     store.addProvider(
                         ProviderConfig(
-                            id = "stremio|yts",
-                            name = "YTS (Stremio)",
+                            id = "stremio|cinemeta",
+                            name = "Cinemeta catalog (Stremio — metadata only)",
                             type = ProviderType.STREMIO,
                             url = "https://v3-cinemeta.strem.io/manifest.json",
                         )
                     )
+                } else {
+                    // Migrate the old misleading label in place.
+                    store.updateProviders { list ->
+                        list.map { c ->
+                            if (c.type == ProviderType.STREMIO && c.id == "stremio|yts") c.copy(name = "Cinemeta catalog (Stremio — metadata only)") else c
+                        }
+                    }
                 }
             }
-            providers.refresh()
+            // (One refresh after seeding below — Home must not paint from the
+            // pre-seed YTS+Cinemeta set alone.)
             // Seed the bundled engine repos once, exactly like the Android app:
             // the Yoru (nuvio), SkyStream and Aniyomi default repos are how
             // those engines are discovered at all, and a first run can't be

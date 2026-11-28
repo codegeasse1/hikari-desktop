@@ -215,12 +215,14 @@ object NuvioRuntime {
     private val fetchExecutor: ExecutorService = Executors.newFixedThreadPool(4)
 
     private val client by lazy {
-        OkHttpClient.Builder()
+        com.hikari.app.net.Http.applyConscryptTls(
+            OkHttpClient.Builder()
             .followRedirects(true)
             .followSslRedirects(true)
             .connectTimeout(30, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
-            // Plain OkHttp, mirroring NuvioMobile's own httpRequestRaw: no
+            .proxySelector(java.net.ProxySelector.getDefault())
+            // Plain OkHttp over the app pinned Conscrypt trust, mirroring NuvioMobile's own httpRequestRaw: no
             // cookie jar, no UA rewriting, transparent gzip via the bridge's
             // Accept-Encoding stripping, and — unlike the 0.3.5x builds — NO
             // CloudflareVerifier interceptor. nuvio does no CF solving and no
@@ -230,7 +232,7 @@ object NuvioRuntime {
             // sit behind an interactive Cloudflare challenge simply won't
             // resolve (they don't in nuvio either); the fetch log records the
             // challenge so it's diagnosable.
-            .dns(com.hikari.app.net.HikariDns)
+            .dns(com.hikari.app.net.HikariDns))
             .build()
     }
 

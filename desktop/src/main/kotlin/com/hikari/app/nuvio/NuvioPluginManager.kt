@@ -15,8 +15,8 @@ import org.json.JSONObject
 import java.io.File
 
 /**
- * Install/uninstall of Nuvio JS scrapers, plus first-run seeding of the three
- * canonical Nuvio provider repos and a few pre-installed providers so the
+ * Install/uninstall of Nuvio JS scrapers, plus first-run seeding of the canonical
+ * Nuvio provider repos and a few pre-installed providers so the
  * feature works out of the box.
  */
 object NuvioPluginManager {
@@ -34,17 +34,12 @@ object NuvioPluginManager {
         Triple(
             "https://raw.githubusercontent.com/tapframe/nuvio-providers/main/manifest.json",
             "Yoru's Nuvio Repo",
-            "English nuvio providers (vixsrc, moviebox, showbox, …)",
+            "English nuvio providers (vixsrc, moviebox, showbox, hdhub4u, moviesdrive, …)",
         ),
         Triple(
             "https://raw.githubusercontent.com/Gowaru/gowaru-nuvio-providers/main/manifest.json",
             "Gowaru's Nuvio Repo",
             "Nuvio providers by Gowaru (French-oriented)",
-        ),
-        Triple(
-            "https://raw.githubusercontent.com/phisher98/phisher-nuvio-providers/main/manifest.json",
-            "Phisher's Nuvio Repo",
-            "Nuvio providers by Phisher98",
         ),
         Triple(
             "https://plugin.eclipsia.dpdns.org/manifest.json",
@@ -58,7 +53,15 @@ object NuvioPluginManager {
 
     /** Adds the default repos once and pre-installs a few providers so nuvio
      *  sources are available immediately. Non-fatal on any failure. */
+    /** Default repos known to be dead upstream (HTTP 404 on every mirror) — pruned from saved repos on every seed. */
+    val DEAD_REPO_URLS = setOf(
+        "https://raw.githubusercontent.com/phisher98/phisher-nuvio-providers/main/manifest.json",
+    )
+
     suspend fun seedDefaults(context: Context, store: AppStore) {
+        for (dead in DEAD_REPO_URLS) {
+            runCatching { store.removeCs3Repo(dead) }
+        }
         for ((url, name, desc) in DEFAULT_REPOS) {
             runCatching { store.addCs3Repo(Cs3Repo(url, name, desc, RepoKind.NUVIO)) }
         }
@@ -124,11 +127,32 @@ object NuvioPluginManager {
                 Exception("Not a valid nuvio provider: $detail")
             )
         }
+        val displayName = clean.removeSuffix(".js")
+        // Same-name ghost eviction: manifests spell the same scraper differently
+        // per repo ("HDHub4u" vs "hdhub4u"), which used to mint a second id AND
+        // a second file so the old build survived next to the new one. Any
+        // other NUVIO provider with the same display name from a different
+        // source is removed first (its orphan file is deleted below).
+        runCatching {
+            val store = HikariApp.instance.store
+            val ghosts = store.providers().filter {
+                it.type == ProviderType.NUVIO && it.name.equals(displayName, true) && it.extra != sourceUrl
+            }
+            if (ghosts.isNotEmpty()) {
+                val paths = ghosts.map { it.url }.toSet()
+                store.updateProviders { list -> list.filter { c -> ghosts.none { g -> g.id == c.id } } }
+                val remaining = store.providers().map { it.url }.toSet()
+                val base = context.filesDir.absolutePath
+                paths.forEach { p ->
+                    if (p.startsWith(base) && p !in remaining) runCatching { File(p).delete() }
+                }
+            }
+        }
         val id = "nuvio|" + clean.hashCode()
         HikariApp.instance.store.addProvider(
             ProviderConfig(
                 id = id,
-                name = clean.removeSuffix(".js"),
+                name = displayName,
                 type = ProviderType.NUVIO,
                 url = file.absolutePath,
                 iconUrl = iconUrl,

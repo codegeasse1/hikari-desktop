@@ -309,6 +309,13 @@ class ContentRepository(private val manager: ProviderManager) {
         sweepSolo = soloProviders
     }
 
+    /** One-line summary of the current sweep scope, for empty states and Settings. */
+    fun sweepScopeSummary(): String = when {
+        sweepAll -> "Scope: sweeping all sources."
+        sweepEngines.isEmpty() -> "Scope: this title's engine only (cross-engine rescue is off — enable Settings → Playback and servers → sweep from all sources to let your other engines cover this title)."
+        else -> "Scope: this title's engine + " + sweepEngines.sorted().joinToString(", ") + "."
+    }
+
     /** Engines whose ids are per-site slugs (never interchangeable). */
     private fun isScraperFamily(t: ProviderType?): Boolean = when (t) {
         ProviderType.CS3, ProviderType.HIKARI, ProviderType.NUVIO,

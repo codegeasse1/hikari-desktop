@@ -283,7 +283,7 @@ object ImageLoader {
                 }
             }
         }
-        return Http.getBytes(url, headers)
+        return Http.getBytesRobust(url, headers)
     }
 
     private fun shouldTryWebView(url: String): Boolean {

@@ -1090,6 +1090,24 @@ object Http {
         // ends up on screen under "Couldn't load this repo", and it is the one
         // place the user can judge whether to retry, change network, or stop
         // caring — the extensions they already have keep working either way.
+        // A deleted-upstream repo fails every mirror with HTTP 404/410 — that is
+        // not the network fault and no retry or VPN will ever fix it. Say so,
+        // with the live replacements, instead of "switch network/VPN".
+        val gone = real.count { t ->
+            val m = ((t.message ?: "") + " " + humanMessage(t)).lowercase()
+            m.contains("404") || m.contains("410") ||
+                (m.contains("http") && m.contains("not found"))
+        }
+        if (gone * 2 >= real.size) {
+            return "This repository no longer exists upstream (HTTP 404 on every mirror) — " +
+                "it was deleted by its owner, so no network or VPN change can bring it back.\n" +
+                "Live replacements: Yoru's Nuvio repo " +
+                "(https://raw.githubusercontent.com/tapframe/nuvio-providers/main/manifest.json) for " +
+                "hdhub4u/moviesdrive, and the official SkyStream repo " +
+                "(https://raw.githubusercontent.com/akashdh11/skystream-plugins/main/repo.json).\n" +
+                "Remove the dead repo URL and add the replacement. " +
+                "Extensions you already installed keep working."
+        }
         return "No server answered from this network — $detail.\n" +
             "Extensions you already installed keep working. Try again in a minute, or switch " +
             "network/VPN if this keeps happening."
@@ -2041,6 +2059,16 @@ object Http {
         } catch (e: Exception) {
             null
         }
+
+    /** [getString] over the full mirror/TLS ladder ([fetchStringRobust]): null on
+     *  failure, exactly like [getString]. Stream-critical paths must use this,
+     *  not the single-shot [getString] (one failing host blanked whole lookups). */
+    fun getStringRobust(url: String, headers: Map<String, String> = emptyMap()): String? =
+        fetchStringRobust(url, headers).getOrNull()
+
+    /** [getBytes] over the full download ladder ([fetchBytesRobust]). */
+    fun getBytesRobust(url: String, headers: Map<String, String> = emptyMap()): ByteArray? =
+        fetchBytesRobust(url, headers)
 
     /**
      * Streams a download to [dest], reporting (downloadedBytes, totalBytes) through

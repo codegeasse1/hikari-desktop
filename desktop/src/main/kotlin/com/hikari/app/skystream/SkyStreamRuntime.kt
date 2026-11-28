@@ -217,11 +217,13 @@ object SkyStreamRuntime {
     }
 
     private val client by lazy {
-        OkHttpClient.Builder()
+        com.hikari.app.net.Http.applyConscryptTls(
+            OkHttpClient.Builder()
             .followRedirects(true)
             .followSslRedirects(true)
             .connectTimeout(30, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
+            .proxySelector(java.net.ProxySelector.getDefault())
             // Cloudflare, the whole reason a seemingly installed SkyStream
             // extension can show an empty catalog: most extension sites
             // (4khdhub.link and friends) answer a plain HTTP client with a
@@ -234,7 +236,7 @@ object SkyStreamRuntime {
             // (extension-repo hosts on some ISPs only answer via a public
             // resolver).
             .addInterceptor(com.hikari.app.net.WebViewFallbackInterceptor())
-            .dns(com.hikari.app.net.HikariDns)
+            .dns(com.hikari.app.net.HikariDns))
             .build()
     }
 

@@ -83,7 +83,9 @@ class ProviderManager(private val store: AppStore) {
                             try {
                                 val p = withTimeoutOrNull(15_000L) { instantiate(c) }
                                 if (p == null) {
-                                    null to ProviderStatus(c.id, c.name, c.type, loaded = false, error = "init timed out or no provider instance")
+                                    val why = if (!hasDesktopProvider(c.type)) "no desktop provider for this engine yet (inert — install an extension that ships one, or ignore this row)"
+                                    else "init timed out or no provider instance"
+                                    null to ProviderStatus(c.id, c.name, c.type, loaded = false, error = why)
                                 } else {
                                     instances[key] = p
                                     p to ProviderStatus(c.id, c.name, c.type, loaded = true, error = null)
@@ -118,6 +120,13 @@ class ProviderManager(private val store: AppStore) {
     /** Forgets one provider's cached instance (used after a reinstall). */
     fun invalidate(id: String) {
         instances.keys.removeAll { it.substringBefore('|') == id }
+    }
+
+    /** Engines with no desktop ContentProvider yet (manga readers, video forks). */
+    private fun hasDesktopProvider(t: ProviderType): Boolean = when (t) {
+        ProviderType.STREMIO, ProviderType.UNIVERSAL, ProviderType.CS3, ProviderType.HIKARI,
+        ProviderType.SKYSTREAM, ProviderType.NUVIO, ProviderType.ANIYOMI, ProviderType.IPTV -> true
+        else -> false
     }
 
     fun instantiate(c: ProviderConfig): ContentProvider? = when (c.type) {

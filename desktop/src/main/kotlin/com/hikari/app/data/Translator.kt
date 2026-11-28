@@ -146,12 +146,13 @@ object Translator {
     private fun fetch(text: String): String {
         val url = "https://translate.googleapis.com/translate_a/single?client=gtx" +
             "&sl=auto&tl=en&dt=t&q=" + java.net.URLEncoder.encode(text, "UTF-8")
-        return try {
-            val body = Http.get(url).use { it.body?.string() } ?: return ""
-            JSONArray(body).optJSONArray(0)?.optJSONArray(0)?.optString(0).orEmpty()
-        } catch (e: Exception) {
-            ""
-        }
+        // Robust ladder (mirrors/TLS passes), not the single-shot GET: a throttled
+        // translate host used to blank all translated text with no reason logged.
+        return runCatching {
+            Http.getStringRobust(url)
+                ?.let { runCatching { JSONArray(it).optJSONArray(0)?.optJSONArray(0)?.optString(0) }.getOrNull() }
+                .orEmpty()
+        }.getOrDefault("")
     }
 
     private fun maybePersist() {

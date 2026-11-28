@@ -83,7 +83,7 @@ class UniversalScraper(override val config: ProviderConfig) : ContentProvider {
         java.net.URLEncoder.encode(s, "UTF-8").replace("+", "%20")
 
     private suspend fun scrapeList(url: String, rules: JSONObject): List<MediaItem> {
-        val html = Http.getString(url) ?: return emptyList()
+        val html = Http.getStringRobust(url) ?: return emptyList()
         val doc = runCatching { Jsoup.parse(html, url) }.getOrNull() ?: return emptyList()
         val itemSel = rules.optString("item")
         if (itemSel.isBlank()) return emptyList()
@@ -398,7 +398,7 @@ class UniversalScraper(override val config: ProviderConfig) : ContentProvider {
         if (api != null) return getApiMeta(item)
         val d = conf.optJSONObject("detail") ?: return item
         if (item.id == item.title && !item.id.startsWith("http")) return item
-        val html = Http.getString(item.id) ?: return item
+        val html = Http.getStringRobust(item.id) ?: return item
         val doc = runCatching { Jsoup.parse(html, item.id) }.getOrNull() ?: return item
         val title = pick(doc, d.optString("title"), null) ?: item.title
         val poster = pick(doc, d.optString("poster"), "src")
@@ -421,7 +421,7 @@ class UniversalScraper(override val config: ProviderConfig) : ContentProvider {
         val tpl = e.optString("url")
         if (tpl.isBlank()) return null
         val pageUrl = absUrl(tpl.replace("{href}", item.id))
-        val html = Http.getString(pageUrl) ?: return null
+        val html = Http.getStringRobust(pageUrl) ?: return null
         val doc = runCatching { Jsoup.parse(html, pageUrl) }.getOrNull() ?: return null
         val itemSel = e.optString("item")
         if (itemSel.isBlank()) return null
@@ -456,7 +456,7 @@ class UniversalScraper(override val config: ProviderConfig) : ContentProvider {
         depth: Int
     ) {
         if (depth > 2) return
-        val html = Http.getString(pageUrl) ?: return
+        val html = Http.getStringRobust(pageUrl) ?: return
         val doc = runCatching { Jsoup.parse(html, pageUrl) }.getOrNull() ?: return
 
         val videoSel = s.optString("video").ifBlank { "video" }
