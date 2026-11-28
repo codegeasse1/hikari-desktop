@@ -110,6 +110,9 @@ jobs:
           } > build-errors.txt
           cat build-errors.txt
           grep -E "^e: " gradle-build.log | head -n 60 | sed -E 's/^e: (.+): \(([0-9]+), ([0-9]+)\): (.*)/::error file=\1,line=\2,col=\3::\4/' || true
+          echo "==== ERROR FEED (temporary diagnosis: raw kotlinc lines as messages) ===="
+          grep -E "^e: " gradle-build.log | head -n 60 | cut -c1-800 | while IFS= read -r line; do echo "::error::$line"; done || true
+          grep -E "FAILURE|What went wrong|Execution failed|error: |Caused by" gradle-build.log | head -n 20 | cut -c1-800 | while IFS= read -r line; do echo "::error::gradle: $line"; done || true
           exit 1
         shell: bash
 
