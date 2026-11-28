@@ -1,37 +1,146 @@
 package com.hikari.app.providers
 
+import com.hikari.app.data.Logs
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Serialises work PER PROVIDER, with separate lanes.
+ * One non-reentrant lane per provider. Foreground work (opening a title or
+ * playing it) gets priority over background catalogue/search work. A wedged
+ * third-party extension cannot permanently own the lock: after a bounded grace
+ * period a fresh lane is installed and the old call is allowed to finish alone.
  *
- * A source lookup fans out across every installed extension at once, and the
- * expensive engines (a cold Aniyomi APK, a CS3 plugin's first class load, a
- * SkyStream/nuvio JS engine boot) must not be entered twice concurrently for the
- * same provider — the second caller would either pay for a second boot or collide
- * with the first inside a runtime that is not reentrant. Different providers run
- * in parallel; the same provider runs one call at a time PER LANE.
- *
- * Lanes exist so playback never queues behind browsing: an interactive Play
- * lookup (streams for the title on screen) runs on the "fg" lane while
- * catalog/meta/search work runs on "bg". A 51CG-style provider whose translate
- * + remote-config storm holds the lock during a catalog sweep used to make the
- * Play lookup wait out the whole storm and burn the first-source budget — the
- * "No playable source" with a healthy catalog.
+ * The String overload preserves the desktop call sites ("fg"/"bg"); the enum
+ * overload is the Android contract.
  */
 object ProviderGate {
+    enum class Lane { INTERACTIVE, BACKGROUND }
 
     private val locks = ConcurrentHashMap<String, Mutex>()
+    private val interactiveWaiters = ConcurrentHashMap<String, AtomicInteger>()
+    private val interactiveWindows = AtomicInteger(0)
 
-    private fun lockFor(providerId: String, lane: String): Mutex =
-        locks.computeIfAbsent("$providerId|$lane") { Mutex() }
+    private const val BACKGROUND_MAX_HOLD_MS = 20_000L
+    private const val BACKGROUND_COURTESY_MS = 2_000L
+    private const val INTERACTIVE_GATE_MAX_MS = 90_000L
+    private const val BACKGROUND_GATE_MAX_MS = 120_000L
+    private const val STUCK_GRACE_MS = 5_000L
+    private const val WAIT_LOG_MS = 750L
 
-    suspend fun <T> withProvider(providerId: String, lane: String = "fg", block: suspend () -> T): T =
-        lockFor(providerId, lane).withLock { block() }
+    class ProviderStalledException(
+        val providerId: String,
+        val waitedMs: Long,
+    ) : Exception("stalled behind an earlier call into this extension (${waitedMs / 1000}s)")
 
-    /** True while some call for [providerId] is in flight, on any lane. */
-    fun isBusy(providerId: String): Boolean =
-        locks["$providerId|fg"]?.isLocked == true || locks["$providerId|bg"]?.isLocked == true
+    private fun lockFor(id: String) = locks.computeIfAbsent(id) { Mutex() }
+    private fun waitersFor(id: String) = interactiveWaiters.computeIfAbsent(id) { AtomicInteger(0) }
+
+    fun interactiveActive(): Boolean = interactiveWindows.get() > 0
+
+    suspend fun <T> interactive(block: suspend () -> T): T {
+        interactiveWindows.incrementAndGet()
+        try {
+            return block()
+        } finally {
+            interactiveWindows.decrementAndGet()
+        }
+    }
+
+    suspend fun <T> withProvider(
+        providerId: String,
+        lane: String = "fg",
+        block: suspend () -> T,
+    ): T = withProvider(
+        providerId,
+        if (lane.equals("bg", ignoreCase = true) || lane.equals("background", ignoreCase = true))
+            Lane.BACKGROUND else Lane.INTERACTIVE,
+        block,
+    )
+
+    suspend fun <T> withProvider(
+        id: String,
+        lane: Lane = Lane.INTERACTIVE,
+        block: suspend () -> T,
+    ): T {
+        if (lane == Lane.INTERACTIVE) {
+            val waiters = waitersFor(id)
+            waiters.incrementAndGet()
+            try {
+                var mutex = lockFor(id)
+                val started = System.currentTimeMillis()
+                var contendedSince = -1L
+                while (true) {
+                    if (mutex.tryLock()) {
+                        try {
+                            return block()
+                        } finally {
+                            mutex.unlock()
+                        }
+                    }
+                    val now = System.currentTimeMillis()
+                    if (contendedSince < 0L) contendedSince = now
+                    if (now - contendedSince >= STUCK_GRACE_MS) {
+                        locks[id] = Mutex()
+                        mutex = lockFor(id)
+                        contendedSince = now
+                        Logs.log("Provider", "$id: interactive waiter bypassed a stuck holder after ${STUCK_GRACE_MS / 1000}s")
+                        continue
+                    }
+                    if (now - started >= INTERACTIVE_GATE_MAX_MS) {
+                        throw ProviderStalledException(id, now - started)
+                    }
+                    delay(25L)
+                }
+            } finally {
+                waiters.decrementAndGet()
+            }
+        }
+
+        var mutex = lockFor(id)
+        val waiters = waitersFor(id)
+        val started = System.currentTimeMillis()
+        var contendedSince = -1L
+        while (true) {
+            val elapsed = System.currentTimeMillis() - started
+            if (elapsed >= BACKGROUND_GATE_MAX_MS) {
+                throw ProviderStalledException(id, elapsed)
+            }
+            val pageWantsThis = waiters.get() > 0 && elapsed < BACKGROUND_MAX_HOLD_MS
+            val somePageLoading = waiters.get() == 0 && interactiveWindows.get() > 0 &&
+                elapsed < BACKGROUND_COURTESY_MS
+            if (!pageWantsThis && !somePageLoading) {
+                if (mutex.tryLock()) {
+                    if (elapsed >= WAIT_LOG_MS) {
+                        Logs.log("Provider", "$id: background call started after ${elapsed / 1000.0}s")
+                    }
+                    try {
+                        return block()
+                    } finally {
+                        mutex.unlock()
+                    }
+                }
+                val now = System.currentTimeMillis()
+                if (contendedSince < 0L) contendedSince = now
+                if (now - contendedSince >= STUCK_GRACE_MS) {
+                    locks[id] = Mutex()
+                    mutex = lockFor(id)
+                    contendedSince = now
+                    Logs.log("Provider", "$id: background waiter bypassed a stuck holder after ${STUCK_GRACE_MS / 1000}s")
+                }
+            } else {
+                contendedSince = -1L
+            }
+            delay(25L)
+        }
+    }
+
+    fun isBusy(providerId: String): Boolean = locks[providerId]?.isLocked == true
+
+    fun breaker(id: String) {
+        locks[id] = Mutex()
+        interactiveWaiters.remove(id)
+        Logs.log("Provider", "$id: stall breaker pulled — later calls no longer queue behind the stuck one")
+    }
 }
