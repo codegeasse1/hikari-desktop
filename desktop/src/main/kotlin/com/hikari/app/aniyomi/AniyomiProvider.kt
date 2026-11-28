@@ -619,5 +619,5 @@ class AniyomiProvider(override val config: ProviderConfig) : ContentProvider {
     /** Runs [block] inside Hikari's per-provider lock (mutex, NOT re-entrant —
      *  the private `…Locked` helpers are what the public overrides compose). */
     private suspend fun <T> gate(block: suspend () -> T): T =
-        ProviderGate.withProvider(config.id) { withContext(Dispatchers.IO) { block() } }
+        ProviderGate.withProvider(config.id, ProviderGate.Lane.INTERACTIVE) { withContext(Dispatchers.IO) { block() } }
 }

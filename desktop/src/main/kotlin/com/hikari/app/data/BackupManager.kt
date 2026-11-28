@@ -152,38 +152,38 @@ object BackupManager {
             val name = pendingName
             if (name != null) {
                 pendingName = null
-                if (stack.isNotEmpty() && !stack.last()) out.write(',')
+                if (stack.isNotEmpty() && !stack.last()) out.write(",")
                 out.write(JSONObject.quote(name))
-                out.write(':')
+                out.write(":")
                 stack[stack.size - 1] = false
             } else if (stack.isNotEmpty()) {
-                if (!stack.last()) out.write(',')
+                if (!stack.last()) out.write(",")
                 stack[stack.size - 1] = false
             }
         }
 
         fun beginObject(): MiniJsonWriter {
             beforeValue()
-            out.write('{')
+            out.write("{")
             stack.addLast(true)
             return this
         }
 
         fun endObject(): MiniJsonWriter {
-            out.write('}')
+            out.write("}")
             if (stack.isNotEmpty()) stack.removeLast()
             return this
         }
 
         fun beginArray(): MiniJsonWriter {
             beforeValue()
-            out.write('[')
+            out.write("[")
             stack.addLast(true)
             return this
         }
 
         fun endArray(): MiniJsonWriter {
-            out.write(']')
+            out.write("]")
             if (stack.isNotEmpty()) stack.removeLast()
             return this
         }
