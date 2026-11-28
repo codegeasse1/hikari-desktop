@@ -637,7 +637,7 @@ class ContentRepository(private val manager: ProviderManager) {
     private suspend fun translateRows(rows: List<CatalogRow>): List<CatalogRow> {
         val safeRows = NsfwGate.filterRows(rows)
         val on = Translator.enabledIds()
-        if (on.isEmpty()) return rows
+        if (on.isEmpty()) return safeRows
         return safeRows.map { row ->
             if (row.providerId !in on) return@map row
             val newTitle = Translator.translate(row.title)
@@ -648,9 +648,10 @@ class ContentRepository(private val manager: ProviderManager) {
     }
 
     private suspend fun translateItems(items: List<MediaItem>): List<MediaItem> {
+        val safeItems = NsfwGate.filter(items)
         val on = Translator.enabledIds()
-        if (on.isEmpty()) return items
-        val toTranslate = items.filter { it.providerId in on }
+        if (on.isEmpty()) return safeItems
+        val toTranslate = safeItems.filter { it.providerId in on }
         if (toTranslate.isEmpty()) return safeItems
         val translations = Translator.translateAll(toTranslate.map { it.title })
         var anyChanged = false
@@ -661,7 +662,7 @@ class ContentRepository(private val manager: ProviderManager) {
                 it.copy(title = t)
             } else it
         }
-        if (!anyChanged) return items
+        if (!anyChanged) return safeItems
         val byId = changed.associateBy { it.uniqueId }
         return safeItems.map { byId[it.uniqueId] ?: it }
     }
