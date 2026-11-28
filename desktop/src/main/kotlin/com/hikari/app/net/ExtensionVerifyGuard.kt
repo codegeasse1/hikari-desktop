@@ -122,50 +122,50 @@ object ExtensionVerifyGuard {
         override fun edit(): SharedPreferences.Editor = GuardedEditor(real.edit())
 
         override fun registerOnSharedPreferenceChangeListener(
-            listener: SharedPreferences.OnSharedPreferenceChangeListener?,
+            listener: SharedPreferences.OnSharedPreferenceChangeListener,
         ) = real.registerOnSharedPreferenceChangeListener(listener)
 
         override fun unregisterOnSharedPreferenceChangeListener(
-            listener: SharedPreferences.OnSharedPreferenceChangeListener?,
+            listener: SharedPreferences.OnSharedPreferenceChangeListener,
         ) = real.unregisterOnSharedPreferenceChangeListener(listener)
     }
 
     private class GuardedEditor(private val real: SharedPreferences.Editor) : SharedPreferences.Editor {
-        override fun putString(key: String?, value: String?): SharedPreferences.Editor {
+        override fun putString(key: String, value: String?): SharedPreferences.Editor {
             val turningOn = value != null && value.trim().lowercase() == "true"
-            real.putString(key, if (key != null && turningOn && forcesOff(key)) "false" else value)
+            real.putString(key, if (turningOn && forcesOff(key)) "false" else value)
             return this
         }
 
         override fun putStringSet(
-            key: String?,
+            key: String,
             values: Set<String>?,
         ): SharedPreferences.Editor {
             real.putStringSet(key, values)
             return this
         }
 
-        override fun putInt(key: String?, value: Int): SharedPreferences.Editor {
+        override fun putInt(key: String, value: Int): SharedPreferences.Editor {
             real.putInt(key, value)
             return this
         }
 
-        override fun putLong(key: String?, value: Long): SharedPreferences.Editor {
+        override fun putLong(key: String, value: Long): SharedPreferences.Editor {
             real.putLong(key, value)
             return this
         }
 
-        override fun putFloat(key: String?, value: Float): SharedPreferences.Editor {
+        override fun putFloat(key: String, value: Float): SharedPreferences.Editor {
             real.putFloat(key, value)
             return this
         }
 
-        override fun putBoolean(key: String?, value: Boolean): SharedPreferences.Editor {
+        override fun putBoolean(key: String, value: Boolean): SharedPreferences.Editor {
             real.putBoolean(key, if (key != null && forcesOff(key)) false else value)
             return this
         }
 
-        override fun remove(key: String?): SharedPreferences.Editor {
+        override fun remove(key: String): SharedPreferences.Editor {
             real.remove(key)
             return this
         }
