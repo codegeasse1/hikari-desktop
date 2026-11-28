@@ -329,16 +329,18 @@ object TmdbResolver {
             } else {
                 ""
             }
+            val safeParams = LinkedHashMap(query)
+            val safePath = com.hikari.app.data.NsfwGate.restrictRequest(path, safeParams)
             // TMDB answers ~40 requests per 10s window: the home screen fans
             // out dozens of lookups at once (hero + art upgrades), and an
             // unthrottled burst comes back 429 for most of them — which used to
             // read as "TMDB has no art for this title" and left provider
             // thumbnails everywhere. Four at a time stay under the limit; one
             // delayed retry covers the stragglers the window still clips.
-            tmdbGate.withPermit { tryKeys(path, query, lang) }
+            tmdbGate.withPermit { tryKeys(safePath, safeParams, lang) }
                 ?: run {
                     delay(2_000L)
-                    tmdbGate.withPermit { tryKeys(path, query, lang) }
+                    tmdbGate.withPermit { tryKeys(safePath, safeParams, lang) }
                 }
         }
 
