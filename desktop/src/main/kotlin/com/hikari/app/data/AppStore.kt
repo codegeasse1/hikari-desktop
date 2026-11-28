@@ -597,6 +597,8 @@ class AppStore(private val dir: File) {
                     .put("iconUrl", c.iconUrl ?: "")
                     .put("enabled", c.enabled)
                     .put("extra", c.extra ?: "")
+                    .put("nsfw", c.nsfw ?: JSONObject.NULL)
+                    .put("lang", c.lang ?: "")
             )
         }
         return arr.toString()
@@ -617,6 +619,8 @@ class AppStore(private val dir: File) {
                     iconUrl = o.optString("iconUrl").ifBlank { null },
                     enabled = o.optBoolean("enabled", true),
                     extra = o.optString("extra").ifBlank { null },
+                    nsfw = o.opt("nsfw")?.takeUnless { it == JSONObject.NULL }?.let { o.optBoolean("nsfw") },
+                    lang = o.optString("lang").ifBlank { null },
                 )
             }.filter { it.id.isNotBlank() }
         } catch (e: Exception) {
@@ -633,6 +637,7 @@ class AppStore(private val dir: File) {
                     .put("name", r.name)
                     .put("description", r.description)
                     .put("kind", r.kind.name)
+                    .put("iconUrl", r.iconUrl)
             )
         }
         return arr.toString()
@@ -650,6 +655,7 @@ class AppStore(private val dir: File) {
                     description = o.optString("description"),
                     kind = runCatching { RepoKind.valueOf(o.optString("kind", "CS3")) }
                         .getOrDefault(RepoKind.CS3),
+                    iconUrl = o.optString("iconUrl"),
                 )
             }.filter { it.url.isNotBlank() }
         } catch (e: Exception) {
@@ -669,6 +675,15 @@ class AppStore(private val dir: File) {
                     .put("poster", m.posterUrl ?: "")
                     .put("year", m.year ?: 0)
                     .put("overview", m.overview ?: "")
+                    .put("backdrop", m.backdropUrl ?: "")
+                    .put("rawType", m.rawType)
+                    .put("rating", m.rating ?: JSONObject.NULL)
+                    .put("originalTitle", m.originalTitle)
+                    .put("nsfw", m.nsfw)
+                    .put("quality", m.quality ?: "")
+                    .put("nextEpisodeDate", m.nextEpisodeDate ?: "")
+                    .put("metadataSource", m.metadataSource ?: "")
+                    .put("genres", JSONArray(m.genres))
             )
         }
         return arr.toString()
@@ -689,6 +704,17 @@ class AppStore(private val dir: File) {
                     posterUrl = o.optString("poster").ifBlank { null },
                     year = o.optInt("year", 0).takeIf { it > 0 },
                     overview = o.optString("overview").ifBlank { null },
+                    backdropUrl = o.optString("backdrop").ifBlank { null },
+                    rawType = o.optString("rawType"),
+                    rating = o.opt("rating")?.takeUnless { it == JSONObject.NULL }?.let { o.optDouble("rating") },
+                    originalTitle = o.optString("originalTitle"),
+                    nsfw = o.optBoolean("nsfw", false),
+                    quality = o.optString("quality").ifBlank { null },
+                    nextEpisodeDate = o.optString("nextEpisodeDate").ifBlank { null },
+                    metadataSource = o.optString("metadataSource").ifBlank { null },
+                    genres = o.optJSONArray("genres")?.let { arr ->
+                        (0 until arr.length()).mapNotNull { index -> arr.optString(index).takeIf { it.isNotBlank() } }
+                    }.orEmpty(),
                 )
             }
         } catch (e: Exception) {
