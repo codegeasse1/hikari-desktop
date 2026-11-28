@@ -93,7 +93,7 @@ object ExtensionVerifyGuard {
         private fun guarded(key: String?): Boolean = key != null && forcesOff(key)
 
         override fun getAll(): Map<String, *> {
-            val out = HashMap<String, Any?>(real.all)
+            val out = HashMap<String, Any?>(real.getAll())
             for (key in out.keys.toList()) if (forcesOff(key)) out[key] = false
             return out
         }
@@ -203,7 +203,7 @@ object ExtensionVerifyGuard {
     private fun discoveredToggles(context: Context): List<Pair<SharedPreferences?, String>> {
         val out = LinkedHashSet<Pair<SharedPreferences?, String>>()
         for (file in prefFiles(context)) {
-            val keys = runCatching { file.all.keys }.getOrNull() ?: continue
+            val keys = runCatching { file.getAll().keys }.getOrNull() ?: continue
             for (key in keys) {
                 if (key.isBlank() || !looksLikeVerifyToggle(key)) continue
                 out += (file to key)
@@ -214,7 +214,7 @@ object ExtensionVerifyGuard {
 
     private fun readToggle(context: Context, key: String): Boolean? {
         for (file in prefFiles(context)) {
-            val raw = runCatching { file.all[key] }.getOrNull() ?: continue
+            val raw = runCatching { file.getAll()[key] }.getOrNull() ?: continue
             val parsed = when (raw) {
                 is Boolean -> raw
                 is Number -> raw.toInt() != 0
