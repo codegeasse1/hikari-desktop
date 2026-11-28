@@ -584,7 +584,7 @@ object BackupManager {
                     }
                     else -> o.optString("value", null)
                 }
-                if (AppStore.DeviceLocal.contains(key)) {
+                if (DeviceLocal.contains(key)) {
                     deviceLocal++
                     continue
                 }

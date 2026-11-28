@@ -20,8 +20,8 @@ import java.io.File
  * Desktop mechanics: Android's per-file SharedPreferences become the desktop's
  * JSON-file prefs (Context.getSharedPreferences) plus the default prefs file;
  * there are no CS_PREFS_NAME/HK_PREFS_NAME constants on the desktop, so the
- * scan covers the default prefs plus every `~/.hikari/prefs/*.json` file
- * instead of Android's `shared_prefs/*.xml` directory. The write path still
+ * scan covers the default prefs plus every JSON file under the prefs folder
+ * instead of Android's shared_prefs folder. The write path still
  * goes through CloudStreamApp.setKey first (the runtime's live view), then the
  * files.
  */

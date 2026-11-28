@@ -6,7 +6,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
-import kotlin.math.maxOf
 
 /**
  * Anime/donghua metadata fallback for titles TMDB mistranslates.
